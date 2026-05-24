@@ -1426,13 +1426,13 @@ class LayerPanel(QFrame):
         # 圖示行
         icon_item = QListWidgetItem()
         icon_item.setFlags(Qt.ItemFlag.NoItemFlags)
-        icon_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon_item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
         self.list.addItem(icon_item)
 
         # 主文
         title_item = QListWidgetItem("Open an OASIS")
         title_item.setFlags(Qt.ItemFlag.NoItemFlags)
-        title_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        title_item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
         title_item.setForeground(QColor(_TK_TEXT_SEC))
         font = title_item.font()
         font.setPixelSize(_FS_LABEL)
@@ -1443,7 +1443,7 @@ class LayerPanel(QFrame):
         # 次文
         hint_item = QListWidgetItem("toolbar → Open OASIS…")
         hint_item.setFlags(Qt.ItemFlag.NoItemFlags)
-        hint_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        hint_item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
         hint_item.setForeground(QColor(_TK_TEXT_HINT))
         font2 = hint_item.font()
         font2.setPixelSize(_FS_CAPTION)

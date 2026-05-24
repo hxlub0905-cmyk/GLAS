@@ -2,6 +2,24 @@
 
 ---
 
+## [2026-05-24] LAYERS empty hint 置中微調
+
+**變更類型：** UI 微調
+
+**動機/現象：** `LayerPanel._show_empty_hint()` 的三個 item 用 `AlignCenter`，
+改為 `AlignHCenter` 明確水平置中（QListWidget 無 list-wide setAlignment API，
+per-item setTextAlignment 即正確機制）。`_group()` 橘色標籤上一輪已完成，本次未動。
+
+**修復/實作（`glas/app/gds_align_tool.py`）：** icon/title/hint 三 item 的
+`setTextAlignment` 由 `Qt.AlignmentFlag.AlignCenter` → `AlignHCenter`。
+
+**測試：** `python3 -m py_compile` 通過；`pytest tests/test_gds_align_m6.py
+tests/test_gds_align_m7.py` 59 passed。
+
+**影響檔案：** `glas/app/gds_align_tool.py`。
+
+**Branch：** `claude/jolly-babbage-8nwED`（PR #2）
+
 ## [2026-05-24] GLAS UI 五項修正（依 docs/glas_ui_fixes.md）
 
 **變更類型：** 功能（UI / UX 微調）
