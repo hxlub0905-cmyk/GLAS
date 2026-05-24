@@ -14,11 +14,16 @@ Usage:
 """
 from __future__ import annotations
 
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QSizePolicy
+from PyQt6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSizePolicy,
+)
 
 # ── Tier visual tokens (kept here so they travel with the widget) ─────────────
 _TIER_BG     = {1: "#fff4e8", 2: "#f9f4ee", 3: "#f4f0ec"}
 _TIER_BORDER = {1: "#efd8b8", 2: "#ede4d8", 3: "#e8e0d8"}
+
+# Caption font-size for the collapsed-state status badge (matches styles.py).
+_FS_CAPTION = 11
 
 # Inline QSS applied to the toggle button when a trailing_widget is present.
 # Uses type-selector pseudo-states (safe here: QPushButton has no child buttons).
@@ -76,6 +81,11 @@ class CollapsibleSection(QWidget):
         self._btn.clicked.connect(self._toggle)
         self._update_label()
 
+        # Optional status badge shown on the right of the header while the
+        # section is collapsed (set via set_badge); hidden when expanded.
+        self._badge = QLabel()
+        self._badge.hide()
+
         if trailing_widget is not None:
             # Header: container (full-width background + borders) wrapping the
             # toggle button and the trailing widget side by side.
@@ -92,12 +102,20 @@ class CollapsibleSection(QWidget):
             chl.setSpacing(0)
             self._btn.setStyleSheet(_TIER_HOVER_QSS.get(tier, _TIER_HOVER_QSS[2]))
             chl.addWidget(self._btn, stretch=1)
+            chl.addWidget(self._badge)
             chl.addWidget(trailing_widget)
             outer.addWidget(container)
         else:
-            # Original path: just the toggle button as the header.
+            # Original path: toggle button as the header, plus the badge on the
+            # right (wrapped in a row so the badge stays right-aligned).
             self._btn.setStyleSheet("text-align: left;")
-            outer.addWidget(self._btn)
+            row = QWidget()
+            rhl = QHBoxLayout(row)
+            rhl.setContentsMargins(0, 0, 6, 0)
+            rhl.setSpacing(0)
+            rhl.addWidget(self._btn, stretch=1)
+            rhl.addWidget(self._badge)
+            outer.addWidget(row)
 
         # ── content body ─────────────────────────────────────────────────────
         self._body = QWidget()
@@ -121,9 +139,25 @@ class CollapsibleSection(QWidget):
         self._collapsed = val
         self._body.setVisible(not val)
         self._update_label()
+        self._update_badge_visibility()
 
     def is_collapsed(self) -> bool:
         return self._collapsed
+
+    def set_badge(self, text: str, fg: str = "", bg: str = "") -> None:
+        """Set (or clear) the header status badge. Only visible while the
+        section is collapsed; pass an empty ``text`` to remove it."""
+        self._badge.setText(text)
+        if text:
+            self._badge.setStyleSheet(
+                f"QLabel {{ color: {fg}; background: {bg};"
+                " border-radius: 3px; padding: 1px 7px;"
+                f" font-size: {_FS_CAPTION}px; }}"
+            )
+        self._update_badge_visibility()
+
+    def _update_badge_visibility(self) -> None:
+        self._badge.setVisible(self._collapsed and bool(self._badge.text()))
 
     # ── private ───────────────────────────────────────────────────────────────
 

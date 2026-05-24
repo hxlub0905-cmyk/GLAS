@@ -402,3 +402,62 @@ class TestEmptyListPlaceholder:
         assert mw.sem_panel.list.item(0).text().startswith("D1")
         mw.sem_panel.set_images([])                 # back to placeholder
         assert "Load SEM" in mw.sem_panel.list.item(0).text()
+
+
+# ── Batch 1: Load SEM accent, coord badge, image-list badges ──────────
+
+
+class TestBatch1LoadSemAccent:
+
+    def test_load_sem_btn_has_accent_qss(self, mw):
+        qss = mw.sem_panel.load_sem_btn.styleSheet()
+        assert gat._TK_ACCENT.name() in qss
+
+
+@pytest.mark.skipif(gat.CollapsibleSection is None,
+                    reason="CollapsibleSection unavailable")
+class TestBatch1CoordBadge:
+
+    def test_coord_badge_not_set(self, mw):
+        mw.sem_panel.update_coord_badge({"fov_w_nm": 0, "fov_h_nm": 0})
+        assert mw.sem_panel._coord_section._badge.text() == "not set"
+
+    def test_coord_badge_set(self, mw):
+        mw.sem_panel.update_coord_badge(
+            {"fov_w_nm": 2000000, "fov_h_nm": 1500000})
+        assert mw.sem_panel._coord_section._badge.text() == "FOV 2000 × 1500"
+
+    def test_coord_badge_hidden_when_expanded(self, mw):
+        mw.sem_panel.update_coord_badge({"fov_w_nm": 0, "fov_h_nm": 0})
+        mw.sem_panel.set_coord_collapsed(False)
+        assert mw.sem_panel._coord_section._badge.isHidden()
+
+
+class TestBatch1ImageListBadges:
+
+    def test_image_list_no_coords_badge(self, mw):
+        from PyQt6.QtCore import Qt
+        img = sem_loader.SemImage(image_id="D9", filename="x.png",
+                                  file_path=Path("x.png"))
+        mw.sem_panel.set_images([img])
+        item = mw.sem_panel.list.item(0)
+        assert item.data(Qt.ItemDataRole.UserRole + 2) == "no coords"
+
+    def test_image_list_score_green(self, mw):
+        from PyQt6.QtCore import Qt
+        img = sem_loader.SemImage(image_id="D1", filename="a.png",
+                                  file_path=Path("a.png"), xrel=1.0, yrel=2.0)
+        mw.sem_panel.set_images([img])
+        mw.sem_panel.set_score("D1", 0.95, 0.7)
+        item = mw.sem_panel.list.item(0)
+        assert item.data(Qt.ItemDataRole.UserRole + 2) == "0.95"
+        assert item.data(Qt.ItemDataRole.UserRole + 4) == "#ebf7f0"
+
+    def test_image_list_score_red(self, mw):
+        from PyQt6.QtCore import Qt
+        img = sem_loader.SemImage(image_id="D1", filename="a.png",
+                                  file_path=Path("a.png"), xrel=1.0, yrel=2.0)
+        mw.sem_panel.set_images([img])
+        mw.sem_panel.set_score("D1", 0.3, 0.7)
+        item = mw.sem_panel.list.item(0)
+        assert item.data(Qt.ItemDataRole.UserRole + 4) == "#feeeee"

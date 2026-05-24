@@ -2,6 +2,39 @@
 
 ---
 
+## [2026-05-24] UI batch 1：Load SEM 主色按鈕 / Coord 折疊 badge / image list badge
+
+**變更類型：** 功能（UI / UX）
+
+**動機/現象：** 三項視覺強化：(1) `Load SEM…` 按鈕視覺權重不足，與 `Open OASIS…`
+不對等；(2) Coordinate Setup 收起後看不出 FOV 是否已設定；(3) image list 每列無法
+一眼看出對位狀態（有無座標 / fine-align 分數）。
+
+**修復/實作：**
+- **Fix 1（`gds_align_tool.py`）**：新增 `_LOAD_SEM_BTN_QSS`（橘底白字 + hover 深橘 +
+  menu-indicator），`SemPanel` 的 Load SEM 按鈕存為 `self.load_sem_btn` 並套用該 QSS。
+  （按鈕實際在 `SemPanel` 而非 toolbar。）
+- **Fix 2（`collapsible.py` + `gds_align_tool.py`）**：`CollapsibleSection` header 加
+  `self._badge` QLabel（右對齊，no-trailing 路徑也包一層 row）+ `set_badge(text,fg,bg)`
+  + `_update_badge_visibility()`（僅在收起且有文字時顯示）；`SemPanel.update_coord_badge()`
+  讀 `fov_w_nm`/`fov_w`（皆 nm，/1000→µm）顯示綠色 `FOV W × H` 或琥珀 `not set`，
+  於 `__init__` 末 seed 一次、`MainWindow._on_coord_changed` 每次更新。
+- **Fix 3（`gds_align_tool.py`）**：新增 `_ImageListDelegate(QStyledItemDelegate)`，在右
+  邊距以 UserRole+2/+3/+4 資料畫圓角 badge；`set_images` 對無座標列調暗文字 + 設
+  `no coords` 灰 badge；`set_score` 改設分數 badge（綠/琥珀/紅，門檻 `>=t` / `>=0.7t` /
+  else），不再 inline 改文字。
+
+**測試：** `py_compile` 兩檔通過；更新 `test_gds_align_m4b.py::test_end_to_end`（改驗 badge
+資料角色而非 `[score]` 文字）；`test_gds_align_m7.py` 新增 7 項（accent QSS / coord badge
+not-set / set / hidden-when-expanded / no-coords badge / score green / score red）。完整
+`pytest tests/` 442 passed。offscreen render-grab 煙霧測試：視窗正常顯示、Load SEM 橘色、
+badge 正確。
+
+**影響檔案：** `glas/app/gds_align_tool.py`、`glas/app/collapsible.py`、
+`tests/test_gds_align_m7.py`、`tests/test_gds_align_m4b.py`。
+
+**Branch：** `claude/jolly-babbage-8nwED`（PR #2）
+
 ## [2026-05-24] LAYERS empty hint 置中微調
 
 **變更類型：** UI 微調

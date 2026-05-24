@@ -58,9 +58,9 @@ from typing import Optional
 
 import numpy as np
 
-from PyQt6.QtCore import Qt, QObject, QPointF, QRectF, QSize, QThread, QTimer, QElapsedTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QObject, QPointF, QRect, QRectF, QSize, QThread, QTimer, QElapsedTimer, pyqtSignal
 from PyQt6.QtGui import (
-    QAction, QBrush, QColor, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap,
+    QAction, QBrush, QColor, QFontMetrics, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap,
     QPolygonF, QMouseEvent, QShortcut, QWheelEvent,
 )
 from PyQt6.QtWidgets import (
@@ -68,8 +68,8 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFrame, QGridLayout,
     QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton, QScrollArea,
-    QSizePolicy, QSlider, QSpinBox, QSplitter, QStatusBar, QToolButton,
-    QVBoxLayout, QWidget,
+    QSizePolicy, QSlider, QSpinBox, QSplitter, QStatusBar, QStyledItemDelegate,
+    QToolButton, QVBoxLayout, QWidget,
 )
 
 try:
@@ -146,6 +146,25 @@ _TK_TOOLBAR_BG = "#fff7ee"
 
 # Font-size scale (px), matching styles.py FS_* tokens.
 _FS_MICRO, _FS_CAPTION, _FS_LABEL, _FS_BODY, _FS_TITLE = 10, 11, 12, 13, 14
+
+# Primary-emphasis QSS for the "Load SEM…" menu button so it carries the same
+# orange weight as the toolbar's "Open OASIS…" entry point.
+_LOAD_SEM_BTN_QSS = (
+    "QPushButton {"
+    f"  background: {_TK_ACCENT.name()};"
+    "  color: #ffffff;"
+    "  font-weight: 600;"
+    "  border: none;"
+    "  border-radius: 4px;"
+    "  padding: 3px 10px;"
+    "}"
+    f"QPushButton:hover {{ background: {_TK_ACCENT_DK.name()}; }}"
+    "QPushButton::menu-indicator {"
+    "  subcontrol-origin: padding;"
+    "  subcontrol-position: right center;"
+    "  right: 6px;"
+    "}"
+)
 
 
 def _hint_qss(size: int = _FS_CAPTION, color: str = "#8a7660",
@@ -2946,6 +2965,41 @@ class FineAlignPanel(QGroupBox):
         self._result_lbl.setText("")
 
 
+class _ImageListDelegate(QStyledItemDelegate):
+    """Paints a small status badge in the right margin of each SEM image row
+    (fine-align score colour-coded, or a neutral ``no coords`` tag). Badge
+    text / colours travel on the item via the UserRole+2..+4 data roles."""
+
+    _BADGE_MARGIN = 6
+    _BADGE_H = 16
+    _BADGE_PADDING = 8
+
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        badge_text = index.data(Qt.ItemDataRole.UserRole + 2)
+        badge_fg = index.data(Qt.ItemDataRole.UserRole + 3)
+        badge_bg = index.data(Qt.ItemDataRole.UserRole + 4)
+        if not badge_text:
+            return
+        painter.save()
+        fm = QFontMetrics(option.font)
+        text_w = fm.horizontalAdvance(badge_text) + self._BADGE_PADDING * 2
+        badge_rect = QRect(
+            option.rect.right() - text_w - self._BADGE_MARGIN,
+            option.rect.center().y() - self._BADGE_H // 2,
+            text_w,
+            self._BADGE_H,
+        )
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setBrush(QColor(badge_bg))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(badge_rect, 3, 3)
+        painter.setPen(QColor(badge_fg))
+        painter.setFont(option.font)
+        painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, badge_text)
+        painter.restore()
+
+
 class SemPanel(QFrame):
     """Right column: a single 'Load SEM…' button (KLARF / image folder via a
     drop-down) + Coordinate Setup + the image list. Owns no file I/O — it
@@ -2987,18 +3041,19 @@ class SemPanel(QFrame):
         v.addWidget(title)
 
         btn_row = QHBoxLayout()
-        load_sem_btn = QPushButton("Load SEM…")
-        load_sem_btn.setToolTip(
+        self.load_sem_btn = QPushButton("Load SEM…")
+        self.load_sem_btn.setToolTip(
             "Load SEM images from a KLARF defect list (carries die-corner "
             "coordinates for auto-jump) or from a plain image folder "
             "(no coordinates).")
-        sem_menu = QMenu(load_sem_btn)
+        self.load_sem_btn.setStyleSheet(_LOAD_SEM_BTN_QSS)
+        sem_menu = QMenu(self.load_sem_btn)
         act_klarf = sem_menu.addAction("From KLARF file…")
         act_klarf.triggered.connect(lambda: self.load_klarf_requested.emit())
         act_folder = sem_menu.addAction("From image folder…")
         act_folder.triggered.connect(lambda: self.load_folder_requested.emit())
-        load_sem_btn.setMenu(sem_menu)
-        btn_row.addWidget(load_sem_btn)
+        self.load_sem_btn.setMenu(sem_menu)
+        btn_row.addWidget(self.load_sem_btn)
         btn_row.addStretch(1)
         v.addLayout(btn_row)
 
@@ -3017,6 +3072,7 @@ class SemPanel(QFrame):
         self.list = QListWidget(self)
         self.list.setMinimumHeight(120)
         _config_list(self.list)
+        self.list.setItemDelegate(_ImageListDelegate(self.list))
         self.list.itemClicked.connect(self._on_clicked)
         v.addWidget(self.list, 1)
 
@@ -3055,6 +3111,25 @@ class SemPanel(QFrame):
         self._images: list = []
         self._scores: dict = {}
         self._show_list_placeholder()
+        # Seed the collapsed-state FOV badge so it's present from the start.
+        self.update_coord_badge({})
+
+    def update_coord_badge(self, values: dict) -> None:
+        """Reflect the Coordinate Setup FOV state in the section header badge
+        (shown while the section is collapsed): green ``FOV W × H`` (µm) when
+        set, muted amber ``not set`` otherwise."""
+        if CollapsibleSection is None:
+            return
+        fov_w = float(values.get("fov_w_nm", values.get("fov_w", 0)) or 0)
+        fov_h = float(values.get("fov_h_nm", values.get("fov_h", 0)) or 0)
+        if fov_w > 0 and fov_h > 0:
+            w_um = int(round(fov_w / 1000))
+            h_um = int(round(fov_h / 1000))
+            self._coord_section.set_badge(
+                f"FOV {w_um} × {h_um}", fg="#3e7f5d", bg="#ebf7f0")
+        else:
+            self._coord_section.set_badge(
+                "not set", fg="#c8a080", bg="#fff0e0")
 
     def _show_list_placeholder(self) -> None:
         """Fill the empty image list with a muted hint so it doesn't read as a
@@ -3093,27 +3168,34 @@ class SemPanel(QFrame):
             self._show_list_placeholder()
             return
         for img in self._images:
-            tag = "" if img.has_coords else "  (no coords)"
-            item = QListWidgetItem(f"{img.image_id}: {img.filename}{tag}")
+            item = QListWidgetItem(f"{img.image_id}: {img.filename}")
             item.setData(Qt.ItemDataRole.UserRole, img)
+            if not img.has_coords:
+                item.setForeground(QColor(_TK_TEXT_SEC))
+                item.setData(Qt.ItemDataRole.UserRole + 2, "no coords")
+                item.setData(Qt.ItemDataRole.UserRole + 3, "#9a8878")
+                item.setData(Qt.ItemDataRole.UserRole + 4, "#f4f0ea")
             self.list.addItem(item)
 
     def set_score(self, image_id, score: float, threshold: float) -> None:
         """Annotate the matching list row with a colour-coded fine-align
-        score (green ≥ threshold, orange near, red below) — plan M4b."""
-        from PyQt6.QtGui import QColor as _QColor
+        score badge (green ≥ threshold, amber near, red below) — plan M4b."""
         self._scores[image_id] = (score, threshold)
         for i in range(self.list.count()):
             item = self.list.item(i)
             img = item.data(Qt.ItemDataRole.UserRole)
             if img is None or img.image_id != image_id:
                 continue
-            tag = "" if img.has_coords else "  (no coords)"
-            item.setText(f"{img.image_id}: {img.filename}{tag}   [{score:.2f}]")
-            color = ("#2e7d32" if score >= threshold
-                     else "#b8860b" if score >= max(0.0, threshold - 0.2)
-                     else "#c0392b")
-            item.setForeground(_QColor(color))
+            score_text = f"{score:.2f}"
+            if score >= threshold:
+                fg, bg = "#3e7f5d", "#ebf7f0"   # green
+            elif score >= threshold * 0.7:
+                fg, bg = "#b8860b", "#fff8e0"   # amber
+            else:
+                fg, bg = "#a32d2d", "#feeeee"   # red
+            item.setData(Qt.ItemDataRole.UserRole + 2, score_text)
+            item.setData(Qt.ItemDataRole.UserRole + 3, fg)
+            item.setData(Qt.ItemDataRole.UserRole + 4, bg)
             break
 
     def _on_clicked(self, item: QListWidgetItem) -> None:
@@ -3678,6 +3760,7 @@ class MainWindow(QMainWindow):
 
     def _on_coord_changed(self) -> None:
         v = self.sem_panel.coord_setup.values()
+        self.sem_panel.update_coord_badge(v)
         self._chip_corner_x = v["chip_corner_x"]
         self._chip_corner_y = v["chip_corner_y"]
         self._fov_w = v["fov_w"]

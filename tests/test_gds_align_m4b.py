@@ -226,8 +226,10 @@ class TestRunFineAlign:
         # Overlay anchor reflects the refined correction.
         gx, gy = mw._current_image_gds()
         assert (gx, gy) == pytest.approx((3500.0, 4300.0), abs=1.0)
-        # The list row shows the score.
-        assert "[" in mw.sem_panel.list.item(0).text()
+        # The list row carries the score badge (UserRole+2 data role).
+        from PyQt6.QtCore import Qt as _Qt
+        assert mw.sem_panel.list.item(0).data(
+            _Qt.ItemDataRole.UserRole + 2) == f"{score:.2f}"
 
     def test_no_poi_is_noop(self, mw):
         mw._poi_entry = None
