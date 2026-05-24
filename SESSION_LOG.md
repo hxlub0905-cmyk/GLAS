@@ -2,6 +2,92 @@
 
 ---
 
+## [2026-05-24] UI batch 1：Load SEM 主色按鈕 / Coord 折疊 badge / image list badge
+
+**變更類型：** 功能（UI / UX）
+
+**動機/現象：** 三項視覺強化：(1) `Load SEM…` 按鈕視覺權重不足，與 `Open OASIS…`
+不對等；(2) Coordinate Setup 收起後看不出 FOV 是否已設定；(3) image list 每列無法
+一眼看出對位狀態（有無座標 / fine-align 分數）。
+
+**修復/實作：**
+- **Fix 1（`gds_align_tool.py`）**：新增 `_LOAD_SEM_BTN_QSS`（橘底白字 + hover 深橘 +
+  menu-indicator），`SemPanel` 的 Load SEM 按鈕存為 `self.load_sem_btn` 並套用該 QSS。
+  （按鈕實際在 `SemPanel` 而非 toolbar。）
+- **Fix 2（`collapsible.py` + `gds_align_tool.py`）**：`CollapsibleSection` header 加
+  `self._badge` QLabel（右對齊，no-trailing 路徑也包一層 row）+ `set_badge(text,fg,bg)`
+  + `_update_badge_visibility()`（僅在收起且有文字時顯示）；`SemPanel.update_coord_badge()`
+  讀 `fov_w_nm`/`fov_w`（皆 nm，/1000→µm）顯示綠色 `FOV W × H` 或琥珀 `not set`，
+  於 `__init__` 末 seed 一次、`MainWindow._on_coord_changed` 每次更新。
+- **Fix 3（`gds_align_tool.py`）**：新增 `_ImageListDelegate(QStyledItemDelegate)`，在右
+  邊距以 UserRole+2/+3/+4 資料畫圓角 badge；`set_images` 對無座標列調暗文字 + 設
+  `no coords` 灰 badge；`set_score` 改設分數 badge（綠/琥珀/紅，門檻 `>=t` / `>=0.7t` /
+  else），不再 inline 改文字。
+
+**測試：** `py_compile` 兩檔通過；更新 `test_gds_align_m4b.py::test_end_to_end`（改驗 badge
+資料角色而非 `[score]` 文字）；`test_gds_align_m7.py` 新增 7 項（accent QSS / coord badge
+not-set / set / hidden-when-expanded / no-coords badge / score green / score red）。完整
+`pytest tests/` 442 passed。offscreen render-grab 煙霧測試：視窗正常顯示、Load SEM 橘色、
+badge 正確。
+
+**影響檔案：** `glas/app/gds_align_tool.py`、`glas/app/collapsible.py`、
+`tests/test_gds_align_m7.py`、`tests/test_gds_align_m4b.py`。
+
+**Branch：** `claude/jolly-babbage-8nwED`（PR #2）
+
+## [2026-05-24] LAYERS empty hint 置中微調
+
+**變更類型：** UI 微調
+
+**動機/現象：** `LayerPanel._show_empty_hint()` 的三個 item 用 `AlignCenter`，
+改為 `AlignHCenter` 明確水平置中（QListWidget 無 list-wide setAlignment API，
+per-item setTextAlignment 即正確機制）。`_group()` 橘色標籤上一輪已完成，本次未動。
+
+**修復/實作（`glas/app/gds_align_tool.py`）：** icon/title/hint 三 item 的
+`setTextAlignment` 由 `Qt.AlignmentFlag.AlignCenter` → `AlignHCenter`。
+
+**測試：** `python3 -m py_compile` 通過；`pytest tests/test_gds_align_m6.py
+tests/test_gds_align_m7.py` 59 passed。
+
+**影響檔案：** `glas/app/gds_align_tool.py`。
+
+**Branch：** `claude/jolly-babbage-8nwED`（PR #2）
+
+## [2026-05-24] GLAS UI 五項修正（依 docs/glas_ui_fixes.md）
+
+**變更類型：** 功能（UI / UX 微調）
+
+**動機/現象：** 依 `docs/glas_ui_fixes.md` 修正五個 UI 問題：右欄 Coordinate Setup
+預設展開把 image list 擠掉、左欄 LAYERS 空白引導視覺太輕、Set/Clear Offset 放在中央
+視圖下方定位不清、toolbar group label 對比不足、中央 empty state 與 guidance strip
+文字重複。
+
+**修復/實作（`glas/app/gds_align_tool.py`）：**
+- 問題1：`SemPanel` 的 Coordinate Setup `_wrap_section(..., collapsed=True)`（原 False）；
+  `MainWindow.__init__` 加 `self._coord_collapsed_once = True`，使自動收起邏輯不再干預
+  （預設已收起，user 再展開即固定）。
+- 問題2：`LayerPanel._show_empty_hint()` 由單行小字改為圖示 + 主文「Open an OASIS」+
+  次文「toolbar → Open OASIS…」三層置中結構。
+- 問題3：Set/Clear Offset 由中央 `center_layout` 移入 `SemPanel`（image list 下方、
+  Load GDS ROI 上方），改名 `self.sem_panel.set_offset_btn/clear_offset_btn`，
+  signal 在 `MainWindow.__init__` 重新接線；原 `self._set_offset_btn/_clear_offset_btn`
+  區塊整段刪除（無其他 setEnabled 引用）。
+- 問題4：`_build_toolbar` 的 `_group()` label 改用 `_TK_ACCENT_DK` 色、letter-spacing
+  1px、padding；FILE group 前加 `h.addSpacing(4)`。
+- 問題5：`SemViewer._draw_empty_state()` 三步驟提示改為「Follow the steps above to get
+  started」，由 guidance strip 負責引導。
+
+**測試：** `python3 -m py_compile` 通過；同步更新 4 個測試的舊行為斷言
+（`test_gds_align_m6.py::test_set_document_none_clears`、`test_gds_align_m7.py` 的
+`test_initial_collapse_state` / `test_no_collapse_without_valid_fov` / `test_layers_empty_hint`），
+`pytest tests/test_gds_align_m6.py tests/test_gds_align_m7.py` 59 passed，
+完整 `pytest tests/` 435 passed。
+
+**影響檔案：** `glas/app/gds_align_tool.py`、`tests/test_gds_align_m6.py`、
+`tests/test_gds_align_m7.py`。
+
+**Branch：** `claude/jolly-babbage-8nwED`
+
 ## [2026-05-24] GLAS 品牌元素整合（icon / wordmark / About）
 
 **變更類型：** 功能（UI / branding）

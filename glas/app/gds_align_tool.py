@@ -58,9 +58,9 @@ from typing import Optional
 
 import numpy as np
 
-from PyQt6.QtCore import Qt, QObject, QPointF, QRectF, QSize, QThread, QTimer, QElapsedTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QObject, QPointF, QRect, QRectF, QSize, QThread, QTimer, QElapsedTimer, pyqtSignal
 from PyQt6.QtGui import (
-    QAction, QBrush, QColor, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap,
+    QAction, QBrush, QColor, QFontMetrics, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap,
     QPolygonF, QMouseEvent, QShortcut, QWheelEvent,
 )
 from PyQt6.QtWidgets import (
@@ -68,8 +68,8 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFrame, QGridLayout,
     QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton, QScrollArea,
-    QSizePolicy, QSlider, QSpinBox, QSplitter, QStatusBar, QToolButton,
-    QVBoxLayout, QWidget,
+    QSizePolicy, QSlider, QSpinBox, QSplitter, QStatusBar, QStyledItemDelegate,
+    QToolButton, QVBoxLayout, QWidget,
 )
 
 try:
@@ -146,6 +146,25 @@ _TK_TOOLBAR_BG = "#fff7ee"
 
 # Font-size scale (px), matching styles.py FS_* tokens.
 _FS_MICRO, _FS_CAPTION, _FS_LABEL, _FS_BODY, _FS_TITLE = 10, 11, 12, 13, 14
+
+# Primary-emphasis QSS for the "Load SEM…" menu button so it carries the same
+# orange weight as the toolbar's "Open OASIS…" entry point.
+_LOAD_SEM_BTN_QSS = (
+    "QPushButton {"
+    f"  background: {_TK_ACCENT.name()};"
+    "  color: #ffffff;"
+    "  font-weight: 600;"
+    "  border: none;"
+    "  border-radius: 4px;"
+    "  padding: 3px 10px;"
+    "}"
+    f"QPushButton:hover {{ background: {_TK_ACCENT_DK.name()}; }}"
+    "QPushButton::menu-indicator {"
+    "  subcontrol-origin: padding;"
+    "  subcontrol-position: right center;"
+    "  right: 6px;"
+    "}"
+)
 
 
 def _hint_qss(size: int = _FS_CAPTION, color: str = "#8a7660",
@@ -1418,12 +1437,37 @@ class LayerPanel(QFrame):
         self._show_empty_hint()
 
     def _show_empty_hint(self) -> None:
-        """Muted placeholder when no layers are loaded yet."""
+        """Muted placeholder when no layers are loaded yet (icon + title +
+        hint, so the empty LAYERS column reads as an onboarding cue rather
+        than a blank list)."""
         self.list.clear()
-        item = QListWidgetItem("Open an OASIS to list layers.")
-        item.setFlags(Qt.ItemFlag.NoItemFlags)
-        item.setForeground(QColor(_TK_TEXT_HINT))
-        self.list.addItem(item)
+
+        # 圖示行
+        icon_item = QListWidgetItem()
+        icon_item.setFlags(Qt.ItemFlag.NoItemFlags)
+        icon_item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self.list.addItem(icon_item)
+
+        # 主文
+        title_item = QListWidgetItem("Open an OASIS")
+        title_item.setFlags(Qt.ItemFlag.NoItemFlags)
+        title_item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
+        title_item.setForeground(QColor(_TK_TEXT_SEC))
+        font = title_item.font()
+        font.setPixelSize(_FS_LABEL)
+        font.setBold(True)
+        title_item.setFont(font)
+        self.list.addItem(title_item)
+
+        # 次文
+        hint_item = QListWidgetItem("toolbar → Open OASIS…")
+        hint_item.setFlags(Qt.ItemFlag.NoItemFlags)
+        hint_item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
+        hint_item.setForeground(QColor(_TK_TEXT_HINT))
+        font2 = hint_item.font()
+        font2.setPixelSize(_FS_CAPTION)
+        hint_item.setFont(font2)
+        self.list.addItem(hint_item)
 
     def set_document(self, doc: Optional[GdsDocument]) -> None:
         self._doc = doc
@@ -2368,7 +2412,7 @@ class SemViewer(QWidget):
         p.setFont(sub)
         p.setPen(QPen(_TK_TEXT_HINT))
         p.drawText(r.adjusted(0, 56, 0, 56), Qt.AlignmentFlag.AlignCenter,
-                   "1. Open OASIS   →   2. Load SEM   →   3. Click a defect")
+                   "Follow the steps above to get started")
 
     def _draw_hud(self, p: QPainter) -> None:
         """Corner readout: zoom factor (top-right), cursor GDS coordinate
@@ -2921,6 +2965,41 @@ class FineAlignPanel(QGroupBox):
         self._result_lbl.setText("")
 
 
+class _ImageListDelegate(QStyledItemDelegate):
+    """Paints a small status badge in the right margin of each SEM image row
+    (fine-align score colour-coded, or a neutral ``no coords`` tag). Badge
+    text / colours travel on the item via the UserRole+2..+4 data roles."""
+
+    _BADGE_MARGIN = 6
+    _BADGE_H = 16
+    _BADGE_PADDING = 8
+
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        badge_text = index.data(Qt.ItemDataRole.UserRole + 2)
+        badge_fg = index.data(Qt.ItemDataRole.UserRole + 3)
+        badge_bg = index.data(Qt.ItemDataRole.UserRole + 4)
+        if not badge_text:
+            return
+        painter.save()
+        fm = QFontMetrics(option.font)
+        text_w = fm.horizontalAdvance(badge_text) + self._BADGE_PADDING * 2
+        badge_rect = QRect(
+            option.rect.right() - text_w - self._BADGE_MARGIN,
+            option.rect.center().y() - self._BADGE_H // 2,
+            text_w,
+            self._BADGE_H,
+        )
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setBrush(QColor(badge_bg))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(badge_rect, 3, 3)
+        painter.setPen(QColor(badge_fg))
+        painter.setFont(option.font)
+        painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, badge_text)
+        painter.restore()
+
+
 class SemPanel(QFrame):
     """Right column: a single 'Load SEM…' button (KLARF / image folder via a
     drop-down) + Coordinate Setup + the image list. Owns no file I/O — it
@@ -2962,18 +3041,19 @@ class SemPanel(QFrame):
         v.addWidget(title)
 
         btn_row = QHBoxLayout()
-        load_sem_btn = QPushButton("Load SEM…")
-        load_sem_btn.setToolTip(
+        self.load_sem_btn = QPushButton("Load SEM…")
+        self.load_sem_btn.setToolTip(
             "Load SEM images from a KLARF defect list (carries die-corner "
             "coordinates for auto-jump) or from a plain image folder "
             "(no coordinates).")
-        sem_menu = QMenu(load_sem_btn)
+        self.load_sem_btn.setStyleSheet(_LOAD_SEM_BTN_QSS)
+        sem_menu = QMenu(self.load_sem_btn)
         act_klarf = sem_menu.addAction("From KLARF file…")
         act_klarf.triggered.connect(lambda: self.load_klarf_requested.emit())
         act_folder = sem_menu.addAction("From image folder…")
         act_folder.triggered.connect(lambda: self.load_folder_requested.emit())
-        load_sem_btn.setMenu(sem_menu)
-        btn_row.addWidget(load_sem_btn)
+        self.load_sem_btn.setMenu(sem_menu)
+        btn_row.addWidget(self.load_sem_btn)
         btn_row.addStretch(1)
         v.addLayout(btn_row)
 
@@ -2984,7 +3064,7 @@ class SemPanel(QFrame):
         # the inner panels (tests + signal wiring rely on those refs).
         self.coord_setup = CoordinateSetupPanel(self)
         self._coord_section = self._wrap_section(
-            "Coordinate Setup", self.coord_setup, collapsed=False)
+            "Coordinate Setup", self.coord_setup, collapsed=True)
         v.addWidget(self._coord_section)
 
         # Image list — the primary defect-navigation control — gets the
@@ -2992,6 +3072,7 @@ class SemPanel(QFrame):
         self.list = QListWidget(self)
         self.list.setMinimumHeight(120)
         _config_list(self.list)
+        self.list.setItemDelegate(_ImageListDelegate(self.list))
         self.list.itemClicked.connect(self._on_clicked)
         v.addWidget(self.list, 1)
 
@@ -3005,6 +3086,19 @@ class SemPanel(QFrame):
             "(needs 'Open OASIS (ROI)…' first). Re-click after changing "
             "FOV / fine-tune to reload.")
         self.load_roi_btn.clicked.connect(self.load_roi_requested)
+
+        # Set / Clear Offset — 屬於 SEM 對位流程，放在 image list 下方
+        offset_row = QHBoxLayout()
+        offset_row.setSpacing(6)
+        self.set_offset_btn = QPushButton("Set Offset")
+        self.set_offset_btn.setToolTip(
+            "Fold the current GDS drag into the global origin correction δ.")
+        self.clear_offset_btn = QPushButton("Clear Offset")
+        self.clear_offset_btn.setToolTip("Reset the global δ and drag to zero.")
+        offset_row.addWidget(self.set_offset_btn)
+        offset_row.addWidget(self.clear_offset_btn)
+        v.addLayout(offset_row)
+
         v.addWidget(self.load_roi_btn)
 
         # Fine Align is only needed while aligning — start collapsed; expands
@@ -3017,6 +3111,25 @@ class SemPanel(QFrame):
         self._images: list = []
         self._scores: dict = {}
         self._show_list_placeholder()
+        # Seed the collapsed-state FOV badge so it's present from the start.
+        self.update_coord_badge({})
+
+    def update_coord_badge(self, values: dict) -> None:
+        """Reflect the Coordinate Setup FOV state in the section header badge
+        (shown while the section is collapsed): green ``FOV W × H`` (µm) when
+        set, muted amber ``not set`` otherwise."""
+        if CollapsibleSection is None:
+            return
+        fov_w = float(values.get("fov_w_nm", values.get("fov_w", 0)) or 0)
+        fov_h = float(values.get("fov_h_nm", values.get("fov_h", 0)) or 0)
+        if fov_w > 0 and fov_h > 0:
+            w_um = int(round(fov_w / 1000))
+            h_um = int(round(fov_h / 1000))
+            self._coord_section.set_badge(
+                f"FOV {w_um} × {h_um}", fg="#3e7f5d", bg="#ebf7f0")
+        else:
+            self._coord_section.set_badge(
+                "not set", fg="#c8a080", bg="#fff0e0")
 
     def _show_list_placeholder(self) -> None:
         """Fill the empty image list with a muted hint so it doesn't read as a
@@ -3055,27 +3168,34 @@ class SemPanel(QFrame):
             self._show_list_placeholder()
             return
         for img in self._images:
-            tag = "" if img.has_coords else "  (no coords)"
-            item = QListWidgetItem(f"{img.image_id}: {img.filename}{tag}")
+            item = QListWidgetItem(f"{img.image_id}: {img.filename}")
             item.setData(Qt.ItemDataRole.UserRole, img)
+            if not img.has_coords:
+                item.setForeground(QColor(_TK_TEXT_SEC))
+                item.setData(Qt.ItemDataRole.UserRole + 2, "no coords")
+                item.setData(Qt.ItemDataRole.UserRole + 3, "#9a8878")
+                item.setData(Qt.ItemDataRole.UserRole + 4, "#f4f0ea")
             self.list.addItem(item)
 
     def set_score(self, image_id, score: float, threshold: float) -> None:
         """Annotate the matching list row with a colour-coded fine-align
-        score (green ≥ threshold, orange near, red below) — plan M4b."""
-        from PyQt6.QtGui import QColor as _QColor
+        score badge (green ≥ threshold, amber near, red below) — plan M4b."""
         self._scores[image_id] = (score, threshold)
         for i in range(self.list.count()):
             item = self.list.item(i)
             img = item.data(Qt.ItemDataRole.UserRole)
             if img is None or img.image_id != image_id:
                 continue
-            tag = "" if img.has_coords else "  (no coords)"
-            item.setText(f"{img.image_id}: {img.filename}{tag}   [{score:.2f}]")
-            color = ("#2e7d32" if score >= threshold
-                     else "#b8860b" if score >= max(0.0, threshold - 0.2)
-                     else "#c0392b")
-            item.setForeground(_QColor(color))
+            score_text = f"{score:.2f}"
+            if score >= threshold:
+                fg, bg = "#3e7f5d", "#ebf7f0"   # green
+            elif score >= threshold * 0.7:
+                fg, bg = "#b8860b", "#fff8e0"   # amber
+            else:
+                fg, bg = "#a32d2d", "#feeeee"   # red
+            item.setData(Qt.ItemDataRole.UserRole + 2, score_text)
+            item.setData(Qt.ItemDataRole.UserRole + 3, fg)
+            item.setData(Qt.ItemDataRole.UserRole + 4, bg)
             break
 
     def _on_clicked(self, item: QListWidgetItem) -> None:
@@ -3149,6 +3269,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("GLAS")
         self.resize(1200, 800)
+        # Coordinate Setup starts collapsed (see SemPanel); don't auto-collapse
+        # again so a user re-expanding it sticks.
+        self._coord_collapsed_once = True
 
         _icon_path = Path(__file__).resolve().parent / "icons" / "glas_icon_32.svg"
         if _icon_path.exists():
@@ -3194,25 +3317,11 @@ class MainWindow(QMainWindow):
         self.minimap.defect_clicked.connect(self._on_defect_clicked)
         self.sem_viewer.set_corner_overlay(self.minimap)
 
-        # Origin-offset (δ) controls — operate on the current SEM-overlay drag.
-        offset_row = QHBoxLayout()
-        offset_row.setContentsMargins(8, 4, 8, 4)
-        self._set_offset_btn = QPushButton("Set Offset")
-        self._set_offset_btn.setToolTip(
-            "Fold the current GDS drag on the SEM into the global origin "
-            "correction δ (applied to every defect).")
-        self._set_offset_btn.clicked.connect(self._on_set_offset)
-        self._clear_offset_btn = QPushButton("Clear Offset")
-        self._clear_offset_btn.setToolTip("Reset the global δ and the current drag to zero.")
-        self._clear_offset_btn.clicked.connect(self._on_clear_offset)
-        offset_row.addWidget(self._set_offset_btn)
-        offset_row.addWidget(self._clear_offset_btn)
-        offset_row.addStretch(1)
-        offset_w = QWidget(center)
-        offset_w.setLayout(offset_row)
-        center_layout.addWidget(offset_w)
-
         self.sem_panel = SemPanel(splitter)
+        # Origin-offset (δ) controls live in the SEM panel (below the image
+        # list); they operate on the current SEM-overlay drag.
+        self.sem_panel.set_offset_btn.clicked.connect(self._on_set_offset)
+        self.sem_panel.clear_offset_btn.clicked.connect(self._on_clear_offset)
 
         splitter.addWidget(self.layer_panel)
         splitter.addWidget(center)
@@ -3344,8 +3453,8 @@ class MainWindow(QMainWindow):
         def _group(text):
             lbl = QLabel(text)
             lbl.setStyleSheet(
-                f"color:{_TK_TEXT_HINT.name()}; font-size:{_FS_MICRO}px; "
-                f"font-weight:700; letter-spacing:0.5px;")
+                f"color:{_TK_ACCENT_DK.name()}; font-size:{_FS_MICRO}px; "
+                f"font-weight:700; letter-spacing:1px; padding: 0 4px;")
             return lbl
 
         # GLAS wordmark（toolbar 最左側）
@@ -3361,6 +3470,7 @@ class MainWindow(QMainWindow):
             h.addWidget(_divider())
 
         # ── File group ──
+        h.addSpacing(4)
         h.addWidget(_group("FILE"))
         open_btn = QPushButton(_qicon("folder-open"), " Open OASIS…")
         open_btn.setProperty("variant", "primary")
@@ -3650,6 +3760,7 @@ class MainWindow(QMainWindow):
 
     def _on_coord_changed(self) -> None:
         v = self.sem_panel.coord_setup.values()
+        self.sem_panel.update_coord_badge(v)
         self._chip_corner_x = v["chip_corner_x"]
         self._chip_corner_y = v["chip_corner_y"]
         self._fov_w = v["fov_w"]

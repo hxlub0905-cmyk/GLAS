@@ -123,12 +123,13 @@ class TestLayerPanel:
         panel = gat.LayerPanel()
         panel.set_document(gat.GdsDocument())
         panel.set_document(None)
-        # M7 #2: empty doc shows a single non-selectable placeholder hint
-        # instead of a blank list.
-        assert panel.list.count() == 1
+        # Empty doc shows a non-selectable onboarding hint (icon + title +
+        # sub-hint) instead of a blank list.
+        assert panel.list.count() == 3
         from PyQt6.QtCore import Qt
-        assert panel.list.item(0).flags() == Qt.ItemFlag.NoItemFlags
-        assert "Open an OASIS" in panel.list.item(0).text()
+        for i in range(panel.list.count()):
+            assert panel.list.item(i).flags() == Qt.ItemFlag.NoItemFlags
+        assert "Open an OASIS" in panel.list.item(1).text()
 
 
 # ── MainWindow single-view UX ────────────────────────────────────────
