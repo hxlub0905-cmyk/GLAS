@@ -1418,12 +1418,37 @@ class LayerPanel(QFrame):
         self._show_empty_hint()
 
     def _show_empty_hint(self) -> None:
-        """Muted placeholder when no layers are loaded yet."""
+        """Muted placeholder when no layers are loaded yet (icon + title +
+        hint, so the empty LAYERS column reads as an onboarding cue rather
+        than a blank list)."""
         self.list.clear()
-        item = QListWidgetItem("Open an OASIS to list layers.")
-        item.setFlags(Qt.ItemFlag.NoItemFlags)
-        item.setForeground(QColor(_TK_TEXT_HINT))
-        self.list.addItem(item)
+
+        # 圖示行
+        icon_item = QListWidgetItem()
+        icon_item.setFlags(Qt.ItemFlag.NoItemFlags)
+        icon_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.list.addItem(icon_item)
+
+        # 主文
+        title_item = QListWidgetItem("Open an OASIS")
+        title_item.setFlags(Qt.ItemFlag.NoItemFlags)
+        title_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        title_item.setForeground(QColor(_TK_TEXT_SEC))
+        font = title_item.font()
+        font.setPixelSize(_FS_LABEL)
+        font.setBold(True)
+        title_item.setFont(font)
+        self.list.addItem(title_item)
+
+        # 次文
+        hint_item = QListWidgetItem("toolbar → Open OASIS…")
+        hint_item.setFlags(Qt.ItemFlag.NoItemFlags)
+        hint_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        hint_item.setForeground(QColor(_TK_TEXT_HINT))
+        font2 = hint_item.font()
+        font2.setPixelSize(_FS_CAPTION)
+        hint_item.setFont(font2)
+        self.list.addItem(hint_item)
 
     def set_document(self, doc: Optional[GdsDocument]) -> None:
         self._doc = doc
@@ -2368,7 +2393,7 @@ class SemViewer(QWidget):
         p.setFont(sub)
         p.setPen(QPen(_TK_TEXT_HINT))
         p.drawText(r.adjusted(0, 56, 0, 56), Qt.AlignmentFlag.AlignCenter,
-                   "1. Open OASIS   →   2. Load SEM   →   3. Click a defect")
+                   "Follow the steps above to get started")
 
     def _draw_hud(self, p: QPainter) -> None:
         """Corner readout: zoom factor (top-right), cursor GDS coordinate
@@ -2984,7 +3009,7 @@ class SemPanel(QFrame):
         # the inner panels (tests + signal wiring rely on those refs).
         self.coord_setup = CoordinateSetupPanel(self)
         self._coord_section = self._wrap_section(
-            "Coordinate Setup", self.coord_setup, collapsed=False)
+            "Coordinate Setup", self.coord_setup, collapsed=True)
         v.addWidget(self._coord_section)
 
         # Image list — the primary defect-navigation control — gets the
@@ -3005,6 +3030,19 @@ class SemPanel(QFrame):
             "(needs 'Open OASIS (ROI)…' first). Re-click after changing "
             "FOV / fine-tune to reload.")
         self.load_roi_btn.clicked.connect(self.load_roi_requested)
+
+        # Set / Clear Offset — 屬於 SEM 對位流程，放在 image list 下方
+        offset_row = QHBoxLayout()
+        offset_row.setSpacing(6)
+        self.set_offset_btn = QPushButton("Set Offset")
+        self.set_offset_btn.setToolTip(
+            "Fold the current GDS drag into the global origin correction δ.")
+        self.clear_offset_btn = QPushButton("Clear Offset")
+        self.clear_offset_btn.setToolTip("Reset the global δ and drag to zero.")
+        offset_row.addWidget(self.set_offset_btn)
+        offset_row.addWidget(self.clear_offset_btn)
+        v.addLayout(offset_row)
+
         v.addWidget(self.load_roi_btn)
 
         # Fine Align is only needed while aligning — start collapsed; expands
@@ -3149,6 +3187,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("GLAS")
         self.resize(1200, 800)
+        # Coordinate Setup starts collapsed (see SemPanel); don't auto-collapse
+        # again so a user re-expanding it sticks.
+        self._coord_collapsed_once = True
 
         _icon_path = Path(__file__).resolve().parent / "icons" / "glas_icon_32.svg"
         if _icon_path.exists():
@@ -3194,25 +3235,11 @@ class MainWindow(QMainWindow):
         self.minimap.defect_clicked.connect(self._on_defect_clicked)
         self.sem_viewer.set_corner_overlay(self.minimap)
 
-        # Origin-offset (δ) controls — operate on the current SEM-overlay drag.
-        offset_row = QHBoxLayout()
-        offset_row.setContentsMargins(8, 4, 8, 4)
-        self._set_offset_btn = QPushButton("Set Offset")
-        self._set_offset_btn.setToolTip(
-            "Fold the current GDS drag on the SEM into the global origin "
-            "correction δ (applied to every defect).")
-        self._set_offset_btn.clicked.connect(self._on_set_offset)
-        self._clear_offset_btn = QPushButton("Clear Offset")
-        self._clear_offset_btn.setToolTip("Reset the global δ and the current drag to zero.")
-        self._clear_offset_btn.clicked.connect(self._on_clear_offset)
-        offset_row.addWidget(self._set_offset_btn)
-        offset_row.addWidget(self._clear_offset_btn)
-        offset_row.addStretch(1)
-        offset_w = QWidget(center)
-        offset_w.setLayout(offset_row)
-        center_layout.addWidget(offset_w)
-
         self.sem_panel = SemPanel(splitter)
+        # Origin-offset (δ) controls live in the SEM panel (below the image
+        # list); they operate on the current SEM-overlay drag.
+        self.sem_panel.set_offset_btn.clicked.connect(self._on_set_offset)
+        self.sem_panel.clear_offset_btn.clicked.connect(self._on_clear_offset)
 
         splitter.addWidget(self.layer_panel)
         splitter.addWidget(center)
@@ -3344,8 +3371,8 @@ class MainWindow(QMainWindow):
         def _group(text):
             lbl = QLabel(text)
             lbl.setStyleSheet(
-                f"color:{_TK_TEXT_HINT.name()}; font-size:{_FS_MICRO}px; "
-                f"font-weight:700; letter-spacing:0.5px;")
+                f"color:{_TK_ACCENT_DK.name()}; font-size:{_FS_MICRO}px; "
+                f"font-weight:700; letter-spacing:1px; padding: 0 4px;")
             return lbl
 
         # GLAS wordmark（toolbar 最左側）
@@ -3361,6 +3388,7 @@ class MainWindow(QMainWindow):
             h.addWidget(_divider())
 
         # ── File group ──
+        h.addSpacing(4)
         h.addWidget(_group("FILE"))
         open_btn = QPushButton(_qicon("folder-open"), " Open OASIS…")
         open_btn.setProperty("variant", "primary")

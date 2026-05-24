@@ -60,8 +60,9 @@ class TestCollapsibleRefs:
     @pytest.mark.skipif(gat.CollapsibleSection is None,
                         reason="CollapsibleSection unavailable")
     def test_initial_collapse_state(self, mw):
-        # Setup starts open (must be filled); Fine Align starts collapsed.
-        assert mw.sem_panel._coord_section.is_collapsed() is False
+        # Coordinate Setup now starts collapsed so it doesn't crowd the image
+        # list; Fine Align also starts collapsed.
+        assert mw.sem_panel._coord_section.is_collapsed() is True
         assert mw.sem_panel._fine_section.is_collapsed() is True
 
 
@@ -88,11 +89,14 @@ class TestAutoCollapse:
         assert mw.sem_panel._coord_section.is_collapsed() is False
 
     def test_no_collapse_without_valid_fov(self, mw):
+        # Coordinate Setup now starts collapsed (flag defaults True), so a jump
+        # with an invalid FOV simply leaves the default collapsed state intact.
         mw._fov_w = mw._fov_h = 0.0
         img = sem_loader.SemImage(image_id="D1", filename="a.png",
                                   file_path=Path("a.png"), xrel=1.0, yrel=2.0)
         mw._jump_to_image(img)
-        assert getattr(mw, "_coord_collapsed_once", False) is False
+        assert mw._coord_collapsed_once is True
+        assert mw.sem_panel._coord_section.is_collapsed() is True
 
 
 # ── M7.2 token centralization ────────────────────────────────────────
@@ -161,12 +165,14 @@ class TestRefinements:
     """M7 visual refinements (single-column setup, empty hints, weights)."""
 
     def test_layers_empty_hint(self, mw):
-        # No document -> a non-selectable LAYERS placeholder.
+        # No document -> a non-selectable LAYERS onboarding hint (icon + title
+        # + sub-hint).
         lst = mw.layer_panel.list
-        assert lst.count() == 1
-        assert "Open an OASIS" in lst.item(0).text()
+        assert lst.count() == 3
+        assert "Open an OASIS" in lst.item(1).text()
         from PyQt6.QtCore import Qt
-        assert lst.item(0).flags() == Qt.ItemFlag.NoItemFlags
+        for i in range(lst.count()):
+            assert lst.item(i).flags() == Qt.ItemFlag.NoItemFlags
 
     def test_load_roi_not_primary(self, mw):
         # Only the toolbar "Open OASIS…" should carry the primary emphasis.

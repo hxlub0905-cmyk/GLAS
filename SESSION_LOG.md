@@ -2,6 +2,41 @@
 
 ---
 
+## [2026-05-24] GLAS UI 五項修正（依 docs/glas_ui_fixes.md）
+
+**變更類型：** 功能（UI / UX 微調）
+
+**動機/現象：** 依 `docs/glas_ui_fixes.md` 修正五個 UI 問題：右欄 Coordinate Setup
+預設展開把 image list 擠掉、左欄 LAYERS 空白引導視覺太輕、Set/Clear Offset 放在中央
+視圖下方定位不清、toolbar group label 對比不足、中央 empty state 與 guidance strip
+文字重複。
+
+**修復/實作（`glas/app/gds_align_tool.py`）：**
+- 問題1：`SemPanel` 的 Coordinate Setup `_wrap_section(..., collapsed=True)`（原 False）；
+  `MainWindow.__init__` 加 `self._coord_collapsed_once = True`，使自動收起邏輯不再干預
+  （預設已收起，user 再展開即固定）。
+- 問題2：`LayerPanel._show_empty_hint()` 由單行小字改為圖示 + 主文「Open an OASIS」+
+  次文「toolbar → Open OASIS…」三層置中結構。
+- 問題3：Set/Clear Offset 由中央 `center_layout` 移入 `SemPanel`（image list 下方、
+  Load GDS ROI 上方），改名 `self.sem_panel.set_offset_btn/clear_offset_btn`，
+  signal 在 `MainWindow.__init__` 重新接線；原 `self._set_offset_btn/_clear_offset_btn`
+  區塊整段刪除（無其他 setEnabled 引用）。
+- 問題4：`_build_toolbar` 的 `_group()` label 改用 `_TK_ACCENT_DK` 色、letter-spacing
+  1px、padding；FILE group 前加 `h.addSpacing(4)`。
+- 問題5：`SemViewer._draw_empty_state()` 三步驟提示改為「Follow the steps above to get
+  started」，由 guidance strip 負責引導。
+
+**測試：** `python3 -m py_compile` 通過；同步更新 4 個測試的舊行為斷言
+（`test_gds_align_m6.py::test_set_document_none_clears`、`test_gds_align_m7.py` 的
+`test_initial_collapse_state` / `test_no_collapse_without_valid_fov` / `test_layers_empty_hint`），
+`pytest tests/test_gds_align_m6.py tests/test_gds_align_m7.py` 59 passed，
+完整 `pytest tests/` 435 passed。
+
+**影響檔案：** `glas/app/gds_align_tool.py`、`tests/test_gds_align_m6.py`、
+`tests/test_gds_align_m7.py`。
+
+**Branch：** `claude/jolly-babbage-8nwED`
+
 ## [2026-05-24] GLAS 品牌元素整合（icon / wordmark / About）
 
 **變更類型：** 功能（UI / branding）
