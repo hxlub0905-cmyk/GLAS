@@ -1,0 +1,24 @@
+<svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- outer circle -->
+  <circle cx="128" cy="128" r="116" fill="#fff8f2" stroke="#eedcc8" stroke-width="5"/>
+  <!-- inner ring hint -->
+  <circle cx="128" cy="128" r="76" fill="none" stroke="#f29f4b" stroke-width="3.5" stroke-opacity="0.3"/>
+  <!-- crosshair ticks -->
+  <line x1="128" y1="12"  x2="128" y2="44"  stroke="#d97d1e" stroke-width="7" stroke-linecap="round"/>
+  <line x1="128" y1="212" x2="128" y2="244" stroke="#d97d1e" stroke-width="7" stroke-linecap="round"/>
+  <line x1="12"  y1="128" x2="44"  y2="128" stroke="#d97d1e" stroke-width="7" stroke-linecap="round"/>
+  <line x1="212" y1="128" x2="244" y2="128" stroke="#d97d1e" stroke-width="7" stroke-linecap="round"/>
+  <!-- G letterform centered at 128,128 -->
+  <!-- top bar -->
+  <rect x="84" y="80"  width="88" height="18" rx="8" fill="#d97d1e"/>
+  <!-- left bar -->
+  <rect x="84" y="80"  width="18" height="96" rx="8" fill="#d97d1e"/>
+  <!-- bottom bar -->
+  <rect x="84" y="158" width="88" height="18" rx="8" fill="#d97d1e"/>
+  <!-- crossbar -->
+  <rect x="128" y="120" width="44" height="18" rx="8" fill="#f29f4b"/>
+  <!-- right inner vertical -->
+  <rect x="154" y="120" width="18" height="56" rx="8" fill="#d97d1e"/>
+  <!-- center dot -->
+  <circle cx="128" cy="128" r="9" fill="#d97d1e"/>
+</svg>
