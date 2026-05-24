@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '⚠️  GLAS Session Reminder：請先讀 SESSION_LOG.md 最上方 3-5 條了解專案近況；本 session 結束前必須在 SESSION_LOG.md 新增變更紀錄（除非僅 read-only 探索）。詳細規則見 CLAUDE.md §2。'"
+          },
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/check_progress.sh\""
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/check_session_log.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}

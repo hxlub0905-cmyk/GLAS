@@ -1,0 +1,246 @@
+Record FileRecord  "1.8"
+{
+  Record LotRecord "N9Y320.2F"
+  {
+    Record WaferRecord "N9Y320.18"
+    {
+      Field DieOrigin 2 {0, 0}
+      Field OrientationInstructions 1 {""}
+      Field ProcessEquipmentState 7 {"KPSS41", "", "", "", "", "", ""}
+      Field SampleCenterLocation 2 {20434404, 10607650}
+      Field ScribeID 1 {"N9Y320.18"}
+      Field SlotNumber 1 {1}
+
+      List DefectList
+      {
+        Columns 42 { int32 DEFECTID,  int32 XREL,  int32 YREL,  int32 XINDEX,  int32 YINDEX,
+        int32 XSIZE,  int32 YSIZE,  float DEFECTAREA,  int32 DSIZE,  int32 CLASSNUMBER,
+        int32 TEST,  int32 ROUGHBINNUMBER,  int32 FINEBINNUMBER,  int32 SAMPLEBINNUMBER,  float CONTRAST,
+        int32 CHANNELID,  int32 MANSEMCLASS,  int32 AUTOONSEMCLASS,  int32 AUTOOFFSEMCLASS,  int32 AUTOOFFOPTADC,
+        int32 FACLASS,  int32 INTENSITY,  float KILLPROB,  int32 REGIONID,  int32 EVENTTYPE,
+        int32 EBRLINE,  ImageList IMAGEINFO,  int32 POLARITY,  float CRITICALAREA,
+        int32 MANOPTCLASS,  float PHI,  int32 DBCLASS,  int32 DBGROUP,  float DBCRITICALITYINDEX,
+        float CELLSIZE,  int32 CAREAREAGROUPCODE,  float PCI,  float LINECOMPLEXITY,  float DCIRANGE,
+        double XOFFSET,  double ADRHIGHSCORE,  double YOFFSET  }
+        Data 6
+        {
+          6301 20267174 20652619 -4 1 10 10 100.0 10 212 1 0 0 0 0.0000 0 0
+            0 0 0 0 0 0.0000 0 0 0  Images 1 { "1.000_00001.jpg" "JPG" 1 "24" }
+            0 0.0000 0 0.0 0 0 0.0000 0.000000 0 0.0000 0.0000 0.0000 0.000000
+            0.000000 0.000000 ;
+          11205 20282918 20654582 -3 1 10 10 100.0 10 212 1 0 0 0 0.0000 0
+            0 0 0 0 0 0 0.0000 0 0 0  Images 1 { "1.000_00002.jpg" "JPG" 1 "24" }
+            0 0.0000 0 0.0 0 0 0.0000 0.000000 0 0.0000 0.0000 0.0000 0.000000
+            0.000000 0.000000 ;
+          25901 20281239 20643118 0 1 10 10 100.0 10 212 1 0 0 0 0.0000 0 0
+            0 0 0 0 0 0.0000 0 0 0  Images 1 { "1.000_00003.jpg" "JPG" 1 "24" }
+            0 0.0000 0 0.0 0 0 0.0000 0.000000 0 0.0000 0.0000 0.0000 0.000000
+            0.000000 0.000000 ;
+          26608 20279147 20652568 0 2 10 10 100.0 10 212 1 0 0 0 0.0000 0 0
+            0 0 0 0 0 0.0000 0 0 0  Images 1 { "1.000_00004.jpg" "JPG" 1 "24" }
+            0 0.0000 0 0.0 0 0 0.0000 0.000000 0 0.0000 0.0000 0.0000 0.000000
+            0.000000 0.000000 ;
+          27301 20278488 20640964 0 3 10 10 100.0 10 212 1 0 0 0 0.0000 0 0
+            0 0 0 0 0 0.0000 0 0 0  Images 1 { "1.000_00005.jpg" "JPG" 1 "24" }
+            0 0.0000 0 0.0 0 0 0.0000 0.000000 0 0.0000 0.0000 0.0000 0.000000
+            0.000000 0.000000 ;
+          168201 20282634 20642982 1 -2 10 10 100.0 10 212 2 0 0 0 0.0000 0
+            0 0 0 0 0 0 0.0000 0 0 0  Images 1 { "1.000_00006.jpg" "JPG" 1 "24" }
+            0 0.0000 0 0.0 0 0 0.0000 0.000000 0 0.0000 0.0000 0.0000 0.000000
+            0.000000 0.000000 ;
+        }
+      }
+      Record TestRecord "1"
+      {
+        Field AreaPerTest 1 {4.6880000000e+09}
+        Field InspectedAreaOrigin 2 {6, 5}
+        Field InspectionTest 2 {1, "1" }
+
+        List SampleTestPlanList
+        {
+          Columns 2 { int32 XINDEX, int32 YINDEX }
+          Data 41
+          {
+            -5 -2 ;
+            -5 -1 ;
+            -5 0 ;
+            -5 1 ;
+            -5 2 ;
+            -4 -3 ;
+            -4 -2 ;
+            -4 -1 ;
+            -4 0 ;
+            -4 1 ;
+            -4 2 ;
+            -4 3 ;
+            -3 -3 ;
+            -3 -2 ;
+            -3 -1 ;
+            -3 0 ;
+            -3 1 ;
+            -3 2 ;
+            -3 3 ;
+            -2 -4 ;
+            -2 -3 ;
+            -2 -2 ;
+            -2 -1 ;
+            -2 0 ;
+            -2 1 ;
+            -2 2 ;
+            -2 3 ;
+            -1 -4 ;
+            -1 -3 ;
+            -1 -2 ;
+            -1 -1 ;
+            -1 0 ;
+            -1 1 ;
+            -1 2 ;
+            -1 3 ;
+            -1 4 ;
+            0 0 ;
+            0 1 ;
+            0 2 ;
+            0 3 ;
+            0 4 ;
+          }
+        }
+      }
+      Record TestRecord "3"
+      {
+        Field AreaPerTest 1 {1.0000000000e+06}
+        Field InspectedAreaOrigin 2 {6, 5}
+        Field InspectionTest 2 {3, "3" }
+
+        List SampleTestPlanList
+        {
+          Columns 2 { int32 XINDEX, int32 YINDEX }
+          Data 3
+          {
+            0 -3 ;
+            0 -1 ;
+            1 1 ;
+          }
+        }
+      }
+      Record TestRecord "2"
+      {
+        Field AreaPerTest 1 {4.6880000000e+09}
+        Field InspectedAreaOrigin 2 {6, 5}
+        Field InspectionTest 2 {2, "2" }
+
+        List SampleTestPlanList
+        {
+          Columns 2 { int32 XINDEX, int32 YINDEX }
+          Data 60
+          {
+            -5 -2 ;
+            -5 0 ;
+            -4 -3 ;
+            -4 -1 ;
+            -4 1 ;
+            -3 -2 ;
+            -3 0 ;
+            -3 2 ;
+            -2 -3 ;
+            -2 -1 ;
+            -2 1 ;
+            -2 3 ;
+            -1 -4 ;
+            -1 -2 ;
+            -1 0 ;
+            -1 2 ;
+            0 1 ;
+            0 3 ;
+            0 -4 ;
+            0 -3 ;
+            0 -2 ;
+            1 -4 ;
+            1 -3 ;
+            1 -2 ;
+            1 -1 ;
+            1 0 ;
+            1 2 ;
+            1 3 ;
+            1 4 ;
+            2 -4 ;
+            2 -3 ;
+            2 -2 ;
+            2 -1 ;
+            2 0 ;
+            2 1 ;
+            2 2 ;
+            2 3 ;
+            3 -4 ;
+            3 -3 ;
+            3 -2 ;
+            3 -1 ;
+            3 0 ;
+            3 1 ;
+            3 2 ;
+            3 3 ;
+            4 -3 ;
+            4 -2 ;
+            4 -1 ;
+            4 0 ;
+            4 1 ;
+            4 2 ;
+            4 3 ;
+            5 -2 ;
+            5 -1 ;
+            5 0 ;
+            5 1 ;
+            5 2 ;
+            6 -1 ;
+            6 0 ;
+            6 1 ;
+          }
+        }
+      }
+      Record SummaryRecord
+      {
+
+        List TestSummaryList
+        {
+          Columns 11 { int32 TESTNO,  int32 NDEFECT,  float DEFDENSITY,  int32 NDIE,  int32 NDEFDIE,
+          float HAZEREGION,  float HAZEAVERAGE,  float HAZESTDDEV,  float HAZEMEDIAN,  float HAZEPEAK,
+          float AREAPERTEST  }
+          Data 3
+          {
+            1  0  0.0000000000e+00  41  41
+              -1  -1  -1  -1  -1  4.6880000000e+09   ;
+            3  0  0.0000000000e+00  3  3
+              -1  -1  -1  -1  -1  1.0000000000e+06   ;
+            2  0  0.0000000000e+00  60  60
+              -1  -1  -1  -1  -1  4.6880000000e+09   ;
+          }
+        }
+      }
+    }
+    Field DeviceID 1 {"TMVG10"}
+    Field DiePitch 2 {23376636, 32874750}
+    Field FabID 1 {"FAB12"}
+    Field InspectionStationID 3 {"KPSS41", "PRIMEVISION", "KPSS41"}
+    Field OrientationMarkLocation 1 {0}
+    Field RecipeID 3 {"TMVG10_MGCMP_SCF_MGEX_WPH_HC8K_PV10", "01-29-2026", "12:40:34"}
+    Field RecipeVersion 3 {"", "", ""}
+    Field ResultTimestamp 2 {"04-12-2026", "13:17:11"}
+    Field SampleOrientationMarkType 1 {"NOTCH"}
+    Field SampleSize 2 {300000000, 0}
+    Field SampleType 1 {"WAFER"}
+    Field StepID 1 {"MGCMP_SCF_MGEX_WPH_HC8K_PV10"}
+
+    List ClassLookupList
+    {
+      Columns 3 { int32 CLASSNUMBER, string CLASSNAME, string CLASSCODE }
+      Data 3
+      {
+         0 "No Review" "";
+         212 "Grey VC" "";
+         1076 "CMG Cut fail" "";
+      }
+    }
+  }
+  Field FileTimestamp 2 {"05-20-2026", "14:12:33"}
+
+}
+EndOfFile;
