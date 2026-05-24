@@ -60,7 +60,7 @@ import numpy as np
 
 from PyQt6.QtCore import Qt, QObject, QPointF, QRectF, QSize, QThread, QTimer, QElapsedTimer, pyqtSignal
 from PyQt6.QtGui import (
-    QAction, QBrush, QColor, QImage, QKeySequence, QPainter, QPen, QPixmap,
+    QAction, QBrush, QColor, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap,
     QPolygonF, QMouseEvent, QShortcut, QWheelEvent,
 )
 from PyQt6.QtWidgets import (
@@ -3147,8 +3147,12 @@ class AlignmentExportDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("GDS Align Tool")
+        self.setWindowTitle("GLAS")
         self.resize(1200, 800)
+
+        _icon_path = Path(__file__).resolve().parent / "icons" / "glas_icon_32.svg"
+        if _icon_path.exists():
+            self.setWindowIcon(QIcon(str(_icon_path)))
 
         # Top-level horizontal split: layers | (gds canvas | sem viewer) | sem panel
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
@@ -3343,6 +3347,18 @@ class MainWindow(QMainWindow):
                 f"color:{_TK_TEXT_HINT.name()}; font-size:{_FS_MICRO}px; "
                 f"font-weight:700; letter-spacing:0.5px;")
             return lbl
+
+        # GLAS wordmark（toolbar 最左側）
+        _wm_path = Path(__file__).resolve().parent / "icons" / "glas_wordmark.svg"
+        if _wm_path.exists():
+            wm_label = QLabel(bar)
+            wm_pixmap = QPixmap(str(_wm_path))
+            wm_label.setPixmap(
+                wm_pixmap.scaledToHeight(28, Qt.TransformationMode.SmoothTransformation)
+            )
+            wm_label.setContentsMargins(4, 0, 8, 0)
+            h.addWidget(wm_label)
+            h.addWidget(_divider())
 
         # ── File group ──
         h.addWidget(_group("FILE"))
@@ -4462,17 +4478,57 @@ class MainWindow(QMainWindow):
                 pass
 
     def _show_about(self) -> None:
-        QMessageBox.information(
-            self, "About",
-            "GDS Align Tool — independent companion to MMH.\n\n"
-            "Plan: docs/plans/F2-gds-align-tool.md\n"
-            "OASIS-only: a built-in streaming parser + random-access ROI "
-            "reader load geometry around each SEM defect; no klayout / gdstk "
-            "dependency.\n\n"
-            "Features: layer panel + Boolean compose, SEM dual-pane overlay "
-            "with drag align, POI template + cv2.matchTemplate fine "
-            "alignment, and CSV / JSON export.",
-        )
+        dlg = QDialog(self)
+        dlg.setWindowTitle("About GLAS")
+        dlg.setFixedSize(380, 280)
+
+        v = QVBoxLayout(dlg)
+        v.setContentsMargins(32, 28, 32, 24)
+        v.setSpacing(0)
+
+        _icon_path = Path(__file__).resolve().parent / "icons" / "glas_icon_128.svg"
+        if _icon_path.exists():
+            icon_lbl = QLabel(dlg)
+            pm = QPixmap(str(_icon_path)).scaledToHeight(
+                72, Qt.TransformationMode.SmoothTransformation)
+            icon_lbl.setPixmap(pm)
+            icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            v.addWidget(icon_lbl)
+            v.addSpacing(12)
+
+        name_lbl = QLabel("GLAS", dlg)
+        name_lbl.setStyleSheet(
+            "font-size: 22px; font-weight: 500; color: #3f3428; letter-spacing: 3px;")
+        name_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(name_lbl)
+
+        sub_lbl = QLabel("GDS-Layout Alignment for SEM", dlg)
+        sub_lbl.setStyleSheet(
+            "font-size: 10px; color: #8a7660; letter-spacing: 1.5px; margin-top: 2px;")
+        sub_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(sub_lbl)
+
+        v.addSpacing(16)
+
+        ver_lbl = QLabel("Version 1.0.0", dlg)
+        ver_lbl.setStyleSheet("font-size: 12px; color: #9a8878;")
+        ver_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(ver_lbl)
+
+        info_lbl = QLabel(
+            "Built-in OASIS streaming parser · No klayout / gdstk dependency", dlg)
+        info_lbl.setStyleSheet("font-size: 11px; color: #b0a090;")
+        info_lbl.setWordWrap(True)
+        info_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(info_lbl)
+
+        v.addStretch(1)
+
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok, dlg)
+        bb.accepted.connect(dlg.accept)
+        v.addWidget(bb)
+
+        dlg.exec()
 
 
 def main() -> int:
@@ -4485,6 +4541,16 @@ def main() -> int:
         print("[gds-align] debug mode ON (ROI walk tracing -> stderr)",
               file=sys.stderr, flush=True)
     app = QApplication(sys.argv)
+
+    app.setApplicationName("GLAS")
+    app.setApplicationDisplayName("GLAS")
+    app.setApplicationVersion("1.0.0")
+    app.setOrganizationName("GLAS")
+
+    _icon_path = Path(__file__).resolve().parent / "icons" / "glas_icon_256.svg"
+    if _icon_path.exists():
+        app.setWindowIcon(QIcon(str(_icon_path)))
+
     if _APP_QSS is not None:
         app.setStyleSheet(_APP_QSS)
     else:

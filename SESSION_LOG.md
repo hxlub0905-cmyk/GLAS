@@ -2,6 +2,32 @@
 
 ---
 
+## [2026-05-24] GLAS 品牌元素整合（icon / wordmark / About）
+
+**變更類型：** 功能（UI / branding）
+
+**動機/現象：** 應用程式仍沿用舊名 "GDS Align Tool"，缺視窗 icon、wordmark 與品牌化
+About 對話框。依 `docs/IMPLEMENT.md` 將五項品牌元素整合進 app。
+
+**修復/實作（`glas/app/gds_align_tool.py`）：**
+- import：QtGui import 補上 `QIcon`。
+- `main()`：設定 `setApplicationName/DisplayName/Version/OrganizationName("GLAS"...)`，
+  並以 `icons/glas_icon_256.svg` 設 `app.setWindowIcon`（所有視窗共用）。
+- `MainWindow.__init__()`：視窗標題 "GDS Align Tool" → "GLAS"，並以
+  `icons/glas_icon_32.svg` 設 titlebar icon。
+- `_build_toolbar()`：toolbar 最左側插入 `icons/glas_wordmark.svg` wordmark（高度 28px）
+  + VLine 分隔線（沿用既有 `_divider()` helper）。
+- `_show_about()`：由 `QMessageBox.information` 升級為自繪 `QDialog`（128 icon + 大字 GLAS
+  + subtitle + 版本 + 說明 + OK 按鈕）。
+- 四個 SVG（256/128/32/wordmark）此 session 前已置於 `glas/app/icons/`。
+
+**測試：** `python3 -m py_compile glas/app/gds_align_tool.py` 通過；sandbox 無 PyQt6
+無法實際啟動 GUI 驗收（taskbar icon / wordmark 顯示 / About 對話框待 user 本地確認）。
+
+**影響檔案：** `glas/app/gds_align_tool.py`。
+
+**Branch：** `claude/determined-einstein-Bfo0G`
+
 ## [2026-05-24] GLAS 專案自 MMH 抽離成立
 
 **變更類型：** 專案建立 / 重構（抽離）
