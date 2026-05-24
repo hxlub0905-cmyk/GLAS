@@ -1,0 +1,30 @@
+<svg width="220" height="48" viewBox="0 0 220 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- icon at 48x48 -->
+  <circle cx="24" cy="24" r="21.75" fill="#fff8f2" stroke="#eedcc8" stroke-width="0.9375"/>
+  <circle cx="24" cy="24" r="14.25" fill="none" stroke="#f29f4b" stroke-width="0.6563" stroke-opacity="0.3"/>
+  <line x1="24" y1="2.25"  x2="24" y2="8.25"  stroke="#d97d1e" stroke-width="1.3125" stroke-linecap="round"/>
+  <line x1="24" y1="39.75" x2="24" y2="45.75" stroke="#d97d1e" stroke-width="1.3125" stroke-linecap="round"/>
+  <line x1="2.25"  y1="24" x2="8.25"  y2="24" stroke="#d97d1e" stroke-width="1.3125" stroke-linecap="round"/>
+  <line x1="39.75" y1="24" x2="45.75" y2="24" stroke="#d97d1e" stroke-width="1.3125" stroke-linecap="round"/>
+  <rect x="15.75" y="15"   width="16.5" height="3.375" rx="1.5" fill="#d97d1e"/>
+  <rect x="15.75" y="15"   width="3.375" height="18"   rx="1.5" fill="#d97d1e"/>
+  <rect x="15.75" y="29.625" width="16.5" height="3.375" rx="1.5" fill="#d97d1e"/>
+  <rect x="24"    y="22.5" width="8.25"  height="3.375" rx="1.5" fill="#f29f4b"/>
+  <rect x="28.875" y="22.5" width="3.375" height="10.5" rx="1.5" fill="#d97d1e"/>
+  <circle cx="24" cy="24" r="1.6875" fill="#d97d1e"/>
+
+  <!-- GLAS text -->
+  <text x="60" y="32"
+    font-family="'Segoe UI', 'PingFang TC', 'Microsoft JhengHei', 'Helvetica Neue', Arial, sans-serif"
+    font-size="26"
+    font-weight="500"
+    letter-spacing="3"
+    fill="#3f3428">GLAS</text>
+
+  <!-- subtitle -->
+  <text x="61" y="43"
+    font-family="'Segoe UI', 'PingFang TC', 'Microsoft JhengHei', 'Helvetica Neue', Arial, sans-serif"
+    font-size="8"
+    letter-spacing="1.5"
+    fill="#8a7660">GDS · LAYOUT · ALIGNMENT · SEM</text>
+</svg>
