@@ -1842,7 +1842,10 @@ class ExpressionLayerDialog(QDialog):
         ops.setContentsMargins(0, 0, 0, 0)
         for tok, tip in [("&", "intersection"), ("|", "union"),
                          ("-", "difference"), ("~", "complement"),
-                         (" > W:", "grow (nm)"), (" < H:", "shrink (nm)"),
+                         (" > W:", "grow width / X (nm per side)"),
+                         (" > H:", "grow height / Y (nm per side)"),
+                         (" < W:", "shrink width / X (nm per side)"),
+                         (" < H:", "shrink height / Y (nm per side)"),
                          ("(", ""), (")", "")]:
             b = QToolButton(box)
             b.setText(tok.strip() or tok)
@@ -3045,6 +3048,7 @@ class CoordinateSetupPanel(QGroupBox):
         self._fine_dy.setToolTip("Manual fine-tune Y (nm) for the < 1 FOV residual; range ±FOV.")
 
         self._corner_lbl = QLabel("→ chip corner: 0, 0 nm")
+        self._corner_lbl.setWordWrap(True)
         self._corner_lbl.setStyleSheet(_hint_qss(_FS_LABEL, pad="2px 0"))
         self._corner_lbl.setToolTip(
             "chip_corner = (DieX − GDS_off) × 1000 (µm→nm); "
@@ -3052,6 +3056,7 @@ class CoordinateSetupPanel(QGroupBox):
         self._nm_per_px.setToolTip(
             "GDS-to-SEM scale (nm per pixel). auto = FOV width ÷ image pixel width.")
         self._origin_lbl = QLabel("origin δ: 0, 0 nm")
+        self._origin_lbl.setWordWrap(True)
         self._origin_lbl.setStyleSheet(_hint_qss(_FS_LABEL, pad="2px 0"))
         self._origin_lbl.setToolTip(
             "Constant KLARF→GDS origin correction δ. Drag the GDS over the SEM "

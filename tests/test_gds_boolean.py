@@ -162,26 +162,53 @@ class TestEvaluate:
         with pytest.raises(BooleanExprError):
             evaluate(ast, self._bind())
 
-    def test_grow(self):
+    def test_grow_width_is_directional(self):
+        # > W:5 grows X only (5 per side): 10x10 -> 20x10 = 200 (NOT 400).
         _, ast = parse_expression("A > W:5")
         g = evaluate(ast, {"A": box(0, 0, 10, 10)})
-        # grow 5 per side with square joins -> 20x20 = 400
-        assert g.area == pytest.approx(400.0)
+        assert g.area == pytest.approx(200.0)
+        x0, y0, x1, y1 = g.bounds
+        assert (x0, y0, x1, y1) == pytest.approx((-5.0, 0.0, 15.0, 10.0))
 
-    def test_shrink(self):
-        _, ast = parse_expression("A < H:2")
+    def test_grow_height_is_directional(self):
+        # > H:5 grows Y only: 10x10 -> 10x20 = 200.
+        _, ast = parse_expression("A > H:5")
         g = evaluate(ast, {"A": box(0, 0, 10, 10)})
-        # shrink 2 per side -> 6x6 = 36
-        assert g.area == pytest.approx(36.0)
+        assert g.area == pytest.approx(200.0)
+        assert g.bounds == pytest.approx((0.0, -5.0, 10.0, 15.0))
+
+    def test_shrink_height_is_directional(self):
+        # < H:2 shrinks Y only (2 per side): 10x10 -> 10x6 = 60.
+        _, ast = parse_expression("A < H:2")
+        g = evaluate(ast, {"A": box(0, 0, 10, 10)},
+                     fov_bbox=box(-50, -50, 50, 50))
+        assert g.area == pytest.approx(60.0)
+        assert g.bounds == pytest.approx((0.0, 2.0, 10.0, 8.0))
+
+    def test_shrink_width_is_directional(self):
+        _, ast = parse_expression("A < W:2")
+        g = evaluate(ast, {"A": box(0, 0, 10, 10)},
+                     fov_bbox=box(-50, -50, 50, 50))
+        assert g.area == pytest.approx(60.0)
+        assert g.bounds == pytest.approx((2.0, 0.0, 8.0, 10.0))
+
+    def test_shrink_without_fov_raises(self):
+        _, ast = parse_expression("A < W:1")
+        with pytest.raises(BooleanExprError):
+            evaluate(ast, {"A": box(0, 0, 10, 10)})
 
     def test_full_example(self):
         # L0 = [(A > W:1) & B] < H:1
         A = box(0, 0, 10, 10)
         B = box(0, 0, 10, 10)
         _, ast = parse_expression("[(A > W:1) & B] < H:1")
-        g = evaluate(ast, {"A": A, "B": B})
-        # A grow1 -> 12x12 region; & B (10x10) -> 10x10; shrink1 -> 8x8=64
-        assert g.area == pytest.approx(64.0)
+        g = evaluate(ast, {"A": A, "B": B}, fov_bbox=box(-50, -50, 50, 50))
+        # A grow X by1 -> 12x10; & B (10x10) -> 10x10; shrink Y by1 -> 10x8=80
+        assert g.area == pytest.approx(80.0)
+
+    def test_bad_axis_label_raises(self):
+        with pytest.raises(BooleanExprError):
+            parse_expression("A > Q:5")
 
     def test_missing_binding_raises(self):
         _, ast = parse_expression("A & Z")

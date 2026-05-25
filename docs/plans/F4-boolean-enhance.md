@@ -89,6 +89,21 @@ layer 機制，主要是補「持久化重算 + 巢狀解析 + 編輯 + UI」。
 - [x] 即時預覽（沿用 `preview_cb`）：在 canvas 畫出當前 FOV 結果。
 - [x] 驗證：py_compile；對話框可開/輸入/報錯/預覽（user 本地）；token 插入純邏輯測試。
 
+### M3.1: 修 edit 閃退 + 對話框內嵌預覽（user 回饋）  [status: done]
+
+- [x] edit/delete/add 一律 `QTimer.singleShot(0, …)` 延遲，避免在 row 事件 handler 內開
+  modal 又被 `set_document` 刪除 → use-after-free 閃退。
+- [x] `ExpressionLayerDialog` 內嵌 `_ExprPreview` 迷你 canvas，Preview 在對話框內渲染、
+  不動主 doc；OK 鈕改名 Save。
+
+### M4: 方向性 W/H morphology（user 回饋）  [status: done]
+
+- [x] `> W:n` 只長寬（X）、`> H:n` 只長高（Y）、`< W:n`/`< H:n` 各軸縮，每邊 ±n nm。
+  grow = 與軸線段的 Minkowski sum（`_dilate_axis`，對任意多邊形精確）；shrink = 補集-膨脹-
+  補集 erosion（`_morph_axis`，需 fov_bbox）。parser 限制 label 僅 W/H。
+- [x] 對話框運算子鈕擴成 `> W: / > H: / < W: / < H:` 四顆。
+- [x] 驗證：更新 morph 測試（方向性面積/bounds、shrink 需 fov、bad axis label）。
+
 ---
 
 ## Affected Files

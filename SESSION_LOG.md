@@ -2,6 +2,35 @@
 
 ---
 
+## [2026-05-25] [F4] 方向性 W/H morphology + coordinate setup 版面溢出修復
+
+**變更類型：** 功能（語意變更）+ bug fix
+
+**動機現象：** (1) `A > W:10` 看起來把高度也加大 —— 原本 morph 是**等向** buffer，W/H 只是
+標籤、`>`/`<` 為 grow/shrink 全方向。user 要 W/H 變成**方向性**（W=寬/X、H=高/Y）。
+(2) Coordinate Setup 輸入第一個值後整個面板暴寬、超出 UI。
+
+**修復實作：**
+- **方向性 W/H（`gds_boolean.py`）**：`> W:n`=只長寬、`> H:n`=只長高、`< W:n`/`< H:n`=各軸縮，
+  每邊各 ±n nm（總 ±2n）。新增 `_dilate_axis`（與軸線段的 Minkowski sum：geom + 平移副本 +
+  各邊掃成平行四邊形 → 對任意多邊形精確）與 `_morph_axis`（grow 用 dilate；shrink 用補集-膨脹-
+  補集 erosion，需 fov_bbox）。`evaluate` 的 Morph 分支改呼叫 `_morph_axis`；parser 限制軸
+  標籤僅 W/H（大小寫不拘）否則報錯。更新 `tests/test_gds_boolean.py` morph 測試（方向性
+  面積 + bounds、shrink 缺 fov 報錯、非法軸標籤報錯）。對話框運算子鈕擴成 `>W: >H: <W: <H:`。
+- **版面溢出（`gds_align_tool.py`）**：`CoordinateSetupPanel` 的 `_corner_lbl`/`_origin_lbl`
+  無 word-wrap，輸入值後標籤文字變長（含千分位 + nm/µm），單行 QLabel 撐寬固定 300px 的 SEM
+  面板而溢出。兩個 label 加 `setWordWrap(True)`。
+
+**測試：** `py_compile` 三檔過。sandbox 無 numpy/shapely/PyQt6 → 未跑 pytest / GUI，待 user
+本地 `pytest tests/test_gds_boolean.py -v` + 驗 GUI（W/H 方向、coordinate setup 不再溢出）。
+
+**影響檔案：** `glas/core/gds_boolean.py`、`glas/app/gds_align_tool.py`、
+`tests/test_gds_boolean.py`、`CLAUDE.md`、`docs/plans/F4-boolean-enhance.md`。
+
+**Branch：** `claude/compassionate-dijkstra-84Gjd`（PR #3）
+
+---
+
 ## [2026-05-25] [F4] 修復 edit 閃退 + 對話框內嵌預覽
 
 **變更類型：** bug fix + 功能
