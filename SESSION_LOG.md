@@ -2,6 +2,21 @@
 
 ---
 
+## [2026-05-25] [F4] 規劃：Boolean 強化（食譜化重算 + 巢狀 + 編輯 + 對話框重設計）
+
+**變更類型：** 文件（plan，尚未動工）
+
+**內容：** user 調整優先序：F4 改做 Boolean 強化、原 fine align 診斷改排 F5。經探索確認現況
+（synthetic layer 只算一次、ROI reload 即遺失、無法編輯、無法巢狀），Q&A 收斂為四項：
+食譜化每 FOV 自動重算、巢狀引用 synthetic、編輯/刪除、表達式對話框完整重設計。
+新增 `docs/plans/F4-boolean-enhance.md`（3 milestone）；§8 更新 [F4] 指向新 plan、
+[F5] = fine align 診斷。**待 user 核准後才開工。**
+
+**影響檔案：** `docs/plans/F4-boolean-enhance.md`、`docs/plans/F5-finealign-diagnostics.md`
+（renumber）、`CLAUDE.md`。
+
+**Branch：** `claude/compassionate-dijkstra-84Gjd`（PR #3）
+
 ## [2026-05-25] [F4] 規劃：Fine align 診斷（殘差疊圖 + 批次結果總覽）
 
 **變更類型：** 文件（plan，尚未動工）
