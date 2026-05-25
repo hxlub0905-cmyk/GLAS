@@ -1,6 +1,7 @@
 # [F6] OAS 讀取與批次 fine-align 加速（mmap + 共享 map + thread-pool 批次）
 
-> **狀態：** planned（待核准）
+> **狀態：** in progress（M1–M3 程式碼完成，沙箱已過 numpy-free 等價驗證；numpy/cv2/PyQt6
+> 相依的等價測試與實機效能待 user 本地驗收）
 > **§8 ID：** [F6]
 > **建立：** 2026-05-25
 > **負責 branch：** claude/dazzling-cori-5T7XE
@@ -54,54 +55,52 @@ mmap 與 thread-pool 都帶 fallback（無 fileno → slurp；cv2 缺 → 既有
 
 ## Milestones
 
-### M1: A1 — mmap-backed OasisStream（ROI 路徑，bulk 維持 slurp）  [status: planned]
+### M1: A1 — mmap-backed OasisStream（ROI 路徑，bulk 維持 slurp）  [status: done — code + sandbox numpy-free 等價過]
 
-- [ ] `OasisStream.__init__(base, *, use_mmap: bool = False)`：當 `use_mmap` 且 `base` 有真實
-  `fileno()` → `mmap.mmap(fileno, 0, access=ACCESS_READ)` 當 `self._buf`，保留 fd（存 `self._fd`），
-  decode 完全沿用 `buf[pos]`(回 int) / `buf[a:b]`(回 bytes) / `len(buf)`（mmap 三者語意同 bytes）。
-- [ ] **fallback**：`mmap` 失敗（BytesIO 無 fileno、平台不支援、空檔）→ `except (ValueError, OSError,
-  io.UnsupportedOperation)` 退回 `base.read()`，行為與今日完全相同（測試的 BytesIO 路徑不受影響）。
-- [ ] `close()`：若 `_buf` 是 mmap → `_buf.close()` + 關 fd；否則維持 `_buf = b""`。`_stack`（CBLOCK
-  解壓後的 bytes）與 `read/tell/seek/clear_substreams` 不變。
-- [ ] `OasisReader.__init__` 加 `use_mmap: bool = False`，傳給 `OasisStream`；**預設 False（bulk 不變）**。
-- [ ] 驗證：py_compile；新增等價測試——同一份合成 OASIS（沿用 `test_oasis_random.py` 既有 builder）
-  分別以 `use_mmap=True/False` decode，斷言 `iter_records` 序列與 `RandomAccessReader.load_cell`
-  的 rects/polys ndarray **完全相等**；BytesIO 仍走 slurp fallback。
+- [x] `OasisStream.__init__(base=None, *, use_mmap=False, shared_buf=None)`：`use_mmap` 且 `base` 有真實
+  `fileno()` → `mmap.mmap(fileno, 0, ACCESS_READ)` 當 `_buf`（持有 base 至 close）；decode 沿用
+  `buf[pos]`(int)/`buf[a:b]`(bytes)/`len(buf)`。
+- [x] **fallback**：mmap 失敗（BytesIO/平台/空檔）→ `except (ValueError, OSError, io.UnsupportedOperation,
+  AttributeError)` 退回 `base.read()`，行為與今日相同。
+- [x] `close()`：mmap → `_mmap.close()` + 關 base；slurp → `_buf=b""`。`_stack`/`read/tell/seek` 不變。
+- [x] `OasisReader` / `scan_cell_offsets` 加 `use_mmap=False`（預設 False，bulk 不變）；`RandomAccessReader`
+  內部走 mmap。
+- [x] 驗證：py_compile + `TestOasisStreamMmapEquivalence`（read 原語/iter_records/scan index 三者 mmap↔slurp
+  相等、BytesIO fallback）**沙箱實跑過**；numpy-gated `load_cell` 幾何相等待本地。
 
-### M2: A2 — 單一 mmap 共享給 offset-scan 與持久 ROI reader（去雙重 map）  [status: planned]
+### M2: A2 — 單一 map 共享給 offset-scan 與持久 ROI reader（去雙重 slurp）  [status: done — code + sandbox numpy-free 等價過]
 
-- [ ] `scan_cell_offsets(path, *, use_mmap=False)` 走 mmap（讀 name-table 前綴即 break，本就便宜）。
-- [ ] `RandomAccessReader.__init__` 改為**檔案只 map 一次**：建立一個 mmap-backed `OasisStream`，
-  讓「offset-scan pass」與「持久 geometry reader」共用同一個 mmap 物件（各自獨立 `OasisStream`／
-  `_pos` 游標；mmap 唯讀、多 OasisStream 併讀安全）。新增 `OasisReader` 接「既有 buffer/mmap」的
-  建構路徑（不重開、不重 map）。offset index 只算一次。
-- [ ] 驗證：py_compile；斷言「共享 map 後算出的 `by_refnum/by_name/unit/layernames` 與獨立呼叫
-  `scan_cell_offsets` 結果**完全相等**」；`RandomAccessReader` 既有測試全綠（行為不變）；
-  以小檔確認檔案 handle/map 數量降為 1（可用 errors 清單為空 + load 結果一致間接驗證）。
+- [x] `OasisStream/OasisReader/scan_cell_offsets(shared_buf=...)`：包外部擁有的 buffer，各自 `_pos`，
+  `close()` 只丟自身 ref、不關共享 map。
+- [x] `RandomAccessReader.__init__`：建一個 owning mmap `OasisStream`，`_buf` 同時給 persistent reader 與
+  `scan_cell_offsets` → 檔案只 map 一次、index 只算一次。
+- [x] `RandomAccessReader.close()` + `__enter__/__exit__`：先關共享 wrapper、再關 owning map；idempotent。
+- [x] 驗證：py_compile + `TestSharedMapEquivalence`（共享 map scan/iter_records 與獨立呼叫相等、關 wrapper
+  後 owner map 仍可用、close idempotent）**沙箱實跑過**。
 
-### M3: B1 — thread-pool 批次 fine-align（per-thread reader 共享 map）  [status: planned]
+### M3: B1 — thread-pool 批次 fine-align（per-thread 獨立 reader）  [status: done — code 完成，等價測試待本地相依]
 
-- [ ] 批次驅動改用 `concurrent.futures.ThreadPoolExecutor(max_workers=auto)`（auto 見 Q2）。
-  `FineAlignAllWorker` 仍是 QThread 進入點；`run()` 內部 submit 每張影像為一個 task。
-- [ ] **per-thread reader**：GUI thread 先算好 offset index（一次），各 worker thread 經
-  `threading.local` 建/重用一個 `RandomAccessReader`，**共享同一 mmap + 共享 offset index**
-  （新增「以既有 mmap + 既有 index 建 reader」路徑，跳過重掃）。每 reader 各自 `_memo/_reach_memo`。
-- [ ] **結果一致性**：每張影像 task 回傳 `(image_id, dx, dy, score, used_r, status)`，future 完成即
-  emit `result`（順序無關，存 `_refined[image_id]`，最終狀態與循序版相同）。`progress` 計已完成數。
-- [ ] **cancel**：沿用 `threading.Event`；每個 task 開頭檢查 `is_set()` 直接 return，並把
-  `cancel_cb=event.is_set` 傳進 `poi_polys_for_roi`（中斷進行中的 walk）。cancel 後 pool 收尾、
-  保留已完成結果（與 F5 M5 行為一致）。
-- [ ] **cv2 過度訂閱**：評估在批次期間 `cv2.setNumThreads()` 的取捨（thread pool + cv2 內部多緒可能
-  互搶）；若無明顯助益則維持預設、不動，並記錄結論。**不納入會改變數值結果的設定**。
-- [ ] 驗證：py_compile；**golden 等價測試**——同一批 job 跑「舊循序版」vs「thread-pool 版」，斷言
-  **每張影像的 (dx,dy,score,used_r,status) 完全相等**（worker 數 1 與 N 都測）。
+- [x] 抽出純函式 `_fine_align_image(job, rar, root, poi_specs, cfg, cancel_is_set)`（無共享可變狀態）。
+- [x] `FineAlignAllWorker.run()` 改 `ThreadPoolExecutor(max_workers=_auto_batch_workers())`
+  （`min(cpu_count, 8)`）；每 worker thread 經 `threading.local` 用 `rar.clone()` 取私有 reader、
+  結束逐一 close。
+- [x] **per-thread 獨立 reader（取代原「共享單一 map+index」構想）**：clone 各自 mmap，OS page-cache 共享
+  → 不耗 N× RAM；零共享可變狀態 → 結果逐值等於循序。index 重掃（≤8 次 name-table）成本可忽略，換完全
+  獨立、無生命週期風險。`RandomAccessReader.clone()` + `_init_wanted`。
+- [x] **結果一致性**：signal 由 run() 單一 thread 在 future 完成時 emit（pool thread 只算）；順序無關。
+- [x] **cancel**：`threading.Event`，task 起點 + `poi_polys_for_roi(cancel_cb=...)` 讀 `is_set()`；cancel 後
+  跳出收集、pool `__exit__` 等 in-flight（快速 bail）、保留已完成結果。
+- [x] **cv2 執行緒決策**：**維持 cv2 預設不動**——`setNumThreads` 全域且會影響單張路徑、且可能改變 float
+  加總順序而動 score；為保證 golden 等價，不採用任何改變數值的設定。
+- [x] 驗證：py_compile + `TestBatchParallelEquivalence`（循序 vs 4-worker pool 每張 tuple 相等）；沙箱無
+  numpy/cv2/PyQt6 → 待本地實跑。
 
-### M4: 等價性與效能總驗收  [status: planned]
+### M4: 等價性與效能總驗收  [status: in progress — 測試齊備，實機/相依驗收待本地]
 
-- [ ] 彙整 golden-output 測試成 `tests/test_accel_equivalence.py`：mmap↔slurp 幾何相等、
-  共享 map↔獨立 scan 的 index 相等、循序↔並行的批次結果相等。
-- [ ] （sandbox 無 numpy/cv2/PyQt6）py_compile 全過 + 純邏輯測試；**實機效能與 GUI 批次加速、
-  大檔 mmap 記憶體下降由 user 本地驗收**（plan 末「驗證方式」）。
+- [x] golden 測試彙整於 `tests/test_accel_equivalence.py`（mmap↔slurp / 共享map↔獨立scan / 循序↔並行）。
+- [ ] 本地 `pytest tests/test_accel_equivalence.py tests/test_oasis_random.py tests/test_oasis_streamer.py -v`
+  全綠（含 numpy/cv2/PyQt6-gated）。
+- [ ] 實機效能、GUI 批次加速、大檔 mmap 記憶體下降由 user 本地驗收。
 
 ---
 

@@ -212,10 +212,22 @@ class RandomAccessReader:
         self._bbox_layer = bbox_layer
         if wanted_layers is not None and bbox_layer is not None:
             wanted_layers = set(wanted_layers) | {bbox_layer}
+        # Post-union wanted set, kept so clone() can build an independent
+        # reader with the exact same filter (F6 M3 thread-pool batch).
+        self._init_wanted = (set(wanted_layers)
+                             if wanted_layers is not None else None)
+        # F6 M1/M2: the random-access path only touches a few cells, so map
+        # the file read-only instead of slurping it whole — a 345 MB layout no
+        # longer costs 345 MB of RAM. mmap falls back to slurp transparently
+        # when unavailable (see OasisStream). M2: map the file exactly ONCE
+        # and share that buffer between the offset-scan pass and the persistent
+        # geometry reader (each gets its own cursor), instead of mapping twice.
+        self._owned_stream = oas.OasisStream(open(path, "rb"), use_mmap=True)
+        shared = self._owned_stream._buf
         self._reader = oas.OasisReader(
             path, wanted_layers=wanted_layers,
-            defer_repetition=True)
-        idx = oas.scan_cell_offsets(path)
+            defer_repetition=True, shared_buf=shared)
+        idx = oas.scan_cell_offsets(path, shared_buf=shared)
         self._by_refnum: dict[int, int] = idx["by_refnum"]
         self._by_name: dict[str, int] = idx["by_name"]
         # OASIS START `unit` = grid steps per micron. Raw coordinates are in
@@ -241,6 +253,37 @@ class RandomAccessReader:
         _dbg(f"RandomAccessReader: {len(self._by_refnum):,} offsets indexed "
              f"from {self._path.name} (wanted={wanted_layers} "
              f"bbox_layer={bbox_layer})")
+
+    def clone(self) -> "RandomAccessReader":
+        """An independent reader over the same file/filter (F6 M3).
+
+        Used by the thread-pool batch fine-align so each worker thread owns a
+        private reader (private ``_memo`` / cursor) with no shared mutable
+        state — results are therefore identical to the sequential path. Each
+        clone maps the file read-only; the OS shares the physical pages across
+        clones, so N readers do not cost N× the RAM."""
+        return RandomAccessReader(
+            self._path, wanted_layers=self._init_wanted,
+            dtype=self._dtype, bbox_layer=self._bbox_layer)
+
+    def close(self) -> None:
+        """Release the file map (F6 M2). Drops the shared-buffer wrappers
+        first, then closes the single owned mmap so no reference still points
+        into a closed mapping. Safe to call more than once."""
+        try:
+            self._reader.close()
+        except Exception:
+            pass
+        try:
+            self._owned_stream.close()
+        except Exception:
+            pass
+
+    def __enter__(self) -> "RandomAccessReader":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
 
     def has_offsets(self) -> bool:
         return bool(self._by_refnum)

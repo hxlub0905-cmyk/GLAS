@@ -2,6 +2,41 @@
 
 ---
 
+## [2026-05-25] [F6] 實作 M1–M3：mmap 讀取 + 單一 map 共享 + thread-pool 批次（待本地驗收）
+
+**變更類型：** 功能（效能加速，行為不變）
+
+**動機現象：** ROI 模式開大檔整檔 slurp 進 RAM（`oasis_streamer.py` `OasisStream`）、`RandomAccessReader`
+開檔 slurp 兩次、批次 fine-align（`FineAlignAllWorker`）刻意單執行緒。plan F6 已核准。
+
+**修復實作：**
+- **M1 mmap-backed OasisStream**：`OasisStream(base=None, *, use_mmap=False, shared_buf=None)`，`use_mmap`
+  且 base 有 fileno → `mmap.mmap(ACCESS_READ)`；BytesIO/平台/空檔 → fallback `base.read()`（行為不變）。
+  `close()` 釋放 mmap + 持有的 base。`OasisReader`/`scan_cell_offsets` 加 `use_mmap`（預設 False，bulk
+  decode 路徑維持 slurp）；`RandomAccessReader` 內部走 mmap。
+- **M2 單一 map 共享**：`shared_buf` 路徑讓 `OasisStream/OasisReader/scan_cell_offsets` 包外部擁有的
+  buffer（各自 `_pos`，close 不關共享 map）；`RandomAccessReader.__init__` 建一個 owning mmap，`_buf`
+  同時給 persistent reader 與 scan → 檔案只 map 一次、offset index 只算一次。新增
+  `RandomAccessReader.close()` / `__enter__/__exit__`（先關 wrapper 再關 owning map，idempotent）。
+- **M3 thread-pool 批次**：抽出純函式 `_fine_align_image(...)`；`FineAlignAllWorker.run()` 改
+  `ThreadPoolExecutor(max_workers=min(cpu_count,8))`，每 worker thread 經 `threading.local` 用
+  `RandomAccessReader.clone()` 取私有 reader（私有 _memo/cursor；mmap 由 OS 共享實體頁，不耗 N× RAM），
+  零共享可變狀態 → 結果與循序逐值相同。signal 由 run() 單一 thread 在 future 完成時 emit；cancel 沿用
+  `threading.Event`（task 起點 + walk cancel_cb 讀 is_set，cancel 後保留已完成結果）。
+  **cv2 執行緒設定維持預設不動**（避免改變 score 數值，保證 golden 等價）。
+
+**測試：** 新增 `tests/test_accel_equivalence.py`（mmap↔slurp 的 read/iter_records/scan 等價、共享map↔
+獨立scan 等價、`RandomAccessReader` close idempotent、循序↔4-worker pool 每張 result tuple 等價）。
+**沙箱實跑 numpy-free 等價檢查全通過**（OasisStream/iter_records/scan/shared-map）；numpy/cv2/PyQt6-gated
+項（load_cell 幾何、批次並行）與實機效能、GUI 批次加速、mmap 記憶體下降待 user 本地驗收。py_compile 全過。
+
+**影響檔案：** `glas/core/oasis_streamer.py`、`glas/core/oasis_random.py`、`glas/app/gds_align_tool.py`、
+`tests/test_accel_equivalence.py`、`docs/plans/F6-readwalk-batch-accel.md`。
+
+**Branch：** `claude/dazzling-cori-5T7XE`
+
+---
+
 ## [2026-05-25] [F6] 規劃：OAS 讀取 + 批次 fine-align 加速（待核准）
 
 **變更類型：** 文件（plan，尚未動工）

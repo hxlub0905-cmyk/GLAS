@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import mmap
 import struct
 import sys
 import zlib
@@ -205,23 +206,69 @@ class OasisStream:
     for any external caller that still treats the stream as a file.
     """
 
-    def __init__(self, base: BinaryIO) -> None:
-        # Slurp the whole file at open time. Outer OASIS files are
-        # bounded by user RAM (300-500 MB on real D2DB masks); the
-        # in-memory cost trades for ~5× fewer Python method calls in
-        # the hot decoder. Close the OS file descriptor immediately so
-        # we never hold it across long parser runs.
-        self._buf: bytes = base.read()
+    def __init__(self, base: Optional[BinaryIO] = None, *,
+                 use_mmap: bool = False, shared_buf: object = None) -> None:
+        # ``shared_buf`` (F6 M2): wrap an existing, externally-owned buffer
+        # (an mmap or bytes opened once by RandomAccessReader) with our own
+        # ``_pos`` cursor. We do NOT own it, so close() only drops our
+        # reference — the owner closes the real mapping. This lets the
+        # offset-scan pass and the persistent ROI reader share a single map
+        # of the file instead of mapping it twice.
+        if shared_buf is not None:
+            self._mmap = None
+            self._base = None
+            self._buf = shared_buf
+            self._pos = 0
+            self._closed = False
+            self._stack: list[tuple[object, int]] = []
+            return
+        # Two backing strategies, selected by ``use_mmap``:
+        #
+        #  • slurp (default): read the whole file into a ``bytes`` buffer.
+        #    Outer OASIS files are bounded by user RAM (300-500 MB on real
+        #    D2DB masks); the in-memory cost trades for ~5× fewer Python
+        #    method calls in the hot decoder. Best for the bulk full-decode
+        #    path (oasis_store) which reads every byte anyway.
+        #  • mmap (F6 M1): map the file read-only and walk it via ``_pos``.
+        #    Best for the random-access ROI path, which only touches a few
+        #    cells — the OS pages in just those, so a 345 MB file no longer
+        #    costs 345 MB of RAM. ``buf[pos]`` (int) / ``buf[a:b]`` (bytes) /
+        #    ``len(buf)`` are identical to bytes, so decoders are unchanged.
+        #
+        # mmap falls back to slurp transparently when ``base`` has no real
+        # fileno (e.g. io.BytesIO in tests), the platform refuses, or the
+        # file is empty — so behaviour is identical on those paths.
+        self._mmap: Optional[mmap.mmap] = None
+        self._base: Optional[BinaryIO] = None
+        self._buf = b""
+        if use_mmap:
+            try:
+                fd = base.fileno()
+                self._mmap = mmap.mmap(fd, 0, access=mmap.ACCESS_READ)
+                self._buf = self._mmap          # type: ignore[assignment]
+                # Keep ``base`` open for the mapping's lifetime; closed in
+                # close(). (CPython keeps the mapping valid past an fd close
+                # on most platforms, but holding the handle is portable.)
+                self._base = base
+            except (ValueError, OSError, io.UnsupportedOperation, AttributeError):
+                self._mmap = None
+                self._base = None
+                self._buf = b""
+        if self._mmap is None:
+            self._buf = base.read()
+            # Close the OS file descriptor immediately so we never hold it
+            # across long parser runs.
+            try:
+                base.close()
+            except Exception:
+                pass
         self._pos: int = 0
         self._closed: bool = False
-        try:
-            base.close()
-        except Exception:
-            pass
         # Stack of (saved_buf, saved_pos) snapshots, taken when a CBLOCK
         # is pushed. The top of the stack holds the outer substream's
         # state we'll restore when the current inner substream drains.
-        self._stack: list[tuple[bytes, int]] = []
+        # (saved_buf is the mmap or a bytes payload; both index the same.)
+        self._stack: list[tuple[object, int]] = []
 
     # ── File-like API (back-compat for cold paths) ─────────────────────────
     def read(self, n: int = -1) -> bytes:
@@ -267,6 +314,18 @@ class OasisStream:
         # closes. Subsequent reads will fail with ValueError, matching
         # the BinaryIO contract.
         self._buf = b""
+        if self._mmap is not None:
+            try:
+                self._mmap.close()
+            except Exception:
+                pass
+            self._mmap = None
+        if self._base is not None:
+            try:
+                self._base.close()
+            except Exception:
+                pass
+            self._base = None
         self._closed = True
 
     @property
@@ -1037,8 +1096,14 @@ class OasisReader:
                  *,
                  wanted_layers: Optional[set[tuple[int, int]]] = None,
                  capture_prop_values: bool = False,
-                 defer_repetition: bool = False) -> None:
+                 defer_repetition: bool = False,
+                 use_mmap: bool = False,
+                 shared_buf: object = None) -> None:
         """Open ``path`` and validate the OASIS magic.
+
+        ``shared_buf`` (F6 M2): when given, read from this externally-owned
+        buffer (an mmap/bytes the caller opened once) instead of opening the
+        file. The reader does not own it; ``close()`` only drops the wrapper.
 
         ``wanted_layers``: optional filter. When provided, geometry records
         whose ``(layer, datatype)`` (or ``(text_layer, text_type)`` for
@@ -1056,7 +1121,11 @@ class OasisReader:
         # All decoders read through OasisStream so CBLOCK substreams stay
         # invisible to them. The wrapper exposes the same read/tell/seek
         # surface a plain file handle does.
-        self._f: OasisStream = OasisStream(open(self._path, "rb"))
+        if shared_buf is not None:
+            self._f = OasisStream(shared_buf=shared_buf)
+        else:
+            self._f = OasisStream(
+                open(self._path, "rb"), use_mmap=use_mmap)
         self._modal = ModalState()
         self._last_record_start: int = 0
         # When True, PLACEMENT payloads carry the compact (rtype, raw)
@@ -2243,9 +2312,13 @@ def _name_str(v) -> str:
     return v if isinstance(v, str) else str(v)
 
 
-def scan_cell_offsets(path: str | Path) -> dict:
+def scan_cell_offsets(path: str | Path, *, use_mmap: bool = False,
+                      shared_buf: object = None) -> dict:
     """Read the name-table section and return the per-cell byte-offset
     index from ``S_CELL_OFFSET`` properties (M3.5a).
+
+    ``shared_buf`` (F6 M2): scan an already-mapped buffer instead of
+    re-opening the file, so RandomAccessReader maps the file only once.
 
     Random-access ROI load (M3.5b/c) seeks straight to a cell's CELL
     record using these offsets, decoding only the cells a SEM image's FOV
@@ -2256,7 +2329,8 @@ def scan_cell_offsets(path: str | Path) -> dict:
     positions of each cell's CELL record in the file. Empty index when
     the file carries no ``S_CELL_OFFSET`` (caller falls back to a full
     decode)."""
-    reader = OasisReader(path, capture_prop_values=True)
+    reader = OasisReader(path, capture_prop_values=True, use_mmap=use_mmap,
+                         shared_buf=shared_buf)
     propname_by_refnum: dict[int, str] = {}
     pn_implicit = 0
     cn_implicit = 0
@@ -2315,6 +2389,7 @@ def scan_cell_offsets(path: str | Path) -> dict:
         elif rid in (CELL_REFNUM, CELL_NAME):
             break    # body reached; name table fully behind us
 
+    reader.close()   # release the mmap / slurp buffer (F6 M1)
     return {
         "by_refnum": by_refnum,
         "by_name": by_name,

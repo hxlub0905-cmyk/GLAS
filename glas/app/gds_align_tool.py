@@ -50,9 +50,11 @@ from __future__ import annotations
 import csv
 import json
 import multiprocessing as mp
+import os
 import sys
 import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -1113,11 +1115,60 @@ class RoiWalkWorker(QObject):
             self.finished.emit(doc, per_layer)
 
 
+def _auto_batch_workers() -> int:
+    """Thread-pool size for batch fine-align (F6 M3): one per core, capped at
+    8 so a many-core box doesn't oversubscribe cv2's own internal threads."""
+    return max(1, min(os.cpu_count() or 1, 8))
+
+
+def _fine_align_image(job, rar, root, poi_specs, cfg, cancel_is_set):
+    """Process ONE image: walk the POI ROI, render the template, match.
+
+    Pure per-image work with no shared mutable state (``rar`` is the calling
+    thread's private reader), so the result is independent of execution order
+    — identical whether run sequentially or across a thread pool (F6 M3).
+    Returns ``(image_id, dx, dy, score, used_radius_px, status)`` or ``None``
+    if cancelled before any work was done."""
+    image_id, anchor, path, exists = job
+    if cancel_is_set():
+        return None
+    c = cfg
+    if anchor is None:
+        return (str(image_id), 0.0, 0.0, 0.0, 0, "no-coords")
+    sem = (cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+           if (cv2 and exists) else None)
+    if sem is None:
+        return (str(image_id), 0.0, 0.0, 0.0, 0, "missing-file")
+    H, W = sem.shape[:2]
+    nm_per_px = (c["nm_manual"] if (not c["nm_auto"] and
+                 c["nm_manual"] > 0) else c["fov_w"] / max(1, W))
+    if nm_per_px <= 0:
+        return (str(image_id), 0.0, 0.0, 0.0, 0, "no-scale")
+    roi = (anchor[0] - c["fov_w"], anchor[1] - c["fov_h"],
+           anchor[0] + c["fov_w"], anchor[1] + c["fov_h"])
+    poi_layers = []
+    for spec, fg in poi_specs:
+        polys = poi_polys_for_roi(rar, root, roi, spec, cancel_cb=cancel_is_set)
+        if polys:
+            poi_layers.append((polys, fg))
+    if not poi_layers:
+        return (str(image_id), 0.0, 0.0, 0.0, 0, "flat")
+    template = render_composite_template(
+        poi_layers, anchor, W, H, nm_per_px, c["bg_glv"], c["blur_sigma_px"])
+    radius_px = c["search_radius_nm"] / nm_per_px
+    dx, dy, score, used_r = fine_align_one(sem, template, nm_per_px, radius_px)
+    return (str(image_id), dx, dy, score, int(used_r), "ok")
+
+
 class FineAlignAllWorker(QObject):
     """Batch fine align (plan M4b "Run all"): for every SEM image with
     coordinates, walk the POI ROI, render a template and run
-    ``cv2.matchTemplate``. Sequential (one reader, no concurrent access);
-    emits per-image results + progress so the UI stays responsive."""
+    ``cv2.matchTemplate``. F6 M3: parallelised across a thread pool — each
+    worker thread clones the reader (private ``_memo`` / cursor, no shared
+    mutable state), and the heavy cv2 calls release the GIL. Per-image results
+    are independent of order, so the output is identical to the old sequential
+    path; signals are emitted from this (single) worker thread as futures
+    complete, keeping the UI responsive."""
 
     progress = pyqtSignal(int, int, str)        # (done, total, image_id)
     # (image_id, dx, dy, score, used_radius_px, status); status is objective:
@@ -1136,9 +1187,9 @@ class FineAlignAllWorker(QObject):
         self._poi_specs = list(poi_specs)
         self._jobs = jobs        # list of (image_id, anchor|None, path, exists)
         self._cfg = cfg          # dict: fov_w/h, nm_auto, nm_manual, bg/blur, search_radius_nm
-        # threading.Event so a cancel from the GUI thread takes effect inside
-        # this worker's tight loop *immediately* — a queued slot would never run
-        # while run() monopolises the worker thread (F5 M5).
+        # threading.Event: a cancel from the GUI thread is read by every pool
+        # task (start of work + walk cancel_cb), so it takes effect promptly
+        # without relying on a queued slot (F5 M5 / F6 M3).
         self._cancel = threading.Event()
 
     def cancel(self) -> None:
@@ -1147,48 +1198,50 @@ class FineAlignAllWorker(QObject):
     def run(self) -> None:
         try:
             n = len(self._jobs)
+            workers = min(_auto_batch_workers(), max(1, n))
+            # Per-thread private reader: cloned lazily on first use by each pool
+            # thread, tracked so we can close every map at the end.
+            tl = threading.local()
+            created: list = []
+            clock = threading.Lock()
+
+            def reader_for_thread():
+                r = getattr(tl, "rar", None)
+                if r is None:
+                    r = self._rar.clone()
+                    with clock:
+                        created.append(r)
+                    tl.rar = r
+                return r
+
+            def task(job):
+                return _fine_align_image(
+                    job, reader_for_thread(), self._root, self._poi_specs,
+                    self._cfg, self._cancel.is_set)
+
             done = 0
-            c = self._cfg
-            for image_id, anchor, path, exists in self._jobs:
-                if self._cancel.is_set():
-                    self.cancelled.emit()
-                    return
-                done += 1
-                self.progress.emit(done, n, str(image_id))
-                if anchor is None:
-                    self.result.emit(str(image_id), 0.0, 0.0, 0.0, 0, "no-coords")
-                    continue
-                sem = (cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
-                       if (cv2 and exists) else None)
-                if sem is None:
-                    self.result.emit(str(image_id), 0.0, 0.0, 0.0, 0,
-                                     "missing-file")
-                    continue
-                H, W = sem.shape[:2]
-                nm_per_px = (c["nm_manual"] if (not c["nm_auto"] and
-                             c["nm_manual"] > 0) else c["fov_w"] / max(1, W))
-                if nm_per_px <= 0:
-                    self.result.emit(str(image_id), 0.0, 0.0, 0.0, 0, "no-scale")
-                    continue
-                roi = (anchor[0] - c["fov_w"], anchor[1] - c["fov_h"],
-                       anchor[0] + c["fov_w"], anchor[1] + c["fov_h"])
-                poi_layers = []
-                for spec, fg in self._poi_specs:
-                    polys = poi_polys_for_roi(
-                        self._rar, self._root, roi, spec,
-                        cancel_cb=self._cancel.is_set)
-                    if polys:
-                        poi_layers.append((polys, fg))
-                if not poi_layers:
-                    self.result.emit(str(image_id), 0.0, 0.0, 0.0, 0, "flat")
-                    continue
-                template = render_composite_template(
-                    poi_layers, anchor, W, H, nm_per_px,
-                    c["bg_glv"], c["blur_sigma_px"])
-                radius_px = c["search_radius_nm"] / nm_per_px
-                dx, dy, score, used_r = fine_align_one(sem, template, nm_per_px,
-                                                       radius_px)
-                self.result.emit(str(image_id), dx, dy, score, int(used_r), "ok")
+            try:
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    futures = [ex.submit(task, job) for job in self._jobs]
+                    for fut in as_completed(futures):
+                        res = fut.result()
+                        done += 1
+                        if res is not None:
+                            self.progress.emit(done, n, res[0])
+                            self.result.emit(*res)
+                        if self._cancel.is_set():
+                            # Stop collecting; the pool's __exit__ waits for the
+                            # few in-flight tasks, which bail fast on cancel.
+                            break
+            finally:
+                for r in created:
+                    try:
+                        r.close()
+                    except Exception:
+                        pass
+            if self._cancel.is_set():
+                self.cancelled.emit()
+                return
         except oasis_random.WalkCancelled:
             self.cancelled.emit()
         except Exception as exc:                       # noqa: BLE001
