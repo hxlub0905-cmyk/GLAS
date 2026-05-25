@@ -2,6 +2,40 @@
 
 ---
 
+## [2026-05-25] [F7] 實作 M1–M4：Batch 工作區 + inline 進度 + 進度條質感（待本地驗收）
+
+**變更類型：** 功能（UI/UX，運算不變）
+
+**內容：** 依核准的 F7 plan（規劃期間 user 反映「Batch 放 View 那排怪」，Q&A 改為**動作進入+返回鈕**，
+不放 segmented）實作四個 milestone：
+- **M1 進度條質感**：`_AnimatedBar` 升級——橘→深橘垂直漸層 + 軟外發光（外擴低 alpha rounded rect）+
+  determinate 時條內置中 % 數字（先深色全畫、再白色 clip 到填充，兩種底都可讀）+ bar 加高 14→20px、
+  更圓潤、保留掃光帶。API 不變 → 全 app 進度條（OASIS 載入/overlay/ROI）同步變精緻。
+- **M2 `BatchResultsPanel`**：新 QWidget，把舊 `FineAlignResultsDialog` 的 summary/only-low 篩選/sortable
+  表/`_ScoreHistogram`/`_ResidualScatter`/median 鈕搬入；對外 `set_rows(rows,threshold)`；頂部 inline 進度區
+  （`_AnimatedBar`+spinner+done/total/%/Elapsed/ETA+Cancel，閒置隱藏）；signals image_activated/
+  apply_median_requested/cancel_requested/back_requested。
+- **M3 Batch 工作區**：`_center_split` 變 [canvas, batch_panel, sem_viewer]；新增 `_enter_batch_workspace()`
+  （記 `_prev_view_mode`、隱藏 canvas/minimap、左結果≈55%/右 SEM≈45%）與 `_exit_batch_workspace()`；
+  `_set_view_mode` 開頭一律隱藏 batch_panel（點任一 View 鈕即離開）+ gds 模式 setSizes 改 3 值；
+  點結果列 → `_on_sem_image_selected` 就地換右側 overlay、不離開工作區。
+- **M4 批次接線改 inline**：`_on_run_fine_align_all` 改 `_enter_batch_workspace()`+`start_progress()`，
+  **不再開 modal `LoadProgressDialog`**；`_on_fa_progress`→panel.set_progress、`_on_fa_result`→更新
+  `_refined`/badge 並 `_refresh_batch_panel()`（streaming 重填）；finished/cancelled/failed→`end_progress`
+  + 重填、保留部分結果；cancel 由 panel 按鈕經 `_on_fa_cancel_clicked` 直接 `worker.cancel()`（threading.Event
+  即時）；「Results…」鈕（`_open_fa_results`）改為進工作區+重填。移除已無用的 `FineAlignResultsDialog`
+  類別與 `_fa_progress`/`_fa_results_dlg` 屬性。**OASIS 載入/overlay 匯出仍用原 modal 進度。**
+
+**不動：** F6 批次運算與結果值、fine-align 符號、SemViewer 折疊、CE early-stop（§7 不變式）；median→δ 機制。
+
+**測試：** `py_compile` 全過。沙箱無 PyQt6/numpy/cv2 → GUI/外觀/互動（進度條漸層發光%、Run all/Results…
+進工作區、inline 進度+ETA、streaming 表、即時 cancel、點列就地換 overlay、← 回對位、四 view 切換）
+待 user 本地驗收；`pytest tests/test_gds_align_f5.py`（純函式）不受影響、待本地跑。
+
+**影響檔案：** `glas/app/gds_align_tool.py`、`docs/plans/F7-batch-workspace-ui.md`、`CLAUDE.md`。
+
+**Branch：** `claude/dazzling-cori-5T7XE`
+
 ## [2026-05-25] [F7] 規劃：批次對位工作區（Batch view-mode + inline 進度 + 進度條質感）（待核准）
 
 **變更類型：** 文件（plan，尚未動工）

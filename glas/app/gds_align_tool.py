@@ -724,11 +724,13 @@ class _AnimatedBar(QWidget):
     the old dialog avoided ``QProgressBar`` entirely)."""
 
     _TRACK = QColor("#ece0d2")
-    _FILL = QColor("#e0863a")
+    _FILL = QColor("#e0863a")        # mid tone, used for the soft glow
+    _FILL_HI = QColor("#f2a85d")     # glossy top of the gradient
+    _FILL_LO = QColor("#cf6a1f")     # deeper bottom of the gradient
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self.setFixedHeight(14)
+        self.setFixedHeight(20)
         self.setSizePolicy(QSizePolicy.Policy.Expanding,
                            QSizePolicy.Policy.Fixed)
         self._frac = 0.0
@@ -752,38 +754,71 @@ class _AnimatedBar(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         w = float(self.width())
-        h = float(self.height())
+        H = float(self.height())
+        m = 3.0                     # vertical margin so the soft glow can bleed
+        y = m
+        h = H - 2.0 * m
         r = h / 2.0
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(self._TRACK)
-        p.drawRoundedRect(QRectF(0, 0, w, h), r, r)
+        p.drawRoundedRect(QRectF(0, y, w, h), r, r)
         if self._indeterminate:
             bw = max(48.0, w * 0.30)
             t = self._phase
             tri = 2.0 * t if t < 0.5 else 2.0 * (1.0 - t)   # ping-pong
-            self._fill(p, tri * (w - bw), bw, h, r)
+            self._fill(p, tri * (w - bw), bw, y, h, r, None)
         elif self._frac > 0:
-            self._fill(p, 0.0, self._frac * w, h, r)
+            self._fill(p, 0.0, self._frac * w, y, h, r, self._frac)
         p.end()
 
-    def _fill(self, p: QPainter, x: float, fw: float, h: float,
-              r: float) -> None:
+    def _fill(self, p: QPainter, x: float, fw: float, y: float, h: float,
+              r: float, frac_text: Optional[float]) -> None:
         if fw <= 0:
             return
+        rect = QRectF(x, y, fw, h)
+        rr = min(r, fw / 2.0)
+        # Soft outer glow: a couple of expanding low-alpha rounded rects behind
+        # the fill give the bar a lit, raised feel.
+        p.setPen(Qt.PenStyle.NoPen)
+        for grow, alpha in ((3.0, 38), (1.5, 70)):
+            gc = QColor(self._FILL)
+            gc.setAlpha(alpha)
+            p.setBrush(gc)
+            p.drawRoundedRect(rect.adjusted(-grow, -grow, grow, grow),
+                              rr + grow, rr + grow)
+        # Glossy vertical gradient fill (lighter top -> deeper bottom).
         path = QPainterPath()
-        path.addRoundedRect(QRectF(x, 0, fw, h), min(r, fw / 2.0), r)
+        path.addRoundedRect(rect, rr, r)
         p.save()
         p.setClipPath(path)
-        p.fillRect(QRectF(x, 0, fw, h), self._FILL)
+        grad = QLinearGradient(0, y, 0, y + h)
+        grad.setColorAt(0.0, self._FILL_HI)
+        grad.setColorAt(1.0, self._FILL_LO)
+        p.fillRect(rect, QBrush(grad))
         # Sweeping highlight band across the filled portion.
         band = max(32.0, fw * 0.4)
         sx = x - band + self._phase * (fw + band)
-        grad = QLinearGradient(sx, 0, sx + band, 0)
-        grad.setColorAt(0.0, QColor(255, 255, 255, 0))
-        grad.setColorAt(0.5, QColor(255, 255, 255, 95))
-        grad.setColorAt(1.0, QColor(255, 255, 255, 0))
-        p.fillRect(QRectF(x, 0, fw, h), QBrush(grad))
+        sheen = QLinearGradient(sx, 0, sx + band, 0)
+        sheen.setColorAt(0.0, QColor(255, 255, 255, 0))
+        sheen.setColorAt(0.5, QColor(255, 255, 255, 110))
+        sheen.setColorAt(1.0, QColor(255, 255, 255, 0))
+        p.fillRect(rect, QBrush(sheen))
         p.restore()
+        # Inline percent (determinate only): drawn dark everywhere then white
+        # clipped to the fill, so it reads on both the track and the fill.
+        if frac_text is not None:
+            txt = f"{int(round(frac_text * 100))}%"
+            f = self.font()
+            f.setBold(True)
+            p.setFont(f)
+            trect = QRectF(0, y, float(self.width()), h)
+            p.setPen(QColor("#6f5236"))
+            p.drawText(trect, Qt.AlignmentFlag.AlignCenter, txt)
+            p.save()
+            p.setClipPath(path)
+            p.setPen(QColor(255, 255, 255, 240))
+            p.drawText(trect, Qt.AlignmentFlag.AlignCenter, txt)
+            p.restore()
 
 
 class LoadProgressDialog(QDialog):
@@ -3982,76 +4017,129 @@ class _NumItem(QTableWidgetItem):
             return super().__lt__(other)
 
 
-class FineAlignResultsDialog(QDialog):
-    """Batch fine-align overview: a sortable results table (score colour-coded,
-    optional below-threshold filter), a score histogram and a residual scatter,
-    plus a one-click 'apply median residual to origin δ' action (F5 M2 + M3).
-    Double-clicking a row asks MainWindow to jump to that image."""
+class BatchResultsPanel(QWidget):
+    """In-window batch fine-align workspace (F7): an inline progress strip
+    (shown while a batch runs), a sortable results table (score colour-coded,
+    optional below-threshold filter), a score histogram + residual scatter, and
+    a one-click 'apply median residual to origin δ' action. Lives in the centre
+    splitter beside the SEM overlay; double-clicking a row asks MainWindow to
+    swap the overlay to that image in place. Same data/logic as the old
+    ``FineAlignResultsDialog`` — only the container changed."""
 
     image_activated = pyqtSignal(str)
     apply_median_requested = pyqtSignal(float, float)
+    cancel_requested = pyqtSignal()
+    back_requested = pyqtSignal()
 
     _OK_BG = QColor("#dff3e6")
     _LOW_BG = QColor("#fdf2cf")
     _BAD_BG = QColor("#f7ded9")
 
-    def __init__(self, parent, rows, threshold: float) -> None:
+    _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Fine-align results")
-        self.setMinimumSize(660, 600)
-        self._rows = list(rows)
-        self._threshold = threshold
+        self._rows: list = []
+        self._threshold = 0.5
         v = QVBoxLayout(self)
+        v.setContentsMargins(10, 8, 10, 8)
+        v.setSpacing(8)
 
-        n_ok = sum(1 for r in self._rows if r["status"] == "ok")
-        n_low = sum(1 for r in self._rows if r["status"] == "low-score")
-        summary = QLabel(
-            f"{len(self._rows)} images  ·  {n_ok} ok  ·  {n_low} low-score  ·  "
-            f"threshold {threshold:.2f}")
-        summary.setStyleSheet(f"font-weight:600; color:{_TK_ACCENT_DK.name()};")
-        v.addWidget(summary)
+        # Header: back to alignment + title.
+        header = QHBoxLayout()
+        self._back_btn = QPushButton("←  Back to alignment", self)
+        self._back_btn.setToolTip("Leave the batch workspace and return to the "
+                                  "single-image alignment view.")
+        self._back_btn.clicked.connect(self.back_requested)
+        header.addWidget(self._back_btn)
+        title = QLabel("Batch fine-align", self)
+        title.setStyleSheet(f"font-weight:600; color:{_TK_ACCENT_DK.name()};")
+        header.addWidget(title, 1)
+        v.addLayout(header)
 
+        # Inline progress strip (hidden when idle).
+        self._prog_box = QWidget(self)
+        pb = QVBoxLayout(self._prog_box)
+        pb.setContentsMargins(0, 0, 0, 0)
+        pb.setSpacing(4)
+        self._bar = _AnimatedBar(self._prog_box)
+        pb.addWidget(self._bar)
+        prow = QHBoxLayout()
+        self._spinner = QLabel(self._SPINNER[0], self._prog_box)
+        self._spinner.setStyleSheet(
+            "color:#c97028; font-size:18px;"
+            " font-family:'Consolas','DejaVu Sans Mono',monospace;")
+        self._spinner.setFixedWidth(22)
+        prow.addWidget(self._spinner)
+        self._prog_lbl = QLabel("", self._prog_box)
+        self._prog_lbl.setStyleSheet("color:#6f6254; font-size:12px;")
+        prow.addWidget(self._prog_lbl, 1)
+        self._cancel_btn = QPushButton("Cancel", self._prog_box)
+        self._cancel_btn.clicked.connect(self._on_cancel_clicked)
+        prow.addWidget(self._cancel_btn)
+        pb.addLayout(prow)
+        v.addWidget(self._prog_box)
+        self._prog_box.hide()
+
+        self._cancelled = False
+        self._spin_idx = 0
+        self._progress: Optional[tuple] = None
+        self._cur_id = ""
+        self._elapsed = QElapsedTimer()
+        self._tick = QTimer(self)
+        self._tick.setInterval(120)
+        self._tick.timeout.connect(self._on_tick)
+
+        # Summary + filter.
+        self._summary = QLabel("No batch results yet.", self)
+        self._summary.setStyleSheet(
+            f"font-weight:600; color:{_TK_ACCENT_DK.name()};")
+        v.addWidget(self._summary)
         self._only_low = QCheckBox("Only show score below threshold", self)
         self._only_low.toggled.connect(lambda _on: self._fill_table())
         v.addWidget(self._only_low)
 
+        # Results table.
         self._table = QTableWidget(0, 6, self)
         self._table.setHorizontalHeaderLabels(
             ["Image", "Score", "dx (nm)", "dy (nm)", "Used r (px)", "Status"])
         self._table.setSortingEnabled(True)
-        self._table.setEditTriggers(
-            QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows)
         self._table.verticalHeader().setVisible(False)
         self._table.cellDoubleClicked.connect(self._on_cell_activated)
-        self._fill_table()
         v.addWidget(self._table, 1)
 
-        charts = QHBoxLayout()
-        scores = [r["score"] for r in self._rows if r["score"] is not None]
-        charts.addWidget(_ScoreHistogram(score_histogram(scores), threshold), 1)
-        pts = [(r["dx_nm"], r["dy_nm"]) for r in self._rows
-               if r["dx_nm"] is not None
-               and r["status"] in ("ok", "low-score")]
-        charts.addWidget(_ResidualScatter(pts, self._median_residual()), 1)
-        v.addLayout(charts)
+        # Charts (rebuilt on each refresh).
+        self._charts = QWidget(self)
+        self._charts_l = QHBoxLayout(self._charts)
+        self._charts_l.setContentsMargins(0, 0, 0, 0)
+        v.addWidget(self._charts)
 
         btn_row = QHBoxLayout()
-        self._apply_btn = QPushButton(
-            "Apply median residual to origin δ", self)
+        self._apply_btn = QPushButton("Apply median residual to origin δ", self)
         self._apply_btn.setToolTip(
             "Shift the global origin δ by the median (dx, dy) of all matched "
             "images, then re-run to see if residuals converge.")
         self._apply_btn.clicked.connect(self._on_apply_median)
-        if self._median_residual() is None:
-            self._apply_btn.setEnabled(False)
+        self._apply_btn.setEnabled(False)
         btn_row.addWidget(self._apply_btn)
         btn_row.addStretch(1)
-        close_btn = QPushButton("Close", self)
-        close_btn.clicked.connect(self.accept)
-        btn_row.addWidget(close_btn)
         v.addLayout(btn_row)
+
+    # ── data ────────────────────────────────────────────────────────────────
+    def set_rows(self, rows, threshold: float) -> None:
+        self._rows = list(rows)
+        self._threshold = threshold
+        n_ok = sum(1 for r in self._rows if r["status"] == "ok")
+        n_low = sum(1 for r in self._rows if r["status"] == "low-score")
+        self._summary.setText(
+            f"{len(self._rows)} images  ·  {n_ok} ok  ·  {n_low} low-score  ·  "
+            f"threshold {threshold:.2f}")
+        self._fill_table()
+        self._rebuild_charts()
+        self._apply_btn.setEnabled(self._median_residual() is not None)
 
     def _visible_rows(self) -> list:
         if self._only_low.isChecked():
@@ -4090,6 +4178,20 @@ class FineAlignResultsDialog(QDialog):
         self._table.setSortingEnabled(True)
         self._table.resizeColumnsToContents()
 
+    def _rebuild_charts(self) -> None:
+        while self._charts_l.count():
+            it = self._charts_l.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.deleteLater()
+        scores = [r["score"] for r in self._rows if r["score"] is not None]
+        self._charts_l.addWidget(
+            _ScoreHistogram(score_histogram(scores), self._threshold), 1)
+        pts = [(r["dx_nm"], r["dy_nm"]) for r in self._rows
+               if r["dx_nm"] is not None and r["status"] in ("ok", "low-score")]
+        self._charts_l.addWidget(
+            _ResidualScatter(pts, self._median_residual()), 1)
+
     def _on_cell_activated(self, row: int, _col: int) -> None:
         item = self._table.item(row, 0)
         if item is not None:
@@ -4108,9 +4210,62 @@ class FineAlignResultsDialog(QDialog):
 
     def _on_apply_median(self) -> None:
         med = self._median_residual()
-        if med is None:
+        if med is not None:
+            self.apply_median_requested.emit(med[0], med[1])
+
+    # ── inline progress ───────────────────────────────────────────────────────
+    def start_progress(self) -> None:
+        self._cancelled = False
+        self._progress = None
+        self._cur_id = ""
+        self._cancel_btn.setEnabled(True)
+        self._bar.set_indeterminate(True)
+        self._prog_lbl.setText("Starting…")
+        self._elapsed.start()
+        self._tick.start()
+        self._prog_box.show()
+
+    def set_progress(self, done: int, total: int, image_id: str = "") -> None:
+        self._progress = (done, total)
+        self._cur_id = image_id
+        self._bar.set_fraction(done / total if total else 0.0)
+        self._refresh_detail()
+
+    def end_progress(self, text: str = "") -> None:
+        self._tick.stop()
+        self._prog_box.hide()
+
+    def _on_cancel_clicked(self) -> None:
+        if self._cancelled:
             return
-        self.apply_median_requested.emit(med[0], med[1])
+        self._cancelled = True
+        self._cancel_btn.setEnabled(False)
+        self.cancel_requested.emit()
+
+    def _on_tick(self) -> None:
+        self._spin_idx = (self._spin_idx + 1) % len(self._SPINNER)
+        self._spinner.setText(self._SPINNER[self._spin_idx])
+        self._bar.advance()
+        self._refresh_detail()
+
+    def _refresh_detail(self) -> None:
+        secs = int(self._elapsed.elapsed() / 1000)
+        elapsed = f"Elapsed {secs // 60}:{secs % 60:02d}"
+        if self._progress is not None:
+            done, total = self._progress
+            pct = int(100 * done / total) if total else 0
+            eta = ""
+            el = self._elapsed.elapsed() / 1000.0
+            if 0 < done < total and el > 0:
+                rem = el / done * (total - done)
+                eta = f"  ·  ETA {int(rem) // 60}:{int(rem) % 60:02d}"
+            cur = f"  ·  {self._cur_id}" if self._cur_id else ""
+            detail = f"{done} / {total}  ·  {pct}%  ·  {elapsed}{eta}{cur}"
+        else:
+            detail = elapsed
+        if self._cancelled:
+            detail += "  ·  cancelling…"
+        self._prog_lbl.setText(detail)
 
 
 class _ImageListDelegate(QStyledItemDelegate):
@@ -4486,16 +4641,29 @@ class MainWindow(QMainWindow):
 
         self._center_split = QSplitter(Qt.Orientation.Horizontal, center)
         self.canvas = GdsCanvas(self._center_split)
+        # F7: batch workspace pane (left = results, right = SEM overlay).
+        # Entered via Run all / Results…, not a view mode; hidden otherwise.
+        self.batch_panel = BatchResultsPanel(self._center_split)
         self.sem_viewer = SemViewer(self._center_split)
-        self._center_split.addWidget(self.canvas)
-        self._center_split.addWidget(self.sem_viewer)
+        self._center_split.addWidget(self.canvas)       # idx 0
+        self._center_split.addWidget(self.batch_panel)  # idx 1
+        self._center_split.addWidget(self.sem_viewer)   # idx 2
         self._center_split.setStretchFactor(0, 1)
         self._center_split.setStretchFactor(1, 1)
+        self._center_split.setStretchFactor(2, 1)
         center_layout.addWidget(self._center_split, 1)
         # Single-view UX (M6.3): show SEM+overlay big by default; the GDS
         # overview / minimap are opt-in view modes.
         self.canvas.setVisible(False)
+        self.batch_panel.setVisible(False)
         self._view_mode = "sem"
+        self._batch_active = False
+        self._prev_view_mode = "sem"
+        self.batch_panel.image_activated.connect(self._on_results_image_activated)
+        self.batch_panel.apply_median_requested.connect(
+            self._on_apply_median_residual)
+        self.batch_panel.back_requested.connect(self._exit_batch_workspace)
+        self.batch_panel.cancel_requested.connect(self._on_fa_cancel_clicked)
         # M7-ov #9: corner minimap floated over the SEM view (hidden unless in
         # 'minimap' mode).
         self.minimap = MiniMap(self.sem_viewer)
@@ -4604,8 +4772,6 @@ class MainWindow(QMainWindow):
         # M4b "Run all" batch worker state.
         self._fa_thread: Optional[QThread] = None
         self._fa_worker = None
-        self._fa_progress = None
-        self._fa_results_dlg = None
         # F5 M6 overlay/image export worker state.
         self._ov_thread: Optional[QThread] = None
         self._ov_worker = None
@@ -4826,15 +4992,20 @@ class MainWindow(QMainWindow):
 
     def _set_view_mode(self, mode: str) -> None:
         """Switch the centre view between SEM-only / GDS overview / minimap
-        (M7-ov view-mode selector). Mutually exclusive."""
+        (M7-ov view-mode selector). Mutually exclusive. Also leaves the batch
+        workspace, if active (F7)."""
         if mode not in self._VIEW_MODES:
             return
+        # Leaving the batch workspace (clicking any view button exits it).
+        self._batch_active = False
+        self.batch_panel.setVisible(False)
         self._view_mode = mode
-        # GDS overview pane visible only in 'gds'.
+        # GDS overview pane visible only in 'gds'. Splitter widgets are
+        # [canvas, batch_panel, sem_viewer]; size all three explicitly.
         self.canvas.setVisible(mode == "gds")
         if mode == "gds":
             total = max(2, self._center_split.width())
-            self._center_split.setSizes([total // 2, total - total // 2])
+            self._center_split.setSizes([total // 2, 0, total - total // 2])
         # Corner minimap visible only in 'minimap'.
         self.minimap.setVisible(mode == "minimap")
         if mode == "minimap":
@@ -4847,6 +5018,23 @@ class MainWindow(QMainWindow):
             btn.blockSignals(True)
             btn.setChecked(True)
             btn.blockSignals(False)
+
+    def _enter_batch_workspace(self) -> None:
+        """Show the batch workspace (left = results, right = SEM overlay),
+        remembering the current view mode so 'Back' can restore it (F7)."""
+        if not self._batch_active:
+            self._prev_view_mode = self._view_mode
+        self._batch_active = True
+        self.canvas.setVisible(False)
+        self.minimap.setVisible(False)
+        self.batch_panel.setVisible(True)
+        total = max(2, self._center_split.width())
+        left = int(total * 0.55)
+        self._center_split.setSizes([0, left, total - left])
+
+    def _exit_batch_workspace(self) -> None:
+        """Return from the batch workspace to the previous view mode (F7)."""
+        self._set_view_mode(getattr(self, "_prev_view_mode", "sem"))
 
     def _cycle_view_mode(self) -> None:
         i = self._VIEW_MODES.index(getattr(self, "_view_mode", "sem"))
@@ -5371,8 +5559,11 @@ class MainWindow(QMainWindow):
             "nm_auto": self._nm_auto, "nm_manual": self._nm_per_px_manual,
             **self.sem_panel.fine_align.values(),
         }
-        self._fa_progress = LoadProgressDialog(self)
-        self._fa_progress.set_text("Fine aligning all images…")
+        # F7: run inside the batch workspace with inline progress, instead of a
+        # modal dialog. Show the (initial) results table and the progress strip.
+        self._enter_batch_workspace()
+        self._refresh_batch_panel()
+        self.batch_panel.start_progress()
         self._fa_thread = QThread(self)
         self._fa_worker = FineAlignAllWorker(
             self._rar, self._roi_root, specs, jobs, cfg)
@@ -5383,26 +5574,30 @@ class MainWindow(QMainWindow):
         self._fa_worker.finished.connect(self._on_fa_finished)
         self._fa_worker.failed.connect(self._on_fa_failed)
         self._fa_worker.cancelled.connect(self._on_fa_cancelled)
-        # DirectConnection: run cancel() in the GUI thread so it sets the
-        # worker's threading.Event right away. A default (queued) connection
-        # would wait for the worker's event loop, which never runs while run()
-        # is busy — that was the "cancel keeps running" bug (F5 M5 #3).
-        self._fa_progress.cancel_requested.connect(
-            self._fa_worker.cancel, Qt.ConnectionType.DirectConnection)
         for sig in (self._fa_worker.finished, self._fa_worker.failed,
                     self._fa_worker.cancelled):
             sig.connect(self._fa_thread.quit)
         self._fa_thread.finished.connect(self._cleanup_fa)
         self.sem_panel.fine_align.set_running(True)
-        self._fa_progress.show()
         QApplication.processEvents()
         self._fa_thread.start()
 
+    def _on_fa_cancel_clicked(self) -> None:
+        """Cancel button in the batch panel: set the worker's threading.Event
+        directly from the GUI thread so it takes effect immediately (F5 M5)."""
+        if self._fa_worker is not None:
+            self._fa_worker.cancel()
+
+    def _refresh_batch_panel(self) -> None:
+        """Rebuild the batch panel rows from the current refined offsets +
+        per-image meta (used during streaming and after finish)."""
+        thr = self.sem_panel.fine_align.values()["score_threshold"]
+        rows = fine_align_result_rows(
+            self._sem_images, self._refined, self._fa_meta, thr)
+        self.batch_panel.set_rows(rows, thr)
+
     def _on_fa_progress(self, done: int, total: int, image_id: str) -> None:
-        if self._fa_progress is not None:
-            self._fa_progress.set_text(
-                f"Fine aligning all images…\ncurrent: {image_id}")
-            self._fa_progress.set_progress(done, total)
+        self.batch_panel.set_progress(done, total, image_id)
 
     def _on_fa_result(self, image_id: str, dx: float, dy: float,
                       score: float, used_r: int, status: str) -> None:
@@ -5416,38 +5611,38 @@ class MainWindow(QMainWindow):
             # rendered/exported with outdated alignment (PR#4 review).
             self._refined.pop(image_id, None)
             self.sem_panel.clear_score(image_id)
+        # Stream the new row into the batch panel as it arrives (F7).
+        self._refresh_batch_panel()
 
     def _on_fa_finished(self, count: int) -> None:
+        self.batch_panel.end_progress()
         self._status_doc.setText(f"fine align: processed {count} image(s)")
         self._refresh_overview_defects()      # recolour all dots by score
         if self._current_sem is not None:
             self.sem_viewer.reset_drag()
             self._jump_to_image(self._current_sem)
-        self._open_fa_results()
+        self._refresh_batch_panel()           # final rows + median enabled
 
     def _on_fa_failed(self, msg: str) -> None:
+        self.batch_panel.end_progress()
         QMessageBox.critical(self, "Run all failed", msg)
 
     def _on_fa_cancelled(self) -> None:
         # Partial results are kept (not cleared), so the overview still reflects
         # whatever finished before the cancel (F5 M5).
+        self.batch_panel.end_progress()
         self._status_doc.setText("fine align: cancelled (partial results kept)")
         self._refresh_overview_defects()
+        self._refresh_batch_panel()
 
     def _open_fa_results(self) -> None:
-        """Open (or refresh) the batch results overview dialog (F5 M2)."""
+        """'Results…' action: enter the batch workspace and refresh the table
+        (F7 — replaces the old modal results dialog)."""
         if not self._sem_images:
             self._status_doc.setText("results: load SEM images first")
             return
-        thr = self.sem_panel.fine_align.values()["score_threshold"]
-        rows = fine_align_result_rows(
-            self._sem_images, self._refined, self._fa_meta, thr)
-        dlg = FineAlignResultsDialog(self, rows, thr)
-        dlg.image_activated.connect(self._on_results_image_activated)
-        dlg.apply_median_requested.connect(self._on_apply_median_residual)
-        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
-        self._fa_results_dlg = dlg
-        dlg.show()
+        self._enter_batch_workspace()
+        self._refresh_batch_panel()
 
     def _on_results_image_activated(self, image_id: str) -> None:
         for im in self._sem_images:
@@ -5472,11 +5667,7 @@ class MainWindow(QMainWindow):
             f"residual convergence")
 
     def _cleanup_fa(self) -> None:
-        if self._fa_progress is not None:
-            self._fa_progress.shutdown()
-            self._fa_progress.close()
-            self._fa_progress.deleteLater()
-            self._fa_progress = None
+        self.batch_panel.end_progress()
         if self._fa_worker is not None:
             self._fa_worker.deleteLater()
             self._fa_worker = None
