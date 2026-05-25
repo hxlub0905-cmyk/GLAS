@@ -1258,16 +1258,22 @@ class FineAlignAllWorker(QObject):
             try:
                 with ThreadPoolExecutor(max_workers=workers) as ex:
                     futures = [ex.submit(task, job) for job in self._jobs]
+                    # Always drain every future, even after a cancel: once the
+                    # event is set, not-yet-started tasks return None immediately
+                    # (they check cancel at the top) and in-flight walks bail
+                    # fast via cancel_cb, so this stays responsive — but futures
+                    # whose work already completed still emit their result, so
+                    # "partial results kept" holds deterministically for
+                    # workers > 1 (PR#5 review).
                     for fut in as_completed(futures):
-                        res = fut.result()
+                        try:
+                            res = fut.result()
+                        except oasis_random.WalkCancelled:
+                            res = None      # walk bailed on cancel — no result
                         done += 1
                         if res is not None:
                             self.progress.emit(done, n, res[0])
                             self.result.emit(*res)
-                        if self._cancel.is_set():
-                            # Stop collecting; the pool's __exit__ waits for the
-                            # few in-flight tasks, which bail fast on cancel.
-                            break
             finally:
                 for r in created:
                     try:

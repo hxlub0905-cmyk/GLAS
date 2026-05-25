@@ -2,6 +2,27 @@
 
 ---
 
+## [2026-05-25] [F6] PR#5 review fix（P1）：批次 cancel 後保留所有已完成結果
+
+**變更類型：** bug fix
+
+**動機現象：** PR#5 review（chatgpt-codex-connector，P1）指出 `FineAlignAllWorker.run()` 在
+`as_completed` 迴圈裡一旦 `self._cancel.is_set()` 就 `break`，會丟掉其他**已完成**（或在 pool
+`__exit__` 等待期間完成）的 future 結果——那些影像即使運算已完成也不會 emit `result`、不進
+`_refined`/結果表。workers>1 時 cancel 行為變得不確定，且違反「partial results kept」的設計意圖。
+
+**修復實作：** 移除 `break`，改成**一律 drain 所有 future**。cancel 一旦設定，未開始的 task 在
+`_fine_align_image` 開頭檢查 `cancel_is_set()` 立即回 None、進行中的 walk 經 `cancel_cb` 快速 bail
+（仍保持即時反應），但已完成 future 仍會 emit 結果 → 「保留已完成結果」對 workers>1 變確定性。
+逐 future 用 `try/except oasis_random.WalkCancelled` 包 `fut.result()`，bail 的 walk 視為無結果、
+不中斷整個迴圈。
+
+**測試：** `py_compile` 過。沙箱無 PyQt6 → cancel 路徑互動待 user 本地驗（非 cancel 路徑等價測試不受影響）。
+
+**影響檔案：** `glas/app/gds_align_tool.py`。
+
+**Branch：** `claude/dazzling-cori-5T7XE`（PR #5）
+
 ## [2026-05-25] [F7] 實作 M1–M4：Batch 工作區 + inline 進度 + 進度條質感（待本地驗收）
 
 **變更類型：** 功能（UI/UX，運算不變）
