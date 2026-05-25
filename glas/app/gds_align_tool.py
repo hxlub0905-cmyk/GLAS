@@ -78,6 +78,24 @@ except Exception:  # pragma: no cover
     cv2 = None  # rasterize_layer falls back to a pure-numpy scanline fill
 
 
+def _screen_avail(margin: int = 80) -> tuple[int, int]:
+    """Available screen (w, h) minus a margin, for sizing dialogs / the main
+    window so a hard-coded minimum can never exceed the display (F3 M1)."""
+    app = QApplication.instance()
+    if app is not None:
+        scr = app.primaryScreen()
+        if scr is not None:
+            g = scr.availableGeometry()
+            return (max(320, g.width() - margin), max(240, g.height() - margin))
+    return (10_000, 10_000)   # no screen yet → don't constrain
+
+
+def _capped_min_width(desired: int) -> int:
+    """Clamp a desired minimum dialog width to the available screen width so a
+    small display isn't forced wider than it is (F3 M1)."""
+    return min(desired, _screen_avail()[0])
+
+
 
 # ── Theme: pull QSS from main app when available; fallback otherwise ─────────
 
@@ -278,6 +296,10 @@ class LayerEntry:
     # re-evaluated. ``None`` for raw layers.
     expr_text: Optional[str] = None
     expr_bindings: Optional[dict] = None
+    # F3 M2: human-readable layer name from OASIS LAYERNAME (raw layers only;
+    # "" when the file declares none). Display-only — NOT part of LayerKey
+    # identity, so layer lookup / dedup is unaffected.
+    display_name: str = ""
 
     def fill_alpha(self) -> int:
         """Fill alpha (0-255) derived from ``opacity`` %."""
@@ -377,7 +399,8 @@ def _roi_entry(rar, root, layer: int, datatype: int, roi_bbox, color,
         entry = LayerEntry(
             key=LayerKey(layer=layer, datatype=datatype),
             polygons=polygons, color=color,
-            bboxes=np.asarray(bboxes, dtype=np.float32))
+            bboxes=np.asarray(bboxes, dtype=np.float32),
+            display_name=rar.layer_display_name(layer, datatype))
     return entry, res["stats"]
 
 
@@ -478,7 +501,7 @@ class LayerFilterDialog(QDialog):
         self._roi_mode = roi_mode
         self.setWindowTitle("Pick ROI layers" if roi_mode else "Layer filter")
         self.setModal(True)
-        self.setMinimumWidth(540)
+        self.setMinimumWidth(_capped_min_width(540))
 
         v = QVBoxLayout(self)
         v.setContentsMargins(20, 16, 20, 14)
@@ -1340,12 +1363,17 @@ class _LayerRow(QWidget):
         self._apply_swatch()
         h.addWidget(self._swatch)
 
-        label = entry.key.label()
+        # Prefix the OASIS LAYERNAME when the file declares one (F3 M2):
+        # "METAL1 (L17/D0)"; raw layers with no name fall back to "L17/D0".
+        ld = entry.key.label()
+        name = getattr(entry, "display_name", "")
+        label = f"{name} ({ld})" if (name and not entry.key.synthetic) else ld
         n_poly = len(entry.polygons)
         if n_poly:
             label = f"{label}  ·  {n_poly}"
         self._lbl = QLabel(label, self)
         self._lbl.setStyleSheet(f"font-size: {_FS_LABEL}px;")
+        self._lbl.setToolTip(label)
         h.addWidget(self._lbl, 1)
 
         self._slider = QSlider(Qt.Orientation.Horizontal, self)
@@ -1541,7 +1569,7 @@ class ExpressionLayerDialog(QDialog):
                  preview_cb=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Compose expression layer")
-        self.setMinimumWidth(420)
+        self.setMinimumWidth(_capped_min_width(420))
         self._layer_keys = list(layer_keys)
         self._preview_cb = preview_cb
         self._combos: dict[str, QComboBox] = {}
@@ -3211,7 +3239,7 @@ class AlignmentExportDialog(QDialog):
     def __init__(self, parent, images) -> None:
         super().__init__(parent)
         self.setWindowTitle("Export alignment")
-        self.setMinimumWidth(360)
+        self.setMinimumWidth(_capped_min_width(360))
         v = QVBoxLayout(self)
 
         v.addWidget(QLabel("Format"))
@@ -3269,6 +3297,11 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("GLAS")
         self.resize(1200, 800)
+        # Left (260) + right (300) fixed panels + a usable centre + chrome: stop
+        # the window shrinking into a cramped, broken layout (F3 M1). Capped to
+        # the screen so small displays still open.
+        _avw, _avh = _screen_avail()
+        self.setMinimumSize(min(940, _avw), min(600, _avh))
         # Coordinate Setup starts collapsed (see SemPanel); don't auto-collapse
         # again so a user re-expanding it sticks.
         self._coord_collapsed_once = True

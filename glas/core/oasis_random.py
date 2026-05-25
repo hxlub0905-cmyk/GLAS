@@ -130,6 +130,30 @@ class CellContent:
         return out
 
 
+def _iv_contains(iv: tuple, v: int) -> bool:
+    """Does an OASIS unsigned-interval ``(min, max)`` contain ``v``?
+    ``max == -1`` is the spec's INF sentinel (see decode_interval)."""
+    lo, hi = iv
+    return v >= lo and (hi < 0 or v <= hi)
+
+
+def resolve_layer_name(layernames: list, layer: int, datatype: int) -> str:
+    """Name for ``(layer, datatype)`` from LAYERNAME records, or "" (F3 M2).
+
+    ``layernames`` is ``[(name, layer_iv, datatype_iv), ...]``. Prefer the most
+    specific record (single-value intervals beat ranges) so a broad catch-all
+    doesn't mask an exact label."""
+    best: Optional[str] = None
+    best_rank = -1
+    for name, liv, div in layernames:
+        if not (_iv_contains(liv, layer) and _iv_contains(div, datatype)):
+            continue
+        rank = (1 if liv[0] == liv[1] else 0) + (1 if div[0] == div[1] else 0)
+        if name and rank > best_rank:
+            best, best_rank = name, rank
+    return best or ""
+
+
 def _analytic_bbox(rect_specs: dict, poly_specs: dict) -> Optional[Bbox]:
     """Cell-local bbox over all layers from descriptors — base geometry
     bbox extended by each repetition's analytic extent (no expansion)."""
@@ -180,6 +204,7 @@ class RandomAccessReader:
         # coords, so geometry must be scaled by this to reach nm (the frame
         # the FOV box / KLARF / RFL all use). unit==1000 -> 1.0 (no-op).
         self._unit = idx.get("unit")
+        self._layernames = idx.get("layernames") or []
         self._nm_per_grid = (1000.0 / self._unit) if self._unit else 1.0
         _dbg(f"OASIS unit (grid steps per micron) = {self._unit!r} "
              f"-> 1 grid = {self._nm_per_grid} nm "
@@ -200,6 +225,10 @@ class RandomAccessReader:
 
     def has_offsets(self) -> bool:
         return bool(self._by_refnum)
+
+    def layer_display_name(self, layer: int, datatype: int) -> str:
+        """OASIS LAYERNAME for ``(layer, datatype)``, or "" (F3 M2)."""
+        return resolve_layer_name(self._layernames, layer, datatype)
 
     def offset_for(self, cell_id: object) -> Optional[int]:
         """Byte offset of ``cell_id``'s CELL record, or None if unknown.

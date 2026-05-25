@@ -425,3 +425,27 @@ class TestWalkRoi:
         assert res["rects"].shape[0] == 0
         assert res["stats"].instances_visited == 0
         assert res["stats"].instances_pruned == 2
+
+
+class TestResolveLayerName:
+    """F3 M2: OASIS LAYERNAME -> human-readable layer label."""
+
+    LN = [("METAL1", (17, 17), (0, 0)),
+          ("VIA", (20, 20), (0, -1)),       # datatype INF
+          ("ALL", (0, -1), (0, -1))]        # catch-all range
+
+    def test_exact_single_value(self):
+        assert orx.resolve_layer_name(self.LN, 17, 0) == "METAL1"
+
+    def test_datatype_inf(self):
+        assert orx.resolve_layer_name(self.LN, 20, 5) == "VIA"
+
+    def test_catch_all_range(self):
+        assert orx.resolve_layer_name(self.LN, 99, 0) == "ALL"
+
+    def test_no_match_or_empty(self):
+        assert orx.resolve_layer_name([], 1, 2) == ""
+
+    def test_narrower_record_wins(self):
+        ln = [("R", (10, 30), (0, 0)), ("X", (20, 20), (0, 0))]
+        assert orx.resolve_layer_name(ln, 20, 0) == "X"
