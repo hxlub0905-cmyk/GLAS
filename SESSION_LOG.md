@@ -2,6 +2,35 @@
 
 ---
 
+## [2026-05-25] [F4] 修復 edit 閃退 + 對話框內嵌預覽
+
+**變更類型：** bug fix + 功能
+
+**動機現象：** (1) 編輯 expression layer 時偶發閃退（終端機有 Error）。(2) 預覽新 Boolean
+layer 要回主視窗才看得到，且 modal 對話框擋住主畫面 canvas。
+
+**修復實作：**
+- **閃退根因**：edit/delete 由 `_LayerRow` 的按鈕點擊 / 雙擊 signal 觸發，handler 內同步
+  開 modal 對話框（`exec()`）；對話框關閉後 `_recompute_recipes()` → `set_document()` 會
+  刪掉那個 row widget，待 `exec()` 返回時控制流回到「已被刪除的 C++ row 物件」的事件
+  handler → use-after-free，PyQt6 直接 abort。改為 `_on_edit_recipe`/`_on_delete_recipe`/
+  `_on_add_expression` 一律用 `QTimer.singleShot(0, …)` 延遲，等 row 的 handler 完全 unwind
+  後再開對話框，避免在 row 事件處理中刪除自身。
+- **內嵌預覽**：`ExpressionLayerDialog` 新增 `_ExprPreview` 迷你 canvas（fit-to-view），按
+  Preview 直接在對話框內渲染結果（filled highlight）疊在綁定的 raw layer（細外框）上，
+  對話框不關、不再動主視窗 doc/canvas；確認無誤再按 **Save**（OK 鈕改名 Save）儲存。
+  `_preview_expression` 改回傳 `(ok, msg, data)` 且**不再 mutate 主 doc**（移除原本塞臨時層
+  + cancel 時 recompute 的迂迴）。
+
+**測試：** `py_compile` 過。sandbox 無 PyQt6 → GUI 待 user 本地驗（編輯不再閃退、Preview 在
+對話框內顯示、Save 才存）。
+
+**影響檔案：** `glas/app/gds_align_tool.py`。
+
+**Branch：** `claude/compassionate-dijkstra-84Gjd`（PR #3）
+
+---
+
 ## [2026-05-25] [F4] 實作：Boolean 強化（食譜化重算 + 巢狀 + 編輯 + 對話框重設計）
 
 **變更類型：** 功能（新功能 + 重構）

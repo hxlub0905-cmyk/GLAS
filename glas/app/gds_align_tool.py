@@ -1633,6 +1633,93 @@ class LayerPanel(QFrame):
 # ── Expression layer dialog (M2.6) ───────────────────────────────────────────
 
 
+class _ExprPreview(QWidget):
+    """Fit-to-view mini canvas for the compose dialog (F4): the expression
+    result (filled highlight) over its bound raw layers (thin outlines), so
+    the layer can be reviewed in-dialog without returning to the main window."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setMinimumHeight(200)
+        self.setStyleSheet(
+            "background:#1a1712; border:1px solid #4a4030; border-radius:6px;")
+        self._result: list = []
+        self._context: list = []
+        self._bbox: Optional[tuple] = None
+        self._msg = "press Preview to render the layer here"
+
+    def set_message(self, msg: str) -> None:
+        self._msg = msg
+        self.update()
+
+    def set_data(self, data: Optional[dict]) -> None:
+        if not data:
+            self._result, self._context, self._bbox = [], [], None
+        else:
+            self._result = data.get("result", [])
+            self._context = data.get("context", [])
+            self._bbox = self._fit_bbox(data)
+        self.update()
+
+    @staticmethod
+    def _fit_bbox(data: dict) -> Optional[tuple]:
+        allp = list(data.get("result", []))
+        for polys, _ in data.get("context", []):
+            allp += polys
+        x0 = y0 = float("inf")
+        x1 = y1 = float("-inf")
+        for poly in allp:
+            a = np.asarray(poly, dtype=float)
+            if a.size == 0:
+                continue
+            x0 = min(x0, a[:, 0].min()); y0 = min(y0, a[:, 1].min())
+            x1 = max(x1, a[:, 0].max()); y1 = max(y1, a[:, 1].max())
+        if x0 == float("inf"):
+            return data.get("fov")
+        px = (x1 - x0) * 0.05 or 1.0
+        py = (y1 - y0) * 0.05 or 1.0
+        return (x0 - px, y0 - py, x1 + px, y1 + py)
+
+    def paintEvent(self, ev) -> None:  # noqa: N802 (Qt override)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = self.rect()
+        if self._bbox is None or not (self._result or self._context):
+            p.setPen(QPen(QColor("#8a7660")))
+            p.drawText(rect, Qt.AlignmentFlag.AlignCenter, self._msg)
+            return
+        x0, y0, x1, y1 = self._bbox
+        bw = max(x1 - x0, 1e-6)
+        bh = max(y1 - y0, 1e-6)
+        margin = 10
+        aw = rect.width() - 2 * margin
+        ah = rect.height() - 2 * margin
+        s = min(aw / bw, ah / bh)
+        ox = margin + (aw - bw * s) / 2.0
+        oy = margin + (ah - bh * s) / 2.0
+
+        def to_polygon(poly):
+            pts = [QPointF(ox + (float(pt[0]) - x0) * s,
+                           oy + (y1 - float(pt[1])) * s) for pt in poly]
+            return QPolygonF(pts)
+
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        for polys, color in self._context:
+            pen = QPen(QColor(color)); pen.setWidthF(1.0)
+            p.setPen(pen)
+            for poly in polys:
+                if len(poly) >= 2:
+                    p.drawPolygon(to_polygon(poly))
+        hl = QColor("#ff5fb0")
+        fill = QColor(hl); fill.setAlpha(90)
+        p.setBrush(QBrush(fill))
+        pen = QPen(hl); pen.setWidthF(1.6)
+        p.setPen(pen)
+        for poly in self._result:
+            if len(poly) >= 2:
+                p.drawPolygon(to_polygon(poly))
+
+
 class ExpressionLayerDialog(QDialog):
     """Compose / edit a synthetic layer from a Boolean expression (F4).
 
@@ -1642,12 +1729,14 @@ class ExpressionLayerDialog(QDialog):
     palette offers clickable layer / synthetic chips (each inserts the next
     free letter and pre-binds it) and operator buttons (``&`` ``|`` ``-`` ``~``
     grow / shrink / brackets) that insert at the cursor. The expression is
-    validated live: the OK button is disabled and an inline message shown until
-    it parses and every letter is bound.
+    validated live: the Save button is disabled and an inline message shown
+    until it parses and every letter is bound.
 
-    ``preview_cb(name, expr, bindings)`` (optional) draws the result on the
-    canvas. ``recipe`` (optional) pre-fills the form for editing an existing
-    layer. ``bindings`` are tagged: ``("raw", layer, datatype)`` /
+    ``preview_cb(name, expr, bindings) -> (ok, msg, data)`` (optional) is
+    called by the Preview button; the result is rendered in the embedded
+    preview canvas (the dialog stays open) so the layer is reviewed in place
+    and only committed on Save. ``recipe`` (optional) pre-fills the form for
+    editing. ``bindings`` are tagged: ``("raw", layer, datatype)`` /
     ``("ref", name)``.
     """
 
@@ -1696,7 +1785,7 @@ class ExpressionLayerDialog(QDialog):
         v.addLayout(self._bind_box)
 
         prev_row = QHBoxLayout()
-        self._preview_btn = QPushButton("Preview in current view", self)
+        self._preview_btn = QPushButton("Preview", self)
         self._preview_btn.clicked.connect(self._on_preview)
         prev_row.addWidget(self._preview_btn)
         self._result_lbl = QLabel("", self)
@@ -1704,8 +1793,11 @@ class ExpressionLayerDialog(QDialog):
         prev_row.addWidget(self._result_lbl, 1)
         v.addLayout(prev_row)
 
+        self._preview = _ExprPreview(self)
+        v.addWidget(self._preview)
+
         self._buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok |
+            QDialogButtonBox.StandardButton.Save |
             QDialogButtonBox.StandardButton.Cancel, self)
         self._buttons.accepted.connect(self._on_accept)
         self._buttons.rejected.connect(self.reject)
@@ -1880,7 +1972,7 @@ class ExpressionLayerDialog(QDialog):
 
     def _revalidate(self) -> None:
         err = self._validate()
-        ok_btn = self._buttons.button(QDialogButtonBox.StandardButton.Ok)
+        ok_btn = self._buttons.button(QDialogButtonBox.StandardButton.Save)
         ok_btn.setEnabled(err is None)
         if err:
             self._result_lbl.setText(err)
@@ -1898,11 +1990,14 @@ class ExpressionLayerDialog(QDialog):
             return
         if self._preview_cb is None:
             return
-        ok, msg = self._preview_cb(self.name(), self.expression(),
-                                   self.bindings())
+        ok, msg, data = self._preview_cb(self.name(), self.expression(),
+                                         self.bindings())
         self._result_lbl.setText(msg)
         self._result_lbl.setStyleSheet(
             f"color: {_TK_SUCCESS};" if ok else f"color: {_TK_DANGER};")
+        self._preview.set_data(data if ok else None)
+        if not ok:
+            self._preview.set_message(msg)
 
     def _on_accept(self) -> None:
         err = self._validate()
@@ -4948,30 +5043,36 @@ class MainWindow(QMainWindow):
         return errors
 
     def _preview_expression(self, name: str, expr: str,
-                            bindings: dict) -> tuple[bool, str]:
-        """Preview callback for ExpressionLayerDialog: evaluate over the
-        canvas's current view and draw the result live as a temporary
-        synthetic layer (not yet committed as a recipe)."""
+                            bindings: dict) -> tuple:
+        """Preview callback for ExpressionLayerDialog. Evaluates over the
+        canvas's current view and returns ``(ok, msg, data)`` for the dialog's
+        embedded preview — WITHOUT mutating the main document/canvas, so the
+        user reviews the result inside the dialog and only commits on Save.
+
+        ``data`` = ``{"result": [polys], "context": [(polys, QColor)], "fov":
+        bbox}`` (``result`` = the synthetic geometry; ``context`` = the bound
+        raw layers, drawn faintly for reference)."""
         if self._doc is None:
-            return (False, "Load a layout first.")
+            return (False, "Load a layout first.", None)
+        fov = self.canvas.viewport_bbox_nm()
         try:
-            polys = self._eval_expression(
-                expr, bindings, self.canvas.viewport_bbox_nm())
+            result = self._eval_expression(expr, bindings, fov)
         except Exception as exc:
-            return (False, str(exc))
-        key = LayerKey(layer=-1, datatype=0, name=name or "preview",
-                       synthetic=True)
-        existing = self._doc.find(key)
-        color = existing.color if existing is not None else self._next_expr_color()
-        self._doc.entries = [e for e in self._doc.entries
-                             if not (e.key.synthetic and e.key.name == key.name)]
-        self._doc.entries.append(LayerEntry(
-            key=key, polygons=polys, visible=True, color=color,
-            bboxes=self._bboxes_from_polys(polys),
-            expr_text=expr, expr_bindings=dict(bindings)))
-        self.layer_panel.set_document(self._doc)
-        self.canvas.refresh()
-        return (True, f"{len(polys)} polygons in current view")
+            return (False, str(exc), None)
+        x0, y0, x1, y1 = fov
+        cx, cy, w, h = (x0 + x1) / 2.0, (y0 + y1) / 2.0, (x1 - x0), (y1 - y0)
+        context: list = []
+        for val in bindings.values():
+            v = gds_boolean.normalize_binding(val)
+            if v[0] != "raw":
+                continue
+            entry = self._doc.find(LayerKey(layer=v[1], datatype=v[2]))
+            if entry is None or entry.bboxes is None or entry.bboxes.shape[0] == 0:
+                continue
+            idx = gds_fov.fov_overlap_indices(cx, cy, w, h, entry.bboxes)
+            context.append(([entry.polygons[int(i)] for i in idx], entry.color))
+        data = {"result": result, "context": context, "fov": fov}
+        return (True, f"{len(result)} polygons in current view", data)
 
     def _open_expression_dialog(self, recipe: Optional[dict] = None) -> None:
         """Open the compose dialog to create a new recipe (``recipe`` None) or
@@ -4993,8 +5094,6 @@ class MainWindow(QMainWindow):
             self, keys, ref_names=refs, preview_cb=self._preview_expression,
             recipe=recipe)
         if dlg.exec() != QDialog.DialogCode.Accepted:
-            # Cancel after a preview drew a temp layer — recompute to discard it.
-            self._recompute_recipes()
             return
         old_name = recipe["name"] if recipe is not None else None
         self._register_recipe(dlg.name(), dlg.expression(), dlg.bindings(),
@@ -5008,14 +5107,26 @@ class MainWindow(QMainWindow):
                 f"expression layer '{dlg.name()}' · {n} binding(s)")
 
     def _on_add_expression(self) -> None:
-        self._open_expression_dialog(None)
+        # Deferred so the triggering widget's signal/event handler fully
+        # unwinds before the modal dialog (and the set_document that follows)
+        # runs — opening exec() inside a row handler that then gets deleted is
+        # a use-after-free that crashes PyQt.
+        QTimer.singleShot(0, lambda: self._open_expression_dialog(None))
 
     def _on_edit_recipe(self, name: str) -> None:
+        QTimer.singleShot(0, lambda: self._edit_recipe_deferred(name))
+
+    def _edit_recipe_deferred(self, name: str) -> None:
         rec = self._recipe(name)
         if rec is not None:
             self._open_expression_dialog(rec)
 
     def _on_delete_recipe(self, name: str) -> None:
+        # Defer for the same reason as edit: the ✕ click handler lives on a
+        # row that _recompute_recipes() → set_document() deletes.
+        QTimer.singleShot(0, lambda: self._delete_recipe_deferred(name))
+
+    def _delete_recipe_deferred(self, name: str) -> None:
         rec = self._recipe(name)
         if rec is None:
             return
