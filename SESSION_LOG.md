@@ -2,6 +2,21 @@
 
 ---
 
+## [2026-05-25] [F5] 規劃擴充：診斷範圍收斂為 3 milestone（待核准）
+
+**變更類型：** 文件（plan，尚未動工）
+
+**內容：** 探索 fine-align 子系統後與 user 收斂 F5 範圍。除原 M1 殘差疊圖、M2 批次結果表，
+納入 C1 殘差散點圖、C5 score 直方圖（並入 M2）、C3 狀態/失敗原因 + C4 used radius（表格欄）、
+C2 中位殘差→origin δ 一鍵套用（新 M3）。改寫 `docs/plans/F5-finealign-diagnostics.md`
+為 3 milestone；§8 F5 條目同步。**待 user 核准後才開工。**
+
+**影響檔案：** `docs/plans/F5-finealign-diagnostics.md`、`CLAUDE.md`。
+
+**Branch：** `claude/compassionate-dijkstra-84Gjd`（PR #3）
+
+---
+
 ## [2026-05-25] 完成 [F4] + [F1]：user 驗收通過，§8 結案
 
 **變更類型：** 文件（任務結案，無程式碼變更）
