@@ -2,6 +2,137 @@
 
 ---
 
+## [2026-05-25] [F6] PR#5 review fix（P1）：批次 cancel 後保留所有已完成結果
+
+**變更類型：** bug fix
+
+**動機現象：** PR#5 review（chatgpt-codex-connector，P1）指出 `FineAlignAllWorker.run()` 在
+`as_completed` 迴圈裡一旦 `self._cancel.is_set()` 就 `break`，會丟掉其他**已完成**（或在 pool
+`__exit__` 等待期間完成）的 future 結果——那些影像即使運算已完成也不會 emit `result`、不進
+`_refined`/結果表。workers>1 時 cancel 行為變得不確定，且違反「partial results kept」的設計意圖。
+
+**修復實作：** 移除 `break`，改成**一律 drain 所有 future**。cancel 一旦設定，未開始的 task 在
+`_fine_align_image` 開頭檢查 `cancel_is_set()` 立即回 None、進行中的 walk 經 `cancel_cb` 快速 bail
+（仍保持即時反應），但已完成 future 仍會 emit 結果 → 「保留已完成結果」對 workers>1 變確定性。
+逐 future 用 `try/except oasis_random.WalkCancelled` 包 `fut.result()`，bail 的 walk 視為無結果、
+不中斷整個迴圈。
+
+**測試：** `py_compile` 過。沙箱無 PyQt6 → cancel 路徑互動待 user 本地驗（非 cancel 路徑等價測試不受影響）。
+
+**影響檔案：** `glas/app/gds_align_tool.py`。
+
+**Branch：** `claude/dazzling-cori-5T7XE`（PR #5）
+
+## [2026-05-25] [F7] 實作 M1–M4：Batch 工作區 + inline 進度 + 進度條質感（待本地驗收）
+
+**變更類型：** 功能（UI/UX，運算不變）
+
+**內容：** 依核准的 F7 plan（規劃期間 user 反映「Batch 放 View 那排怪」，Q&A 改為**動作進入+返回鈕**，
+不放 segmented）實作四個 milestone：
+- **M1 進度條質感**：`_AnimatedBar` 升級——橘→深橘垂直漸層 + 軟外發光（外擴低 alpha rounded rect）+
+  determinate 時條內置中 % 數字（先深色全畫、再白色 clip 到填充，兩種底都可讀）+ bar 加高 14→20px、
+  更圓潤、保留掃光帶。API 不變 → 全 app 進度條（OASIS 載入/overlay/ROI）同步變精緻。
+- **M2 `BatchResultsPanel`**：新 QWidget，把舊 `FineAlignResultsDialog` 的 summary/only-low 篩選/sortable
+  表/`_ScoreHistogram`/`_ResidualScatter`/median 鈕搬入；對外 `set_rows(rows,threshold)`；頂部 inline 進度區
+  （`_AnimatedBar`+spinner+done/total/%/Elapsed/ETA+Cancel，閒置隱藏）；signals image_activated/
+  apply_median_requested/cancel_requested/back_requested。
+- **M3 Batch 工作區**：`_center_split` 變 [canvas, batch_panel, sem_viewer]；新增 `_enter_batch_workspace()`
+  （記 `_prev_view_mode`、隱藏 canvas/minimap、左結果≈55%/右 SEM≈45%）與 `_exit_batch_workspace()`；
+  `_set_view_mode` 開頭一律隱藏 batch_panel（點任一 View 鈕即離開）+ gds 模式 setSizes 改 3 值；
+  點結果列 → `_on_sem_image_selected` 就地換右側 overlay、不離開工作區。
+- **M4 批次接線改 inline**：`_on_run_fine_align_all` 改 `_enter_batch_workspace()`+`start_progress()`，
+  **不再開 modal `LoadProgressDialog`**；`_on_fa_progress`→panel.set_progress、`_on_fa_result`→更新
+  `_refined`/badge 並 `_refresh_batch_panel()`（streaming 重填）；finished/cancelled/failed→`end_progress`
+  + 重填、保留部分結果；cancel 由 panel 按鈕經 `_on_fa_cancel_clicked` 直接 `worker.cancel()`（threading.Event
+  即時）；「Results…」鈕（`_open_fa_results`）改為進工作區+重填。移除已無用的 `FineAlignResultsDialog`
+  類別與 `_fa_progress`/`_fa_results_dlg` 屬性。**OASIS 載入/overlay 匯出仍用原 modal 進度。**
+
+**不動：** F6 批次運算與結果值、fine-align 符號、SemViewer 折疊、CE early-stop（§7 不變式）；median→δ 機制。
+
+**測試：** `py_compile` 全過。沙箱無 PyQt6/numpy/cv2 → GUI/外觀/互動（進度條漸層發光%、Run all/Results…
+進工作區、inline 進度+ETA、streaming 表、即時 cancel、點列就地換 overlay、← 回對位、四 view 切換）
+待 user 本地驗收；`pytest tests/test_gds_align_f5.py`（純函式）不受影響、待本地跑。
+
+**影響檔案：** `glas/app/gds_align_tool.py`、`docs/plans/F7-batch-workspace-ui.md`、`CLAUDE.md`。
+
+**Branch：** `claude/dazzling-cori-5T7XE`
+
+## [2026-05-25] [F7] 規劃：批次對位工作區（Batch view-mode + inline 進度 + 進度條質感）（待核准）
+
+**變更類型：** 文件（plan，尚未動工）
+
+**內容：** user 提出批次對位的 UI/UX 想改善（批次結果是否該有專屬畫面、進度條不夠質感）。探索現有
+view-mode（`_VIEW_MODES`+`QButtonGroup`+`_set_view_mode` 切 `_center_split`）、`FineAlignResultsDialog`、
+`_AnimatedBar`/`LoadProgressDialog`、批次接線後，用 AskUserQuestion 收斂三個岔路：(1) 批次結果放
+**第四個 view-mode「Batch」**（中央左=結果表/直方圖/散點、右=SEM overlay、點列就地換 overlay）、
+(2) 批次跑時 **inline 進度+結果 streaming**（取代 modal）、(3) 進度條 **漸層+發光+條內 %**。產出
+`docs/plans/F7-batch-workspace-ui.md`（5 milestone：M1 `_AnimatedBar` 質感、M2 抽 `BatchResultsPanel`、
+M3 加 Batch view-mode、M4 批次接線改 inline、M5 收尾）。強調純 UI 重新安置+視覺，**不動 F6 批次運算
+與 §7 不變式**。§8 註冊 [F7]。**待 user 核准後才開工。**
+
+**測試：** 無（純 plan）。
+
+**影響檔案：** `docs/plans/F7-batch-workspace-ui.md`、`CLAUDE.md`（§8）、`SESSION_LOG.md`。
+
+**Branch：** `claude/dazzling-cori-5T7XE`
+
+## [2026-05-25] [F6] 實作 M1–M3：mmap 讀取 + 單一 map 共享 + thread-pool 批次（待本地驗收）
+
+**變更類型：** 功能（效能加速，行為不變）
+
+**動機現象：** ROI 模式開大檔整檔 slurp 進 RAM（`oasis_streamer.py` `OasisStream`）、`RandomAccessReader`
+開檔 slurp 兩次、批次 fine-align（`FineAlignAllWorker`）刻意單執行緒。plan F6 已核准。
+
+**修復實作：**
+- **M1 mmap-backed OasisStream**：`OasisStream(base=None, *, use_mmap=False, shared_buf=None)`，`use_mmap`
+  且 base 有 fileno → `mmap.mmap(ACCESS_READ)`；BytesIO/平台/空檔 → fallback `base.read()`（行為不變）。
+  `close()` 釋放 mmap + 持有的 base。`OasisReader`/`scan_cell_offsets` 加 `use_mmap`（預設 False，bulk
+  decode 路徑維持 slurp）；`RandomAccessReader` 內部走 mmap。
+- **M2 單一 map 共享**：`shared_buf` 路徑讓 `OasisStream/OasisReader/scan_cell_offsets` 包外部擁有的
+  buffer（各自 `_pos`，close 不關共享 map）；`RandomAccessReader.__init__` 建一個 owning mmap，`_buf`
+  同時給 persistent reader 與 scan → 檔案只 map 一次、offset index 只算一次。新增
+  `RandomAccessReader.close()` / `__enter__/__exit__`（先關 wrapper 再關 owning map，idempotent）。
+- **M3 thread-pool 批次**：抽出純函式 `_fine_align_image(...)`；`FineAlignAllWorker.run()` 改
+  `ThreadPoolExecutor(max_workers=min(cpu_count,8))`，每 worker thread 經 `threading.local` 用
+  `RandomAccessReader.clone()` 取私有 reader（私有 _memo/cursor；mmap 由 OS 共享實體頁，不耗 N× RAM），
+  零共享可變狀態 → 結果與循序逐值相同。signal 由 run() 單一 thread 在 future 完成時 emit；cancel 沿用
+  `threading.Event`（task 起點 + walk cancel_cb 讀 is_set，cancel 後保留已完成結果）。
+  **cv2 執行緒設定維持預設不動**（避免改變 score 數值，保證 golden 等價）。
+
+**測試：** 新增 `tests/test_accel_equivalence.py`（mmap↔slurp 的 read/iter_records/scan 等價、共享map↔
+獨立scan 等價、`RandomAccessReader` close idempotent、循序↔4-worker pool 每張 result tuple 等價）。
+**沙箱實跑 numpy-free 等價檢查全通過**（OasisStream/iter_records/scan/shared-map）；numpy/cv2/PyQt6-gated
+項（load_cell 幾何、批次並行）與實機效能、GUI 批次加速、mmap 記憶體下降待 user 本地驗收。py_compile 全過。
+
+**影響檔案：** `glas/core/oasis_streamer.py`、`glas/core/oasis_random.py`、`glas/app/gds_align_tool.py`、
+`tests/test_accel_equivalence.py`、`docs/plans/F6-readwalk-batch-accel.md`。
+
+**Branch：** `claude/dazzling-cori-5T7XE`
+
+---
+
+## [2026-05-25] [F6] 規劃：OAS 讀取 + 批次 fine-align 加速（待核准）
+
+**變更類型：** 文件（plan，尚未動工）
+
+**內容：** user 要求在「功能完全不變」前提下找 OAS 讀取與批次 fine-align 的加速點。探索熱路徑後
+（`OasisStream` slurp `oasis_streamer.py:214`、`RandomAccessReader` 雙重 slurp `oasis_random.py:215`、
+`FineAlignAllWorker` 刻意單執行緒 `gds_align_tool.py:1116`）與 user 用 AskUserQuestion 收斂三個岔路：
+(1) 批次平行化用 **thread pool**（per-thread reader + 共享 mmap；cv2 釋放 GIL）、(2) worker 數
+**自動**（cpu_count 上限 8）、(3) mmap **只用在 ROI/隨機存取路徑**（bulk decode 維持 slurp）。
+產出 `docs/plans/F6-readwalk-batch-accel.md`（4 milestone：M1 mmap-backed OasisStream + fallback、
+M2 單一 map 共享去雙重 slurp、M3 thread-pool 批次、M4 等價總驗收），核心驗收條件為 **golden-output
+逐 byte／逐數值等價測試**（mmap↔slurp 幾何相等、共享map↔獨立scan index 相等、循序↔並行批次結果
+相等），強調不改演算法與 §7 不變式。§8 註冊 [F6]。**待 user 核准後才開工。**
+
+**測試：** 無（純 plan）。
+
+**影響檔案：** `docs/plans/F6-readwalk-batch-accel.md`、`CLAUDE.md`（§8）、`SESSION_LOG.md`。
+
+**Branch：** `claude/dazzling-cori-5T7XE`
+
+---
+
 ## [2026-05-25] [F5] PR#4 review fix：非 ok 批次狀態清掉舊 refined offset
 
 **變更類型：** bug fix
