@@ -16,10 +16,10 @@ outputs come back (plan Q12):
 
 Grammar (precedence high -> low, plan M2.4)::
 
-    1. ~            complement              (unary prefix, highest)
-    2. > W:n / < H:n grow / shrink (nm)     (postfix morphology)
-    3. &            intersection
-    4. | / -        union / difference      (lowest)
+    1. ~              complement                  (unary prefix, highest)
+    2. > W/H:n / < W/H:n  grow / shrink (nm)       (postfix morphology)
+    3. &              intersection
+    4. | / -          union / difference          (lowest)
 
     ( ... ) and [ ... ] both group.
 
@@ -27,18 +27,23 @@ The parser is a ~80-line hand-written recursive-descent (plan Q10): the
 grammar is small and fixed, and hand-rolling keeps error messages sharp
 and avoids a pyparsing dependency.
 
-Operator semantics (shapely >= 2.0, plan Q11)::
+Operator semantics (shapely >= 2.0)::
 
     A & B     -> A.intersection(B)
     A | B     -> A.union(B)
     A - B     -> A.difference(B)
     ~A        -> fov_bbox.difference(A)
-    A > W:n   -> A.buffer(+n)   grow n nm per side  (square joins)
-    A < H:n   -> A.buffer(-n)   shrink n nm per side
+    A > W:n   -> grow width  (X) by n nm per side  (anisotropic, F4)
+    A > H:n   -> grow height (Y) by n nm per side
+    A < W:n   -> shrink width  (X) by n nm per side
+    A < H:n   -> shrink height (Y) by n nm per side
 
-``n`` is in nanometres -- GDS coordinates are already nm, so a buffer of
-``n`` maps straight through (plan Q11): ``A > W:5`` grows every side by
-5 nm (total width +10 nm).
+``n`` is in nanometres (GDS coords are already nm). ``W``/``H`` pick the
+axis; ``>``/``<`` pick grow/shrink. The bias is **directional** (F4): each
+side along the chosen axis moves by ``n`` (so ``A > W:5`` on a 10×10 box
+gives 20×10). Grow is the exact Minkowski sum with the axis segment;
+shrink is the morphological erosion (complement-dilate-complement, so it
+needs ``fov_bbox``).
 """
 from __future__ import annotations
 
@@ -50,6 +55,7 @@ import numpy as np
 try:
     import shapely
     from shapely import Polygon, MultiPolygon, box, unary_union
+    from shapely.affinity import translate
     from shapely.geometry.base import BaseGeometry
     _SHAPELY_OK = True
 except Exception as exc:  # pragma: no cover - import guard
@@ -200,13 +206,17 @@ class _Parser:
             if label_t[0] != "IDENT":
                 raise BooleanExprError(
                     f"expected W/H label after {op!r}, got {label_t!r}")
+            label = str(label_t[1]).upper()
+            if label not in ("W", "H"):
+                raise BooleanExprError(
+                    f"expected axis W or H after {op!r}, got {label_t[1]!r}")
             self._expect_op(":")
             num_t = self._next()
             if num_t[0] != "NUM":
                 raise BooleanExprError(
-                    f"expected nm amount after {op!r} {label_t[1]}:, "
+                    f"expected nm amount after {op!r} {label}:, "
                     f"got {num_t!r}")
-            node = Morph(node, sign, float(num_t[1]), str(label_t[1]))
+            node = Morph(node, sign, float(num_t[1]), label)
         return node
 
     # ~ (highest)
@@ -271,6 +281,110 @@ def referenced_layers(ast: object) -> set[str]:
     return out
 
 
+# ── Bindings + nested-recipe resolution (F4) ─────────────────────────
+#
+# A binding maps an expression letter to a source of geometry. Two forms:
+#
+#   ("raw", layer, datatype)   -- a raw layout layer
+#   ("ref", name)              -- another synthetic (expression) layer,
+#                                 enabling nested composition L1 = L0 - C
+#
+# The legacy form ``(layer, datatype)`` (a 2-tuple) is read as ``("raw",
+# layer, datatype)`` so older caches / sidecars keep working.
+
+
+def normalize_binding(val) -> tuple:
+    """Coerce a binding value into tagged form (see module note).
+
+    ``(layer, datatype)`` -> ``("raw", layer, datatype)``; tagged tuples
+    pass through unchanged. Raises :class:`BooleanExprError` otherwise."""
+    t = tuple(val)
+    if len(t) == 2 and t[0] not in ("raw", "ref"):
+        return ("raw", int(t[0]), int(t[1]))
+    if t and t[0] == "raw" and len(t) == 3:
+        return ("raw", int(t[1]), int(t[2]))
+    if t and t[0] == "ref" and len(t) == 2:
+        return ("ref", str(t[1]))
+    raise BooleanExprError(f"bad binding {val!r}")
+
+
+def recipe_dependency_order(ref_map: Mapping[str, set]) -> list[str]:
+    """Topologically order synthetic recipes so dependencies come first.
+
+    ``ref_map`` maps each recipe name to the set of OTHER recipe names it
+    references (via ``("ref", name)`` bindings). Returns the names in an
+    order safe to evaluate in. Raises :class:`BooleanExprError` on a
+    circular reference or a reference to an unknown recipe."""
+    order: list[str] = []
+    state: dict[str, int] = {}   # name -> 0 (on stack) / 1 (done)
+
+    def visit(n: str, stack: list[str]) -> None:
+        st = state.get(n)
+        if st == 1:
+            return
+        if st == 0:
+            cyc = " -> ".join(stack[stack.index(n):] + [n])
+            raise BooleanExprError(f"circular reference: {cyc}")
+        state[n] = 0
+        for dep in sorted(ref_map.get(n, ())):
+            if dep not in ref_map:
+                raise BooleanExprError(
+                    f"binding references unknown synthetic layer {dep!r}")
+            visit(dep, stack + [n])
+        state[n] = 1
+        order.append(n)
+
+    for name in ref_map:
+        visit(name, [])
+    return order
+
+
+def resolve_expression(expr: str,
+                       bindings: Mapping[str, tuple],
+                       *,
+                       raw_provider,
+                       recipe_provider,
+                       fov_bbox: Optional["BaseGeometry"] = None,
+                       _cache: Optional[dict] = None,
+                       _visiting: Optional[set] = None) -> "BaseGeometry":
+    """Evaluate ``expr`` whose ``bindings`` may reference raw layers AND
+    other synthetic recipes (nested composition).
+
+    ``raw_provider(layer, datatype) -> geometry`` supplies a raw layer's
+    geometry; ``recipe_provider(name) -> (expr, bindings) | None`` supplies
+    a referenced recipe's definition. Referenced recipes are evaluated
+    recursively and memoized in ``_cache``; cycles raise
+    :class:`BooleanExprError`."""
+    cache = {} if _cache is None else _cache
+    visiting = set() if _visiting is None else _visiting
+    _, ast = parse_expression(expr)
+    geoms: dict[str, "BaseGeometry"] = {}
+    for letter, raw_val in bindings.items():
+        val = normalize_binding(raw_val)
+        if val[0] == "raw":
+            geoms[letter] = raw_provider(val[1], val[2])
+            continue
+        name = val[1]
+        if name in cache:
+            geoms[letter] = cache[name]
+            continue
+        if name in visiting:
+            raise BooleanExprError(f"circular reference to {name!r}")
+        rec = recipe_provider(name)
+        if rec is None:
+            raise BooleanExprError(
+                f"binding references unknown synthetic layer {name!r}")
+        visiting.add(name)
+        g = resolve_expression(rec[0], rec[1], raw_provider=raw_provider,
+                               recipe_provider=recipe_provider,
+                               fov_bbox=fov_bbox, _cache=cache,
+                               _visiting=visiting)
+        visiting.discard(name)
+        cache[name] = g
+        geoms[letter] = g
+    return evaluate(ast, geoms, fov_bbox=fov_bbox)
+
+
 # ── Geometry helpers ─────────────────────────────────────────────────
 
 
@@ -330,6 +444,52 @@ def layer_geometry(bboxes: Optional[np.ndarray] = None,
 # ── Evaluator ────────────────────────────────────────────────────────
 
 
+def _iter_rings(geom: "BaseGeometry"):
+    """Yield every exterior + interior LinearRing of a (multi)polygon."""
+    for g in getattr(geom, "geoms", [geom]):
+        ext = getattr(g, "exterior", None)
+        if ext is None:
+            continue
+        yield ext
+        for ring in getattr(g, "interiors", []):
+            yield ring
+
+
+def _dilate_axis(geom: "BaseGeometry", n: float, axis: str) -> "BaseGeometry":
+    """Exact axis-aligned dilation by ``n`` nm per side (``axis`` 'W'->X,
+    'H'->Y): the Minkowski sum of ``geom`` with the centred segment
+    ``[-n, n]`` on that axis. Computed as the union of ``geom``, its
+    translated copy, and each boundary edge swept into a parallelogram —
+    exact for arbitrary polygons (F4)."""
+    if geom.is_empty or n <= 0:
+        return geom
+    vx, vy = (2.0 * n, 0.0) if axis == "W" else (0.0, 2.0 * n)
+    base = translate(geom, -vx / 2.0, -vy / 2.0)   # centre the bias
+    parts = [base, translate(base, vx, vy)]
+    for ring in _iter_rings(base):
+        coords = list(ring.coords)
+        for (x0, y0), (x1, y1) in zip(coords, coords[1:]):
+            parts.append(Polygon([(x0, y0), (x1, y1),
+                                   (x1 + vx, y1 + vy), (x0 + vx, y0 + vy)]))
+    g = unary_union(parts)
+    return g if g.is_valid else g.buffer(0)
+
+
+def _morph_axis(geom: "BaseGeometry", sign: int, n: float, axis: str,
+                fov_bbox: Optional["BaseGeometry"]) -> "BaseGeometry":
+    """Directional grow (``sign>0``) / shrink (``sign<0``) of ``geom`` by
+    ``n`` nm per side along ``axis`` ('W'/'H'). Shrink is morphological
+    erosion (complement-dilate-complement) and needs ``fov_bbox``."""
+    if sign > 0:
+        return _dilate_axis(geom, n, axis)
+    if fov_bbox is None:
+        raise BooleanExprError(
+            "shrink '< W/H:n' needs a FOV bounding box to bound the "
+            "erosion; pass fov_bbox=")
+    comp = fov_bbox.difference(geom)
+    return fov_bbox.difference(_dilate_axis(comp, n, axis))
+
+
 def fov_box(cx: float, cy: float, fov_w: float, fov_h: float) -> "BaseGeometry":
     """Build the FOV rectangle as a shapely polygon (centre + size, nm).
     Pass this as ``fov_bbox`` to :func:`evaluate` when the expression
@@ -371,10 +531,9 @@ def evaluate(ast: object,
             return fov_bbox.difference(ev(n.child))
         if isinstance(n, Morph):
             g = ev(n.child)
-            d = n.sign * n.amount
-            # Square joins/caps keep rectangular layout corners sharp
-            # rather than rounding them off.
-            return g.buffer(d, join_style="mitre", cap_style="square")
+            # Directional bias (F4): W -> X axis, H -> Y axis; > grows and
+            # < shrinks, n nm per side along that axis.
+            return _morph_axis(g, n.sign, n.amount, n.label, fov_bbox)
         if isinstance(n, BinOp):
             a, b = ev(n.left), ev(n.right)
             if n.op == "&":

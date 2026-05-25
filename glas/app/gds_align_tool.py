@@ -68,7 +68,7 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFrame, QGridLayout,
     QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton, QScrollArea,
-    QSizePolicy, QSlider, QSpinBox, QSplitter, QStatusBar, QStyledItemDelegate,
+    QSizePolicy, QSpinBox, QSplitter, QStatusBar, QStyle, QStyledItemDelegate,
     QToolButton, QVBoxLayout, QWidget,
 )
 
@@ -76,6 +76,24 @@ try:
     import cv2  # type: ignore
 except Exception:  # pragma: no cover
     cv2 = None  # rasterize_layer falls back to a pure-numpy scanline fill
+
+
+def _screen_avail(margin: int = 80) -> tuple[int, int]:
+    """Available screen (w, h) minus a margin, for sizing dialogs / the main
+    window so a hard-coded minimum can never exceed the display (F3 M1)."""
+    app = QApplication.instance()
+    if app is not None:
+        scr = app.primaryScreen()
+        if scr is not None:
+            g = scr.availableGeometry()
+            return (max(320, g.width() - margin), max(240, g.height() - margin))
+    return (10_000, 10_000)   # no screen yet → don't constrain
+
+
+def _capped_min_width(desired: int) -> int:
+    """Clamp a desired minimum dialog width to the available screen width so a
+    small display isn't forced wider than it is (F3 M1)."""
+    return min(desired, _screen_avail()[0])
 
 
 
@@ -166,6 +184,27 @@ _LOAD_SEM_BTN_QSS = (
     "}"
 )
 
+# Per-layer POI toggle (left LayerPanel). Unchecked: a visible outlined chip
+# (the old 18×16 flat "P" was invisible against the panel — F3 M4). Checked:
+# solid accent so the chosen POI layers stand out.
+_POI_BTN_QSS = (
+    "QToolButton {"
+    "  background: #ffffff;"
+    f"  color: {_TK_ACCENT_DK.name()};"
+    f"  border: 1px solid {_TK_ACCENT.name()};"
+    "  border-radius: 4px;"
+    "  font-weight: 700;"
+    "  font-size: 10px;"
+    "  padding: 0 2px;"
+    "}"
+    f"QToolButton:hover {{ background: #fff0e0; }}"
+    "QToolButton:checked {"
+    f"  background: {_TK_ACCENT.name()};"
+    "  color: #ffffff;"
+    f"  border: 1px solid {_TK_ACCENT_DK.name()};"
+    "}"
+)
+
 
 def _hint_qss(size: int = _FS_CAPTION, color: str = "#8a7660",
               pad: str = "") -> str:
@@ -177,6 +216,14 @@ def _hint_qss(size: int = _FS_CAPTION, color: str = "#8a7660",
 def _result_qss(color: str, size: int = _FS_LABEL) -> str:
     """QSS for a coloured result label (success/danger/accent)."""
     return f"font-size:{size}px; color:{color};"
+
+
+def _entry_label(entry) -> str:
+    """Display label for a LayerEntry: ``NAME (L17/D0)`` when the OASIS file
+    declares a LAYERNAME, else the bare ``L17/D0`` / ``[expr] name`` (F3)."""
+    base = entry.key.label()
+    name = getattr(entry, "display_name", "")
+    return f"{name} ({base})" if (name and not entry.key.synthetic) else base
 
 
 def _config_list(lst) -> None:
@@ -278,6 +325,10 @@ class LayerEntry:
     # re-evaluated. ``None`` for raw layers.
     expr_text: Optional[str] = None
     expr_bindings: Optional[dict] = None
+    # F3 M2: human-readable layer name from OASIS LAYERNAME (raw layers only;
+    # "" when the file declares none). Display-only — NOT part of LayerKey
+    # identity, so layer lookup / dedup is unaffected.
+    display_name: str = ""
 
     def fill_alpha(self) -> int:
         """Fill alpha (0-255) derived from ``opacity`` %."""
@@ -377,7 +428,8 @@ def _roi_entry(rar, root, layer: int, datatype: int, roi_bbox, color,
         entry = LayerEntry(
             key=LayerKey(layer=layer, datatype=datatype),
             polygons=polygons, color=color,
-            bboxes=np.asarray(bboxes, dtype=np.float32))
+            bboxes=np.asarray(bboxes, dtype=np.float32),
+            display_name=rar.layer_display_name(layer, datatype))
     return entry, res["stats"]
 
 
@@ -478,7 +530,7 @@ class LayerFilterDialog(QDialog):
         self._roi_mode = roi_mode
         self.setWindowTitle("Pick ROI layers" if roi_mode else "Layer filter")
         self.setModal(True)
-        self.setMinimumWidth(540)
+        self.setMinimumWidth(_capped_min_width(540))
 
         v = QVBoxLayout(self)
         v.setContentsMargins(20, 16, 20, 14)
@@ -970,13 +1022,15 @@ class FineAlignAllWorker(QObject):
     failed = pyqtSignal(str)
     cancelled = pyqtSignal()
 
-    def __init__(self, rar, root, poi_spec, jobs, cfg) -> None:
+    def __init__(self, rar, root, poi_specs, jobs, cfg) -> None:
         super().__init__()
         self._rar = rar
         self._root = root
-        self._poi_spec = poi_spec
+        # F3 multi-POI: list of (spec, fg_glv); each spec is walked per ROI and
+        # composited at its fg onto the shared bg before matching.
+        self._poi_specs = list(poi_specs)
         self._jobs = jobs        # list of (image_id, anchor|None, path, exists)
-        self._cfg = cfg          # dict: fov_w/h, nm_auto, nm_manual, fg/bg/blur, search_radius_nm
+        self._cfg = cfg          # dict: fov_w/h, nm_auto, nm_manual, bg/blur, search_radius_nm
         self._cancel = False
 
     def cancel(self) -> None:
@@ -1005,15 +1059,19 @@ class FineAlignAllWorker(QObject):
                     continue
                 roi = (anchor[0] - c["fov_w"], anchor[1] - c["fov_h"],
                        anchor[0] + c["fov_w"], anchor[1] + c["fov_h"])
-                polys = poi_polys_for_roi(
-                    self._rar, self._root, roi, self._poi_spec,
-                    cancel_cb=lambda: self._cancel)
-                if not polys:
+                poi_layers = []
+                for spec, fg in self._poi_specs:
+                    polys = poi_polys_for_roi(
+                        self._rar, self._root, roi, spec,
+                        cancel_cb=lambda: self._cancel)
+                    if polys:
+                        poi_layers.append((polys, fg))
+                if not poi_layers:
                     self.result.emit(str(image_id), 0.0, 0.0, 0.0)
                     continue
-                template = render_poi_template(
-                    polys, anchor, W, H, nm_per_px,
-                    c["fg_glv"], c["bg_glv"], c["blur_sigma_px"])
+                template = render_composite_template(
+                    poi_layers, anchor, W, H, nm_per_px,
+                    c["bg_glv"], c["blur_sigma_px"])
                 radius_px = c["search_radius_nm"] / nm_per_px
                 dx, dy, score, _ = fine_align_one(sem, template, nm_per_px,
                                                   radius_px)
@@ -1111,25 +1169,55 @@ def make_template(mask: np.ndarray, fg_glv: int = 200, bg_glv: int = 80,
     return img
 
 
-def render_poi_template(polygons: list, anchor: tuple, width_px: int,
-                        height_px: int, nm_per_px: float,
-                        fg_glv: int = 200, bg_glv: int = 80,
-                        blur_sigma_px: float = 1.0) -> np.ndarray:
-    """Rasterize the POI ``polygons`` (nm) over the FOV centred on ``anchor``
-    at the SEM resolution and turn it into a grey template the same size as
-    the SEM image (plan M4b)."""
+def _fit_mask(mask: np.ndarray, height_px: int, width_px: int) -> np.ndarray:
+    """Clamp/pad a rasterized mask to exactly ``(height_px, width_px)``."""
+    if mask.shape == (height_px, width_px):
+        return mask
+    fixed = np.zeros((height_px, width_px), dtype=np.uint8)
+    h = min(mask.shape[0], height_px)
+    w = min(mask.shape[1], width_px)
+    fixed[:h, :w] = mask[:h, :w]
+    return fixed
+
+
+def render_composite_template(poi_layers: list, anchor: tuple, width_px: int,
+                              height_px: int, nm_per_px: float,
+                              bg_glv: int = 80,
+                              blur_sigma_px: float = 1.0) -> np.ndarray:
+    """Composite several POI layers into one SEM-like grey template (plan F3).
+
+    ``poi_layers`` is ``[(polygons, fg_glv), ...]`` — each layer's polygons
+    (nm) are rasterized over the FOV centred on ``anchor`` and painted at that
+    layer's ``fg_glv`` onto a shared ``bg_glv`` background (later layers paint
+    over earlier ones where they overlap). One Gaussian blur softens the edges
+    so the result matches a band-limited SEM frame. With a single layer this is
+    identical to the old single-POI template."""
     gx, gy = anchor
     half_w = width_px / 2.0 * nm_per_px
     half_h = height_px / 2.0 * nm_per_px
     bbox = (gx - half_w, gy - half_h, gx + half_w, gy + half_h)
-    mask = rasterize_layer(polygons, bbox, nm_per_px)
-    if mask.shape != (height_px, width_px):
-        fixed = np.zeros((height_px, width_px), dtype=np.uint8)
-        h = min(mask.shape[0], height_px)
-        w = min(mask.shape[1], width_px)
-        fixed[:h, :w] = mask[:h, :w]
-        mask = fixed
-    return make_template(mask, fg_glv, bg_glv, blur_sigma_px)
+    img = np.full((height_px, width_px), np.uint8(bg_glv), dtype=np.uint8)
+    for polygons, fg_glv in poi_layers:
+        if not polygons:
+            continue
+        mask = _fit_mask(rasterize_layer(polygons, bbox, nm_per_px),
+                         height_px, width_px)
+        img[mask > 0] = np.uint8(fg_glv)
+    if blur_sigma_px and blur_sigma_px > 0 and cv2 is not None:
+        k = int(max(1, round(blur_sigma_px * 3))) * 2 + 1
+        img = cv2.GaussianBlur(img, (k, k), float(blur_sigma_px))
+    return img
+
+
+def render_poi_template(polygons: list, anchor: tuple, width_px: int,
+                        height_px: int, nm_per_px: float,
+                        fg_glv: int = 200, bg_glv: int = 80,
+                        blur_sigma_px: float = 1.0) -> np.ndarray:
+    """Single-POI template (plan M4b) — thin wrapper over
+    :func:`render_composite_template` with one layer."""
+    return render_composite_template(
+        [(polygons, fg_glv)], anchor, width_px, height_px, nm_per_px,
+        bg_glv, blur_sigma_px)
 
 
 def _parabola_subpx(res: np.ndarray, bx: int, by: int, axis: int) -> float:
@@ -1200,23 +1288,27 @@ def _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb=None):
 def poi_polys_for_roi(rar, root, roi_bbox, poi_spec, cancel_cb=None):
     """POI polygons (nm, root coords) for a given ROI, for batch fine align
     (plan M4b "Run all"). ``poi_spec`` is ``('raw', layer, datatype)`` or
-    ``('expr', expr_text, bindings)``; the latter walks each bound layer over
-    the ROI and evaluates the Boolean expression."""
+    ``('expr', expr_text, bindings[, recipes])``; the latter walks each bound
+    layer over the ROI and evaluates the Boolean expression, resolving any
+    nested synthetic references via ``recipes`` (``{name: (expr, bindings)}``)."""
     kind = poi_spec[0]
     if kind == "raw":
         _, layer, datatype = poi_spec
         return _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb)
     # expression POI
-    _, expr, bindings = poi_spec
+    expr, bindings = poi_spec[1], poi_spec[2]
+    recipes = poi_spec[3] if len(poi_spec) > 3 else {}
     x0, y0, x1, y1 = roi_bbox
     cx, cy, w, h = (x0 + x1) / 2.0, (y0 + y1) / 2.0, (x1 - x0), (y1 - y0)
-    _, ast = gds_boolean.parse_expression(expr)
-    geoms: dict = {}
-    for letter, key in bindings.items():
-        ps = _walk_roi_polys(rar, root, roi_bbox, key[0], key[1], cancel_cb)
-        geoms[letter] = gds_boolean.polys_to_geometry(ps)
-    geom = gds_boolean.evaluate(ast, geoms,
-                                fov_bbox=gds_boolean.fov_box(cx, cy, w, h))
+
+    def raw_provider(layer: int, datatype: int):
+        ps = _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb)
+        return gds_boolean.polys_to_geometry(ps)
+
+    geom = gds_boolean.resolve_expression(
+        expr, bindings, raw_provider=raw_provider,
+        recipe_provider=lambda n: recipes.get(n),
+        fov_bbox=gds_boolean.fov_box(cx, cy, w, h))
     return gds_boolean.geometry_to_polygons(geom)
 
 
@@ -1301,12 +1393,14 @@ def write_alignment_json(path, rows, synthetic_layers=None):
 # ── LayerPanel widget ────────────────────────────────────────────────────────
 
 class _LayerRow(QWidget):
-    """One LayerPanel row: visibility checkbox + colour swatch + label +
-    per-layer opacity slider (plan M6.2). Mutates the bound ``LayerEntry``
-    in place and emits ``changed`` so the canvas / SEM overlay redraw."""
+    """One LayerPanel row: visibility checkbox + POI toggle + colour swatch +
+    label. Mutates the bound ``LayerEntry`` in place and emits ``changed`` so
+    the canvas / SEM overlay redraw."""
 
     changed = pyqtSignal()
     poi_toggled = pyqtSignal(bool)   # M4b: this row chosen / cleared as POI
+    edit_requested = pyqtSignal()    # F4: edit this synthetic layer's recipe
+    delete_requested = pyqtSignal()  # F4: delete this synthetic layer
 
     def __init__(self, entry: "LayerEntry",
                  parent: Optional[QWidget] = None) -> None:
@@ -1323,12 +1417,15 @@ class _LayerRow(QWidget):
         h.addWidget(self._chk)
 
         self.poi_btn = QToolButton(self)
-        self.poi_btn.setText("P")
+        self.poi_btn.setText("POI")
         self.poi_btn.setCheckable(True)
-        self.poi_btn.setFixedSize(18, 16)
+        self.poi_btn.setFixedSize(34, 18)
+        self.poi_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.poi_btn.setStyleSheet(_POI_BTN_QSS)
         self.poi_btn.setToolTip(
-            "Use this layer as the POI alignment template (M4b fine align). "
-            "Only one layer can be the POI.")
+            "Add / remove this layer as a POI alignment template (F3 fine "
+            "align). Several layers can be POIs — they composite into one "
+            "synthetic template, each at its own grey level.")
         self.poi_btn.toggled.connect(self.poi_toggled)
         h.addWidget(self.poi_btn)
 
@@ -1340,26 +1437,40 @@ class _LayerRow(QWidget):
         self._apply_swatch()
         h.addWidget(self._swatch)
 
-        label = entry.key.label()
+        # Prefix the OASIS LAYERNAME when the file declares one (F3 M2):
+        # "METAL1 (L17/D0)"; raw layers with no name fall back to "L17/D0".
+        label = _entry_label(entry)
         n_poly = len(entry.polygons)
         if n_poly:
             label = f"{label}  ·  {n_poly}"
         self._lbl = QLabel(label, self)
         self._lbl.setStyleSheet(f"font-size: {_FS_LABEL}px;")
+        self._lbl.setToolTip(label)
         h.addWidget(self._lbl, 1)
 
-        self._slider = QSlider(Qt.Orientation.Horizontal, self)
-        self._slider.setRange(0, 100)
-        self._slider.setValue(int(entry.opacity))
-        self._slider.setFixedWidth(64)
-        self._slider.setToolTip("Fill opacity (0 = fully transparent, outline only)")
-        self._slider.valueChanged.connect(self._on_opacity)
-        h.addWidget(self._slider)
+        # F4: synthetic (expression) layers get inline edit / delete controls;
+        # double-clicking the row also opens the editor.
+        if entry.key.synthetic:
+            self._edit_btn = QToolButton(self)
+            self._edit_btn.setText("✎")
+            self._edit_btn.setFixedSize(20, 18)
+            self._edit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._edit_btn.setToolTip("Edit this expression")
+            self._edit_btn.clicked.connect(self.edit_requested)
+            h.addWidget(self._edit_btn)
 
-        self._pct = QLabel(f"{int(entry.opacity)}%", self)
-        self._pct.setFixedWidth(34)
-        self._pct.setStyleSheet(_hint_qss(_FS_CAPTION))
-        h.addWidget(self._pct)
+            self._del_btn = QToolButton(self)
+            self._del_btn.setText("✕")
+            self._del_btn.setFixedSize(20, 18)
+            self._del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._del_btn.setToolTip("Delete this expression layer")
+            self._del_btn.clicked.connect(self.delete_requested)
+            h.addWidget(self._del_btn)
+
+    def mouseDoubleClickEvent(self, ev) -> None:  # noqa: N802 (Qt override)
+        if self._entry.key.synthetic:
+            self.edit_requested.emit()
+        super().mouseDoubleClickEvent(ev)
 
     def _apply_swatch(self) -> None:
         c = self._entry.color
@@ -1379,11 +1490,6 @@ class _LayerRow(QWidget):
             self._apply_swatch()
             self.changed.emit()
 
-    def _on_opacity(self, value: int) -> None:
-        self._entry.opacity = int(value)
-        self._pct.setText(f"{int(value)}%")
-        self.changed.emit()
-
 
 class LayerPanel(QFrame):
     """Left-side list of layers with toggle + color editing.
@@ -1395,7 +1501,9 @@ class LayerPanel(QFrame):
 
     layers_changed = pyqtSignal()
     add_expression_requested = pyqtSignal()   # M2.6: "+ Expression…" clicked
-    poi_changed = pyqtSignal(object)          # M4b: LayerEntry or None
+    edit_expression_requested = pyqtSignal(str)    # F4: edit recipe by name
+    delete_expression_requested = pyqtSignal(str)  # F4: delete recipe by name
+    pois_changed = pyqtSignal(object)         # F3: list[LayerEntry] (POI set)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -1426,14 +1534,14 @@ class LayerPanel(QFrame):
         btn_row.addWidget(self._expr_btn)
         layout.addLayout(btn_row)
 
-        hint = QLabel("checkbox: show/hide  ·  P: POI  ·  slider: opacity  ·  swatch: colour")
+        hint = QLabel("checkbox: show/hide  ·  POI: fine-align template  ·  swatch: colour")
         hint.setStyleSheet(_hint_qss(_FS_MICRO, pad="6px 10px"))
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
         self._doc: Optional[GdsDocument] = None
         self._rows: list[_LayerRow] = []
-        self._poi_entry: Optional[LayerEntry] = None
+        self._poi_entries: list[LayerEntry] = []
         self._show_empty_hint()
 
     def _show_empty_hint(self) -> None:
@@ -1473,10 +1581,10 @@ class LayerPanel(QFrame):
         self._doc = doc
         self.list.clear()
         self._rows = []
-        self._poi_entry = None
+        self._poi_entries = []
         if doc is None or not doc.entries:
             self._show_empty_hint()
-            self.poi_changed.emit(None)
+            self.pois_changed.emit([])
             return
         for entry in doc.entries:
             item = QListWidgetItem()
@@ -1485,29 +1593,30 @@ class LayerPanel(QFrame):
             row.changed.connect(self.layers_changed)
             row.poi_toggled.connect(
                 lambda on, r=row, e=entry: self._on_poi_toggled(on, r, e))
+            if entry.key.synthetic:
+                row.edit_requested.connect(
+                    lambda n=entry.key.name: self.edit_expression_requested.emit(n))
+                row.delete_requested.connect(
+                    lambda n=entry.key.name: self.delete_expression_requested.emit(n))
             item.setSizeHint(row.sizeHint())
             self.list.addItem(item)
             self.list.setItemWidget(item, row)
             self._rows.append(row)
-        self.poi_changed.emit(None)
+        self.pois_changed.emit([])
 
     def _on_poi_toggled(self, on: bool, row: "_LayerRow",
                         entry: "LayerEntry") -> None:
-        """Keep POI exclusive: turning one on clears the others."""
-        if on:
-            for other in self._rows:
-                if other is not row and other.poi_btn.isChecked():
-                    other.poi_btn.blockSignals(True)
-                    other.poi_btn.setChecked(False)
-                    other.poi_btn.blockSignals(False)
-            self._poi_entry = entry
-            self.poi_changed.emit(entry)
-        elif self._poi_entry is entry:
-            self._poi_entry = None
-            self.poi_changed.emit(None)
+        """F3: POI is multi-select — several layers can be active POIs at once.
+        Rebuild the set from the rows' checked state (in panel order) so the
+        composite ordering is stable. Driven by row state rather than list
+        membership because ``LayerEntry`` holds NumPy arrays, whose dataclass
+        ``__eq__`` makes ``in`` / ``remove`` raise on array truth-value."""
+        ordered = [r._entry for r in self._rows if r.poi_btn.isChecked()]
+        self._poi_entries = ordered
+        self.pois_changed.emit(list(ordered))
 
-    def poi_entry(self) -> Optional["LayerEntry"]:
-        return self._poi_entry
+    def poi_entries(self) -> list["LayerEntry"]:
+        return list(self._poi_entries)
 
     def raw_layer_keys(self) -> list[tuple[int, int]]:
         """``(layer, datatype)`` pairs of the non-synthetic layers, for
@@ -1524,41 +1633,151 @@ class LayerPanel(QFrame):
 # ── Expression layer dialog (M2.6) ───────────────────────────────────────────
 
 
-class ExpressionLayerDialog(QDialog):
-    """Compose a synthetic layer from a Boolean expression (plan M2.6).
+class _ExprPreview(QWidget):
+    """Fit-to-view mini canvas for the compose dialog (F4): the expression
+    result (filled highlight) over its bound raw layers (thin outlines), so
+    the layer can be reviewed in-dialog without returning to the main window."""
 
-    The user types an HMI-style expression (``[(A > W:5) & B] < H:5``) and
-    binds each referenced letter to a raw layer via a dropdown. Binding
-    rows are rebuilt live as the expression changes. ``preview_cb`` (when
-    supplied) is invoked by the Preview button with
-    ``(name, expr, bindings)`` and should return ``(ok: bool, msg: str)``;
-    the caller draws the result on the canvas so the user can confirm the
-    ROI before accepting.
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setMinimumHeight(200)
+        self.setStyleSheet(
+            "background:#1a1712; border:1px solid #4a4030; border-radius:6px;")
+        self._result: list = []
+        self._context: list = []
+        self._bbox: Optional[tuple] = None
+        self._msg = "press Preview to render the layer here"
+
+    def set_message(self, msg: str) -> None:
+        self._msg = msg
+        self.update()
+
+    def set_data(self, data: Optional[dict]) -> None:
+        if not data:
+            self._result, self._context, self._bbox = [], [], None
+        else:
+            self._result = data.get("result", [])
+            self._context = data.get("context", [])
+            self._bbox = self._fit_bbox(data)
+        self.update()
+
+    @staticmethod
+    def _fit_bbox(data: dict) -> Optional[tuple]:
+        allp = list(data.get("result", []))
+        for polys, _ in data.get("context", []):
+            allp += polys
+        x0 = y0 = float("inf")
+        x1 = y1 = float("-inf")
+        for poly in allp:
+            a = np.asarray(poly, dtype=float)
+            if a.size == 0:
+                continue
+            x0 = min(x0, a[:, 0].min()); y0 = min(y0, a[:, 1].min())
+            x1 = max(x1, a[:, 0].max()); y1 = max(y1, a[:, 1].max())
+        if x0 == float("inf"):
+            return data.get("fov")
+        px = (x1 - x0) * 0.05 or 1.0
+        py = (y1 - y0) * 0.05 or 1.0
+        return (x0 - px, y0 - py, x1 + px, y1 + py)
+
+    def paintEvent(self, ev) -> None:  # noqa: N802 (Qt override)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = self.rect()
+        if self._bbox is None or not (self._result or self._context):
+            p.setPen(QPen(QColor("#8a7660")))
+            p.drawText(rect, Qt.AlignmentFlag.AlignCenter, self._msg)
+            return
+        x0, y0, x1, y1 = self._bbox
+        bw = max(x1 - x0, 1e-6)
+        bh = max(y1 - y0, 1e-6)
+        margin = 10
+        aw = rect.width() - 2 * margin
+        ah = rect.height() - 2 * margin
+        s = min(aw / bw, ah / bh)
+        ox = margin + (aw - bw * s) / 2.0
+        oy = margin + (ah - bh * s) / 2.0
+
+        def to_polygon(poly):
+            pts = [QPointF(ox + (float(pt[0]) - x0) * s,
+                           oy + (y1 - float(pt[1])) * s) for pt in poly]
+            return QPolygonF(pts)
+
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        for polys, color in self._context:
+            pen = QPen(QColor(color)); pen.setWidthF(1.0)
+            p.setPen(pen)
+            for poly in polys:
+                if len(poly) >= 2:
+                    p.drawPolygon(to_polygon(poly))
+        hl = QColor("#ff5fb0")
+        fill = QColor(hl); fill.setAlpha(90)
+        p.setBrush(QBrush(fill))
+        pen = QPen(hl); pen.setWidthF(1.6)
+        p.setPen(pen)
+        for poly in self._result:
+            if len(poly) >= 2:
+                p.drawPolygon(to_polygon(poly))
+
+
+class ExpressionLayerDialog(QDialog):
+    """Compose / edit a synthetic layer from a Boolean expression (F4).
+
+    The expression uses letters (``A``, ``B``, …); each referenced letter is
+    bound — via a dropdown — to a **raw layer** or **another synthetic layer**
+    (nested composition). To build expressions without memorising letters, the
+    palette offers clickable layer / synthetic chips (each inserts the next
+    free letter and pre-binds it) and operator buttons (``&`` ``|`` ``-`` ``~``
+    grow / shrink / brackets) that insert at the cursor. The expression is
+    validated live: the Save button is disabled and an inline message shown
+    until it parses and every letter is bound.
+
+    ``preview_cb(name, expr, bindings) -> (ok, msg, data)`` (optional) is
+    called by the Preview button; the result is rendered in the embedded
+    preview canvas (the dialog stays open) so the layer is reviewed in place
+    and only committed on Save. ``recipe`` (optional) pre-fills the form for
+    editing. ``bindings`` are tagged: ``("raw", layer, datatype)`` /
+    ``("ref", name)``.
     """
+
+    _LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
     def __init__(self, parent: Optional[QWidget],
                  layer_keys: list[tuple[int, int]],
-                 preview_cb=None) -> None:
+                 ref_names: Optional[list[str]] = None,
+                 preview_cb=None,
+                 recipe: Optional[dict] = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Compose expression layer")
-        self.setMinimumWidth(420)
+        self._editing = recipe is not None
+        self.setWindowTitle(
+            "Edit expression layer" if self._editing
+            else "Compose expression layer")
+        self.setMinimumWidth(_capped_min_width(460))
         self._layer_keys = list(layer_keys)
+        self._ref_names = list(ref_names or [])
         self._preview_cb = preview_cb
         self._combos: dict[str, QComboBox] = {}
         self._bind_rows: dict[str, QWidget] = {}
+        self._pending_bind: Optional[tuple] = None
 
         v = QVBoxLayout(self)
 
         v.addWidget(QLabel("Layer name"))
         self._name_edit = QLineEdit(self)
-        self._name_edit.setText("L0")
+        self._name_edit.setText(recipe["name"] if self._editing else "L0")
+        self._name_edit.textChanged.connect(self._revalidate)
         v.addWidget(self._name_edit)
 
         v.addWidget(QLabel("Expression"))
         self._expr_edit = QLineEdit(self)
         self._expr_edit.setPlaceholderText("[(A > W:5) & B] < H:5")
-        self._expr_edit.textChanged.connect(self._rebuild_bindings)
+        if self._editing:
+            self._expr_edit.setText(recipe.get("expr", ""))
+        self._expr_edit.textChanged.connect(self._on_expr_changed)
         v.addWidget(self._expr_edit)
+
+        # Insert palette: layer / synthetic chips + operator buttons.
+        v.addWidget(self._build_palette())
 
         v.addWidget(QLabel("Bindings"))
         self._bind_box = QVBoxLayout()
@@ -1566,7 +1785,7 @@ class ExpressionLayerDialog(QDialog):
         v.addLayout(self._bind_box)
 
         prev_row = QHBoxLayout()
-        self._preview_btn = QPushButton("Preview in current view", self)
+        self._preview_btn = QPushButton("Preview", self)
         self._preview_btn.clicked.connect(self._on_preview)
         prev_row.addWidget(self._preview_btn)
         self._result_lbl = QLabel("", self)
@@ -1574,12 +1793,91 @@ class ExpressionLayerDialog(QDialog):
         prev_row.addWidget(self._result_lbl, 1)
         v.addLayout(prev_row)
 
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok |
+        self._preview = _ExprPreview(self)
+        v.addWidget(self._preview)
+
+        self._buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save |
             QDialogButtonBox.StandardButton.Cancel, self)
-        buttons.accepted.connect(self._on_accept)
-        buttons.rejected.connect(self.reject)
-        v.addWidget(buttons)
+        self._buttons.accepted.connect(self._on_accept)
+        self._buttons.rejected.connect(self.reject)
+        v.addWidget(self._buttons)
+
+        # Seed binding rows + selections from the recipe (edit) or expression.
+        self._rebuild_bindings()
+        if self._editing:
+            self._apply_recipe_bindings(recipe.get("bindings", {}))
+        self._revalidate()
+
+    # ── insert palette ───────────────────────────────────────────────────────
+    def _build_palette(self) -> QWidget:
+        box = QWidget(self)
+        outer = QVBoxLayout(box)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(4)
+
+        chips = QHBoxLayout()
+        chips.setContentsMargins(0, 0, 0, 0)
+        chips.addWidget(QLabel("insert:"))
+        for (ly, dt) in self._layer_keys:
+            b = QToolButton(box)
+            b.setText(f"L{ly}/D{dt}")
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setToolTip("Insert a new letter bound to this raw layer")
+            b.clicked.connect(
+                lambda _=False, val=("raw", ly, dt): self._insert_layer(val))
+            chips.addWidget(b)
+        for nm in self._ref_names:
+            b = QToolButton(box)
+            b.setText(f"[{nm}]")
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setToolTip("Insert a new letter bound to this synthetic layer")
+            b.clicked.connect(
+                lambda _=False, val=("ref", nm): self._insert_layer(val))
+            chips.addWidget(b)
+        chips.addStretch(1)
+        outer.addLayout(chips)
+
+        ops = QHBoxLayout()
+        ops.setContentsMargins(0, 0, 0, 0)
+        for tok, tip in [("&", "intersection"), ("|", "union"),
+                         ("-", "difference"), ("~", "complement"),
+                         (" > W:", "grow width / X (nm per side)"),
+                         (" > H:", "grow height / Y (nm per side)"),
+                         (" < W:", "shrink width / X (nm per side)"),
+                         (" < H:", "shrink height / Y (nm per side)"),
+                         ("(", ""), (")", "")]:
+            b = QToolButton(box)
+            b.setText(tok.strip() or tok)
+            if tip:
+                b.setToolTip(tip)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _=False, t=tok: self._insert_text(t))
+            ops.addWidget(b)
+        ops.addStretch(1)
+        outer.addLayout(ops)
+        return box
+
+    def _insert_text(self, text: str) -> None:
+        self._expr_edit.insert(text)
+        self._expr_edit.setFocus()
+
+    def _next_free_letter(self) -> Optional[str]:
+        used = set(self._referenced_letters())
+        for ch in self._LETTERS:
+            if ch not in used:
+                return ch
+        return None
+
+    def _insert_layer(self, val: tuple) -> None:
+        """Insert the next free letter at the cursor and pre-bind it to
+        ``val`` (a tagged binding)."""
+        letter = self._next_free_letter()
+        if letter is None:
+            return
+        self._pending_bind = (letter, val)
+        self._expr_edit.insert(letter)
+        self._expr_edit.setFocus()
 
     # ── binding rows ────────────────────────────────────────────────────────
     def _referenced_letters(self) -> list[str]:
@@ -1589,15 +1887,32 @@ class ExpressionLayerDialog(QDialog):
             return []
         return sorted(gds_boolean.referenced_layers(ast))
 
+    def _binding_options(self) -> list[tuple[str, tuple]]:
+        """(label, tagged-value) for every bindable source."""
+        opts = [(f"L{ly}/D{dt}", ("raw", ly, dt))
+                for (ly, dt) in self._layer_keys]
+        opts += [(f"[{nm}]", ("ref", nm)) for nm in self._ref_names]
+        return opts
+
+    def _on_expr_changed(self) -> None:
+        self._rebuild_bindings()
+        self._revalidate()
+
     def _rebuild_bindings(self) -> None:
         letters = self._referenced_letters()
-        # Add a dropdown for each newly referenced letter.
+        options = self._binding_options()
         for letter in letters:
             if letter in self._combos:
                 continue
             combo = QComboBox(self)
-            for (ly, dt) in self._layer_keys:
-                combo.addItem(f"L{ly}/D{dt}", (ly, dt))
+            for label, val in options:
+                combo.addItem(label, val)
+            # Honour a pending pre-bind from a chip click.
+            pend = getattr(self, "_pending_bind", None)
+            if pend is not None and pend[0] == letter:
+                self._select_combo(combo, pend[1])
+                self._pending_bind = None
+            combo.currentIndexChanged.connect(self._revalidate)
             row = QWidget(self)
             rl = QHBoxLayout(row)
             rl.setContentsMargins(0, 0, 0, 0)
@@ -1606,8 +1921,6 @@ class ExpressionLayerDialog(QDialog):
             self._combos[letter] = combo
             self._bind_rows[letter] = row
             self._bind_box.addWidget(row)
-        # Drop rows for letters no longer referenced (only when the
-        # expression parses cleanly, so partial typing doesn't churn).
         if letters:
             for letter in list(self._combos):
                 if letter not in letters:
@@ -1616,6 +1929,19 @@ class ExpressionLayerDialog(QDialog):
                     row.setParent(None)
                     row.deleteLater()
 
+    @staticmethod
+    def _select_combo(combo: QComboBox, val: tuple) -> None:
+        for i in range(combo.count()):
+            if combo.itemData(i) == val:
+                combo.setCurrentIndex(i)
+                return
+
+    def _apply_recipe_bindings(self, bindings: dict) -> None:
+        for letter, val in bindings.items():
+            combo = self._combos.get(letter)
+            if combo is not None:
+                self._select_combo(combo, gds_boolean.normalize_binding(val))
+
     # ── getters ─────────────────────────────────────────────────────────────
     def name(self) -> str:
         return self._name_edit.text().strip()
@@ -1623,27 +1949,41 @@ class ExpressionLayerDialog(QDialog):
     def expression(self) -> str:
         return self._expr_edit.text().strip()
 
-    def bindings(self) -> dict[str, tuple[int, int]]:
-        return {letter: combo.currentData()
+    def bindings(self) -> dict[str, tuple]:
+        return {letter: tuple(combo.currentData())
                 for letter, combo in self._combos.items()
                 if combo.currentData() is not None}
 
-    # ── actions ─────────────────────────────────────────────────────────────
+    # ── validation ───────────────────────────────────────────────────────────
     def _validate(self) -> Optional[str]:
         """Return an error string, or None if the form is valid."""
         if not self.name():
             return "Give the layer a name."
+        if not self.expression():
+            return "Enter an expression."
         try:
             _, ast = gds_boolean.parse_expression(self.expression())
         except Exception as exc:
             return f"Invalid expression: {exc}"
         refs = gds_boolean.referenced_layers(ast)
-        if not self._layer_keys:
-            return "No raw layers available to bind."
+        if not self._binding_options():
+            return "No layers available to bind."
         missing = [r for r in refs if r not in self.bindings()]
         if missing:
-            return f"Bind layer(s): {', '.join(sorted(missing))}"
+            return f"Bind: {', '.join(sorted(missing))}"
         return None
+
+    def _revalidate(self) -> None:
+        err = self._validate()
+        ok_btn = self._buttons.button(QDialogButtonBox.StandardButton.Save)
+        ok_btn.setEnabled(err is None)
+        if err:
+            self._result_lbl.setText(err)
+            self._result_lbl.setStyleSheet(f"color: {_TK_DANGER};")
+        elif not self._result_lbl.text() or self._result_lbl.text() in (
+                "Give the layer a name.", "Enter an expression."):
+            self._result_lbl.setText("ready")
+            self._result_lbl.setStyleSheet(f"color: {_TK_TEXT_SEC};")
 
     def _on_preview(self) -> None:
         err = self._validate()
@@ -1653,11 +1993,14 @@ class ExpressionLayerDialog(QDialog):
             return
         if self._preview_cb is None:
             return
-        ok, msg = self._preview_cb(self.name(), self.expression(),
-                                   self.bindings())
+        ok, msg, data = self._preview_cb(self.name(), self.expression(),
+                                         self.bindings())
         self._result_lbl.setText(msg)
         self._result_lbl.setStyleSheet(
             f"color: {_TK_SUCCESS};" if ok else f"color: {_TK_DANGER};")
+        self._preview.set_data(data if ok else None)
+        if not ok:
+            self._preview.set_message(msg)
 
     def _on_accept(self) -> None:
         err = self._validate()
@@ -2705,6 +3048,7 @@ class CoordinateSetupPanel(QGroupBox):
         self._fine_dy.setToolTip("Manual fine-tune Y (nm) for the < 1 FOV residual; range ±FOV.")
 
         self._corner_lbl = QLabel("→ chip corner: 0, 0 nm")
+        self._corner_lbl.setWordWrap(True)
         self._corner_lbl.setStyleSheet(_hint_qss(_FS_LABEL, pad="2px 0"))
         self._corner_lbl.setToolTip(
             "chip_corner = (DieX − GDS_off) × 1000 (µm→nm); "
@@ -2712,6 +3056,7 @@ class CoordinateSetupPanel(QGroupBox):
         self._nm_per_px.setToolTip(
             "GDS-to-SEM scale (nm per pixel). auto = FOV width ÷ image pixel width.")
         self._origin_lbl = QLabel("origin δ: 0, 0 nm")
+        self._origin_lbl.setWordWrap(True)
         self._origin_lbl.setStyleSheet(_hint_qss(_FS_LABEL, pad="2px 0"))
         self._origin_lbl.setToolTip(
             "Constant KLARF→GDS origin correction δ. Drag the GDS over the SEM "
@@ -2846,15 +3191,17 @@ class CoordinateSetupPanel(QGroupBox):
 
 
 class FineAlignPanel(QGroupBox):
-    """POI template settings + auto fine-alignment controls (plan M4b).
+    """Multi-POI template settings + auto fine-alignment controls (plan F3).
 
-    Select the POI layer on the left LayerPanel (the 'P' toggle); this panel
-    sets the synthetic GLVs / blur and the search radius, then runs
-    ``cv2.matchTemplate`` for the current image. Emits ``run_requested`` for
-    MainWindow to do the work."""
+    Toggle one or more POI layers on the left LayerPanel; each appears here
+    with its own FG grey-level spinbox. They composite into one synthetic
+    template (shared BG / blur), which is matched against the SEM with
+    ``cv2.matchTemplate``. Emits ``run_requested`` / ``run_all_requested`` /
+    ``preview_requested`` for MainWindow to do the work."""
 
     run_requested = pyqtSignal()
     run_all_requested = pyqtSignal()
+    preview_requested = pyqtSignal()
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__("Fine Align", parent)
@@ -2863,10 +3210,18 @@ class FineAlignPanel(QGroupBox):
         grid.setHorizontalSpacing(6)
         grid.setVerticalSpacing(4)
 
-        self._poi_lbl = QLabel("POI: (none — toggle 'P' on a layer)")
+        self._poi_lbl = QLabel("POI: (none — toggle 'POI' on a layer)")
         self._poi_lbl.setWordWrap(True)
         self._poi_lbl.setStyleSheet(_hint_qss(_FS_CAPTION))
         self._poi_set = False
+
+        # Per-POI FG grey rows live in their own box, rebuilt by set_pois().
+        self._poi_box = QWidget(self)
+        self._poi_box_layout = QVBoxLayout(self._poi_box)
+        self._poi_box_layout.setContentsMargins(0, 0, 0, 0)
+        self._poi_box_layout.setSpacing(3)
+        self._poi_fg_spins: dict[tuple, QSpinBox] = {}
+        self._poi_keys: list[tuple] = []
 
         def _spin(lo, hi, val, step=1, dec=0):
             s = QDoubleSpinBox(self) if dec else QSpinBox(self)
@@ -2877,10 +3232,9 @@ class FineAlignPanel(QGroupBox):
                 s.setDecimals(dec)
             return s
 
-        self._fg = _spin(0, 255, 200)
-        self._fg.setToolTip("Synthetic grey level for POI structure pixels.")
         self._bg = _spin(0, 255, 80)
-        self._bg.setToolTip("Synthetic grey level for background pixels.")
+        self._bg.setToolTip("Synthetic grey level for background pixels "
+                            "(shared by all POI layers).")
         self._blur = _spin(0.0, 20.0, 1.0, 0.5, 2)
         self._blur.setToolTip("Gaussian blur σ (px) softening template edges.")
         self._radius = _spin(0, 100_000, 200, 50)
@@ -2897,7 +3251,7 @@ class FineAlignPanel(QGroupBox):
         self._run_btn.setEnabled(False)
         self._run_btn.setToolTip(
             "Refine the alignment of the currently loaded ROI against the "
-            "selected SEM image (needs a POI + loaded ROI + image).")
+            "selected SEM image (needs ≥1 POI + loaded ROI + image).")
         self._run_btn.clicked.connect(self.run_requested)
 
         self._run_all_btn = QPushButton("Run all images", self)
@@ -2907,16 +3261,23 @@ class FineAlignPanel(QGroupBox):
             "(slow on big files; cancellable).")
         self._run_all_btn.clicked.connect(self.run_all_requested)
 
+        self._preview_btn = QPushButton("Preview template…", self)
+        self._preview_btn.setEnabled(False)
+        self._preview_btn.setToolTip(
+            "Show SEM / GDS / synthetic composite template side by side for "
+            "the current image (needs ≥1 POI + image).")
+        self._preview_btn.clicked.connect(self.preview_requested)
+
         self._result_lbl = QLabel("")
         self._result_lbl.setStyleSheet(f"font-size:{_FS_LABEL}px;")
 
         rows = [
-            ("span", self._poi_lbl), ("FG grey", self._fg),
+            ("span", self._poi_lbl), ("span", self._poi_box),
             ("BG grey", self._bg), ("Blur σ (px)", self._blur),
             ("Search radius (nm)", self._radius),
             ("Score threshold", self._thresh),
             ("span", self._run_btn), ("span", self._run_all_btn),
-            ("span", self._result_lbl),
+            ("span", self._preview_btn), ("span", self._result_lbl),
         ]
         # Single-column form (label above input) so labels aren't truncated in
         # the narrow panel (M7 R2), matching CoordinateSetupPanel.
@@ -2932,21 +3293,61 @@ class FineAlignPanel(QGroupBox):
                 grid.addWidget(w, r + 1, 0)
                 r += 2
 
-    def set_poi(self, label: Optional[str]) -> None:
-        self._poi_set = bool(label)
-        self._poi_lbl.setText(f"POI: {label}" if self._poi_set
-                              else "POI: (none — toggle 'P' on a layer)")
-        self._run_btn.setEnabled(self._poi_set)
-        self._run_all_btn.setEnabled(self._poi_set)
+    def set_pois(self, items: list) -> None:
+        """Rebuild the per-POI FG rows from ``items`` (``[(key, label), ...]``),
+        preserving any FG value already entered for a key (F3)."""
+        prev = {k: s.value() for k, s in self._poi_fg_spins.items()}
+        while self._poi_box_layout.count():
+            it = self._poi_box_layout.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        self._poi_fg_spins = {}
+        self._poi_keys = []
+        for key, label in items:
+            row = QWidget(self._poi_box)
+            hl = QHBoxLayout(row)
+            hl.setContentsMargins(0, 0, 0, 0)
+            hl.setSpacing(4)
+            name = QLabel(label, row)
+            name.setStyleSheet(_hint_qss(_FS_CAPTION))
+            name.setToolTip(label)
+            spin = QSpinBox(row)
+            spin.setRange(0, 255)
+            spin.setValue(int(prev.get(key, 200)))
+            spin.setFixedWidth(58)
+            spin.setToolTip("FG grey level for this POI layer's structure pixels.")
+            hl.addWidget(name, 1)
+            hl.addWidget(QLabel("FG", row))
+            hl.addWidget(spin)
+            self._poi_box_layout.addWidget(row)
+            self._poi_fg_spins[key] = spin
+            self._poi_keys.append(key)
+
+        self._poi_set = bool(items)
+        n = len(items)
+        self._poi_lbl.setText(
+            f"POI: {n} layer{'s' if n != 1 else ''} → composite template"
+            if self._poi_set else "POI: (none — toggle 'POI' on a layer)")
+        self._update_enabled()
+
+    def poi_fgs(self) -> dict:
+        """Map of ``key -> fg_glv`` for the active POI layers (F3)."""
+        return {k: int(s.value()) for k, s in self._poi_fg_spins.items()}
+
+    def _update_enabled(self, running: bool = False) -> None:
+        on = self._poi_set and not running
+        self._run_btn.setEnabled(on)
+        self._run_all_btn.setEnabled(on)
+        self._preview_btn.setEnabled(on)
 
     def set_running(self, running: bool) -> None:
         """Disable the run buttons while a batch is in flight."""
-        self._run_btn.setEnabled(self._poi_set and not running)
-        self._run_all_btn.setEnabled(self._poi_set and not running)
+        self._update_enabled(running)
 
     def values(self) -> dict:
         return {
-            "fg_glv": int(self._fg.value()),
             "bg_glv": int(self._bg.value()),
             "blur_sigma_px": float(self._blur.value()),
             "search_radius_nm": float(self._radius.value()),
@@ -2963,6 +3364,67 @@ class FineAlignPanel(QGroupBox):
 
     def clear_result(self) -> None:
         self._result_lbl.setText("")
+
+
+def _gray_to_pixmap(arr: np.ndarray) -> QPixmap:
+    """uint8 grayscale ndarray → QPixmap (F3 preview)."""
+    a = np.ascontiguousarray(arr.astype(np.uint8))
+    h, w = a.shape[:2]
+    img = QImage(a.tobytes(), w, h, w, QImage.Format.Format_Grayscale8)
+    return QPixmap.fromImage(img.copy())
+
+
+def _rgb_to_pixmap(arr: np.ndarray) -> QPixmap:
+    """uint8 (H, W, 3) RGB ndarray → QPixmap (F3 preview)."""
+    a = np.ascontiguousarray(arr.astype(np.uint8))
+    h, w = a.shape[:2]
+    img = QImage(a.tobytes(), w, h, 3 * w, QImage.Format.Format_RGB888)
+    return QPixmap.fromImage(img.copy())
+
+
+class TemplatePreviewDialog(QDialog):
+    """Side-by-side SEM / GDS / synthetic-template preview for the current
+    image, so a multi-POI composite can be eyeballed against the real SEM
+    (plan F3 M5)."""
+
+    _TILE = 280
+
+    def __init__(self, parent, sem: np.ndarray, gds_rgb: np.ndarray,
+                 template: np.ndarray, subtitle: str = "") -> None:
+        super().__init__(parent)
+        self.setWindowTitle("POI template preview")
+        v = QVBoxLayout(self)
+        if subtitle:
+            cap = QLabel(subtitle)
+            cap.setWordWrap(True)
+            cap.setStyleSheet(_hint_qss(_FS_LABEL))
+            v.addWidget(cap)
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        tiles = [("SEM", _gray_to_pixmap(sem)),
+                 ("GDS", _rgb_to_pixmap(gds_rgb)),
+                 ("Template", _gray_to_pixmap(template))]
+        for title, pm in tiles:
+            col = QVBoxLayout()
+            t = QLabel(title)
+            t.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+            t.setStyleSheet(f"font-weight:700; color:{_TK_ACCENT_DK.name()};")
+            pic = QLabel()
+            pic.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            pic.setFixedSize(self._TILE, self._TILE)
+            pic.setStyleSheet(f"background:#1a1a1a; border:1px solid {_TK_BORDER.name()};")
+            if not pm.isNull():
+                pic.setPixmap(pm.scaled(
+                    self._TILE, self._TILE, Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation))
+            col.addWidget(t)
+            col.addWidget(pic)
+            row.addLayout(col)
+        v.addLayout(row)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        btns.rejected.connect(self.reject)
+        btns.accepted.connect(self.accept)
+        v.addWidget(btns)
 
 
 class _ImageListDelegate(QStyledItemDelegate):
@@ -3102,7 +3564,7 @@ class SemPanel(QFrame):
         v.addWidget(self.load_roi_btn)
 
         # Fine Align is only needed while aligning — start collapsed; expands
-        # when a POI is selected (MainWindow._on_poi_changed).
+        # when a POI is selected (MainWindow._on_pois_changed).
         self.fine_align = FineAlignPanel(self)
         self._fine_section = self._wrap_section(
             "Fine Align", self.fine_align, collapsed=True)
@@ -3211,7 +3673,7 @@ class AlignmentExportDialog(QDialog):
     def __init__(self, parent, images) -> None:
         super().__init__(parent)
         self.setWindowTitle("Export alignment")
-        self.setMinimumWidth(360)
+        self.setMinimumWidth(_capped_min_width(360))
         v = QVBoxLayout(self)
 
         v.addWidget(QLabel("Format"))
@@ -3269,6 +3731,11 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("GLAS")
         self.resize(1200, 800)
+        # Left (260) + right (300) fixed panels + a usable centre + chrome: stop
+        # the window shrinking into a cramped, broken layout (F3 M1). Capped to
+        # the screen so small displays still open.
+        _avw, _avh = _screen_avail()
+        self.setMinimumSize(min(940, _avw), min(600, _avh))
         # Coordinate Setup starts collapsed (see SemPanel); don't auto-collapse
         # again so a user re-expanding it sticks.
         self._coord_collapsed_once = True
@@ -3285,7 +3752,7 @@ class MainWindow(QMainWindow):
         center_layout = QVBoxLayout(center)
         center_layout.setContentsMargins(0, 0, 0, 0)
         center_layout.setSpacing(0)
-        toolbar = self._build_toolbar()
+        toolbar = self._wrap_toolbar(self._build_toolbar())
         center_layout.addWidget(toolbar)
 
         # Workflow guidance strip (M6.6): shows the next step to take; hides
@@ -3346,7 +3813,9 @@ class MainWindow(QMainWindow):
         # Wire signals.
         self.layer_panel.layers_changed.connect(self._on_layers_changed)
         self.layer_panel.add_expression_requested.connect(self._on_add_expression)
-        self.layer_panel.poi_changed.connect(self._on_poi_changed)
+        self.layer_panel.edit_expression_requested.connect(self._on_edit_recipe)
+        self.layer_panel.delete_expression_requested.connect(self._on_delete_recipe)
+        self.layer_panel.pois_changed.connect(self._on_pois_changed)
         self.canvas.cursor_pos_nm.connect(self._on_cursor)
         self.canvas.defect_clicked.connect(self._on_defect_clicked)
         self.sem_panel.load_klarf_requested.connect(self._on_load_klarf)
@@ -3356,6 +3825,7 @@ class MainWindow(QMainWindow):
         self.sem_panel.coord_setup.changed.connect(self._on_coord_changed)
         self.sem_panel.fine_align.run_requested.connect(self._on_run_fine_align)
         self.sem_panel.fine_align.run_all_requested.connect(self._on_run_fine_align_all)
+        self.sem_panel.fine_align.preview_requested.connect(self._on_preview_template)
         self.sem_viewer.drag_changed.connect(self._on_overlay_drag)
 
         self._doc: Optional[GdsDocument] = None
@@ -3393,8 +3863,14 @@ class MainWindow(QMainWindow):
         self._roi_center: Optional[tuple[float, float]] = None
         # Color cycle for synthetic expression layers.
         self._expr_color_idx = 0
+        # F4: synthetic-layer "recipes" — the single source of truth for
+        # expression layers. Each is {"name", "expr", "bindings", "color"};
+        # bindings values are tagged ("raw", l, d) / ("ref", name). The doc's
+        # synthetic LayerEntries are derived from these and re-evaluated against
+        # each new FOV (ROI load / cache load) so they follow the defect.
+        self._recipes: list[dict] = []
         # M4b fine align: chosen POI layer + per-image refined offset.
-        self._poi_entry: Optional[LayerEntry] = None
+        self._poi_entries: list[LayerEntry] = []
         self._refined: dict = {}     # image_id -> (dx_nm, dy_nm, score)
         # M4b "Run all" batch worker state.
         self._fa_thread: Optional[QThread] = None
@@ -3554,12 +4030,31 @@ class MainWindow(QMainWindow):
 
         h.addStretch(1)
         # Bolder labels (user request) — set per-button so it can't bleed
-        # background like a parent stylesheet would.
+        # background like a parent stylesheet would. Then pin each button's
+        # minimum width to its (bold) hint so a non-maximized window can never
+        # squeeze a button narrower than its text — the toolbar scrolls
+        # horizontally instead (see _wrap_toolbar). (F3 fix)
         for b in bar.findChildren(QPushButton):
             fb = b.font()
             fb.setBold(True)
             b.setFont(fb)
+            b.setMinimumWidth(b.sizeHint().width())
         return bar
+
+    def _wrap_toolbar(self, bar: QWidget) -> QScrollArea:
+        """Put the toolbar in a horizontal scroll area so a narrow window
+        scrolls it instead of clipping button text (F3 fix)."""
+        sa = QScrollArea(self)
+        sa.setObjectName("gdsToolbarScroll")
+        sa.setFrameShape(QFrame.Shape.NoFrame)
+        sa.setWidgetResizable(True)
+        sa.setWidget(bar)
+        sa.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        sa.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        sa.setStyleSheet(f"QScrollArea#gdsToolbarScroll {{ background: {_TK_TOOLBAR_BG}; }}")
+        sb = sa.style().pixelMetric(QStyle.PixelMetric.PM_ScrollBarExtent)
+        sa.setFixedHeight(bar.sizeHint().height() + sb)
+        return sa
 
     _NUDGE_NM = 10.0   # δ step per arrow-key press
 
@@ -3914,26 +4409,43 @@ class MainWindow(QMainWindow):
         self._fit_view_to_defects()
         self._status_doc.setText("origin δ cleared")
 
-    # ── M4b: POI template + auto fine alignment ──────────────────────────────
-    def _on_poi_changed(self, entry) -> None:
-        self._poi_entry = entry
-        self.sem_panel.fine_align.set_poi(
-            entry.key.label() if entry is not None else None)
-        if entry is not None:          # expand Fine Align when a POI is picked
+    # ── F3: multi-POI template + auto fine alignment ─────────────────────────
+    def _on_pois_changed(self, entries) -> None:
+        self._poi_entries = list(entries or [])
+        self.sem_panel.fine_align.set_pois(
+            [(e.key.key(), _entry_label(e)) for e in self._poi_entries])
+        if self._poi_entries:          # expand Fine Align when a POI is picked
             self.sem_panel.set_fine_collapsed(False)
 
-    def _on_run_fine_align(self) -> None:
-        """Refine the current image's alignment via POI-template matching.
+    def _poi_layers(self) -> list:
+        """``[(polygons, fg_glv), ...]`` for the active POI layers (F3),
+        each at its own FG grey from the panel."""
+        fgs = self.sem_panel.fine_align.poi_fgs()
+        return [(e.polygons, fgs.get(e.key.key(), 200))
+                for e in self._poi_entries if e.polygons]
 
-        Renders the POI layer at the coarse position, runs
-        ``cv2.matchTemplate`` against the loaded SEM frame, stores the residual
-        as a per-image correction and re-jumps so the overlay snaps onto the
-        structure (plan M4b, single-image path)."""
+    def _build_template(self, anchor, W, H, nm_per_px, cfg):
+        """Composite the active POI layers into one template at ``anchor``."""
+        return render_composite_template(
+            self._poi_layers(), anchor, W, H, nm_per_px,
+            cfg["bg_glv"], cfg["blur_sigma_px"])
+
+    def _coarse_anchor(self, img):
+        """Coarse FOV-centre GDS anchor for ``img`` (klarf→gds + fine + δ),
+        excluding any refined offset so the search starts from coarse."""
+        gx, gy = gds_fov.klarf_to_gds(
+            img.xrel, img.yrel, self._chip_corner_x, self._chip_corner_y)
+        return (gx + self._fine_dx + self._origin_dx,
+                gy + self._fine_dy + self._origin_dy)
+
+    def _on_run_fine_align(self) -> None:
+        """Refine the current image's alignment via composite POI-template
+        matching (plan F3, single-image path)."""
         if cv2 is None:
             QMessageBox.warning(self, "Fine align",
                                 "opencv (cv2) is required for fine alignment.")
             return
-        if self._poi_entry is None or not self._poi_entry.polygons:
+        if not self._poi_layers():
             self._status_doc.setText("fine align: select a POI layer first")
             return
         img = self._current_sem
@@ -3948,17 +4460,10 @@ class MainWindow(QMainWindow):
         if nm_per_px <= 0:
             self._status_doc.setText("fine align: set FOV / nm-per-px first")
             return
-        # Render at the coarse position (klarf→gds + fine + δ), excluding the
-        # current refined offset so the search starts from coarse each run.
-        gx, gy = gds_fov.klarf_to_gds(
-            img.xrel, img.yrel, self._chip_corner_x, self._chip_corner_y)
-        anchor = (gx + self._fine_dx + self._origin_dx,
-                  gy + self._fine_dy + self._origin_dy)
+        anchor = self._coarse_anchor(img)
         H, W = sem.shape[:2]
         cfg = self.sem_panel.fine_align.values()
-        template = render_poi_template(
-            self._poi_entry.polygons, anchor, W, H, nm_per_px,
-            cfg["fg_glv"], cfg["bg_glv"], cfg["blur_sigma_px"])
+        template = self._build_template(anchor, W, H, nm_per_px, cfg)
         radius_px = cfg["search_radius_nm"] / nm_per_px
         dx_nm, dy_nm, score, _ = fine_align_one(sem, template, nm_per_px, radius_px)
         self._refined[img.image_id] = (dx_nm, dy_nm, score)
@@ -3979,27 +4484,82 @@ class MainWindow(QMainWindow):
         arr = cv2.imread(str(img.file_path), cv2.IMREAD_GRAYSCALE)
         return arr
 
-    def _poi_spec(self):
-        """The POI as a batch-walkable spec, or None (M4b Run all)."""
-        e = self._poi_entry
-        if e is None:
-            return None
+    def _entry_spec(self, e):
+        """One POI layer as a batch-walkable spec, or None (F3). Synthetic
+        layers carry a recipe snapshot so nested refs can be resolved over
+        the ROI during batch fine align."""
         if e.key.synthetic:
             if not e.expr_text or not e.expr_bindings:
                 return None
-            return ("expr", e.expr_text, dict(e.expr_bindings))
+            return ("expr", e.expr_text, dict(e.expr_bindings),
+                    self._recipes_map())
         return ("raw", e.key.layer, e.key.datatype)
 
+    def _poi_specs(self):
+        """Active POIs as ``[(spec, fg_glv), ...]`` for batch (F3 Run all)."""
+        fgs = self.sem_panel.fine_align.poi_fgs()
+        out = []
+        for e in self._poi_entries:
+            spec = self._entry_spec(e)
+            if spec is not None:
+                out.append((spec, fgs.get(e.key.key(), 200)))
+        return out
+
+    def _render_gds_preview(self, anchor, W, H, nm_per_px) -> np.ndarray:
+        """RGB (H, W, 3) raster of the visible GDS layers over the FOV centred
+        on ``anchor`` at SEM resolution, each in its layer colour (F3 M5)."""
+        gx, gy = anchor
+        half_w = W / 2.0 * nm_per_px
+        half_h = H / 2.0 * nm_per_px
+        bbox = (gx - half_w, gy - half_h, gx + half_w, gy + half_h)
+        rgb = np.full((H, W, 3), 255, dtype=np.uint8)
+        entries = self._doc.visible_entries() if self._doc else []
+        for e in entries:
+            if not e.polygons:
+                continue
+            mask = _fit_mask(rasterize_layer(e.polygons, bbox, nm_per_px), H, W)
+            c = e.color
+            rgb[mask > 0] = (c.red(), c.green(), c.blue())
+        return rgb
+
+    def _on_preview_template(self) -> None:
+        """Pop the SEM / GDS / composite-template comparison (plan F3 M5)."""
+        if not self._poi_layers():
+            self._status_doc.setText("preview: select a POI layer first")
+            return
+        img = self._current_sem
+        if img is None or not img.has_coords:
+            self._status_doc.setText("preview: select an image with coordinates")
+            return
+        sem = self._load_sem_gray(img)
+        if sem is None:
+            self._status_doc.setText("preview: SEM image not readable")
+            return
+        nm_per_px = self._effective_nm_per_px()
+        if nm_per_px <= 0:
+            self._status_doc.setText("preview: set FOV / nm-per-px first")
+            return
+        anchor = self._coarse_anchor(img)
+        H, W = sem.shape[:2]
+        cfg = self.sem_panel.fine_align.values()
+        template = self._build_template(anchor, W, H, nm_per_px, cfg)
+        gds_rgb = self._render_gds_preview(anchor, W, H, nm_per_px)
+        names = "; ".join(_entry_label(e) for e in self._poi_entries)
+        ref = self._refined.get(img.image_id)
+        score = f"  ·  score {ref[2]:.3f}" if ref else ""
+        subtitle = f"{img.image_id}  ·  POI: {names}{score}"
+        TemplatePreviewDialog(self, sem, gds_rgb, template, subtitle).exec()
+
     def _on_run_fine_align_all(self) -> None:
-        """Batch fine-align every image with coordinates (plan M4b Run all)."""
+        """Batch fine-align every image with coordinates (plan F3 Run all)."""
         if cv2 is None:
             QMessageBox.warning(self, "Fine align",
                                 "opencv (cv2) is required for fine alignment.")
             return
         if self._fa_thread is not None:
             return  # already running
-        spec = self._poi_spec()
-        if spec is None:
+        specs = self._poi_specs()
+        if not specs:
             self._status_doc.setText("run all: select a POI layer first")
             return
         if self._rar is None or self._roi_root is None:
@@ -4020,7 +4580,7 @@ class MainWindow(QMainWindow):
         self._fa_progress.set_text("Fine aligning all images…")
         self._fa_thread = QThread(self)
         self._fa_worker = FineAlignAllWorker(
-            self._rar, self._roi_root, spec, jobs, cfg)
+            self._rar, self._roi_root, specs, jobs, cfg)
         self._fa_worker.moveToThread(self._fa_thread)
         self._fa_thread.started.connect(self._fa_worker.run)
         self._fa_worker.progress.connect(self._on_fa_progress)
@@ -4100,7 +4660,7 @@ class MainWindow(QMainWindow):
         images = [i for i in self._sem_images if i.image_id in ids]
         gds_path = self._oas_path or (str(self._doc.path)
                                       if self._doc and self._doc.path else "")
-        poi = self._poi_entry.key.label() if self._poi_entry else ""
+        poi = "; ".join(_entry_label(e) for e in self._poi_entries)
         rows = alignment_rows(
             images, self._refined, coarse_of=self._coarse_gds,
             klarf_path=self._klarf_path, gds_path=gds_path,
@@ -4226,6 +4786,9 @@ class MainWindow(QMainWindow):
         self._doc = doc
         self.layer_panel.set_document(doc)
         self.canvas.set_document(doc)
+        # F4: re-evaluate the Boolean recipes against this defect's ROI so the
+        # synthetic layers follow the FOV (instead of being lost on reload).
+        expr_errs = self._recompute_recipes(doc.bbox_nm)
         # Keep the user's current (overview) view; just refresh the FOV box.
         # Don't re-centre/zoom onto the ROI — that's what made the marker
         # look stuck in the middle of the screen. Zoom in manually to
@@ -4243,6 +4806,8 @@ class MainWindow(QMainWindow):
                f"{total_polys} polys ({pruned:,} instances pruned)")
         if errs:
             msg += f" · ⚠ {errs} cell decode error(s) — run with --debug"
+        if expr_errs:
+            msg += f" · ⚠ expr: {'; '.join(expr_errs)}"
         self._status_doc.setText(msg)
         if total_rects == 0 and total_polys == 0:
             self._status_cursor.setText(
@@ -4353,6 +4918,9 @@ class MainWindow(QMainWindow):
         self._oas_path = path
         self._roi_root = root
         self._roi_layers = layer_keys
+        # New layout → drop any recipes from a previously-open file (recipes
+        # persist across ROI reloads of the SAME file, not across files).
+        self._recipes = []
         lyr_txt = ", ".join(f"L{l}/D{d}" for l, d in layer_keys)
         self._status_doc.setText(
             f"ROI mode: {Path(path).name} · root '{root}' · {lyr_txt}"
@@ -4379,24 +4947,26 @@ class MainWindow(QMainWindow):
     def _eval_expression(self, expr: str, bindings: dict,
                          fov: tuple[float, float, float, float]) -> list:
         """Evaluate ``expr`` over the polygons inside ``fov`` and return a
-        list of result polygons (each ``(n, 2)`` ndarray). Raises on parse
-        / evaluation error or missing shapely (caller shows the message)."""
+        list of result polygons (each ``(n, 2)`` ndarray). Bindings may be
+        raw layers or references to other synthetic recipes (nested). Raises
+        on parse / evaluation error or missing shapely (caller shows it)."""
         x0, y0, x1, y1 = fov
         cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
         w, h = (x1 - x0), (y1 - y0)
-        _, ast = gds_boolean.parse_expression(expr)
-        geoms: dict[str, object] = {}
-        for letter, key in bindings.items():
-            entry = (self._doc.find(LayerKey(layer=key[0], datatype=key[1]))
+
+        def raw_provider(layer: int, datatype: int):
+            entry = (self._doc.find(LayerKey(layer=layer, datatype=datatype))
                      if self._doc is not None else None)
             if entry is None or entry.bboxes is None or entry.bboxes.shape[0] == 0:
-                geoms[letter] = gds_boolean.polys_to_geometry([])
-                continue
+                return gds_boolean.polys_to_geometry([])
             idx = gds_fov.fov_overlap_indices(cx, cy, w, h, entry.bboxes)
             sel = [entry.polygons[int(i)] for i in idx]
-            geoms[letter] = gds_boolean.polys_to_geometry(sel)
-        fov_bbox = gds_boolean.fov_box(cx, cy, w, h)
-        geom = gds_boolean.evaluate(ast, geoms, fov_bbox=fov_bbox)
+            return gds_boolean.polys_to_geometry(sel)
+
+        geom = gds_boolean.resolve_expression(
+            expr, bindings, raw_provider=raw_provider,
+            recipe_provider=self._recipe_def,
+            fov_bbox=gds_boolean.fov_box(cx, cy, w, h))
         return gds_boolean.geometry_to_polygons(geom)
 
     def _next_expr_color(self) -> QColor:
@@ -4404,45 +4974,114 @@ class MainWindow(QMainWindow):
         self._expr_color_idx += 1
         return QColor(c)
 
-    def _upsert_expression_layer(self, name: str, expr: str, bindings: dict,
-                                 fov: tuple[float, float, float, float],
-                                 color: Optional[QColor] = None) -> int:
-        """Evaluate + add (or replace) a synthetic expression layer named
-        ``name``. Returns the polygon count. Does not recompute the global
-        bbox (the result lies inside the FOV, hence inside the existing
-        extent) so large raw layers aren't re-scanned."""
-        polys = self._eval_expression(expr, bindings, fov)
-        bboxes = self._bboxes_from_polys(polys)
-        key = LayerKey(layer=-1, datatype=0, name=name, synthetic=True)
-        # Reuse the existing color when replacing the same-named layer.
-        existing = self._doc.find(key) if self._doc is not None else None
+    # ── F4: synthetic-layer recipe store ────────────────────────────────────
+    def _recipe(self, name: str) -> Optional[dict]:
+        for r in self._recipes:
+            if r["name"] == name:
+                return r
+        return None
+
+    def _recipe_def(self, name: str):
+        """``(expr, bindings)`` for a recipe, or None — the recipe_provider
+        passed to :func:`gds_boolean.resolve_expression` for nested refs."""
+        r = self._recipe(name)
+        return (r["expr"], r["bindings"]) if r is not None else None
+
+    def _recipes_map(self) -> dict:
+        """Snapshot ``{name: (expr, bindings)}`` for the batch (F3) path."""
+        return {r["name"]: (r["expr"], dict(r["bindings"]))
+                for r in self._recipes}
+
+    def _register_recipe(self, name: str, expr: str, bindings: dict,
+                         color: Optional[QColor] = None,
+                         old_name: Optional[str] = None) -> None:
+        """Insert or update a recipe. When ``old_name`` is given (edit), the
+        existing recipe is replaced in place (keeping its slot / colour)."""
+        bindings = {k: gds_boolean.normalize_binding(v)
+                    for k, v in bindings.items()}
+        target = old_name or name
+        existing = self._recipe(target)
         if color is None:
-            color = existing.color if existing is not None else self._next_expr_color()
-        entry = LayerEntry(key=key, polygons=polys, visible=True,
-                           color=color, bboxes=bboxes,
-                           expr_text=expr, expr_bindings=dict(bindings))
+            color = (QColor(existing["color"]) if existing is not None
+                     else self._next_expr_color())
+        rec = {"name": name, "expr": expr, "bindings": bindings,
+               "color": QColor(color).name()}
+        if existing is not None:
+            self._recipes[self._recipes.index(existing)] = rec
+        else:
+            self._recipes.append(rec)
+
+    def _recipe_fov(self) -> tuple[float, float, float, float]:
+        """FOV to evaluate recipes over: the loaded ROI extent when present,
+        else the whole document extent."""
+        if self._doc is not None and self._doc.entries:
+            return self._doc.bbox_nm
+        return (0.0, 0.0, 0.0, 0.0)
+
+    def _recompute_recipes(self,
+                           fov: Optional[tuple[float, float, float, float]]
+                           = None) -> list[str]:
+        """Rebuild every synthetic LayerEntry from the recipes, evaluated
+        against ``fov`` (default: the current ROI / document extent). This is
+        what makes Boolean layers follow the defect — it runs after each ROI /
+        cache load. Returns a list of per-recipe error strings (empty = ok)."""
+        if self._doc is None:
+            return []
         self._doc.entries = [e for e in self._doc.entries
-                             if not (e.key.synthetic and e.key.name == name)]
-        self._doc.entries.append(entry)
+                             if not e.key.synthetic]
+        if fov is None:
+            fov = self._recipe_fov()
+        errors: list[str] = []
+        for r in self._recipes:
+            try:
+                polys = self._eval_expression(r["expr"], r["bindings"], fov)
+            except Exception as exc:
+                errors.append(f"{r['name']}: {exc}")
+                polys = []
+            key = LayerKey(layer=-1, datatype=0, name=r["name"], synthetic=True)
+            self._doc.entries.append(LayerEntry(
+                key=key, polygons=polys, visible=True, color=QColor(r["color"]),
+                bboxes=self._bboxes_from_polys(polys),
+                expr_text=r["expr"], expr_bindings=dict(r["bindings"])))
         self.layer_panel.set_document(self._doc)
         self.canvas.refresh()
-        return len(polys)
+        return errors
 
     def _preview_expression(self, name: str, expr: str,
-                            bindings: dict) -> tuple[bool, str]:
-        """Preview callback for ExpressionLayerDialog: evaluate over the
-        canvas's current view and draw the result live."""
-        if self._doc is None:
-            return (False, "Load a layout first.")
-        try:
-            n = self._upsert_expression_layer(
-                name or "preview", expr, bindings,
-                self.canvas.viewport_bbox_nm())
-        except Exception as exc:
-            return (False, str(exc))
-        return (True, f"{n} polygons in current view")
+                            bindings: dict) -> tuple:
+        """Preview callback for ExpressionLayerDialog. Evaluates over the
+        canvas's current view and returns ``(ok, msg, data)`` for the dialog's
+        embedded preview — WITHOUT mutating the main document/canvas, so the
+        user reviews the result inside the dialog and only commits on Save.
 
-    def _on_add_expression(self) -> None:
+        ``data`` = ``{"result": [polys], "context": [(polys, QColor)], "fov":
+        bbox}`` (``result`` = the synthetic geometry; ``context`` = the bound
+        raw layers, drawn faintly for reference)."""
+        if self._doc is None:
+            return (False, "Load a layout first.", None)
+        fov = self.canvas.viewport_bbox_nm()
+        try:
+            result = self._eval_expression(expr, bindings, fov)
+        except Exception as exc:
+            return (False, str(exc), None)
+        x0, y0, x1, y1 = fov
+        cx, cy, w, h = (x0 + x1) / 2.0, (y0 + y1) / 2.0, (x1 - x0), (y1 - y0)
+        context: list = []
+        for val in bindings.values():
+            v = gds_boolean.normalize_binding(val)
+            if v[0] != "raw":
+                continue
+            entry = self._doc.find(LayerKey(layer=v[1], datatype=v[2]))
+            if entry is None or entry.bboxes is None or entry.bboxes.shape[0] == 0:
+                continue
+            idx = gds_fov.fov_overlap_indices(cx, cy, w, h, entry.bboxes)
+            context.append(([entry.polygons[int(i)] for i in idx], entry.color))
+        data = {"result": result, "context": context, "fov": fov}
+        return (True, f"{len(result)} polygons in current view", data)
+
+    def _open_expression_dialog(self, recipe: Optional[dict] = None) -> None:
+        """Open the compose dialog to create a new recipe (``recipe`` None) or
+        edit an existing one (prefilled)."""
         if self._doc is None or not self._doc.entries:
             QMessageBox.information(self, "No layout",
                                     "Load a GDS / OASIS file first.")
@@ -4452,19 +5091,64 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "No raw layers",
                                     "There are no raw layers to compose.")
             return
-        dlg = ExpressionLayerDialog(self, keys,
-                                    preview_cb=self._preview_expression)
+        # Synthetic layers available to reference (exclude the one being edited
+        # so a recipe can't bind to itself).
+        refs = [r["name"] for r in self._recipes
+                if recipe is None or r["name"] != recipe["name"]]
+        dlg = ExpressionLayerDialog(
+            self, keys, ref_names=refs, preview_cb=self._preview_expression,
+            recipe=recipe)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        try:
-            n = self._upsert_expression_layer(
-                dlg.name(), dlg.expression(), dlg.bindings(),
-                self.canvas.viewport_bbox_nm())
-        except Exception as exc:
-            QMessageBox.critical(self, "Expression failed", str(exc))
+        old_name = recipe["name"] if recipe is not None else None
+        self._register_recipe(dlg.name(), dlg.expression(), dlg.bindings(),
+                              old_name=old_name)
+        errors = self._recompute_recipes()
+        n = len(self._recipe(dlg.name())["bindings"])
+        if errors:
+            self._status_doc.setText("expression error · " + "; ".join(errors))
+        else:
+            self._status_doc.setText(
+                f"expression layer '{dlg.name()}' · {n} binding(s)")
+
+    def _on_add_expression(self) -> None:
+        # Deferred so the triggering widget's signal/event handler fully
+        # unwinds before the modal dialog (and the set_document that follows)
+        # runs — opening exec() inside a row handler that then gets deleted is
+        # a use-after-free that crashes PyQt.
+        QTimer.singleShot(0, lambda: self._open_expression_dialog(None))
+
+    def _on_edit_recipe(self, name: str) -> None:
+        QTimer.singleShot(0, lambda: self._edit_recipe_deferred(name))
+
+    def _edit_recipe_deferred(self, name: str) -> None:
+        rec = self._recipe(name)
+        if rec is not None:
+            self._open_expression_dialog(rec)
+
+    def _on_delete_recipe(self, name: str) -> None:
+        # Defer for the same reason as edit: the ✕ click handler lives on a
+        # row that _recompute_recipes() → set_document() deletes.
+        QTimer.singleShot(0, lambda: self._delete_recipe_deferred(name))
+
+    def _delete_recipe_deferred(self, name: str) -> None:
+        rec = self._recipe(name)
+        if rec is None:
             return
-        self._status_doc.setText(
-            f"expression layer '{dlg.name()}' · {n} polygons")
+        # Block deleting a recipe still referenced by another (would orphan it).
+        dependents = [r["name"] for r in self._recipes
+                      if r is not rec and any(
+                          gds_boolean.normalize_binding(v)[:2] == ("ref", name)
+                          for v in r["bindings"].values())]
+        if dependents:
+            QMessageBox.warning(
+                self, "Cannot delete",
+                f"'{name}' is referenced by: {', '.join(dependents)}. "
+                f"Delete or edit those first.")
+            return
+        self._recipes.remove(rec)
+        self._recompute_recipes()
+        self._status_doc.setText(f"deleted expression layer '{name}'")
 
     # ── M2.1: layer cache export / import ───────────────────────────────────
     def _on_export_cache(self) -> None:
@@ -4505,20 +5189,16 @@ class MainWindow(QMainWindow):
         self._status_doc.setText(f"cache exported · {Path(path).name}")
 
     def _save_expr_sidecar(self, npz_path: str) -> None:
-        """Write expression-layer definitions next to the cache as
-        ``<stem>_expr.json`` (plan M2.6)."""
-        exprs = []
-        for e in self._doc.entries:
-            if e.key.synthetic and e.expr_text:
-                exprs.append({
-                    "name": e.key.name,
-                    "expr": e.expr_text,
-                    "bindings": {k: list(v)
-                                 for k, v in (e.expr_bindings or {}).items()},
-                    "color": e.color.name(),
-                })
-        if not exprs:
+        """Write expression-layer recipes next to the cache as
+        ``<stem>_expr.json`` (plan M2.6 / F4)."""
+        if not self._recipes:
             return
+        exprs = [{
+            "name": r["name"],
+            "expr": r["expr"],
+            "bindings": {k: list(v) for k, v in r["bindings"].items()},
+            "color": r["color"],
+        } for r in self._recipes]
         sidecar = Path(npz_path).with_name(Path(npz_path).stem + "_expr.json")
         sidecar.write_text(json.dumps(exprs, indent=2), encoding="utf-8")
 
@@ -4566,8 +5246,11 @@ class MainWindow(QMainWindow):
         self.sem_panel.set_coord_collapsed(True)
 
     def _restore_expr_sidecar(self, npz_path: str) -> None:
-        """Recreate expression layers from ``<stem>_expr.json`` by
-        re-evaluating over the loaded document's full extent."""
+        """Recreate expression-layer recipes from ``<stem>_expr.json`` and
+        re-evaluate them over the loaded document's extent."""
+        # A freshly-loaded cache fully owns the recipe set — clear any from a
+        # previously-open file even when this cache has no sidecar.
+        self._recipes = []
         sidecar = Path(npz_path).with_name(Path(npz_path).stem + "_expr.json")
         if not sidecar.exists():
             return
@@ -4576,17 +5259,12 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError):
             return
         for d in defs:
-            bindings = {k: tuple(v) for k, v in d.get("bindings", {}).items()}
-            color = QColor(d.get("color") or "#d44fa0")
-            try:
-                self._upsert_expression_layer(
-                    d.get("name", "expr"), d.get("expr", ""), bindings,
-                    self._doc.bbox_nm, color=color)
-            except Exception:
-                # A definition that no longer evaluates (e.g. its bound
-                # layer wasn't included in this cache) is skipped rather
-                # than aborting the whole restore.
-                pass
+            bindings = {k: gds_boolean.normalize_binding(tuple(v))
+                        for k, v in d.get("bindings", {}).items()}
+            self._register_recipe(
+                d.get("name", "expr"), d.get("expr", ""), bindings,
+                color=QColor(d.get("color") or "#d44fa0"))
+        self._recompute_recipes(self._doc.bbox_nm)
 
     def _show_about(self) -> None:
         dlg = QDialog(self)

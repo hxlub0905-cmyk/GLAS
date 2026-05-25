@@ -15,7 +15,7 @@ Usage:
 from __future__ import annotations
 
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSizePolicy,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLayout, QPushButton, QSizePolicy,
 )
 
 # ── Tier visual tokens (kept here so they travel with the widget) ─────────────
@@ -123,6 +123,11 @@ class CollapsibleSection(QWidget):
         self._body_layout = QVBoxLayout(self._body)
         self._body_layout.setContentsMargins(*content_margins)
         self._body_layout.setSpacing(5)
+        # Honour the content's minimum size so an expanded section can never be
+        # squeezed shorter than its widgets inside a constrained column (e.g.
+        # the SEM panel's scroll area) — that squeeze is what clipped the
+        # Coordinate Setup fields/buttons when expanded (F3 M1).
+        self._body_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         outer.addWidget(self._body)
         self._body.setVisible(not collapsed)
 

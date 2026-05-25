@@ -130,6 +130,49 @@ class CellContent:
         return out
 
 
+def _iv_contains(iv: tuple, v: int) -> bool:
+    """Does an OASIS unsigned-interval ``(min, max)`` contain ``v``?
+    ``max == -1`` is the spec's INF sentinel (see decode_interval)."""
+    lo, hi = iv
+    return v >= lo and (hi < 0 or v <= hi)
+
+
+def _iv_width(iv: tuple) -> float:
+    """Width of an OASIS interval; ``inf`` for an unbounded (``..INF``) one."""
+    lo, hi = iv
+    return (hi - lo) if hi >= 0 else float("inf")
+
+
+def _iv_is_all_layers(iv: tuple) -> bool:
+    """An ``(0, INF)`` interval — matches every layer, so a LAYERNAME using it
+    is a file-wide default/placeholder that can't distinguish layers."""
+    return iv[0] == 0 and iv[1] < 0
+
+
+def resolve_layer_name(layernames: list, layer: int, datatype: int) -> str:
+    """Name for ``(layer, datatype)`` from LAYERNAME records, or "" (F3 M2).
+
+    ``layernames`` is ``[(name, layer_iv, datatype_iv), ...]``. Among the
+    records containing ``(layer, datatype)`` the *most specific* wins (narrowest
+    layer interval, then narrowest datatype interval) so a broad range never
+    masks an exact label. An all-layers ``(0, INF)`` catch-all is skipped
+    entirely — otherwise a single placeholder LAYERNAME would label every layer
+    the same (the observed "every layer shows the first name" bug)."""
+    best: Optional[str] = None
+    best_key: Optional[tuple] = None
+    for name, liv, div in layernames:
+        if not name:
+            continue
+        if not (_iv_contains(liv, layer) and _iv_contains(div, datatype)):
+            continue
+        if _iv_is_all_layers(liv):
+            continue
+        key = (_iv_width(liv), _iv_width(div))
+        if best is None or key < best_key:
+            best, best_key = name, key
+    return best or ""
+
+
 def _analytic_bbox(rect_specs: dict, poly_specs: dict) -> Optional[Bbox]:
     """Cell-local bbox over all layers from descriptors — base geometry
     bbox extended by each repetition's analytic extent (no expansion)."""
@@ -180,6 +223,7 @@ class RandomAccessReader:
         # coords, so geometry must be scaled by this to reach nm (the frame
         # the FOV box / KLARF / RFL all use). unit==1000 -> 1.0 (no-op).
         self._unit = idx.get("unit")
+        self._layernames = idx.get("layernames") or []
         self._nm_per_grid = (1000.0 / self._unit) if self._unit else 1.0
         _dbg(f"OASIS unit (grid steps per micron) = {self._unit!r} "
              f"-> 1 grid = {self._nm_per_grid} nm "
@@ -200,6 +244,10 @@ class RandomAccessReader:
 
     def has_offsets(self) -> bool:
         return bool(self._by_refnum)
+
+    def layer_display_name(self, layer: int, datatype: int) -> str:
+        """OASIS LAYERNAME for ``(layer, datatype)``, or "" (F3 M2)."""
+        return resolve_layer_name(self._layernames, layer, datatype)
 
     def offset_for(self, cell_id: object) -> Optional[int]:
         """Byte offset of ``cell_id``'s CELL record, or None if unknown.

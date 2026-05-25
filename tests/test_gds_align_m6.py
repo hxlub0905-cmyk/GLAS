@@ -65,16 +65,6 @@ class TestFillAlpha:
 
 class TestLayerRow:
 
-    def test_slider_sets_opacity_and_emits(self):
-        e = _entry(opacity=35)
-        row = gat._LayerRow(e)
-        fired = []
-        row.changed.connect(lambda: fired.append(1))
-        row._slider.setValue(80)
-        assert e.opacity == 80
-        assert row._pct.text() == "80%"
-        assert fired
-
     def test_checkbox_toggles_visibility_and_emits(self):
         e = _entry(visible=True)
         row = gat._LayerRow(e)

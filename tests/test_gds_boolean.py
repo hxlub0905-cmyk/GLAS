@@ -23,6 +23,9 @@ from gds_boolean import (  # noqa: E402
     geometry_to_polygons,
     make_mask,
     compose,
+    normalize_binding,
+    recipe_dependency_order,
+    resolve_expression,
 )
 
 shapely = pytest.importorskip("shapely")
@@ -159,26 +162,53 @@ class TestEvaluate:
         with pytest.raises(BooleanExprError):
             evaluate(ast, self._bind())
 
-    def test_grow(self):
+    def test_grow_width_is_directional(self):
+        # > W:5 grows X only (5 per side): 10x10 -> 20x10 = 200 (NOT 400).
         _, ast = parse_expression("A > W:5")
         g = evaluate(ast, {"A": box(0, 0, 10, 10)})
-        # grow 5 per side with square joins -> 20x20 = 400
-        assert g.area == pytest.approx(400.0)
+        assert g.area == pytest.approx(200.0)
+        x0, y0, x1, y1 = g.bounds
+        assert (x0, y0, x1, y1) == pytest.approx((-5.0, 0.0, 15.0, 10.0))
 
-    def test_shrink(self):
-        _, ast = parse_expression("A < H:2")
+    def test_grow_height_is_directional(self):
+        # > H:5 grows Y only: 10x10 -> 10x20 = 200.
+        _, ast = parse_expression("A > H:5")
         g = evaluate(ast, {"A": box(0, 0, 10, 10)})
-        # shrink 2 per side -> 6x6 = 36
-        assert g.area == pytest.approx(36.0)
+        assert g.area == pytest.approx(200.0)
+        assert g.bounds == pytest.approx((0.0, -5.0, 10.0, 15.0))
+
+    def test_shrink_height_is_directional(self):
+        # < H:2 shrinks Y only (2 per side): 10x10 -> 10x6 = 60.
+        _, ast = parse_expression("A < H:2")
+        g = evaluate(ast, {"A": box(0, 0, 10, 10)},
+                     fov_bbox=box(-50, -50, 50, 50))
+        assert g.area == pytest.approx(60.0)
+        assert g.bounds == pytest.approx((0.0, 2.0, 10.0, 8.0))
+
+    def test_shrink_width_is_directional(self):
+        _, ast = parse_expression("A < W:2")
+        g = evaluate(ast, {"A": box(0, 0, 10, 10)},
+                     fov_bbox=box(-50, -50, 50, 50))
+        assert g.area == pytest.approx(60.0)
+        assert g.bounds == pytest.approx((2.0, 0.0, 8.0, 10.0))
+
+    def test_shrink_without_fov_raises(self):
+        _, ast = parse_expression("A < W:1")
+        with pytest.raises(BooleanExprError):
+            evaluate(ast, {"A": box(0, 0, 10, 10)})
 
     def test_full_example(self):
         # L0 = [(A > W:1) & B] < H:1
         A = box(0, 0, 10, 10)
         B = box(0, 0, 10, 10)
         _, ast = parse_expression("[(A > W:1) & B] < H:1")
-        g = evaluate(ast, {"A": A, "B": B})
-        # A grow1 -> 12x12 region; & B (10x10) -> 10x10; shrink1 -> 8x8=64
-        assert g.area == pytest.approx(64.0)
+        g = evaluate(ast, {"A": A, "B": B}, fov_bbox=box(-50, -50, 50, 50))
+        # A grow X by1 -> 12x10; & B (10x10) -> 10x10; shrink Y by1 -> 10x8=80
+        assert g.area == pytest.approx(80.0)
+
+    def test_bad_axis_label_raises(self):
+        with pytest.raises(BooleanExprError):
+            parse_expression("A > Q:5")
 
     def test_missing_binding_raises(self):
         _, ast = parse_expression("A & Z")
@@ -276,3 +306,103 @@ class TestCompose:
                            {"A": box(0, 0, 10, 10), "B": box(5, 0, 15, 10)})
         assert name == "L0"
         assert g.area == pytest.approx(50.0)
+
+
+# ── F4: tagged bindings + nested recipes ─────────────────────────────
+
+
+class TestNormalizeBinding:
+
+    def test_legacy_pair_becomes_raw(self):
+        assert normalize_binding((17, 101)) == ("raw", 17, 101)
+
+    def test_tagged_raw_passes_through(self):
+        assert normalize_binding(("raw", 3, 0)) == ("raw", 3, 0)
+
+    def test_ref_passes_through(self):
+        assert normalize_binding(("ref", "L0")) == ("ref", "L0")
+
+    def test_ref_coerces_name_to_str(self):
+        assert normalize_binding(["ref", "X"]) == ("ref", "X")
+
+    def test_bad_binding_raises(self):
+        with pytest.raises(BooleanExprError):
+            normalize_binding(("nope", 1, 2, 3))
+
+
+class TestRecipeDependencyOrder:
+
+    def test_independent_recipes(self):
+        order = recipe_dependency_order({"A": set(), "B": set()})
+        assert set(order) == {"A", "B"}
+
+    def test_dependency_before_dependent(self):
+        order = recipe_dependency_order({"L0": set(), "L1": {"L0"}})
+        assert order.index("L0") < order.index("L1")
+
+    def test_chain(self):
+        order = recipe_dependency_order(
+            {"A": set(), "B": {"A"}, "C": {"B"}})
+        assert order == ["A", "B", "C"]
+
+    def test_cycle_raises(self):
+        with pytest.raises(BooleanExprError):
+            recipe_dependency_order({"A": {"B"}, "B": {"A"}})
+
+    def test_self_cycle_raises(self):
+        with pytest.raises(BooleanExprError):
+            recipe_dependency_order({"A": {"A"}})
+
+    def test_unknown_reference_raises(self):
+        with pytest.raises(BooleanExprError):
+            recipe_dependency_order({"A": {"ghost"}})
+
+
+class TestResolveExpression:
+
+    def _raw(self, layer, datatype):
+        # Two unit-ish squares keyed by (layer, datatype).
+        table = {
+            (1, 0): box(0, 0, 10, 10),
+            (2, 0): box(5, 0, 15, 10),
+            (3, 0): box(0, 0, 4, 10),
+        }
+        return table[(layer, datatype)]
+
+    def test_raw_only(self):
+        g = resolve_expression(
+            "A & B", {"A": ("raw", 1, 0), "B": ("raw", 2, 0)},
+            raw_provider=self._raw, recipe_provider=lambda n: None)
+        assert g.area == pytest.approx(50.0)
+
+    def test_legacy_pair_binding(self):
+        g = resolve_expression(
+            "A", {"A": (1, 0)},
+            raw_provider=self._raw, recipe_provider=lambda n: None)
+        assert g.area == pytest.approx(100.0)
+
+    def test_nested_reference(self):
+        # L0 = A & B (area 50, x 5..15). L1 = L0 - C (C = x 0..4 -> no overlap).
+        recipes = {"L0": ("A & B", {"A": ("raw", 1, 0), "B": ("raw", 2, 0)})}
+        g = resolve_expression(
+            "L0 - C", {"L0": ("ref", "L0"), "C": ("raw", 3, 0)},
+            raw_provider=self._raw,
+            recipe_provider=lambda n: recipes.get(n))
+        assert g.area == pytest.approx(50.0)
+
+    def test_circular_reference_raises(self):
+        recipes = {
+            "L0": ("L1", {"L1": ("ref", "L1")}),
+            "L1": ("L0", {"L0": ("ref", "L0")}),
+        }
+        with pytest.raises(BooleanExprError):
+            resolve_expression(
+                "L0", {"L0": ("ref", "L0")},
+                raw_provider=self._raw,
+                recipe_provider=lambda n: recipes.get(n))
+
+    def test_unknown_reference_raises(self):
+        with pytest.raises(BooleanExprError):
+            resolve_expression(
+                "X", {"X": ("ref", "ghost")},
+                raw_provider=self._raw, recipe_provider=lambda n: None)

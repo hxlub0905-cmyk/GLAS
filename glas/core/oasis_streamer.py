@@ -2266,11 +2266,21 @@ def scan_cell_offsets(path: str | Path) -> dict:
     by_refnum: dict[int, int] = {}
     by_name: dict[str, int] = {}
     cellnames = 0
+    # LAYERNAME records (11/12) map a name to a (layer, datatype) interval; they
+    # live in the name-table section before any CELL, so this same pass picks
+    # them up for free (F3 M2 — layer labels in the UI).
+    layernames: list[tuple[str, tuple, tuple]] = []
 
     unit = None
     for rid, payload in reader.iter_records():
         if rid == START:
             unit = payload.get("unit")
+        if rid in (LAYERNAME_GEOM, LAYERNAME_TEXT):
+            layernames.append((
+                _name_str(payload.get("name", "")),
+                tuple(payload.get("layer_interval") or (0, -1)),
+                tuple(payload.get("datatype_interval") or (0, -1)),
+            ))
         if rid in (PROPNAME_IMP, PROPNAME_EXP):
             nm = _name_str(payload.get("name", ""))
             if rid == PROPNAME_EXP and payload.get("refnum") is not None:
@@ -2311,6 +2321,7 @@ def scan_cell_offsets(path: str | Path) -> dict:
         "found": len(by_refnum),
         "cellnames": cellnames,
         "unit": unit,
+        "layernames": layernames,
     }
 
 
