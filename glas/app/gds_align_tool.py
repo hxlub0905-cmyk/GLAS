@@ -51,6 +51,7 @@ import csv
 import json
 import multiprocessing as mp
 import sys
+import threading
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -60,16 +61,18 @@ import numpy as np
 
 from PyQt6.QtCore import Qt, QObject, QPointF, QRect, QRectF, QSize, QThread, QTimer, QElapsedTimer, pyqtSignal
 from PyQt6.QtGui import (
-    QAction, QBrush, QColor, QFontMetrics, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap,
+    QAction, QBrush, QColor, QFontMetrics, QIcon, QImage, QKeySequence,
+    QLinearGradient, QPainter, QPainterPath, QPen, QPixmap,
     QPolygonF, QMouseEvent, QShortcut, QWheelEvent,
 )
 from PyQt6.QtWidgets import (
-    QApplication, QButtonGroup, QCheckBox, QColorDialog, QComboBox, QDialog,
-    QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFrame, QGridLayout,
-    QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton, QScrollArea,
-    QSizePolicy, QSpinBox, QSplitter, QStatusBar, QStyle, QStyledItemDelegate,
-    QToolButton, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QColorDialog,
+    QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFrame,
+    QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton,
+    QScrollArea, QSizePolicy, QSpinBox, QSplitter, QStatusBar, QStyle,
+    QStyledItemDelegate, QTableWidget, QTableWidgetItem, QToolButton,
+    QVBoxLayout, QWidget,
 )
 
 try:
@@ -708,16 +711,90 @@ class LayerFilterDialog(QDialog):
         self.accept()
 
 
+class _AnimatedBar(QWidget):
+    """Self-painted progress bar with a sweeping sheen, so it looks alive.
+
+    Two modes: *determinate* (fill to a fraction) and *indeterminate* (a
+    sliding block, for phases where total work is unknown). A lighter band
+    sweeps across the filled portion on every ``advance()`` tick, giving the
+    "something is happening" motion even between progress updates. Painting is
+    fully self-contained so the app QSS can't flatten the animation (the reason
+    the old dialog avoided ``QProgressBar`` entirely)."""
+
+    _TRACK = QColor("#ece0d2")
+    _FILL = QColor("#e0863a")
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setFixedHeight(14)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding,
+                           QSizePolicy.Policy.Fixed)
+        self._frac = 0.0
+        self._indeterminate = True
+        self._phase = 0.0   # 0..1, position of the sweeping sheen
+
+    def set_fraction(self, frac: float) -> None:
+        self._indeterminate = False
+        self._frac = max(0.0, min(1.0, frac))
+        self.update()
+
+    def set_indeterminate(self, on: bool = True) -> None:
+        self._indeterminate = on
+        self.update()
+
+    def advance(self) -> None:
+        self._phase = (self._phase + 0.045) % 1.0
+        self.update()
+
+    def paintEvent(self, ev) -> None:  # type: ignore[override]
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w = float(self.width())
+        h = float(self.height())
+        r = h / 2.0
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(self._TRACK)
+        p.drawRoundedRect(QRectF(0, 0, w, h), r, r)
+        if self._indeterminate:
+            bw = max(48.0, w * 0.30)
+            t = self._phase
+            tri = 2.0 * t if t < 0.5 else 2.0 * (1.0 - t)   # ping-pong
+            self._fill(p, tri * (w - bw), bw, h, r)
+        elif self._frac > 0:
+            self._fill(p, 0.0, self._frac * w, h, r)
+        p.end()
+
+    def _fill(self, p: QPainter, x: float, fw: float, h: float,
+              r: float) -> None:
+        if fw <= 0:
+            return
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(x, 0, fw, h), min(r, fw / 2.0), r)
+        p.save()
+        p.setClipPath(path)
+        p.fillRect(QRectF(x, 0, fw, h), self._FILL)
+        # Sweeping highlight band across the filled portion.
+        band = max(32.0, fw * 0.4)
+        sx = x - band + self._phase * (fw + band)
+        grad = QLinearGradient(sx, 0, sx + band, 0)
+        grad.setColorAt(0.0, QColor(255, 255, 255, 0))
+        grad.setColorAt(0.5, QColor(255, 255, 255, 95))
+        grad.setColorAt(1.0, QColor(255, 255, 255, 0))
+        p.fillRect(QRectF(x, 0, fw, h), QBrush(grad))
+        p.restore()
+
+
 class LoadProgressDialog(QDialog):
     """Custom progress dialog for the GDS loader.
 
     QProgressDialog with the main app's QSS produced an empty-looking dialog
-    (the styled ``QProgressBar::chunk`` background killed the indeterminate
-    animation, and the inherited label sometimes rendered with no visible
-    text). This dialog avoids QProgressBar entirely: a Braille spinner +
-    elapsed clock prove the worker is alive even during gdstk's opaque
-    read-phase, and the status label is explicitly styled so users can never
-    miss it. Cancel emits ``cancel_requested``."""
+    (the styled ``QProgressBar::chunk`` background killed the animation, and the
+    inherited label sometimes rendered with no visible text). This dialog uses a
+    self-painted :class:`_AnimatedBar` instead: a sweeping fill bar + Braille
+    spinner + elapsed clock prove the worker is alive even during opaque
+    read-phases. When the caller knows the total work (e.g. batch fine-align),
+    :meth:`set_progress` switches the bar to a determinate fill with percent and
+    ETA; otherwise it stays indeterminate. Cancel emits ``cancel_requested``."""
 
     cancel_requested = pyqtSignal()
 
@@ -750,6 +827,9 @@ class LoadProgressDialog(QDialog):
         self._title.setWordWrap(True)
         layout.addWidget(self._title)
 
+        self._bar = _AnimatedBar(self)
+        layout.addWidget(self._bar)
+
         row = QHBoxLayout()
         row.setSpacing(12)
         self._spinner = QLabel(self._SPINNER[0], self)
@@ -770,6 +850,7 @@ class LoadProgressDialog(QDialog):
 
         self._cancelled = False
         self._spin_idx = 0
+        self._progress: Optional[tuple] = None   # (done, total) when known
         self._elapsed = QElapsedTimer()
         self._elapsed.start()
         self._tick = QTimer(self)
@@ -780,6 +861,13 @@ class LoadProgressDialog(QDialog):
     def set_text(self, text: str) -> None:
         self._title.setText(text)
 
+    def set_progress(self, done: int, total: int) -> None:
+        """Switch the bar to a determinate fill (done / total). The detail line
+        then shows count, percent and an ETA estimated from elapsed time."""
+        self._progress = (done, total)
+        self._bar.set_fraction(done / total if total else 0.0)
+        self._refresh_detail()
+
     def shutdown(self) -> None:
         """Stop the spinner timer (call before close to avoid late updates)."""
         self._tick.stop()
@@ -787,11 +875,26 @@ class LoadProgressDialog(QDialog):
     def _on_tick(self) -> None:
         self._spin_idx = (self._spin_idx + 1) % len(self._SPINNER)
         self._spinner.setText(self._SPINNER[self._spin_idx])
+        self._bar.advance()
+        self._refresh_detail()
+
+    def _refresh_detail(self) -> None:
         secs = int(self._elapsed.elapsed() / 1000)
-        self._detail.setText(
-            f"Elapsed: {secs // 60}:{secs % 60:02d}"
-            + ("  ·  cancelling at next checkpoint…" if self._cancelled else "")
-        )
+        elapsed = f"Elapsed {secs // 60}:{secs % 60:02d}"
+        if self._progress is not None:
+            done, total = self._progress
+            pct = int(100 * done / total) if total else 0
+            eta = ""
+            el = self._elapsed.elapsed() / 1000.0
+            if 0 < done < total and el > 0:
+                rem = el / done * (total - done)
+                eta = f"  ·  ETA {int(rem) // 60}:{int(rem) % 60:02d}"
+            detail = f"{done} / {total}  ·  {pct}%  ·  {elapsed}{eta}"
+        else:
+            detail = elapsed
+        if self._cancelled:
+            detail += "  ·  cancelling at next checkpoint…"
+        self._detail.setText(detail)
 
     def _on_cancel(self) -> None:
         if self._cancelled:
@@ -1017,7 +1120,9 @@ class FineAlignAllWorker(QObject):
     emits per-image results + progress so the UI stays responsive."""
 
     progress = pyqtSignal(int, int, str)        # (done, total, image_id)
-    result = pyqtSignal(str, float, float, float)  # (image_id, dx, dy, score)
+    # (image_id, dx, dy, score, used_radius_px, status); status is objective:
+    # ok / no-coords / missing-file / no-scale / flat (F5 M2/M5 C3-C4).
+    result = pyqtSignal(str, float, float, float, int, str)
     finished = pyqtSignal(int)                  # count aligned
     failed = pyqtSignal(str)
     cancelled = pyqtSignal()
@@ -1031,10 +1136,13 @@ class FineAlignAllWorker(QObject):
         self._poi_specs = list(poi_specs)
         self._jobs = jobs        # list of (image_id, anchor|None, path, exists)
         self._cfg = cfg          # dict: fov_w/h, nm_auto, nm_manual, bg/blur, search_radius_nm
-        self._cancel = False
+        # threading.Event so a cancel from the GUI thread takes effect inside
+        # this worker's tight loop *immediately* — a queued slot would never run
+        # while run() monopolises the worker thread (F5 M5).
+        self._cancel = threading.Event()
 
     def cancel(self) -> None:
-        self._cancel = True
+        self._cancel.set()
 
     def run(self) -> None:
         try:
@@ -1042,20 +1150,25 @@ class FineAlignAllWorker(QObject):
             done = 0
             c = self._cfg
             for image_id, anchor, path, exists in self._jobs:
-                if self._cancel:
+                if self._cancel.is_set():
                     self.cancelled.emit()
                     return
                 done += 1
                 self.progress.emit(done, n, str(image_id))
-                if anchor is None or not exists:
+                if anchor is None:
+                    self.result.emit(str(image_id), 0.0, 0.0, 0.0, 0, "no-coords")
                     continue
-                sem = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE) if cv2 else None
+                sem = (cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+                       if (cv2 and exists) else None)
                 if sem is None:
+                    self.result.emit(str(image_id), 0.0, 0.0, 0.0, 0,
+                                     "missing-file")
                     continue
                 H, W = sem.shape[:2]
                 nm_per_px = (c["nm_manual"] if (not c["nm_auto"] and
                              c["nm_manual"] > 0) else c["fov_w"] / max(1, W))
                 if nm_per_px <= 0:
+                    self.result.emit(str(image_id), 0.0, 0.0, 0.0, 0, "no-scale")
                     continue
                 roi = (anchor[0] - c["fov_w"], anchor[1] - c["fov_h"],
                        anchor[0] + c["fov_w"], anchor[1] + c["fov_h"])
@@ -1063,25 +1176,138 @@ class FineAlignAllWorker(QObject):
                 for spec, fg in self._poi_specs:
                     polys = poi_polys_for_roi(
                         self._rar, self._root, roi, spec,
-                        cancel_cb=lambda: self._cancel)
+                        cancel_cb=self._cancel.is_set)
                     if polys:
                         poi_layers.append((polys, fg))
                 if not poi_layers:
-                    self.result.emit(str(image_id), 0.0, 0.0, 0.0)
+                    self.result.emit(str(image_id), 0.0, 0.0, 0.0, 0, "flat")
                     continue
                 template = render_composite_template(
                     poi_layers, anchor, W, H, nm_per_px,
                     c["bg_glv"], c["blur_sigma_px"])
                 radius_px = c["search_radius_nm"] / nm_per_px
-                dx, dy, score, _ = fine_align_one(sem, template, nm_per_px,
-                                                  radius_px)
-                self.result.emit(str(image_id), dx, dy, score)
+                dx, dy, score, used_r = fine_align_one(sem, template, nm_per_px,
+                                                       radius_px)
+                self.result.emit(str(image_id), dx, dy, score, int(used_r), "ok")
         except oasis_random.WalkCancelled:
             self.cancelled.emit()
         except Exception as exc:                       # noqa: BLE001
             self.failed.emit(str(exc))
         else:
             self.finished.emit(done)
+
+
+def _safe_name(s: str) -> str:
+    """Filesystem-safe basename from an image id (F5 M6)."""
+    out = "".join(ch if (ch.isalnum() or ch in "-_.") else "_" for ch in str(s))
+    return out or "image"
+
+
+class OverlayExportWorker(QObject):
+    """Batch export of SEM frames + aligned GDS-outline overlays + a manifest
+    (F5 M6). For every selected image it optionally writes ``<id>_raw.png`` and
+    ``<id>_overlay.png`` (the POI layer outlines stroked on the SEM at the
+    coarse+refined anchor), then a manifest (CSV + JSON) keyed by image_id so a
+    downstream tool — e.g. MMH — can join back. Sequential single reader, like
+    :class:`FineAlignAllWorker`."""
+
+    progress = pyqtSignal(int, int, str)        # (done, total, image_id)
+    finished = pyqtSignal(int, str)             # (count, manifest_csv_path)
+    failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    _COLS = ["image_id", "raw_png", "overlay_png", "fine_dx_nm", "fine_dy_nm",
+             "score", "status"]
+
+    def __init__(self, rar, root, poi_specs_colored, jobs, cfg, out_dir,
+                 export_raw: bool, export_overlay: bool) -> None:
+        super().__init__()
+        self._rar = rar
+        self._root = root
+        self._poi = list(poi_specs_colored)   # [(spec, (r,g,b)), ...]
+        self._jobs = jobs    # [(image_id, coarse|None, refined|None, path, exists)]
+        self._cfg = cfg
+        self._out_dir = Path(out_dir)
+        self._export_raw = export_raw
+        self._export_overlay = export_overlay
+        self._cancel = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    def run(self) -> None:
+        try:
+            n = len(self._jobs)
+            done = 0
+            c = self._cfg
+            manifest = []
+            for image_id, coarse, refined, path, exists in self._jobs:
+                if self._cancel.is_set():
+                    self.cancelled.emit()
+                    return
+                done += 1
+                self.progress.emit(done, n, str(image_id))
+                row = {
+                    "image_id": str(image_id), "raw_png": "", "overlay_png": "",
+                    "fine_dx_nm": "" if refined is None else round(refined[0], 3),
+                    "fine_dy_nm": "" if refined is None else round(refined[1], 3),
+                    "score": "" if refined is None else round(refined[2], 6),
+                    "status": "ok" if refined is not None else "not-run",
+                }
+                sem = (cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+                       if (cv2 and exists) else None)
+                if sem is None:
+                    row["status"] = "missing-file"
+                    manifest.append(row)
+                    continue
+                base = _safe_name(image_id)
+                if self._export_raw:
+                    name = f"{base}_raw.png"
+                    cv2.imwrite(str(self._out_dir / name), sem)
+                    row["raw_png"] = name
+                if self._export_overlay and coarse is not None and self._poi:
+                    H, W = sem.shape[:2]
+                    nm_per_px = (c["nm_manual"] if (not c["nm_auto"] and
+                                 c["nm_manual"] > 0) else c["fov_w"] / max(1, W))
+                    if nm_per_px > 0:
+                        roi = (coarse[0] - c["fov_w"], coarse[1] - c["fov_h"],
+                               coarse[0] + c["fov_w"], coarse[1] + c["fov_h"])
+                        entries = []
+                        for spec, color in self._poi:
+                            polys = poi_polys_for_roi(
+                                self._rar, self._root, roi, spec,
+                                cancel_cb=self._cancel.is_set)
+                            if polys:
+                                entries.append((polys, color))
+                        anchor = (coarse if refined is None else
+                                  (coarse[0] + refined[0], coarse[1] + refined[1]))
+                        rgb = overlay_outlines_on_sem(sem, entries, anchor,
+                                                      nm_per_px)
+                        name = f"{base}_overlay.png"
+                        # overlay returns RGB; cv2 writes BGR → flip channels.
+                        cv2.imwrite(str(self._out_dir / name), rgb[:, :, ::-1])
+                        row["overlay_png"] = name
+                manifest.append(row)
+            mpath = self._write_manifest(manifest)
+        except oasis_random.WalkCancelled:
+            self.cancelled.emit()
+        except Exception as exc:                       # noqa: BLE001
+            self.failed.emit(str(exc))
+        else:
+            self.finished.emit(done, mpath)
+
+    def _write_manifest(self, rows) -> str:
+        csv_path = self._out_dir / "overlay_manifest.csv"
+        with open(csv_path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=self._COLS)
+            w.writeheader()
+            for r in rows:
+                w.writerow({k: r.get(k, "") for k in self._COLS})
+        json_path = self._out_dir / "overlay_manifest.json"
+        with open(json_path, "w") as f:
+            json.dump({"schema": "mmh-gds-overlay-v1", "columns": self._COLS,
+                       "images": rows}, f, indent=2)
+        return str(csv_path)
 
 
 # ── Rasterization helper (used by M2 Boolean / M4 template) ──────────────────
@@ -1151,6 +1377,57 @@ def _scanline_fill(mask: np.ndarray, pts: np.ndarray) -> None:
             xs1 = min(W - 1, int(np.ceil(xs[j + 1])))
             if xs1 >= xs0:
                 mask[y, xs0:xs1 + 1] = 255
+
+
+def _draw_polyline_np(rgb: np.ndarray, pts: np.ndarray, color: tuple) -> None:
+    """Stroke a closed polyline into an RGB array (numpy fallback for the
+    overlay helper when cv2 is unavailable)."""
+    H, W = rgb.shape[:2]
+    n = len(pts)
+    for i in range(n):
+        x0, y0 = pts[i]
+        x1, y1 = pts[(i + 1) % n]
+        steps = int(max(abs(x1 - x0), abs(y1 - y0))) + 1
+        xs = np.linspace(x0, x1, steps).round().astype(int)
+        ys = np.linspace(y0, y1, steps).round().astype(int)
+        m = (xs >= 0) & (xs < W) & (ys >= 0) & (ys < H)
+        rgb[ys[m], xs[m]] = color
+
+
+def overlay_outlines_on_sem(sem_gray: np.ndarray, entries: list, anchor: tuple,
+                            nm_per_px: float, thickness: int = 1) -> np.ndarray:
+    """Draw layer outlines over a SEM frame, returning an (H, W, 3) uint8 RGB.
+
+    The SEM grayscale is widened to grey RGB, then each entry's polygon
+    *outlines* are stroked in its colour. ``entries`` is ``[(polygons, (r,g,b)),
+    ...]`` with polygons as (N, 2) nm arrays. The FOV is centred on ``anchor``
+    at ``nm_per_px``, mirroring :func:`rasterize_layer`'s mapping (X right, Y
+    flipped to screen convention) so the outlines land on the SEM structure for
+    a given coarse/refined anchor. Self-contained raster — it does not touch the
+    SemViewer screen drawing (F5 M1). Used by both the before/after preview and
+    the overlay PNG export (M6)."""
+    H, W = sem_gray.shape[:2]
+    rgb = np.repeat(sem_gray.astype(np.uint8)[:, :, None], 3, axis=2).copy()
+    gx, gy = anchor
+    x0 = gx - W / 2.0 * nm_per_px
+    y1 = gy + H / 2.0 * nm_per_px
+    for polygons, color in entries:
+        col = (int(color[0]), int(color[1]), int(color[2]))
+        for poly in polygons:
+            arr = np.asarray(poly, dtype=np.float64)
+            if arr.shape[0] < 2:
+                continue
+            px = (arr[:, 0] - x0) / nm_per_px
+            py = (y1 - arr[:, 1]) / nm_per_px
+            pts = np.stack([px, py], axis=1)
+            if cv2 is not None:
+                ip = pts.round().astype(np.int32)
+                cv2.polylines(rgb, [ip], isClosed=True, color=col,
+                              thickness=max(1, thickness),
+                              lineType=cv2.LINE_AA)
+            else:
+                _draw_polyline_np(rgb, pts, col)
+    return rgb
 
 
 # ── M4b: POI template + cv2.matchTemplate fine alignment ─────────────────────
@@ -1351,6 +1628,72 @@ def alignment_rows(images, refined, *, coarse_of, klarf_path="", gds_path="",
             "nm_per_px": round(float(nm_per_px), 6),
         })
     return rows
+
+
+def _median(vals: list) -> float:
+    s = sorted(vals)
+    n = len(s)
+    m = n // 2
+    return s[m] if n % 2 else (s[m - 1] + s[m]) / 2.0
+
+
+def fine_align_result_rows(images, refined, fa_meta, threshold):
+    """Rows for the results table (F5 M2). Each dict has image_id / score /
+    dx_nm / dy_nm / used_radius / status. ``status`` layers a threshold-derived
+    'low-score' on top of the worker's objective status; images that were never
+    aligned get 'not-run'. ``score`` / ``dx_nm`` / ``dy_nm`` are None when no
+    fine-align result exists, so the table can show blanks."""
+    rows = []
+    for img in images:
+        iid = getattr(img, "image_id", "")
+        ref = refined.get(iid)
+        used_r, status = fa_meta.get(iid, (0, "not-run"))
+        score = ref[2] if ref else None
+        if status == "ok" and score is not None and score < threshold:
+            disp = "low-score"
+        else:
+            disp = status
+        rows.append({
+            "image_id": iid,
+            "score": score,
+            "dx_nm": ref[0] if ref else None,
+            "dy_nm": ref[1] if ref else None,
+            "used_radius": int(used_r),
+            "status": disp,
+        })
+    return rows
+
+
+def score_histogram(scores, nbins: int = 10, lo: float = 0.0,
+                    hi: float = 1.0) -> list:
+    """Counts of scores per equal-width bin over [lo, hi] (F5 M2 C5). Returns a
+    length-``nbins`` list[int]; None scores are skipped and out-of-range values
+    are clamped into the end bins."""
+    bins = [0] * max(1, nbins)
+    if hi <= lo:
+        return bins
+    for s in scores:
+        if s is None:
+            continue
+        t = (s - lo) / (hi - lo)
+        idx = int(t * nbins)
+        idx = max(0, min(nbins - 1, idx))
+        bins[idx] += 1
+    return bins
+
+
+def residual_median(refined, ok_ids):
+    """Median (dx, dy) over the given ok image ids (F5 M3 C2), or None if the
+    set is empty / has no stored offsets."""
+    xs, ys = [], []
+    for iid in ok_ids:
+        r = refined.get(iid)
+        if r is not None:
+            xs.append(r[0])
+            ys.append(r[1])
+    if not xs:
+        return None
+    return (_median(xs), _median(ys))
 
 
 def synthetic_layer_specs(doc):
@@ -1611,6 +1954,20 @@ class LayerPanel(QFrame):
         composite ordering is stable. Driven by row state rather than list
         membership because ``LayerEntry`` holds NumPy arrays, whose dataclass
         ``__eq__`` makes ``in`` / ``remove`` raise on array truth-value."""
+        ordered = [r._entry for r in self._rows if r.poi_btn.isChecked()]
+        self._poi_entries = ordered
+        self.pois_changed.emit(list(ordered))
+
+    def check_pois(self, keys) -> None:
+        """Re-check the POI toggle on rows whose layer key is in ``keys``,
+        emitting ``pois_changed`` once (F5 M4 setup restore)."""
+        keyset = set(keys)
+        for r in self._rows:
+            want = r._entry.key.key() in keyset
+            if r.poi_btn.isChecked() != want:
+                r.poi_btn.blockSignals(True)
+                r.poi_btn.setChecked(want)
+                r.poi_btn.blockSignals(False)
         ordered = [r._entry for r in self._rows if r.poi_btn.isChecked()]
         self._poi_entries = ordered
         self.pois_changed.emit(list(ordered))
@@ -3202,6 +3559,7 @@ class FineAlignPanel(QGroupBox):
     run_requested = pyqtSignal()
     run_all_requested = pyqtSignal()
     preview_requested = pyqtSignal()
+    results_requested = pyqtSignal()
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__("Fine Align", parent)
@@ -3233,7 +3591,7 @@ class FineAlignPanel(QGroupBox):
             return s
 
         self._bg = _spin(0, 255, 80)
-        self._bg.setToolTip("Synthetic grey level for background pixels "
+        self._bg.setToolTip("Background grey level for non-structure pixels "
                             "(shared by all POI layers).")
         self._blur = _spin(0.0, 20.0, 1.0, 0.5, 2)
         self._blur.setToolTip("Gaussian blur σ (px) softening template edges.")
@@ -3268,16 +3626,23 @@ class FineAlignPanel(QGroupBox):
             "the current image (needs ≥1 POI + image).")
         self._preview_btn.clicked.connect(self.preview_requested)
 
+        self._results_btn = QPushButton("Results…", self)
+        self._results_btn.setToolTip(
+            "Open the batch results overview (table + score histogram + "
+            "residual scatter). Available after a single or batch run.")
+        self._results_btn.clicked.connect(self.results_requested)
+
         self._result_lbl = QLabel("")
         self._result_lbl.setStyleSheet(f"font-size:{_FS_LABEL}px;")
 
         rows = [
             ("span", self._poi_lbl), ("span", self._poi_box),
-            ("BG grey", self._bg), ("Blur σ (px)", self._blur),
+            ("Background GL", self._bg), ("Blur σ (px)", self._blur),
             ("Search radius (nm)", self._radius),
             ("Score threshold", self._thresh),
             ("span", self._run_btn), ("span", self._run_all_btn),
-            ("span", self._preview_btn), ("span", self._result_lbl),
+            ("span", self._preview_btn), ("span", self._results_btn),
+            ("span", self._result_lbl),
         ]
         # Single-column form (label above input) so labels aren't truncated in
         # the narrow panel (M7 R2), matching CoordinateSetupPanel.
@@ -3317,9 +3682,10 @@ class FineAlignPanel(QGroupBox):
             spin.setRange(0, 255)
             spin.setValue(int(prev.get(key, 200)))
             spin.setFixedWidth(58)
-            spin.setToolTip("FG grey level for this POI layer's structure pixels.")
+            spin.setToolTip("Foreground grey level for this POI layer's "
+                            "structure pixels.")
             hl.addWidget(name, 1)
-            hl.addWidget(QLabel("FG", row))
+            hl.addWidget(QLabel("Foreground GL", row))
             hl.addWidget(spin)
             self._poi_box_layout.addWidget(row)
             self._poi_fg_spins[key] = spin
@@ -3331,6 +3697,13 @@ class FineAlignPanel(QGroupBox):
             f"POI: {n} layer{'s' if n != 1 else ''} → composite template"
             if self._poi_set else "POI: (none — toggle 'POI' on a layer)")
         self._update_enabled()
+
+    def set_fgs(self, fgs: dict) -> None:
+        """Set per-POI Foreground GL spin values by layer key (F5 M4 restore)."""
+        for k, v in fgs.items():
+            s = self._poi_fg_spins.get(k)
+            if s is not None and v is not None:
+                s.setValue(int(v))
 
     def poi_fgs(self) -> dict:
         """Map of ``key -> fg_glv`` for the active POI layers (F3)."""
@@ -3383,14 +3756,18 @@ def _rgb_to_pixmap(arr: np.ndarray) -> QPixmap:
 
 
 class TemplatePreviewDialog(QDialog):
-    """Side-by-side SEM / GDS / synthetic-template preview for the current
-    image, so a multi-POI composite can be eyeballed against the real SEM
-    (plan F3 M5)."""
+    """SEM / GDS / synthetic-template preview plus before/after residual
+    overlays for the current image, so a multi-POI composite can be eyeballed
+    against the real SEM and the fine-align correction can be seen (F3 M5 +
+    F5 M1). ``before_rgb`` / ``after_rgb`` are optional outline overlays
+    (coarse anchor vs coarse+refined); when given they add two more tiles."""
 
-    _TILE = 280
+    _TILE = 260
 
     def __init__(self, parent, sem: np.ndarray, gds_rgb: np.ndarray,
-                 template: np.ndarray, subtitle: str = "") -> None:
+                 template: np.ndarray, subtitle: str = "",
+                 before_rgb: Optional[np.ndarray] = None,
+                 after_rgb: Optional[np.ndarray] = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("POI template preview")
         v = QVBoxLayout(self)
@@ -3399,12 +3776,17 @@ class TemplatePreviewDialog(QDialog):
             cap.setWordWrap(True)
             cap.setStyleSheet(_hint_qss(_FS_LABEL))
             v.addWidget(cap)
-        row = QHBoxLayout()
-        row.setSpacing(10)
         tiles = [("SEM", _gray_to_pixmap(sem)),
                  ("GDS", _rgb_to_pixmap(gds_rgb)),
                  ("Template", _gray_to_pixmap(template))]
-        for title, pm in tiles:
+        if before_rgb is not None:
+            tiles.append(("Overlay · before", _rgb_to_pixmap(before_rgb)))
+        if after_rgb is not None:
+            tiles.append(("Overlay · after", _rgb_to_pixmap(after_rgb)))
+        # Wrap into rows of 3 so 5 tiles don't overflow the screen width.
+        grid = QGridLayout()
+        grid.setSpacing(10)
+        for i, (title, pm) in enumerate(tiles):
             col = QVBoxLayout()
             t = QLabel(title)
             t.setAlignment(Qt.AlignmentFlag.AlignHCenter)
@@ -3419,12 +3801,263 @@ class TemplatePreviewDialog(QDialog):
                     Qt.TransformationMode.SmoothTransformation))
             col.addWidget(t)
             col.addWidget(pic)
-            row.addLayout(col)
-        v.addLayout(row)
+            holder = QWidget()
+            holder.setLayout(col)
+            grid.addWidget(holder, i // 3, i % 3)
+        v.addLayout(grid)
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         btns.rejected.connect(self.reject)
         btns.accepted.connect(self.accept)
         v.addWidget(btns)
+
+
+class _ScoreHistogram(QWidget):
+    """Self-painted score distribution bars + a threshold marker line (F5 M2
+    C5). Lightweight QPainter — no matplotlib dependency."""
+
+    def __init__(self, bins, threshold: float, lo: float = 0.0,
+                 hi: float = 1.0, parent=None) -> None:
+        super().__init__(parent)
+        self._bins = list(bins)
+        self._threshold = threshold
+        self._lo, self._hi = lo, hi
+        self.setMinimumSize(220, 150)
+
+    def paintEvent(self, ev) -> None:  # type: ignore[override]
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = float(self.width()), float(self.height())
+        ml, mr, mt, mb = 8.0, 8.0, 22.0, 18.0
+        p.fillRect(self.rect(), QColor("#fbf6ef"))
+        p.setPen(QColor("#3f3428"))
+        p.drawText(QRectF(0, 2, w, 16), Qt.AlignmentFlag.AlignHCenter,
+                   "Score distribution")
+        plot_w = max(1.0, w - ml - mr)
+        plot_h = max(1.0, h - mt - mb)
+        n = len(self._bins)
+        mx = max(self._bins) if self._bins else 0
+        if n and mx > 0:
+            bw = plot_w / n
+            for i, c in enumerate(self._bins):
+                bh = (c / mx) * plot_h
+                x = ml + i * bw
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor("#e0863a"))
+                p.drawRect(QRectF(x + 1, mt + (plot_h - bh), bw - 2, bh))
+        # threshold vertical line
+        if self._hi > self._lo:
+            tx = ml + (self._threshold - self._lo) / (self._hi - self._lo) * plot_w
+            p.setPen(QPen(QColor("#c0392b"), 1.5, Qt.PenStyle.DashLine))
+            p.drawLine(QPointF(tx, mt), QPointF(tx, mt + plot_h))
+        p.setPen(QColor("#6f6254"))
+        p.drawLine(QPointF(ml, mt + plot_h), QPointF(ml + plot_w, mt + plot_h))
+        p.drawText(QRectF(ml, mt + plot_h + 2, plot_w, 14),
+                   Qt.AlignmentFlag.AlignLeft, f"{self._lo:.1f}")
+        p.drawText(QRectF(ml, mt + plot_h + 2, plot_w, 14),
+                   Qt.AlignmentFlag.AlignRight, f"{self._hi:.1f}")
+        p.end()
+
+
+class _ResidualScatter(QWidget):
+    """Self-painted (dx, dy) residual scatter with an origin cross and a median
+    marker, to spot a systematic shift vs. random spread vs. outliers (F5 M2
+    C1). ``points`` is ``[(dx_nm, dy_nm), ...]``; ``median`` is ``(mx, my)`` or
+    None. +dy is drawn upward (cartesian)."""
+
+    def __init__(self, points, median, parent=None) -> None:
+        super().__init__(parent)
+        self._pts = [(float(x), float(y)) for x, y in points]
+        self._median = median
+        self.setMinimumSize(220, 200)
+
+    def paintEvent(self, ev) -> None:  # type: ignore[override]
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = float(self.width()), float(self.height())
+        p.fillRect(self.rect(), QColor("#fbf6ef"))
+        p.setPen(QColor("#3f3428"))
+        p.drawText(QRectF(0, 2, w, 16), Qt.AlignmentFlag.AlignHCenter,
+                   "Residuals (nm)")
+        m = 26.0
+        cx = w / 2.0
+        cy = h / 2.0 + 6.0
+        half = min(w, h) / 2.0 - m
+        rng = 1.0
+        for x, y in self._pts:
+            rng = max(rng, abs(x), abs(y))
+        if self._median is not None:
+            rng = max(rng, abs(self._median[0]), abs(self._median[1]))
+        rng *= 1.15
+        scale = half / rng if rng > 0 else 1.0
+        # axes
+        p.setPen(QPen(QColor("#cbbca6"), 1))
+        p.drawLine(QPointF(cx - half, cy), QPointF(cx + half, cy))
+        p.drawLine(QPointF(cx, cy - half), QPointF(cx, cy + half))
+        # points
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(192, 134, 58, 170))
+        for x, y in self._pts:
+            px = cx + x * scale
+            py = cy - y * scale
+            p.drawEllipse(QPointF(px, py), 3.0, 3.0)
+        # median marker
+        if self._median is not None:
+            mxp = cx + self._median[0] * scale
+            myp = cy - self._median[1] * scale
+            p.setPen(QPen(QColor("#1f6f43"), 2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawLine(QPointF(mxp - 6, myp), QPointF(mxp + 6, myp))
+            p.drawLine(QPointF(mxp, myp - 6), QPointF(mxp, myp + 6))
+        p.setPen(QColor("#6f6254"))
+        p.drawText(QRectF(cx, cy - half - 2, half, 14),
+                   Qt.AlignmentFlag.AlignRight, f"±{rng:,.0f}")
+        p.end()
+
+
+class _NumItem(QTableWidgetItem):
+    """Table item that sorts by a numeric key instead of its display text, so
+    score / dx / dy columns order correctly (blanks sort last)."""
+
+    def __init__(self, text: str, sortval: float) -> None:
+        super().__init__(text)
+        self._sortval = sortval
+
+    def __lt__(self, other) -> bool:  # type: ignore[override]
+        try:
+            return self._sortval < other._sortval
+        except AttributeError:
+            return super().__lt__(other)
+
+
+class FineAlignResultsDialog(QDialog):
+    """Batch fine-align overview: a sortable results table (score colour-coded,
+    optional below-threshold filter), a score histogram and a residual scatter,
+    plus a one-click 'apply median residual to origin δ' action (F5 M2 + M3).
+    Double-clicking a row asks MainWindow to jump to that image."""
+
+    image_activated = pyqtSignal(str)
+    apply_median_requested = pyqtSignal(float, float)
+
+    _OK_BG = QColor("#dff3e6")
+    _LOW_BG = QColor("#fdf2cf")
+    _BAD_BG = QColor("#f7ded9")
+
+    def __init__(self, parent, rows, threshold: float) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Fine-align results")
+        self.setMinimumSize(660, 600)
+        self._rows = list(rows)
+        self._threshold = threshold
+        v = QVBoxLayout(self)
+
+        n_ok = sum(1 for r in self._rows if r["status"] == "ok")
+        n_low = sum(1 for r in self._rows if r["status"] == "low-score")
+        summary = QLabel(
+            f"{len(self._rows)} images  ·  {n_ok} ok  ·  {n_low} low-score  ·  "
+            f"threshold {threshold:.2f}")
+        summary.setStyleSheet(f"font-weight:600; color:{_TK_ACCENT_DK.name()};")
+        v.addWidget(summary)
+
+        self._only_low = QCheckBox("Only show score below threshold", self)
+        self._only_low.toggled.connect(lambda _on: self._fill_table())
+        v.addWidget(self._only_low)
+
+        self._table = QTableWidget(0, 6, self)
+        self._table.setHorizontalHeaderLabels(
+            ["Image", "Score", "dx (nm)", "dy (nm)", "Used r (px)", "Status"])
+        self._table.setSortingEnabled(True)
+        self._table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.verticalHeader().setVisible(False)
+        self._table.cellDoubleClicked.connect(self._on_cell_activated)
+        self._fill_table()
+        v.addWidget(self._table, 1)
+
+        charts = QHBoxLayout()
+        scores = [r["score"] for r in self._rows if r["score"] is not None]
+        charts.addWidget(_ScoreHistogram(score_histogram(scores), threshold), 1)
+        pts = [(r["dx_nm"], r["dy_nm"]) for r in self._rows
+               if r["dx_nm"] is not None
+               and r["status"] in ("ok", "low-score")]
+        charts.addWidget(_ResidualScatter(pts, self._median_residual()), 1)
+        v.addLayout(charts)
+
+        btn_row = QHBoxLayout()
+        self._apply_btn = QPushButton(
+            "Apply median residual to origin δ", self)
+        self._apply_btn.setToolTip(
+            "Shift the global origin δ by the median (dx, dy) of all matched "
+            "images, then re-run to see if residuals converge.")
+        self._apply_btn.clicked.connect(self._on_apply_median)
+        if self._median_residual() is None:
+            self._apply_btn.setEnabled(False)
+        btn_row.addWidget(self._apply_btn)
+        btn_row.addStretch(1)
+        close_btn = QPushButton("Close", self)
+        close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(close_btn)
+        v.addLayout(btn_row)
+
+    def _visible_rows(self) -> list:
+        if self._only_low.isChecked():
+            return [r for r in self._rows if r["score"] is not None
+                    and r["score"] < self._threshold]
+        return self._rows
+
+    def _fill_table(self) -> None:
+        rows = self._visible_rows()
+        self._table.setSortingEnabled(False)
+        self._table.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            score = r["score"]
+            id_item = QTableWidgetItem(str(r["image_id"]))
+            id_item.setData(Qt.ItemDataRole.UserRole, r["image_id"])
+            self._table.setItem(i, 0, id_item)
+            self._table.setItem(i, 1, _NumItem(
+                "" if score is None else f"{score:.3f}",
+                -1.0 if score is None else score))
+            self._table.setItem(i, 2, _NumItem(
+                "" if r["dx_nm"] is None else f"{r['dx_nm']:,.0f}",
+                1e18 if r["dx_nm"] is None else r["dx_nm"]))
+            self._table.setItem(i, 3, _NumItem(
+                "" if r["dy_nm"] is None else f"{r['dy_nm']:,.0f}",
+                1e18 if r["dy_nm"] is None else r["dy_nm"]))
+            self._table.setItem(i, 4, _NumItem(
+                str(r["used_radius"]), float(r["used_radius"])))
+            self._table.setItem(i, 5, QTableWidgetItem(r["status"]))
+            bg = (self._OK_BG if r["status"] == "ok"
+                  else self._LOW_BG if r["status"] == "low-score"
+                  else self._BAD_BG if r["status"] not in ("not-run",)
+                  else None)
+            if bg is not None:
+                for c in range(6):
+                    self._table.item(i, c).setBackground(bg)
+        self._table.setSortingEnabled(True)
+        self._table.resizeColumnsToContents()
+
+    def _on_cell_activated(self, row: int, _col: int) -> None:
+        item = self._table.item(row, 0)
+        if item is not None:
+            iid = item.data(Qt.ItemDataRole.UserRole)
+            if iid:
+                self.image_activated.emit(str(iid))
+
+    def _median_residual(self):
+        xs = [r["dx_nm"] for r in self._rows if r["dx_nm"] is not None
+              and r["status"] in ("ok", "low-score")]
+        ys = [r["dy_nm"] for r in self._rows if r["dy_nm"] is not None
+              and r["status"] in ("ok", "low-score")]
+        if not xs:
+            return None
+        return (_median(xs), _median(ys))
+
+    def _on_apply_median(self) -> None:
+        med = self._median_residual()
+        if med is None:
+            return
+        self.apply_median_requested.emit(med[0], med[1])
 
 
 class _ImageListDelegate(QStyledItemDelegate):
@@ -3660,6 +4293,26 @@ class SemPanel(QFrame):
             item.setData(Qt.ItemDataRole.UserRole + 4, bg)
             break
 
+    def clear_score(self, image_id) -> None:
+        """Remove a fine-align score badge (e.g. when a re-run fails), keeping
+        the 'no coords' tag for images that never had coordinates (PR#4)."""
+        self._scores.pop(image_id, None)
+        for i in range(self.list.count()):
+            item = self.list.item(i)
+            img = item.data(Qt.ItemDataRole.UserRole)
+            if img is None or img.image_id != image_id:
+                continue
+            if not getattr(img, "has_coords", True):
+                item.setData(Qt.ItemDataRole.UserRole + 2, "no coords")
+                item.setData(Qt.ItemDataRole.UserRole + 3, "#9a8878")
+                item.setData(Qt.ItemDataRole.UserRole + 4, "#f4f0ea")
+            else:
+                item.setData(Qt.ItemDataRole.UserRole + 2, None)
+                item.setData(Qt.ItemDataRole.UserRole + 3, None)
+                item.setData(Qt.ItemDataRole.UserRole + 4, None)
+            self.list.viewport().update()
+            break
+
     def _on_clicked(self, item: QListWidgetItem) -> None:
         img = item.data(Qt.ItemDataRole.UserRole)
         if img is not None:
@@ -3702,6 +4355,18 @@ class AlignmentExportDialog(QDialog):
         row.addStretch(1)
         v.addLayout(row)
 
+        # F5 M6: optional image export for MMH hand-off. When either box is
+        # ticked, the chosen images are also written as PNGs plus a manifest
+        # (image_id ↔ filenames ↔ dx/dy/score) into a folder picked next.
+        img_box = QGroupBox("Also export images (for MMH hand-off)", self)
+        ibl = QVBoxLayout(img_box)
+        self._exp_raw = QCheckBox("Raw SEM image PNG", img_box)
+        self._exp_overlay = QCheckBox(
+            "Aligned GDS-overlay PNG (POI outlines on SEM)", img_box)
+        ibl.addWidget(self._exp_raw)
+        ibl.addWidget(self._exp_overlay)
+        v.addWidget(img_box)
+
         bb = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
             | QDialogButtonBox.StandardButton.Cancel, self)
@@ -3715,12 +4380,13 @@ class AlignmentExportDialog(QDialog):
             self._list.item(i).setCheckState(st)
 
     def selected(self) -> tuple:
-        """``(fmt, [image_id, ...])`` where ``fmt`` is 'csv' or 'json'."""
+        """``(fmt, [image_id, ...], export_raw, export_overlay)`` where ``fmt``
+        is 'csv' or 'json'."""
         fmt = "csv" if self._fmt.currentIndex() == 0 else "json"
         ids = [self._list.item(i).data(Qt.ItemDataRole.UserRole)
                for i in range(self._list.count())
                if self._list.item(i).checkState() == Qt.CheckState.Checked]
-        return fmt, ids
+        return fmt, ids, self._exp_raw.isChecked(), self._exp_overlay.isChecked()
 
 
 # ── Main window ──────────────────────────────────────────────────────────────
@@ -3826,6 +4492,7 @@ class MainWindow(QMainWindow):
         self.sem_panel.fine_align.run_requested.connect(self._on_run_fine_align)
         self.sem_panel.fine_align.run_all_requested.connect(self._on_run_fine_align_all)
         self.sem_panel.fine_align.preview_requested.connect(self._on_preview_template)
+        self.sem_panel.fine_align.results_requested.connect(self._open_fa_results)
         self.sem_viewer.drag_changed.connect(self._on_overlay_drag)
 
         self._doc: Optional[GdsDocument] = None
@@ -3872,10 +4539,24 @@ class MainWindow(QMainWindow):
         # M4b fine align: chosen POI layer + per-image refined offset.
         self._poi_entries: list[LayerEntry] = []
         self._refined: dict = {}     # image_id -> (dx_nm, dy_nm, score)
+        # F5: per-image (used_radius_px, status) parallel to _refined, for the
+        # results table (C3/C4). status: ok / no-coords / missing-file /
+        # no-scale / flat.
+        self._fa_meta: dict = {}
+        # F5 M4: remembered fine-align setup by layer key (visible / colour /
+        # opacity / POI / Foreground GL), captured before each ROI reload and
+        # re-applied after, so switching defect keeps the setup — the user just
+        # presses Run fine align once.
+        self._fa_setup: dict = {}
         # M4b "Run all" batch worker state.
         self._fa_thread: Optional[QThread] = None
         self._fa_worker = None
         self._fa_progress = None
+        self._fa_results_dlg = None
+        # F5 M6 overlay/image export worker state.
+        self._ov_thread: Optional[QThread] = None
+        self._ov_worker = None
+        self._ov_progress = None
         # M5 export: remember the source KLARF / OASIS paths for the manifest.
         self._klarf_path: str = ""
         self._oas_path: str = ""
@@ -4417,6 +5098,51 @@ class MainWindow(QMainWindow):
         if self._poi_entries:          # expand Fine Align when a POI is picked
             self.sem_panel.set_fine_collapsed(False)
 
+    def _capture_fa_setup(self) -> None:
+        """Snapshot per-layer visibility / colour / opacity / POI / Foreground
+        GL into ``self._fa_setup`` (keyed by layer key) for restore after the
+        next ROI reload (F5 M4)."""
+        if self._doc is None:
+            return
+        fgs = self.sem_panel.fine_align.poi_fgs()
+        poi_keys = {e.key.key() for e in self._poi_entries}
+        for e in self._doc.entries:
+            k = e.key.key()
+            self._fa_setup[k] = {
+                "visible": e.visible,
+                "color": (e.color.red(), e.color.green(), e.color.blue()),
+                "opacity": e.opacity,
+                "poi": k in poi_keys,
+                "fg": fgs.get(k),
+            }
+
+    def _apply_fa_setup(self) -> None:
+        """Re-apply the remembered setup to the freshly loaded document by layer
+        key, so switching defect keeps the fine-align setup (F5 M4). Keys absent
+        in this ROI (the defect lacks that layer) are skipped."""
+        if not self._fa_setup or self._doc is None:
+            return
+        poi_keys = []
+        for e in self._doc.entries:
+            s = self._fa_setup.get(e.key.key())
+            if not s:
+                continue
+            e.visible = bool(s["visible"])
+            if s.get("color"):
+                e.color = QColor(*s["color"])
+            if s.get("opacity") is not None:
+                e.opacity = int(s["opacity"])
+            if s.get("poi"):
+                poi_keys.append(e.key.key())
+        # Rebuild rows so checkboxes / swatches reflect the restored state.
+        self.layer_panel.set_document(self._doc)
+        if poi_keys:
+            self.layer_panel.check_pois(poi_keys)
+            self.sem_panel.fine_align.set_fgs(
+                {k: self._fa_setup[k].get("fg") for k in poi_keys})
+        self._update_overlay()
+        self.canvas.refresh()
+
     def _poi_layers(self) -> list:
         """``[(polygons, fg_glv), ...]`` for the active POI layers (F3),
         each at its own FG grey from the panel."""
@@ -4465,8 +5191,10 @@ class MainWindow(QMainWindow):
         cfg = self.sem_panel.fine_align.values()
         template = self._build_template(anchor, W, H, nm_per_px, cfg)
         radius_px = cfg["search_radius_nm"] / nm_per_px
-        dx_nm, dy_nm, score, _ = fine_align_one(sem, template, nm_per_px, radius_px)
+        dx_nm, dy_nm, score, used_r = fine_align_one(sem, template, nm_per_px,
+                                                     radius_px)
         self._refined[img.image_id] = (dx_nm, dy_nm, score)
+        self._fa_meta[img.image_id] = (int(used_r), "ok")
         self.sem_panel.fine_align.set_result(score, dx_nm, dy_nm)
         self.sem_panel.set_score(img.image_id, score, cfg["score_threshold"])
         self.sem_viewer.reset_drag()
@@ -4548,7 +5276,21 @@ class MainWindow(QMainWindow):
         ref = self._refined.get(img.image_id)
         score = f"  ·  score {ref[2]:.3f}" if ref else ""
         subtitle = f"{img.image_id}  ·  POI: {names}{score}"
-        TemplatePreviewDialog(self, sem, gds_rgb, template, subtitle).exec()
+        # Before/after residual overlays: outlines of the visible layers on the
+        # SEM at the coarse anchor (before) and coarse+refined anchor (after).
+        entries = [(e.polygons,
+                    (e.color.red(), e.color.green(), e.color.blue()))
+                   for e in self._doc.visible_entries()
+                   if e.polygons] if self._doc else []
+        before_rgb = after_rgb = None
+        if entries:
+            before_rgb = overlay_outlines_on_sem(sem, entries, anchor, nm_per_px)
+            if ref is not None:
+                after_anchor = (anchor[0] + ref[0], anchor[1] + ref[1])
+                after_rgb = overlay_outlines_on_sem(
+                    sem, entries, after_anchor, nm_per_px)
+        TemplatePreviewDialog(self, sem, gds_rgb, template, subtitle,
+                              before_rgb, after_rgb).exec()
 
     def _on_run_fine_align_all(self) -> None:
         """Batch fine-align every image with coordinates (plan F3 Run all)."""
@@ -4588,7 +5330,12 @@ class MainWindow(QMainWindow):
         self._fa_worker.finished.connect(self._on_fa_finished)
         self._fa_worker.failed.connect(self._on_fa_failed)
         self._fa_worker.cancelled.connect(self._on_fa_cancelled)
-        self._fa_progress.cancel_requested.connect(self._fa_worker.cancel)
+        # DirectConnection: run cancel() in the GUI thread so it sets the
+        # worker's threading.Event right away. A default (queued) connection
+        # would wait for the worker's event loop, which never runs while run()
+        # is busy — that was the "cancel keeps running" bug (F5 M5 #3).
+        self._fa_progress.cancel_requested.connect(
+            self._fa_worker.cancel, Qt.ConnectionType.DirectConnection)
         for sig in (self._fa_worker.finished, self._fa_worker.failed,
                     self._fa_worker.cancelled):
             sig.connect(self._fa_thread.quit)
@@ -4601,13 +5348,21 @@ class MainWindow(QMainWindow):
     def _on_fa_progress(self, done: int, total: int, image_id: str) -> None:
         if self._fa_progress is not None:
             self._fa_progress.set_text(
-                f"Fine aligning all images…\n{done} / {total}  ({image_id})")
+                f"Fine aligning all images…\ncurrent: {image_id}")
+            self._fa_progress.set_progress(done, total)
 
     def _on_fa_result(self, image_id: str, dx: float, dy: float,
-                      score: float) -> None:
+                      score: float, used_r: int, status: str) -> None:
         thr = self.sem_panel.fine_align.values()["score_threshold"]
-        self._refined[image_id] = (dx, dy, score)
-        self.sem_panel.set_score(image_id, score, thr)
+        self._fa_meta[image_id] = (int(used_r), status)
+        if status == "ok":
+            self._refined[image_id] = (dx, dy, score)
+            self.sem_panel.set_score(image_id, score, thr)
+        else:
+            # Drop any stale offset/badge so a now-failing image isn't still
+            # rendered/exported with outdated alignment (PR#4 review).
+            self._refined.pop(image_id, None)
+            self.sem_panel.clear_score(image_id)
 
     def _on_fa_finished(self, count: int) -> None:
         self._status_doc.setText(f"fine align: processed {count} image(s)")
@@ -4615,12 +5370,53 @@ class MainWindow(QMainWindow):
         if self._current_sem is not None:
             self.sem_viewer.reset_drag()
             self._jump_to_image(self._current_sem)
+        self._open_fa_results()
 
     def _on_fa_failed(self, msg: str) -> None:
         QMessageBox.critical(self, "Run all failed", msg)
 
     def _on_fa_cancelled(self) -> None:
-        self._status_doc.setText("fine align: cancelled")
+        # Partial results are kept (not cleared), so the overview still reflects
+        # whatever finished before the cancel (F5 M5).
+        self._status_doc.setText("fine align: cancelled (partial results kept)")
+        self._refresh_overview_defects()
+
+    def _open_fa_results(self) -> None:
+        """Open (or refresh) the batch results overview dialog (F5 M2)."""
+        if not self._sem_images:
+            self._status_doc.setText("results: load SEM images first")
+            return
+        thr = self.sem_panel.fine_align.values()["score_threshold"]
+        rows = fine_align_result_rows(
+            self._sem_images, self._refined, self._fa_meta, thr)
+        dlg = FineAlignResultsDialog(self, rows, thr)
+        dlg.image_activated.connect(self._on_results_image_activated)
+        dlg.apply_median_requested.connect(self._on_apply_median_residual)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self._fa_results_dlg = dlg
+        dlg.show()
+
+    def _on_results_image_activated(self, image_id: str) -> None:
+        for im in self._sem_images:
+            if str(im.image_id) == str(image_id):
+                self._on_sem_image_selected(im)
+                break
+
+    def _on_apply_median_residual(self, mx: float, my: float) -> None:
+        """C2: shift the global origin δ by the median residual so the next
+        Run all should converge. Same sign as the per-image refined offset
+        (both are added to the coarse anchor). Existing _refined kept so the
+        user can compare before/after."""
+        self._origin_dx += mx
+        self._origin_dy += my
+        self.sem_viewer.reset_drag()
+        self.sem_panel.coord_setup.set_origin(self._origin_dx, self._origin_dy)
+        if self._current_sem is not None:
+            self._jump_to_image(self._current_sem)
+        self._fit_view_to_defects()
+        self._status_doc.setText(
+            f"origin δ += ({mx:,.0f}, {my:,.0f}) nm  ·  re-run Run all to check "
+            f"residual convergence")
 
     def _cleanup_fa(self) -> None:
         if self._fa_progress is not None:
@@ -4653,7 +5449,7 @@ class MainWindow(QMainWindow):
         dlg = AlignmentExportDialog(self, self._sem_images)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        fmt, ids = dlg.selected()
+        fmt, ids, exp_raw, exp_overlay = dlg.selected()
         if not ids:
             self._status_doc.setText("export: no images selected")
             return
@@ -4682,6 +5478,95 @@ class MainWindow(QMainWindow):
             return
         self._status_doc.setText(
             f"exported {len(rows)} image(s) → {Path(path).name}")
+        if exp_raw or exp_overlay:
+            self._export_overlay_images(images, exp_raw, exp_overlay)
+
+    # ── F5 M6: SEM + aligned-overlay PNG export ──────────────────────────────
+    def _poi_specs_colored(self) -> list:
+        """``[(spec, (r, g, b)), ...]`` for the active POI layers, for overlay
+        export — the spec walks the ROI, the colour strokes the outline."""
+        out = []
+        for e in self._poi_entries:
+            spec = self._entry_spec(e)
+            if spec is not None:
+                out.append((spec, (e.color.red(), e.color.green(),
+                                   e.color.blue())))
+        return out
+
+    def _export_overlay_images(self, images, exp_raw: bool,
+                               exp_overlay: bool) -> None:
+        if cv2 is None:
+            QMessageBox.warning(self, "Image export",
+                                "opencv (cv2) is required for image export.")
+            return
+        if self._ov_thread is not None:
+            return
+        specs = self._poi_specs_colored()
+        if exp_overlay and (not specs or self._rar is None
+                            or self._roi_root is None):
+            QMessageBox.information(
+                self, "Overlay export",
+                "Overlay PNGs need an OASIS (ROI) open and ≥1 POI layer; "
+                "exporting raw images / manifest only.")
+            exp_overlay = False
+        out_dir = QFileDialog.getExistingDirectory(self, "Export images to…")
+        if not out_dir:
+            return
+        jobs = [(im.image_id, self._coarse_gds(im),
+                 self._refined.get(im.image_id),
+                 str(im.file_path) if im.file_path else "", bool(im.exists))
+                for im in images]
+        cfg = {"fov_w": self._fov_w, "fov_h": self._fov_h,
+               "nm_auto": self._nm_auto, "nm_manual": self._nm_per_px_manual}
+        self._ov_progress = LoadProgressDialog(self)
+        self._ov_progress.set_text("Exporting images…")
+        self._ov_thread = QThread(self)
+        self._ov_worker = OverlayExportWorker(
+            self._rar, self._roi_root, specs, jobs, cfg, out_dir,
+            exp_raw, exp_overlay)
+        self._ov_worker.moveToThread(self._ov_thread)
+        self._ov_thread.started.connect(self._ov_worker.run)
+        self._ov_worker.progress.connect(self._on_ov_progress)
+        self._ov_worker.finished.connect(self._on_ov_finished)
+        self._ov_worker.failed.connect(self._on_ov_failed)
+        self._ov_worker.cancelled.connect(self._on_ov_cancelled)
+        self._ov_progress.cancel_requested.connect(
+            self._ov_worker.cancel, Qt.ConnectionType.DirectConnection)
+        for sig in (self._ov_worker.finished, self._ov_worker.failed,
+                    self._ov_worker.cancelled):
+            sig.connect(self._ov_thread.quit)
+        self._ov_thread.finished.connect(self._cleanup_ov)
+        self._ov_progress.show()
+        QApplication.processEvents()
+        self._ov_thread.start()
+
+    def _on_ov_progress(self, done: int, total: int, image_id: str) -> None:
+        if self._ov_progress is not None:
+            self._ov_progress.set_text(f"Exporting images…\ncurrent: {image_id}")
+            self._ov_progress.set_progress(done, total)
+
+    def _on_ov_finished(self, count: int, manifest: str) -> None:
+        self._status_doc.setText(
+            f"image export: {count} image(s) + manifest → {Path(manifest).name}")
+
+    def _on_ov_failed(self, msg: str) -> None:
+        QMessageBox.critical(self, "Image export failed", msg)
+
+    def _on_ov_cancelled(self) -> None:
+        self._status_doc.setText("image export: cancelled")
+
+    def _cleanup_ov(self) -> None:
+        if self._ov_progress is not None:
+            self._ov_progress.shutdown()
+            self._ov_progress.close()
+            self._ov_progress.deleteLater()
+            self._ov_progress = None
+        if self._ov_worker is not None:
+            self._ov_worker.deleteLater()
+            self._ov_worker = None
+        if self._ov_thread is not None:
+            self._ov_thread.deleteLater()
+            self._ov_thread = None
 
     def _on_goto_gds(self) -> None:
         """Goto a GDS coordinate (µm) typed in the toolbar — the same thing
@@ -4743,6 +5628,9 @@ class MainWindow(QMainWindow):
         roi = (cx - hw, cy - hh, cx + hw, cy + hh)
         self._rar.errors.clear()
         self._roi_center = (cx, cy)
+        # F5 M4: remember the current fine-align setup before this defect's ROI
+        # replaces the document, so it can be re-applied by layer key on load.
+        self._capture_fa_setup()
 
         self._roi_progress = LoadProgressDialog(self)
         self._roi_progress.set_text(
@@ -4789,6 +5677,11 @@ class MainWindow(QMainWindow):
         # F4: re-evaluate the Boolean recipes against this defect's ROI so the
         # synthetic layers follow the FOV (instead of being lost on reload).
         expr_errs = self._recompute_recipes(doc.bbox_nm)
+        # F5 M4: restore the remembered fine-align setup (visibility / colour /
+        # POI / Foreground GL) by layer key, so the user need only press Run
+        # fine align once on the new defect. Runs after recompute so synthetic
+        # layers exist before POI restore.
+        self._apply_fa_setup()
         # Keep the user's current (overview) view; just refresh the FOV box.
         # Don't re-centre/zoom onto the ROI — that's what made the marker
         # look stuck in the middle of the screen. Zoom in manually to
