@@ -2,6 +2,59 @@
 
 ---
 
+## [2026-05-25] [F3] M3–M5：多 POI fine align（合成樣板）＋ POI 鈕／預覽彈窗
+
+**變更類型：** 功能（fine align 多 POI / UI）
+
+**動機/現象：** 原 fine align 僅支援單一 POI，真實半導體 SEM 影像含多層結構。改為可選
+多個 POI layer，各自輸入 FG gray，合成一張類 SEM 樣板做單次 matchTemplate，並能彈窗
+並排 SEM/GDS/Template 做視覺分析。
+
+**修復/實作（`glas/app/gds_align_tool.py`）：**
+- 核心：新增 `render_composite_template(poi_layers,...)`（各層 mask 以各自 fg 疊到共用 bg、
+  一次 blur）；`render_poi_template` 改為 n=1 thin wrapper（行為不變）。
+- `LayerPanel`：POI 改多選，`poi_changed`→`pois_changed(list)`，`_on_poi_toggled` 去互斥、
+  以 panel 順序重組；`_LayerRow` POI 鈕放大改「POI」＋`_POI_BTN_QSS`（解決全白看不到）。
+- `FineAlignPanel`：移除單一 FG，改 `_poi_box` 每 POI 一列（名稱＋FG spin），`set_pois()`
+  保留既有值，新增 `poi_fgs()`；BG/blur/radius/threshold 維持全局；加「Preview template…」。
+- `MainWindow`：`_on_pois_changed` / `_poi_layers` / `_build_template` / `_coarse_anchor` /
+  `_poi_specs` 全多 POI；`FineAlignAllWorker` 改吃 `poi_specs=[(spec,fg)]`；匯出 `poi_layer`
+  多層串接；新增 `TemplatePreviewDialog` + `_on_preview_template` + `_render_gds_preview`。
+
+**測試：** py_compile 全通過；更新 `test_gds_align_m4b.py`（多選、`_poi_specs`、worker
+建構子、composite）、`test_gds_align_m7.py`（`set_pois`）。sandbox 無 PyQt6/numpy/cv2，
+GUI／matchTemplate 互動驗收待 user 本地。
+
+**影響檔案：** `glas/app/gds_align_tool.py`、`tests/test_gds_align_m4b.py`、
+`tests/test_gds_align_m7.py`。
+
+**Branch：** `claude/compassionate-dijkstra-84Gjd`
+
+## [2026-05-25] [F3] M1+M2：版面裁切/最小尺寸修正＋OASIS 圖層名稱顯示
+
+**變更類型：** 功能（UI 修正 + 圖層名稱）
+
+**動機/現象：** (M1) 視窗縮放時版面擠迫、Coordinate Setup 展開時欄位/按鈕被裁切、
+對話框最小寬可能撐破小螢幕。(M2) 左側 layer 只顯示 `L17/D0`，user 想看名稱。
+
+**修復/實作：**
+- M1（`collapsible.py`）：`CollapsibleSection` body layout 加
+  `setSizeConstraint(SetMinimumSize)`，展開段落不再被下方 list 擠壓裁切。
+- M1（`gds_align_tool.py`）：新增 `_screen_avail()` / `_capped_min_width()`，三個對話框
+  最小寬夾到螢幕；`MainWindow.setMinimumSize(min(940,avw),min(600,avh))`。
+- M2（`oasis_streamer.py`）：`scan_cell_offsets` 同輪收集 LAYERNAME → `layernames`。
+- M2（`oasis_random.py`）：`resolve_layer_name()` 純函式 + `RandomAccessReader.layer_display_name()`。
+- M2（`gds_align_tool.py`）：`LayerEntry.display_name`（display-only，不入 LayerKey identity）；
+  `_roi_entry` 填名；`_LayerRow` 顯示 `NAME (L17/D0) · n`，無名稱退回 `L17/D0 · n`。
+
+**測試：** py_compile 全通過；新增 `tests/test_oasis_random.py::TestResolveLayerName` 5 項
+（純函式，已於 sandbox 以等價邏輯驗過）。GUI 版面修正待 user 本地確認。
+
+**影響檔案：** `glas/app/gds_align_tool.py`、`glas/app/collapsible.py`、
+`glas/core/oasis_streamer.py`、`glas/core/oasis_random.py`、`tests/test_oasis_random.py`。
+
+**Branch：** `claude/compassionate-dijkstra-84Gjd`
+
 ## [2026-05-25] 規劃 [F3]：多 POI Fine Align ＋ UI 優化（plan only，尚未動程式）
 
 **變更類型：** 規劃（plan 文件 + §8 任務註冊）

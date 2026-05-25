@@ -184,6 +184,27 @@ _LOAD_SEM_BTN_QSS = (
     "}"
 )
 
+# Per-layer POI toggle (left LayerPanel). Unchecked: a visible outlined chip
+# (the old 18×16 flat "P" was invisible against the panel — F3 M4). Checked:
+# solid accent so the chosen POI layers stand out.
+_POI_BTN_QSS = (
+    "QToolButton {"
+    "  background: #ffffff;"
+    f"  color: {_TK_ACCENT_DK.name()};"
+    f"  border: 1px solid {_TK_ACCENT.name()};"
+    "  border-radius: 4px;"
+    "  font-weight: 700;"
+    "  font-size: 10px;"
+    "  padding: 0 2px;"
+    "}"
+    f"QToolButton:hover {{ background: #fff0e0; }}"
+    "QToolButton:checked {"
+    f"  background: {_TK_ACCENT.name()};"
+    "  color: #ffffff;"
+    f"  border: 1px solid {_TK_ACCENT_DK.name()};"
+    "}"
+)
+
 
 def _hint_qss(size: int = _FS_CAPTION, color: str = "#8a7660",
               pad: str = "") -> str:
@@ -195,6 +216,14 @@ def _hint_qss(size: int = _FS_CAPTION, color: str = "#8a7660",
 def _result_qss(color: str, size: int = _FS_LABEL) -> str:
     """QSS for a coloured result label (success/danger/accent)."""
     return f"font-size:{size}px; color:{color};"
+
+
+def _entry_label(entry) -> str:
+    """Display label for a LayerEntry: ``NAME (L17/D0)`` when the OASIS file
+    declares a LAYERNAME, else the bare ``L17/D0`` / ``[expr] name`` (F3)."""
+    base = entry.key.label()
+    name = getattr(entry, "display_name", "")
+    return f"{name} ({base})" if (name and not entry.key.synthetic) else base
 
 
 def _config_list(lst) -> None:
@@ -993,13 +1022,15 @@ class FineAlignAllWorker(QObject):
     failed = pyqtSignal(str)
     cancelled = pyqtSignal()
 
-    def __init__(self, rar, root, poi_spec, jobs, cfg) -> None:
+    def __init__(self, rar, root, poi_specs, jobs, cfg) -> None:
         super().__init__()
         self._rar = rar
         self._root = root
-        self._poi_spec = poi_spec
+        # F3 multi-POI: list of (spec, fg_glv); each spec is walked per ROI and
+        # composited at its fg onto the shared bg before matching.
+        self._poi_specs = list(poi_specs)
         self._jobs = jobs        # list of (image_id, anchor|None, path, exists)
-        self._cfg = cfg          # dict: fov_w/h, nm_auto, nm_manual, fg/bg/blur, search_radius_nm
+        self._cfg = cfg          # dict: fov_w/h, nm_auto, nm_manual, bg/blur, search_radius_nm
         self._cancel = False
 
     def cancel(self) -> None:
@@ -1028,15 +1059,19 @@ class FineAlignAllWorker(QObject):
                     continue
                 roi = (anchor[0] - c["fov_w"], anchor[1] - c["fov_h"],
                        anchor[0] + c["fov_w"], anchor[1] + c["fov_h"])
-                polys = poi_polys_for_roi(
-                    self._rar, self._root, roi, self._poi_spec,
-                    cancel_cb=lambda: self._cancel)
-                if not polys:
+                poi_layers = []
+                for spec, fg in self._poi_specs:
+                    polys = poi_polys_for_roi(
+                        self._rar, self._root, roi, spec,
+                        cancel_cb=lambda: self._cancel)
+                    if polys:
+                        poi_layers.append((polys, fg))
+                if not poi_layers:
                     self.result.emit(str(image_id), 0.0, 0.0, 0.0)
                     continue
-                template = render_poi_template(
-                    polys, anchor, W, H, nm_per_px,
-                    c["fg_glv"], c["bg_glv"], c["blur_sigma_px"])
+                template = render_composite_template(
+                    poi_layers, anchor, W, H, nm_per_px,
+                    c["bg_glv"], c["blur_sigma_px"])
                 radius_px = c["search_radius_nm"] / nm_per_px
                 dx, dy, score, _ = fine_align_one(sem, template, nm_per_px,
                                                   radius_px)
@@ -1134,25 +1169,55 @@ def make_template(mask: np.ndarray, fg_glv: int = 200, bg_glv: int = 80,
     return img
 
 
-def render_poi_template(polygons: list, anchor: tuple, width_px: int,
-                        height_px: int, nm_per_px: float,
-                        fg_glv: int = 200, bg_glv: int = 80,
-                        blur_sigma_px: float = 1.0) -> np.ndarray:
-    """Rasterize the POI ``polygons`` (nm) over the FOV centred on ``anchor``
-    at the SEM resolution and turn it into a grey template the same size as
-    the SEM image (plan M4b)."""
+def _fit_mask(mask: np.ndarray, height_px: int, width_px: int) -> np.ndarray:
+    """Clamp/pad a rasterized mask to exactly ``(height_px, width_px)``."""
+    if mask.shape == (height_px, width_px):
+        return mask
+    fixed = np.zeros((height_px, width_px), dtype=np.uint8)
+    h = min(mask.shape[0], height_px)
+    w = min(mask.shape[1], width_px)
+    fixed[:h, :w] = mask[:h, :w]
+    return fixed
+
+
+def render_composite_template(poi_layers: list, anchor: tuple, width_px: int,
+                              height_px: int, nm_per_px: float,
+                              bg_glv: int = 80,
+                              blur_sigma_px: float = 1.0) -> np.ndarray:
+    """Composite several POI layers into one SEM-like grey template (plan F3).
+
+    ``poi_layers`` is ``[(polygons, fg_glv), ...]`` — each layer's polygons
+    (nm) are rasterized over the FOV centred on ``anchor`` and painted at that
+    layer's ``fg_glv`` onto a shared ``bg_glv`` background (later layers paint
+    over earlier ones where they overlap). One Gaussian blur softens the edges
+    so the result matches a band-limited SEM frame. With a single layer this is
+    identical to the old single-POI template."""
     gx, gy = anchor
     half_w = width_px / 2.0 * nm_per_px
     half_h = height_px / 2.0 * nm_per_px
     bbox = (gx - half_w, gy - half_h, gx + half_w, gy + half_h)
-    mask = rasterize_layer(polygons, bbox, nm_per_px)
-    if mask.shape != (height_px, width_px):
-        fixed = np.zeros((height_px, width_px), dtype=np.uint8)
-        h = min(mask.shape[0], height_px)
-        w = min(mask.shape[1], width_px)
-        fixed[:h, :w] = mask[:h, :w]
-        mask = fixed
-    return make_template(mask, fg_glv, bg_glv, blur_sigma_px)
+    img = np.full((height_px, width_px), np.uint8(bg_glv), dtype=np.uint8)
+    for polygons, fg_glv in poi_layers:
+        if not polygons:
+            continue
+        mask = _fit_mask(rasterize_layer(polygons, bbox, nm_per_px),
+                         height_px, width_px)
+        img[mask > 0] = np.uint8(fg_glv)
+    if blur_sigma_px and blur_sigma_px > 0 and cv2 is not None:
+        k = int(max(1, round(blur_sigma_px * 3))) * 2 + 1
+        img = cv2.GaussianBlur(img, (k, k), float(blur_sigma_px))
+    return img
+
+
+def render_poi_template(polygons: list, anchor: tuple, width_px: int,
+                        height_px: int, nm_per_px: float,
+                        fg_glv: int = 200, bg_glv: int = 80,
+                        blur_sigma_px: float = 1.0) -> np.ndarray:
+    """Single-POI template (plan M4b) — thin wrapper over
+    :func:`render_composite_template` with one layer."""
+    return render_composite_template(
+        [(polygons, fg_glv)], anchor, width_px, height_px, nm_per_px,
+        bg_glv, blur_sigma_px)
 
 
 def _parabola_subpx(res: np.ndarray, bx: int, by: int, axis: int) -> float:
@@ -1346,12 +1411,15 @@ class _LayerRow(QWidget):
         h.addWidget(self._chk)
 
         self.poi_btn = QToolButton(self)
-        self.poi_btn.setText("P")
+        self.poi_btn.setText("POI")
         self.poi_btn.setCheckable(True)
-        self.poi_btn.setFixedSize(18, 16)
+        self.poi_btn.setFixedSize(34, 18)
+        self.poi_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.poi_btn.setStyleSheet(_POI_BTN_QSS)
         self.poi_btn.setToolTip(
-            "Use this layer as the POI alignment template (M4b fine align). "
-            "Only one layer can be the POI.")
+            "Add / remove this layer as a POI alignment template (F3 fine "
+            "align). Several layers can be POIs — they composite into one "
+            "synthetic template, each at its own grey level.")
         self.poi_btn.toggled.connect(self.poi_toggled)
         h.addWidget(self.poi_btn)
 
@@ -1365,9 +1433,7 @@ class _LayerRow(QWidget):
 
         # Prefix the OASIS LAYERNAME when the file declares one (F3 M2):
         # "METAL1 (L17/D0)"; raw layers with no name fall back to "L17/D0".
-        ld = entry.key.label()
-        name = getattr(entry, "display_name", "")
-        label = f"{name} ({ld})" if (name and not entry.key.synthetic) else ld
+        label = _entry_label(entry)
         n_poly = len(entry.polygons)
         if n_poly:
             label = f"{label}  ·  {n_poly}"
@@ -1423,7 +1489,7 @@ class LayerPanel(QFrame):
 
     layers_changed = pyqtSignal()
     add_expression_requested = pyqtSignal()   # M2.6: "+ Expression…" clicked
-    poi_changed = pyqtSignal(object)          # M4b: LayerEntry or None
+    pois_changed = pyqtSignal(object)         # F3: list[LayerEntry] (POI set)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -1454,14 +1520,14 @@ class LayerPanel(QFrame):
         btn_row.addWidget(self._expr_btn)
         layout.addLayout(btn_row)
 
-        hint = QLabel("checkbox: show/hide  ·  P: POI  ·  slider: opacity  ·  swatch: colour")
+        hint = QLabel("checkbox: show/hide  ·  POI: fine-align template  ·  slider: opacity  ·  swatch: colour")
         hint.setStyleSheet(_hint_qss(_FS_MICRO, pad="6px 10px"))
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
         self._doc: Optional[GdsDocument] = None
         self._rows: list[_LayerRow] = []
-        self._poi_entry: Optional[LayerEntry] = None
+        self._poi_entries: list[LayerEntry] = []
         self._show_empty_hint()
 
     def _show_empty_hint(self) -> None:
@@ -1501,10 +1567,10 @@ class LayerPanel(QFrame):
         self._doc = doc
         self.list.clear()
         self._rows = []
-        self._poi_entry = None
+        self._poi_entries = []
         if doc is None or not doc.entries:
             self._show_empty_hint()
-            self.poi_changed.emit(None)
+            self.pois_changed.emit([])
             return
         for entry in doc.entries:
             item = QListWidgetItem()
@@ -1517,25 +1583,24 @@ class LayerPanel(QFrame):
             self.list.addItem(item)
             self.list.setItemWidget(item, row)
             self._rows.append(row)
-        self.poi_changed.emit(None)
+        self.pois_changed.emit([])
 
     def _on_poi_toggled(self, on: bool, row: "_LayerRow",
                         entry: "LayerEntry") -> None:
-        """Keep POI exclusive: turning one on clears the others."""
+        """F3: POI is multi-select — several layers can be active POIs at once.
+        Emit the current set in panel order."""
         if on:
-            for other in self._rows:
-                if other is not row and other.poi_btn.isChecked():
-                    other.poi_btn.blockSignals(True)
-                    other.poi_btn.setChecked(False)
-                    other.poi_btn.blockSignals(False)
-            self._poi_entry = entry
-            self.poi_changed.emit(entry)
-        elif self._poi_entry is entry:
-            self._poi_entry = None
-            self.poi_changed.emit(None)
+            if entry not in self._poi_entries:
+                self._poi_entries.append(entry)
+        elif entry in self._poi_entries:
+            self._poi_entries.remove(entry)
+        # Re-emit in document/panel order for a stable composite ordering.
+        ordered = [r._entry for r in self._rows if r.poi_btn.isChecked()]
+        self._poi_entries = ordered
+        self.pois_changed.emit(list(ordered))
 
-    def poi_entry(self) -> Optional["LayerEntry"]:
-        return self._poi_entry
+    def poi_entries(self) -> list["LayerEntry"]:
+        return list(self._poi_entries)
 
     def raw_layer_keys(self) -> list[tuple[int, int]]:
         """``(layer, datatype)`` pairs of the non-synthetic layers, for
@@ -2874,15 +2939,17 @@ class CoordinateSetupPanel(QGroupBox):
 
 
 class FineAlignPanel(QGroupBox):
-    """POI template settings + auto fine-alignment controls (plan M4b).
+    """Multi-POI template settings + auto fine-alignment controls (plan F3).
 
-    Select the POI layer on the left LayerPanel (the 'P' toggle); this panel
-    sets the synthetic GLVs / blur and the search radius, then runs
-    ``cv2.matchTemplate`` for the current image. Emits ``run_requested`` for
-    MainWindow to do the work."""
+    Toggle one or more POI layers on the left LayerPanel; each appears here
+    with its own FG grey-level spinbox. They composite into one synthetic
+    template (shared BG / blur), which is matched against the SEM with
+    ``cv2.matchTemplate``. Emits ``run_requested`` / ``run_all_requested`` /
+    ``preview_requested`` for MainWindow to do the work."""
 
     run_requested = pyqtSignal()
     run_all_requested = pyqtSignal()
+    preview_requested = pyqtSignal()
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__("Fine Align", parent)
@@ -2891,10 +2958,18 @@ class FineAlignPanel(QGroupBox):
         grid.setHorizontalSpacing(6)
         grid.setVerticalSpacing(4)
 
-        self._poi_lbl = QLabel("POI: (none — toggle 'P' on a layer)")
+        self._poi_lbl = QLabel("POI: (none — toggle 'POI' on a layer)")
         self._poi_lbl.setWordWrap(True)
         self._poi_lbl.setStyleSheet(_hint_qss(_FS_CAPTION))
         self._poi_set = False
+
+        # Per-POI FG grey rows live in their own box, rebuilt by set_pois().
+        self._poi_box = QWidget(self)
+        self._poi_box_layout = QVBoxLayout(self._poi_box)
+        self._poi_box_layout.setContentsMargins(0, 0, 0, 0)
+        self._poi_box_layout.setSpacing(3)
+        self._poi_fg_spins: dict[tuple, QSpinBox] = {}
+        self._poi_keys: list[tuple] = []
 
         def _spin(lo, hi, val, step=1, dec=0):
             s = QDoubleSpinBox(self) if dec else QSpinBox(self)
@@ -2905,10 +2980,9 @@ class FineAlignPanel(QGroupBox):
                 s.setDecimals(dec)
             return s
 
-        self._fg = _spin(0, 255, 200)
-        self._fg.setToolTip("Synthetic grey level for POI structure pixels.")
         self._bg = _spin(0, 255, 80)
-        self._bg.setToolTip("Synthetic grey level for background pixels.")
+        self._bg.setToolTip("Synthetic grey level for background pixels "
+                            "(shared by all POI layers).")
         self._blur = _spin(0.0, 20.0, 1.0, 0.5, 2)
         self._blur.setToolTip("Gaussian blur σ (px) softening template edges.")
         self._radius = _spin(0, 100_000, 200, 50)
@@ -2925,7 +2999,7 @@ class FineAlignPanel(QGroupBox):
         self._run_btn.setEnabled(False)
         self._run_btn.setToolTip(
             "Refine the alignment of the currently loaded ROI against the "
-            "selected SEM image (needs a POI + loaded ROI + image).")
+            "selected SEM image (needs ≥1 POI + loaded ROI + image).")
         self._run_btn.clicked.connect(self.run_requested)
 
         self._run_all_btn = QPushButton("Run all images", self)
@@ -2935,16 +3009,23 @@ class FineAlignPanel(QGroupBox):
             "(slow on big files; cancellable).")
         self._run_all_btn.clicked.connect(self.run_all_requested)
 
+        self._preview_btn = QPushButton("Preview template…", self)
+        self._preview_btn.setEnabled(False)
+        self._preview_btn.setToolTip(
+            "Show SEM / GDS / synthetic composite template side by side for "
+            "the current image (needs ≥1 POI + image).")
+        self._preview_btn.clicked.connect(self.preview_requested)
+
         self._result_lbl = QLabel("")
         self._result_lbl.setStyleSheet(f"font-size:{_FS_LABEL}px;")
 
         rows = [
-            ("span", self._poi_lbl), ("FG grey", self._fg),
+            ("span", self._poi_lbl), ("span", self._poi_box),
             ("BG grey", self._bg), ("Blur σ (px)", self._blur),
             ("Search radius (nm)", self._radius),
             ("Score threshold", self._thresh),
             ("span", self._run_btn), ("span", self._run_all_btn),
-            ("span", self._result_lbl),
+            ("span", self._preview_btn), ("span", self._result_lbl),
         ]
         # Single-column form (label above input) so labels aren't truncated in
         # the narrow panel (M7 R2), matching CoordinateSetupPanel.
@@ -2960,21 +3041,61 @@ class FineAlignPanel(QGroupBox):
                 grid.addWidget(w, r + 1, 0)
                 r += 2
 
-    def set_poi(self, label: Optional[str]) -> None:
-        self._poi_set = bool(label)
-        self._poi_lbl.setText(f"POI: {label}" if self._poi_set
-                              else "POI: (none — toggle 'P' on a layer)")
-        self._run_btn.setEnabled(self._poi_set)
-        self._run_all_btn.setEnabled(self._poi_set)
+    def set_pois(self, items: list) -> None:
+        """Rebuild the per-POI FG rows from ``items`` (``[(key, label), ...]``),
+        preserving any FG value already entered for a key (F3)."""
+        prev = {k: s.value() for k, s in self._poi_fg_spins.items()}
+        while self._poi_box_layout.count():
+            it = self._poi_box_layout.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        self._poi_fg_spins = {}
+        self._poi_keys = []
+        for key, label in items:
+            row = QWidget(self._poi_box)
+            hl = QHBoxLayout(row)
+            hl.setContentsMargins(0, 0, 0, 0)
+            hl.setSpacing(4)
+            name = QLabel(label, row)
+            name.setStyleSheet(_hint_qss(_FS_CAPTION))
+            name.setToolTip(label)
+            spin = QSpinBox(row)
+            spin.setRange(0, 255)
+            spin.setValue(int(prev.get(key, 200)))
+            spin.setFixedWidth(58)
+            spin.setToolTip("FG grey level for this POI layer's structure pixels.")
+            hl.addWidget(name, 1)
+            hl.addWidget(QLabel("FG", row))
+            hl.addWidget(spin)
+            self._poi_box_layout.addWidget(row)
+            self._poi_fg_spins[key] = spin
+            self._poi_keys.append(key)
+
+        self._poi_set = bool(items)
+        n = len(items)
+        self._poi_lbl.setText(
+            f"POI: {n} layer{'s' if n != 1 else ''} → composite template"
+            if self._poi_set else "POI: (none — toggle 'POI' on a layer)")
+        self._update_enabled()
+
+    def poi_fgs(self) -> dict:
+        """Map of ``key -> fg_glv`` for the active POI layers (F3)."""
+        return {k: int(s.value()) for k, s in self._poi_fg_spins.items()}
+
+    def _update_enabled(self, running: bool = False) -> None:
+        on = self._poi_set and not running
+        self._run_btn.setEnabled(on)
+        self._run_all_btn.setEnabled(on)
+        self._preview_btn.setEnabled(on)
 
     def set_running(self, running: bool) -> None:
         """Disable the run buttons while a batch is in flight."""
-        self._run_btn.setEnabled(self._poi_set and not running)
-        self._run_all_btn.setEnabled(self._poi_set and not running)
+        self._update_enabled(running)
 
     def values(self) -> dict:
         return {
-            "fg_glv": int(self._fg.value()),
             "bg_glv": int(self._bg.value()),
             "blur_sigma_px": float(self._blur.value()),
             "search_radius_nm": float(self._radius.value()),
@@ -2991,6 +3112,67 @@ class FineAlignPanel(QGroupBox):
 
     def clear_result(self) -> None:
         self._result_lbl.setText("")
+
+
+def _gray_to_pixmap(arr: np.ndarray) -> QPixmap:
+    """uint8 grayscale ndarray → QPixmap (F3 preview)."""
+    a = np.ascontiguousarray(arr.astype(np.uint8))
+    h, w = a.shape[:2]
+    img = QImage(a.tobytes(), w, h, w, QImage.Format.Format_Grayscale8)
+    return QPixmap.fromImage(img.copy())
+
+
+def _rgb_to_pixmap(arr: np.ndarray) -> QPixmap:
+    """uint8 (H, W, 3) RGB ndarray → QPixmap (F3 preview)."""
+    a = np.ascontiguousarray(arr.astype(np.uint8))
+    h, w = a.shape[:2]
+    img = QImage(a.tobytes(), w, h, 3 * w, QImage.Format.Format_RGB888)
+    return QPixmap.fromImage(img.copy())
+
+
+class TemplatePreviewDialog(QDialog):
+    """Side-by-side SEM / GDS / synthetic-template preview for the current
+    image, so a multi-POI composite can be eyeballed against the real SEM
+    (plan F3 M5)."""
+
+    _TILE = 280
+
+    def __init__(self, parent, sem: np.ndarray, gds_rgb: np.ndarray,
+                 template: np.ndarray, subtitle: str = "") -> None:
+        super().__init__(parent)
+        self.setWindowTitle("POI template preview")
+        v = QVBoxLayout(self)
+        if subtitle:
+            cap = QLabel(subtitle)
+            cap.setWordWrap(True)
+            cap.setStyleSheet(_hint_qss(_FS_LABEL))
+            v.addWidget(cap)
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        tiles = [("SEM", _gray_to_pixmap(sem)),
+                 ("GDS", _rgb_to_pixmap(gds_rgb)),
+                 ("Template", _gray_to_pixmap(template))]
+        for title, pm in tiles:
+            col = QVBoxLayout()
+            t = QLabel(title)
+            t.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+            t.setStyleSheet(f"font-weight:700; color:{_TK_ACCENT_DK.name()};")
+            pic = QLabel()
+            pic.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            pic.setFixedSize(self._TILE, self._TILE)
+            pic.setStyleSheet(f"background:#1a1a1a; border:1px solid {_TK_BORDER.name()};")
+            if not pm.isNull():
+                pic.setPixmap(pm.scaled(
+                    self._TILE, self._TILE, Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation))
+            col.addWidget(t)
+            col.addWidget(pic)
+            row.addLayout(col)
+        v.addLayout(row)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        btns.rejected.connect(self.reject)
+        btns.accepted.connect(self.accept)
+        v.addWidget(btns)
 
 
 class _ImageListDelegate(QStyledItemDelegate):
@@ -3130,7 +3312,7 @@ class SemPanel(QFrame):
         v.addWidget(self.load_roi_btn)
 
         # Fine Align is only needed while aligning — start collapsed; expands
-        # when a POI is selected (MainWindow._on_poi_changed).
+        # when a POI is selected (MainWindow._on_pois_changed).
         self.fine_align = FineAlignPanel(self)
         self._fine_section = self._wrap_section(
             "Fine Align", self.fine_align, collapsed=True)
@@ -3379,7 +3561,7 @@ class MainWindow(QMainWindow):
         # Wire signals.
         self.layer_panel.layers_changed.connect(self._on_layers_changed)
         self.layer_panel.add_expression_requested.connect(self._on_add_expression)
-        self.layer_panel.poi_changed.connect(self._on_poi_changed)
+        self.layer_panel.pois_changed.connect(self._on_pois_changed)
         self.canvas.cursor_pos_nm.connect(self._on_cursor)
         self.canvas.defect_clicked.connect(self._on_defect_clicked)
         self.sem_panel.load_klarf_requested.connect(self._on_load_klarf)
@@ -3389,6 +3571,7 @@ class MainWindow(QMainWindow):
         self.sem_panel.coord_setup.changed.connect(self._on_coord_changed)
         self.sem_panel.fine_align.run_requested.connect(self._on_run_fine_align)
         self.sem_panel.fine_align.run_all_requested.connect(self._on_run_fine_align_all)
+        self.sem_panel.fine_align.preview_requested.connect(self._on_preview_template)
         self.sem_viewer.drag_changed.connect(self._on_overlay_drag)
 
         self._doc: Optional[GdsDocument] = None
@@ -3427,7 +3610,7 @@ class MainWindow(QMainWindow):
         # Color cycle for synthetic expression layers.
         self._expr_color_idx = 0
         # M4b fine align: chosen POI layer + per-image refined offset.
-        self._poi_entry: Optional[LayerEntry] = None
+        self._poi_entries: list[LayerEntry] = []
         self._refined: dict = {}     # image_id -> (dx_nm, dy_nm, score)
         # M4b "Run all" batch worker state.
         self._fa_thread: Optional[QThread] = None
@@ -3947,26 +4130,43 @@ class MainWindow(QMainWindow):
         self._fit_view_to_defects()
         self._status_doc.setText("origin δ cleared")
 
-    # ── M4b: POI template + auto fine alignment ──────────────────────────────
-    def _on_poi_changed(self, entry) -> None:
-        self._poi_entry = entry
-        self.sem_panel.fine_align.set_poi(
-            entry.key.label() if entry is not None else None)
-        if entry is not None:          # expand Fine Align when a POI is picked
+    # ── F3: multi-POI template + auto fine alignment ─────────────────────────
+    def _on_pois_changed(self, entries) -> None:
+        self._poi_entries = list(entries or [])
+        self.sem_panel.fine_align.set_pois(
+            [(e.key.key(), _entry_label(e)) for e in self._poi_entries])
+        if self._poi_entries:          # expand Fine Align when a POI is picked
             self.sem_panel.set_fine_collapsed(False)
 
-    def _on_run_fine_align(self) -> None:
-        """Refine the current image's alignment via POI-template matching.
+    def _poi_layers(self) -> list:
+        """``[(polygons, fg_glv), ...]`` for the active POI layers (F3),
+        each at its own FG grey from the panel."""
+        fgs = self.sem_panel.fine_align.poi_fgs()
+        return [(e.polygons, fgs.get(e.key.key(), 200))
+                for e in self._poi_entries if e.polygons]
 
-        Renders the POI layer at the coarse position, runs
-        ``cv2.matchTemplate`` against the loaded SEM frame, stores the residual
-        as a per-image correction and re-jumps so the overlay snaps onto the
-        structure (plan M4b, single-image path)."""
+    def _build_template(self, anchor, W, H, nm_per_px, cfg):
+        """Composite the active POI layers into one template at ``anchor``."""
+        return render_composite_template(
+            self._poi_layers(), anchor, W, H, nm_per_px,
+            cfg["bg_glv"], cfg["blur_sigma_px"])
+
+    def _coarse_anchor(self, img):
+        """Coarse FOV-centre GDS anchor for ``img`` (klarf→gds + fine + δ),
+        excluding any refined offset so the search starts from coarse."""
+        gx, gy = gds_fov.klarf_to_gds(
+            img.xrel, img.yrel, self._chip_corner_x, self._chip_corner_y)
+        return (gx + self._fine_dx + self._origin_dx,
+                gy + self._fine_dy + self._origin_dy)
+
+    def _on_run_fine_align(self) -> None:
+        """Refine the current image's alignment via composite POI-template
+        matching (plan F3, single-image path)."""
         if cv2 is None:
             QMessageBox.warning(self, "Fine align",
                                 "opencv (cv2) is required for fine alignment.")
             return
-        if self._poi_entry is None or not self._poi_entry.polygons:
+        if not self._poi_layers():
             self._status_doc.setText("fine align: select a POI layer first")
             return
         img = self._current_sem
@@ -3981,17 +4181,10 @@ class MainWindow(QMainWindow):
         if nm_per_px <= 0:
             self._status_doc.setText("fine align: set FOV / nm-per-px first")
             return
-        # Render at the coarse position (klarf→gds + fine + δ), excluding the
-        # current refined offset so the search starts from coarse each run.
-        gx, gy = gds_fov.klarf_to_gds(
-            img.xrel, img.yrel, self._chip_corner_x, self._chip_corner_y)
-        anchor = (gx + self._fine_dx + self._origin_dx,
-                  gy + self._fine_dy + self._origin_dy)
+        anchor = self._coarse_anchor(img)
         H, W = sem.shape[:2]
         cfg = self.sem_panel.fine_align.values()
-        template = render_poi_template(
-            self._poi_entry.polygons, anchor, W, H, nm_per_px,
-            cfg["fg_glv"], cfg["bg_glv"], cfg["blur_sigma_px"])
+        template = self._build_template(anchor, W, H, nm_per_px, cfg)
         radius_px = cfg["search_radius_nm"] / nm_per_px
         dx_nm, dy_nm, score, _ = fine_align_one(sem, template, nm_per_px, radius_px)
         self._refined[img.image_id] = (dx_nm, dy_nm, score)
@@ -4012,27 +4205,80 @@ class MainWindow(QMainWindow):
         arr = cv2.imread(str(img.file_path), cv2.IMREAD_GRAYSCALE)
         return arr
 
-    def _poi_spec(self):
-        """The POI as a batch-walkable spec, or None (M4b Run all)."""
-        e = self._poi_entry
-        if e is None:
-            return None
+    @staticmethod
+    def _entry_spec(e):
+        """One POI layer as a batch-walkable spec, or None (F3)."""
         if e.key.synthetic:
             if not e.expr_text or not e.expr_bindings:
                 return None
             return ("expr", e.expr_text, dict(e.expr_bindings))
         return ("raw", e.key.layer, e.key.datatype)
 
+    def _poi_specs(self):
+        """Active POIs as ``[(spec, fg_glv), ...]`` for batch (F3 Run all)."""
+        fgs = self.sem_panel.fine_align.poi_fgs()
+        out = []
+        for e in self._poi_entries:
+            spec = self._entry_spec(e)
+            if spec is not None:
+                out.append((spec, fgs.get(e.key.key(), 200)))
+        return out
+
+    def _render_gds_preview(self, anchor, W, H, nm_per_px) -> np.ndarray:
+        """RGB (H, W, 3) raster of the visible GDS layers over the FOV centred
+        on ``anchor`` at SEM resolution, each in its layer colour (F3 M5)."""
+        gx, gy = anchor
+        half_w = W / 2.0 * nm_per_px
+        half_h = H / 2.0 * nm_per_px
+        bbox = (gx - half_w, gy - half_h, gx + half_w, gy + half_h)
+        rgb = np.full((H, W, 3), 255, dtype=np.uint8)
+        entries = self._doc.visible_entries() if self._doc else []
+        for e in entries:
+            if not e.polygons:
+                continue
+            mask = _fit_mask(rasterize_layer(e.polygons, bbox, nm_per_px), H, W)
+            c = e.color
+            rgb[mask > 0] = (c.red(), c.green(), c.blue())
+        return rgb
+
+    def _on_preview_template(self) -> None:
+        """Pop the SEM / GDS / composite-template comparison (plan F3 M5)."""
+        if not self._poi_layers():
+            self._status_doc.setText("preview: select a POI layer first")
+            return
+        img = self._current_sem
+        if img is None or not img.has_coords:
+            self._status_doc.setText("preview: select an image with coordinates")
+            return
+        sem = self._load_sem_gray(img)
+        if sem is None:
+            self._status_doc.setText("preview: SEM image not readable")
+            return
+        nm_per_px = self._effective_nm_per_px()
+        if nm_per_px <= 0:
+            self._status_doc.setText("preview: set FOV / nm-per-px first")
+            return
+        anchor = self._coarse_anchor(img)
+        H, W = sem.shape[:2]
+        cfg = self.sem_panel.fine_align.values()
+        template = self._build_template(anchor, W, H, nm_per_px, cfg)
+        gds_rgb = self._render_gds_preview(anchor, W, H, nm_per_px)
+        names = "; ".join(_entry_label(e) for e in self._poi_entries)
+        ref = self._refined.get(img.image_id)
+        score = f"  ·  score {ref[2]:.3f}" if ref else ""
+        subtitle = f"{img.image_id}  ·  POI: {names}{score}"
+        TemplatePreviewDialog(self, sem, gds_rgb, template, subtitle).exec()
+
     def _on_run_fine_align_all(self) -> None:
-        """Batch fine-align every image with coordinates (plan M4b Run all)."""
+        """Batch fine-align every image with coordinates (plan F3 Run all)."""
         if cv2 is None:
             QMessageBox.warning(self, "Fine align",
                                 "opencv (cv2) is required for fine alignment.")
             return
         if self._fa_thread is not None:
             return  # already running
-        spec = self._poi_spec()
-        if spec is None:
+        specs = self._poi_specs()
+        if not specs:
             self._status_doc.setText("run all: select a POI layer first")
             return
         if self._rar is None or self._roi_root is None:
@@ -4053,7 +4299,7 @@ class MainWindow(QMainWindow):
         self._fa_progress.set_text("Fine aligning all images…")
         self._fa_thread = QThread(self)
         self._fa_worker = FineAlignAllWorker(
-            self._rar, self._roi_root, spec, jobs, cfg)
+            self._rar, self._roi_root, specs, jobs, cfg)
         self._fa_worker.moveToThread(self._fa_thread)
         self._fa_thread.started.connect(self._fa_worker.run)
         self._fa_worker.progress.connect(self._on_fa_progress)
@@ -4133,7 +4379,7 @@ class MainWindow(QMainWindow):
         images = [i for i in self._sem_images if i.image_id in ids]
         gds_path = self._oas_path or (str(self._doc.path)
                                       if self._doc and self._doc.path else "")
-        poi = self._poi_entry.key.label() if self._poi_entry else ""
+        poi = "; ".join(_entry_label(e) for e in self._poi_entries)
         rows = alignment_rows(
             images, self._refined, coarse_of=self._coarse_gds,
             klarf_path=self._klarf_path, gds_path=gds_path,

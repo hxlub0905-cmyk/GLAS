@@ -55,7 +55,7 @@ class TestCollapsibleRefs:
         assert mw.sem_panel.coord_setup is not None
         assert mw.sem_panel.fine_align is not None
         assert hasattr(mw.sem_panel.coord_setup, "values")
-        assert hasattr(mw.sem_panel.fine_align, "set_poi")
+        assert hasattr(mw.sem_panel.fine_align, "set_pois")
 
     @pytest.mark.skipif(gat.CollapsibleSection is None,
                         reason="CollapsibleSection unavailable")

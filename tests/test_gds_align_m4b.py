@@ -174,21 +174,24 @@ def _doc_two_layers():
 
 class TestPoiSelection:
 
-    def test_exclusive_and_run_enabled(self, mw):
+    def test_multi_select_and_run_enabled(self, mw):
         doc, _ = _doc_two_layers()
         mw._doc = doc
         mw.layer_panel.set_document(doc)
         rows = mw.layer_panel._rows
         rows[0].poi_btn.setChecked(True)
-        assert mw._poi_entry.key.label() == "L17/D0"
+        assert [e.key.label() for e in mw._poi_entries] == ["L17/D0"]
         assert mw.sem_panel.fine_align._run_btn.isEnabled()
-        # Selecting another POI clears the first (exclusive).
+        # F3: POI is multi-select — a second layer joins the set (in panel order).
         rows[1].poi_btn.setChecked(True)
-        assert rows[0].poi_btn.isChecked() is False
-        assert mw._poi_entry.key.label() == "L6/D0"
-        # Toggling it off clears the POI entirely.
+        assert rows[0].poi_btn.isChecked() is True
+        assert [e.key.label() for e in mw._poi_entries] == ["L17/D0", "L6/D0"]
+        # Each active POI gets its own FG spin.
+        assert set(mw.sem_panel.fine_align.poi_fgs()) == {(17, 0, ""), (6, 0, "")}
+        # Clearing both disables the run buttons.
+        rows[0].poi_btn.setChecked(False)
         rows[1].poi_btn.setChecked(False)
-        assert mw._poi_entry is None
+        assert mw._poi_entries == []
         assert mw.sem_panel.fine_align._run_btn.isEnabled() is False
 
 
@@ -232,7 +235,7 @@ class TestRunFineAlign:
             _Qt.ItemDataRole.UserRole + 2) == f"{score:.2f}"
 
     def test_no_poi_is_noop(self, mw):
-        mw._poi_entry = None
+        mw._poi_entries = []
         mw._on_run_fine_align()
         assert mw._refined == {}
 
@@ -293,10 +296,11 @@ class TestRunAllWorker:
         jobs = [("D1", anchor, str(p), True),
                 ("D2", None, "", False)]            # no-coords -> skipped
         cfg = {"fov_w": 8000.0, "fov_h": 8000.0, "nm_auto": True,
-               "nm_manual": 0.0, "fg_glv": 200, "bg_glv": 80,
+               "nm_manual": 0.0, "bg_glv": 80,
                "blur_sigma_px": 0.0, "search_radius_nm": 1000.0,
                "score_threshold": 0.5}
-        w = gat.FineAlignAllWorker(_FakeRar(), "top", ("raw", 17, 0), jobs, cfg)
+        w = gat.FineAlignAllWorker(
+            _FakeRar(), "top", [(("raw", 17, 0), 200)], jobs, cfg)
         results = {}
         prog = []
         done = {}
@@ -316,10 +320,11 @@ class TestRunAllWorker:
         _patch_walk(monkeypatch)
         jobs = [("D1", (4000.0, 4000.0), "", False)]
         cfg = {"fov_w": 8000.0, "fov_h": 8000.0, "nm_auto": True,
-               "nm_manual": 0.0, "fg_glv": 200, "bg_glv": 80,
+               "nm_manual": 0.0, "bg_glv": 80,
                "blur_sigma_px": 0.0, "search_radius_nm": 1000.0,
                "score_threshold": 0.5}
-        w = gat.FineAlignAllWorker(_FakeRar(), "top", ("raw", 17, 0), jobs, cfg)
+        w = gat.FineAlignAllWorker(
+            _FakeRar(), "top", [(("raw", 17, 0), 200)], jobs, cfg)
         cancelled = []
         w.cancelled.connect(lambda: cancelled.append(True))
         w.cancel()
@@ -327,20 +332,28 @@ class TestRunAllWorker:
         assert cancelled == [True]
 
 
-class TestPoiSpec:
+class TestPoiSpecs:
 
     def test_raw_spec(self, mw):
         doc, _ = _doc_two_layers()
         mw.layer_panel.set_document(doc)
         mw.layer_panel._rows[0].poi_btn.setChecked(True)
-        assert mw._poi_spec() == ("raw", 17, 0)
+        assert mw._poi_specs() == [(("raw", 17, 0), 200)]
 
     def test_expr_spec(self, mw):
-        mw._poi_entry = gat.LayerEntry(
+        mw._poi_entries = [gat.LayerEntry(
             key=gat.LayerKey(-1, 0, name="L0", synthetic=True), polygons=[],
-            expr_text="A & B", expr_bindings={"A": (17, 0), "B": (6, 0)})
-        assert mw._poi_spec() == ("expr", "A & B", {"A": (17, 0), "B": (6, 0)})
+            expr_text="A & B", expr_bindings={"A": (17, 0), "B": (6, 0)})]
+        assert mw._poi_specs() == [
+            (("expr", "A & B", {"A": (17, 0), "B": (6, 0)}), 200)]
 
     def test_none_spec(self, mw):
-        mw._poi_entry = None
-        assert mw._poi_spec() is None
+        mw._poi_entries = []
+        assert mw._poi_specs() == []
+
+    def test_multi_spec(self, mw):
+        doc, _ = _doc_two_layers()
+        mw.layer_panel.set_document(doc)
+        mw.layer_panel._rows[0].poi_btn.setChecked(True)
+        mw.layer_panel._rows[1].poi_btn.setChecked(True)
+        assert mw._poi_specs() == [(("raw", 17, 0), 200), (("raw", 6, 0), 200)]
