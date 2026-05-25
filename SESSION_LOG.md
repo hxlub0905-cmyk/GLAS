@@ -2,6 +2,47 @@
 
 ---
 
+## [2026-05-25] [F5] 實作完成（M1–M6，待 user 本地驗收）
+
+**變更類型：** 功能（新功能 + bug fix）
+
+**內容：** fine-align 診斷 + 工作流六個 milestone 全數實作（plan 已核准）：
+- **M1 殘差疊圖**：新增純函式 `overlay_outlines_on_sem(sem_gray, entries, anchor, nm_per_px)`
+  （對齊 `rasterize_layer` 的 X 右 / Y-flip 慣例，cv2.polylines + numpy fallback `_draw_polyline_np`）；
+  `TemplatePreviewDialog` 由 3 格擴成含「Overlay·before（coarse）/ after（coarse+refined）」共 5 格
+  （grid 每列 3 格自動換行）；`_on_preview_template` 備好 before/after anchor + entries。
+- **M2 批次總覽**：新增 `FineAlignResultsDialog`（可排序表格 image_id/score/dx/dy/used_radius/status、
+  score 上色、「只看低於 threshold」篩選）+ 自繪 `_ScoreHistogram`（含 threshold 線）+ `_ResidualScatter`
+  （原點十字 + median 標記）；純函式 `fine_align_result_rows` / `score_histogram` / `residual_median`。
+  `FineAlignAllWorker.result` signal 擴成 `(image_id,dx,dy,score,used_r,status)`，每張影像都回報
+  狀態（ok/no-coords/missing-file/no-scale/flat）；新增 `self._fa_meta`；單張路徑也存 used_r/status。
+  `Run all` 完成後自動開窗，Fine Align 面板加「Results…」可重開；雙擊列跳到該影像。
+- **M3 中位殘差→δ**：對話框「Apply median residual to origin δ」鈕 → `_on_apply_median_residual`
+  把 ok/low-score 影像的 median(dx,dy) 加進 `_origin_dx/dy`（與 refined 同號、沿用 Set Offset 機制），
+  不清空既有 `_refined`，提示重跑。
+- **M4 setup 持久化 + 命名**：`BG grey`→`Background GL`、每列 `FG`→`Foreground GL`（不動 `values()` key）；
+  新增 `self._fa_setup`，`_capture_fa_setup`（載新 ROI 前快照 visible/colour/opacity/POI/FG）+
+  `_apply_fa_setup`（`_on_roi_finished` recompute 後依 layer key 還原、缺層略過、不自動 run）；
+  `LayerPanel.check_pois` / `FineAlignPanel.set_fgs` 還原 POI 勾選與 FG。
+- **M5 cancel 即時生效 + ETA**：`FineAlignAllWorker` cancel 改 `threading.Event`，`cancel_requested`
+  以 `DirectConnection` 在 GUI 執行緒直接 set（修「按終止仍一直跑」根因）；`LoadProgressDialog` 先前
+  已加自繪 `_AnimatedBar` + `set_progress`（done/total/%/elapsed/ETA）；cancel 後保留部分結果。
+- **M6 overlay+image 匯出**：`AlignmentExportDialog` 加「Raw SEM PNG / Aligned overlay PNG」勾選 +
+  `selected()` 多回傳兩旗標；新增 `OverlayExportWorker`（逐張輸出 `<id>_raw.png` / `<id>_overlay.png`
+  到選定資料夾，overlay 用 M1 helper 在 coarse+refined anchor 描 POI 輪廓、RGB→BGR 翻轉再 imwrite）+
+  manifest（`overlay_manifest.csv/.json`，schema `mmh-gds-overlay-v1`，image_id join）；`_safe_name`。
+
+**測試：** `py_compile` 全過。新增 `tests/test_gds_align_f5.py`（score_histogram / residual_median /
+fine_align_result_rows status / _safe_name / overlay_outlines_on_sem 落點 / manifest 寫出）。
+**sandbox 無 PyQt6/numpy/cv2 → pytest 與 GUI 未跑**，全部 GUI/互動待 user 本地驗收
+（preview before/after、Run all 進度條/ETA、即時 cancel、Results 表/直方圖/散點、median→δ、
+切 DID 保留 setup 按一次即可、overlay PNG + manifest 匯出）。
+
+**影響檔案：** `glas/app/gds_align_tool.py`、`tests/test_gds_align_f5.py`、
+`docs/plans/F5-finealign-diagnostics.md`、`CLAUDE.md`。
+
+**Branch：** `claude/sharp-lamport-YIk3z`
+
 ## [2026-05-25] [F5-M5部分] Batch 進度條動態化 + ETA
 
 **變更類型：** 功能（UI）
