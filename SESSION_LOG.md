@@ -2,6 +2,26 @@
 
 ---
 
+## [2026-05-25] [F5] PR#4 review fix：非 ok 批次狀態清掉舊 refined offset
+
+**變更類型：** bug fix
+
+**動機現象：** PR#4 review（P1）指出 `_on_fa_result` 對每張影像更新 `_fa_meta`，但只在
+`status == "ok"` 時寫 `_refined`。若某影像先前對位成功、後續 run 回 `flat`/`missing-file`/
+`no-scale`/`no-coords`，舊 offset 仍留在 `_refined`，jump/overlay/export 經 `_refined_offset()`
+會繼續用過期對位渲染/匯出失敗影像。
+
+**修復實作：** `_on_fa_result` 在非 ok 分支 `self._refined.pop(image_id, None)` 並呼叫新增的
+`SemPanel.clear_score(image_id)`（移除 score badge；對本來就無座標的影像保留「no coords」標記）。
+
+**測試：** `py_compile` 過。sandbox 無 PyQt6 → GUI 待 user 驗。
+
+**影響檔案：** `glas/app/gds_align_tool.py`。
+
+**Branch：** `claude/sharp-lamport-YIk3z`（PR #4）
+
+---
+
 ## [2026-05-25] [F5] 實作完成（M1–M6，待 user 本地驗收）
 
 **變更類型：** 功能（新功能 + bug fix）

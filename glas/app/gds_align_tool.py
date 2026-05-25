@@ -4293,6 +4293,26 @@ class SemPanel(QFrame):
             item.setData(Qt.ItemDataRole.UserRole + 4, bg)
             break
 
+    def clear_score(self, image_id) -> None:
+        """Remove a fine-align score badge (e.g. when a re-run fails), keeping
+        the 'no coords' tag for images that never had coordinates (PR#4)."""
+        self._scores.pop(image_id, None)
+        for i in range(self.list.count()):
+            item = self.list.item(i)
+            img = item.data(Qt.ItemDataRole.UserRole)
+            if img is None or img.image_id != image_id:
+                continue
+            if not getattr(img, "has_coords", True):
+                item.setData(Qt.ItemDataRole.UserRole + 2, "no coords")
+                item.setData(Qt.ItemDataRole.UserRole + 3, "#9a8878")
+                item.setData(Qt.ItemDataRole.UserRole + 4, "#f4f0ea")
+            else:
+                item.setData(Qt.ItemDataRole.UserRole + 2, None)
+                item.setData(Qt.ItemDataRole.UserRole + 3, None)
+                item.setData(Qt.ItemDataRole.UserRole + 4, None)
+            self.list.viewport().update()
+            break
+
     def _on_clicked(self, item: QListWidgetItem) -> None:
         img = item.data(Qt.ItemDataRole.UserRole)
         if img is not None:
@@ -5338,6 +5358,11 @@ class MainWindow(QMainWindow):
         if status == "ok":
             self._refined[image_id] = (dx, dy, score)
             self.sem_panel.set_score(image_id, score, thr)
+        else:
+            # Drop any stale offset/badge so a now-failing image isn't still
+            # rendered/exported with outdated alignment (PR#4 review).
+            self._refined.pop(image_id, None)
+            self.sem_panel.clear_score(image_id)
 
     def _on_fa_finished(self, count: int) -> None:
         self._status_doc.setText(f"fine align: processed {count} image(s)")
