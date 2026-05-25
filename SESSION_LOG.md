@@ -2,6 +2,21 @@
 
 ---
 
+## [2026-05-25] 完成 [F4] + [F1]：user 驗收通過，§8 結案
+
+**變更類型：** 文件（任務結案，無程式碼變更）
+
+**內容：** user 本地驗收 [F4]（Boolean 食譜化重算 + 巢狀 + 編輯 + 對話框內嵌預覽 + 方向性
+W/H morphology + coordinate setup 版面修復）與 [F1]（互動驗收：SEM↔GDS 對位 / 拖動 δ /
+fine-align / 批次 Run all / 匯出 / 折疊 UX）皆 OK。從 `CLAUDE.md` §8 移除 [F4]、[F1]；
+`docs/plans/F4-boolean-enhance.md` 標 done、勾完驗收 checkbox。§8 進行中僅剩 [F5]（待核准）。
+
+**影響檔案：** `CLAUDE.md`、`docs/plans/F4-boolean-enhance.md`。
+
+**Branch：** `claude/compassionate-dijkstra-84Gjd`（PR #3）
+
+---
+
 ## [2026-05-25] [F4] 方向性 W/H morphology + coordinate setup 版面溢出修復
 
 **變更類型：** 功能（語意變更）+ bug fix

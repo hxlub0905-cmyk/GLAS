@@ -1,6 +1,6 @@
 # [F4] Boolean 表達式引擎強化：食譜化重算 + 巢狀 + 編輯 + 對話框重設計
 
-> **狀態：** implemented（待 user 本地 GUI/測試驗收）
+> **狀態：** done（user 已驗收 2026-05-25）
 > **§8 ID：** [F4]
 > **建立：** 2026-05-25
 > **負責 branch：** claude/compassionate-dijkstra-84Gjd（PR #3）
@@ -134,10 +134,9 @@ layer 機制，主要是補「持久化重算 + 巢狀解析 + 編輯 + UI」。
 
 - [x] 所有 milestone checkbox 已勾
 - [x] `python3 -m py_compile glas/app/gds_align_tool.py glas/core/gds_boolean.py`（已過）
-- [ ] 新增純邏輯測試通過（巢狀/循環/遷移/重算/相依排序）— **sandbox 無 numpy/shapely，待 user
-  本地 `pytest tests/test_gds_boolean.py -v`**
-- [ ] 手動（user 本地）：定義 L0、L1=巢狀引用 L0；跳多個 defect 看自動重算；編輯 L0 連動；
-  刪除；新對話框 token 插入 / 即時報錯 / 預覽
+- [x] 新增純邏輯測試通過（巢狀/循環/遷移/重算/相依排序）— user 本地 pytest 通過
+- [x] 手動（user 本地）：定義 L0、L1=巢狀引用 L0；跳多個 defect 看自動重算；編輯 L0 連動；
+  刪除；新對話框 token 插入 / 即時報錯 / 預覽 — user 已驗收
 - [x] `SESSION_LOG.md` 有對應紀錄
 
 ---
