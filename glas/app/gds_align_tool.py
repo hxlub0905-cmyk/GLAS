@@ -1288,23 +1288,27 @@ def _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb=None):
 def poi_polys_for_roi(rar, root, roi_bbox, poi_spec, cancel_cb=None):
     """POI polygons (nm, root coords) for a given ROI, for batch fine align
     (plan M4b "Run all"). ``poi_spec`` is ``('raw', layer, datatype)`` or
-    ``('expr', expr_text, bindings)``; the latter walks each bound layer over
-    the ROI and evaluates the Boolean expression."""
+    ``('expr', expr_text, bindings[, recipes])``; the latter walks each bound
+    layer over the ROI and evaluates the Boolean expression, resolving any
+    nested synthetic references via ``recipes`` (``{name: (expr, bindings)}``)."""
     kind = poi_spec[0]
     if kind == "raw":
         _, layer, datatype = poi_spec
         return _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb)
     # expression POI
-    _, expr, bindings = poi_spec
+    expr, bindings = poi_spec[1], poi_spec[2]
+    recipes = poi_spec[3] if len(poi_spec) > 3 else {}
     x0, y0, x1, y1 = roi_bbox
     cx, cy, w, h = (x0 + x1) / 2.0, (y0 + y1) / 2.0, (x1 - x0), (y1 - y0)
-    _, ast = gds_boolean.parse_expression(expr)
-    geoms: dict = {}
-    for letter, key in bindings.items():
-        ps = _walk_roi_polys(rar, root, roi_bbox, key[0], key[1], cancel_cb)
-        geoms[letter] = gds_boolean.polys_to_geometry(ps)
-    geom = gds_boolean.evaluate(ast, geoms,
-                                fov_bbox=gds_boolean.fov_box(cx, cy, w, h))
+
+    def raw_provider(layer: int, datatype: int):
+        ps = _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb)
+        return gds_boolean.polys_to_geometry(ps)
+
+    geom = gds_boolean.resolve_expression(
+        expr, bindings, raw_provider=raw_provider,
+        recipe_provider=lambda n: recipes.get(n),
+        fov_bbox=gds_boolean.fov_box(cx, cy, w, h))
     return gds_boolean.geometry_to_polygons(geom)
 
 
@@ -1395,6 +1399,8 @@ class _LayerRow(QWidget):
 
     changed = pyqtSignal()
     poi_toggled = pyqtSignal(bool)   # M4b: this row chosen / cleared as POI
+    edit_requested = pyqtSignal()    # F4: edit this synthetic layer's recipe
+    delete_requested = pyqtSignal()  # F4: delete this synthetic layer
 
     def __init__(self, entry: "LayerEntry",
                  parent: Optional[QWidget] = None) -> None:
@@ -1442,6 +1448,30 @@ class _LayerRow(QWidget):
         self._lbl.setToolTip(label)
         h.addWidget(self._lbl, 1)
 
+        # F4: synthetic (expression) layers get inline edit / delete controls;
+        # double-clicking the row also opens the editor.
+        if entry.key.synthetic:
+            self._edit_btn = QToolButton(self)
+            self._edit_btn.setText("✎")
+            self._edit_btn.setFixedSize(20, 18)
+            self._edit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._edit_btn.setToolTip("Edit this expression")
+            self._edit_btn.clicked.connect(self.edit_requested)
+            h.addWidget(self._edit_btn)
+
+            self._del_btn = QToolButton(self)
+            self._del_btn.setText("✕")
+            self._del_btn.setFixedSize(20, 18)
+            self._del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._del_btn.setToolTip("Delete this expression layer")
+            self._del_btn.clicked.connect(self.delete_requested)
+            h.addWidget(self._del_btn)
+
+    def mouseDoubleClickEvent(self, ev) -> None:  # noqa: N802 (Qt override)
+        if self._entry.key.synthetic:
+            self.edit_requested.emit()
+        super().mouseDoubleClickEvent(ev)
+
     def _apply_swatch(self) -> None:
         c = self._entry.color
         self._swatch.setStyleSheet(
@@ -1471,6 +1501,8 @@ class LayerPanel(QFrame):
 
     layers_changed = pyqtSignal()
     add_expression_requested = pyqtSignal()   # M2.6: "+ Expression…" clicked
+    edit_expression_requested = pyqtSignal(str)    # F4: edit recipe by name
+    delete_expression_requested = pyqtSignal(str)  # F4: delete recipe by name
     pois_changed = pyqtSignal(object)         # F3: list[LayerEntry] (POI set)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
@@ -1561,6 +1593,11 @@ class LayerPanel(QFrame):
             row.changed.connect(self.layers_changed)
             row.poi_toggled.connect(
                 lambda on, r=row, e=entry: self._on_poi_toggled(on, r, e))
+            if entry.key.synthetic:
+                row.edit_requested.connect(
+                    lambda n=entry.key.name: self.edit_expression_requested.emit(n))
+                row.delete_requested.connect(
+                    lambda n=entry.key.name: self.delete_expression_requested.emit(n))
             item.setSizeHint(row.sizeHint())
             self.list.addItem(item)
             self.list.setItemWidget(item, row)
@@ -1597,40 +1634,61 @@ class LayerPanel(QFrame):
 
 
 class ExpressionLayerDialog(QDialog):
-    """Compose a synthetic layer from a Boolean expression (plan M2.6).
+    """Compose / edit a synthetic layer from a Boolean expression (F4).
 
-    The user types an HMI-style expression (``[(A > W:5) & B] < H:5``) and
-    binds each referenced letter to a raw layer via a dropdown. Binding
-    rows are rebuilt live as the expression changes. ``preview_cb`` (when
-    supplied) is invoked by the Preview button with
-    ``(name, expr, bindings)`` and should return ``(ok: bool, msg: str)``;
-    the caller draws the result on the canvas so the user can confirm the
-    ROI before accepting.
+    The expression uses letters (``A``, ``B``, …); each referenced letter is
+    bound — via a dropdown — to a **raw layer** or **another synthetic layer**
+    (nested composition). To build expressions without memorising letters, the
+    palette offers clickable layer / synthetic chips (each inserts the next
+    free letter and pre-binds it) and operator buttons (``&`` ``|`` ``-`` ``~``
+    grow / shrink / brackets) that insert at the cursor. The expression is
+    validated live: the OK button is disabled and an inline message shown until
+    it parses and every letter is bound.
+
+    ``preview_cb(name, expr, bindings)`` (optional) draws the result on the
+    canvas. ``recipe`` (optional) pre-fills the form for editing an existing
+    layer. ``bindings`` are tagged: ``("raw", layer, datatype)`` /
+    ``("ref", name)``.
     """
+
+    _LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
     def __init__(self, parent: Optional[QWidget],
                  layer_keys: list[tuple[int, int]],
-                 preview_cb=None) -> None:
+                 ref_names: Optional[list[str]] = None,
+                 preview_cb=None,
+                 recipe: Optional[dict] = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Compose expression layer")
-        self.setMinimumWidth(_capped_min_width(420))
+        self._editing = recipe is not None
+        self.setWindowTitle(
+            "Edit expression layer" if self._editing
+            else "Compose expression layer")
+        self.setMinimumWidth(_capped_min_width(460))
         self._layer_keys = list(layer_keys)
+        self._ref_names = list(ref_names or [])
         self._preview_cb = preview_cb
         self._combos: dict[str, QComboBox] = {}
         self._bind_rows: dict[str, QWidget] = {}
+        self._pending_bind: Optional[tuple] = None
 
         v = QVBoxLayout(self)
 
         v.addWidget(QLabel("Layer name"))
         self._name_edit = QLineEdit(self)
-        self._name_edit.setText("L0")
+        self._name_edit.setText(recipe["name"] if self._editing else "L0")
+        self._name_edit.textChanged.connect(self._revalidate)
         v.addWidget(self._name_edit)
 
         v.addWidget(QLabel("Expression"))
         self._expr_edit = QLineEdit(self)
         self._expr_edit.setPlaceholderText("[(A > W:5) & B] < H:5")
-        self._expr_edit.textChanged.connect(self._rebuild_bindings)
+        if self._editing:
+            self._expr_edit.setText(recipe.get("expr", ""))
+        self._expr_edit.textChanged.connect(self._on_expr_changed)
         v.addWidget(self._expr_edit)
+
+        # Insert palette: layer / synthetic chips + operator buttons.
+        v.addWidget(self._build_palette())
 
         v.addWidget(QLabel("Bindings"))
         self._bind_box = QVBoxLayout()
@@ -1646,12 +1704,85 @@ class ExpressionLayerDialog(QDialog):
         prev_row.addWidget(self._result_lbl, 1)
         v.addLayout(prev_row)
 
-        buttons = QDialogButtonBox(
+        self._buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok |
             QDialogButtonBox.StandardButton.Cancel, self)
-        buttons.accepted.connect(self._on_accept)
-        buttons.rejected.connect(self.reject)
-        v.addWidget(buttons)
+        self._buttons.accepted.connect(self._on_accept)
+        self._buttons.rejected.connect(self.reject)
+        v.addWidget(self._buttons)
+
+        # Seed binding rows + selections from the recipe (edit) or expression.
+        self._rebuild_bindings()
+        if self._editing:
+            self._apply_recipe_bindings(recipe.get("bindings", {}))
+        self._revalidate()
+
+    # ── insert palette ───────────────────────────────────────────────────────
+    def _build_palette(self) -> QWidget:
+        box = QWidget(self)
+        outer = QVBoxLayout(box)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(4)
+
+        chips = QHBoxLayout()
+        chips.setContentsMargins(0, 0, 0, 0)
+        chips.addWidget(QLabel("insert:"))
+        for (ly, dt) in self._layer_keys:
+            b = QToolButton(box)
+            b.setText(f"L{ly}/D{dt}")
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setToolTip("Insert a new letter bound to this raw layer")
+            b.clicked.connect(
+                lambda _=False, val=("raw", ly, dt): self._insert_layer(val))
+            chips.addWidget(b)
+        for nm in self._ref_names:
+            b = QToolButton(box)
+            b.setText(f"[{nm}]")
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setToolTip("Insert a new letter bound to this synthetic layer")
+            b.clicked.connect(
+                lambda _=False, val=("ref", nm): self._insert_layer(val))
+            chips.addWidget(b)
+        chips.addStretch(1)
+        outer.addLayout(chips)
+
+        ops = QHBoxLayout()
+        ops.setContentsMargins(0, 0, 0, 0)
+        for tok, tip in [("&", "intersection"), ("|", "union"),
+                         ("-", "difference"), ("~", "complement"),
+                         (" > W:", "grow (nm)"), (" < H:", "shrink (nm)"),
+                         ("(", ""), (")", "")]:
+            b = QToolButton(box)
+            b.setText(tok.strip() or tok)
+            if tip:
+                b.setToolTip(tip)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _=False, t=tok: self._insert_text(t))
+            ops.addWidget(b)
+        ops.addStretch(1)
+        outer.addLayout(ops)
+        return box
+
+    def _insert_text(self, text: str) -> None:
+        self._expr_edit.insert(text)
+        self._expr_edit.setFocus()
+
+    def _next_free_letter(self) -> Optional[str]:
+        used = set(self._referenced_letters())
+        for ch in self._LETTERS:
+            if ch not in used:
+                return ch
+        return None
+
+    def _insert_layer(self, val: tuple) -> None:
+        """Insert the next free letter at the cursor and pre-bind it to
+        ``val`` (a tagged binding)."""
+        letter = self._next_free_letter()
+        if letter is None:
+            return
+        self._pending_bind = (letter, val)
+        self._expr_edit.insert(letter)
+        self._expr_edit.setFocus()
 
     # ── binding rows ────────────────────────────────────────────────────────
     def _referenced_letters(self) -> list[str]:
@@ -1661,15 +1792,32 @@ class ExpressionLayerDialog(QDialog):
             return []
         return sorted(gds_boolean.referenced_layers(ast))
 
+    def _binding_options(self) -> list[tuple[str, tuple]]:
+        """(label, tagged-value) for every bindable source."""
+        opts = [(f"L{ly}/D{dt}", ("raw", ly, dt))
+                for (ly, dt) in self._layer_keys]
+        opts += [(f"[{nm}]", ("ref", nm)) for nm in self._ref_names]
+        return opts
+
+    def _on_expr_changed(self) -> None:
+        self._rebuild_bindings()
+        self._revalidate()
+
     def _rebuild_bindings(self) -> None:
         letters = self._referenced_letters()
-        # Add a dropdown for each newly referenced letter.
+        options = self._binding_options()
         for letter in letters:
             if letter in self._combos:
                 continue
             combo = QComboBox(self)
-            for (ly, dt) in self._layer_keys:
-                combo.addItem(f"L{ly}/D{dt}", (ly, dt))
+            for label, val in options:
+                combo.addItem(label, val)
+            # Honour a pending pre-bind from a chip click.
+            pend = getattr(self, "_pending_bind", None)
+            if pend is not None and pend[0] == letter:
+                self._select_combo(combo, pend[1])
+                self._pending_bind = None
+            combo.currentIndexChanged.connect(self._revalidate)
             row = QWidget(self)
             rl = QHBoxLayout(row)
             rl.setContentsMargins(0, 0, 0, 0)
@@ -1678,8 +1826,6 @@ class ExpressionLayerDialog(QDialog):
             self._combos[letter] = combo
             self._bind_rows[letter] = row
             self._bind_box.addWidget(row)
-        # Drop rows for letters no longer referenced (only when the
-        # expression parses cleanly, so partial typing doesn't churn).
         if letters:
             for letter in list(self._combos):
                 if letter not in letters:
@@ -1688,6 +1834,19 @@ class ExpressionLayerDialog(QDialog):
                     row.setParent(None)
                     row.deleteLater()
 
+    @staticmethod
+    def _select_combo(combo: QComboBox, val: tuple) -> None:
+        for i in range(combo.count()):
+            if combo.itemData(i) == val:
+                combo.setCurrentIndex(i)
+                return
+
+    def _apply_recipe_bindings(self, bindings: dict) -> None:
+        for letter, val in bindings.items():
+            combo = self._combos.get(letter)
+            if combo is not None:
+                self._select_combo(combo, gds_boolean.normalize_binding(val))
+
     # ── getters ─────────────────────────────────────────────────────────────
     def name(self) -> str:
         return self._name_edit.text().strip()
@@ -1695,27 +1854,41 @@ class ExpressionLayerDialog(QDialog):
     def expression(self) -> str:
         return self._expr_edit.text().strip()
 
-    def bindings(self) -> dict[str, tuple[int, int]]:
-        return {letter: combo.currentData()
+    def bindings(self) -> dict[str, tuple]:
+        return {letter: tuple(combo.currentData())
                 for letter, combo in self._combos.items()
                 if combo.currentData() is not None}
 
-    # ── actions ─────────────────────────────────────────────────────────────
+    # ── validation ───────────────────────────────────────────────────────────
     def _validate(self) -> Optional[str]:
         """Return an error string, or None if the form is valid."""
         if not self.name():
             return "Give the layer a name."
+        if not self.expression():
+            return "Enter an expression."
         try:
             _, ast = gds_boolean.parse_expression(self.expression())
         except Exception as exc:
             return f"Invalid expression: {exc}"
         refs = gds_boolean.referenced_layers(ast)
-        if not self._layer_keys:
-            return "No raw layers available to bind."
+        if not self._binding_options():
+            return "No layers available to bind."
         missing = [r for r in refs if r not in self.bindings()]
         if missing:
-            return f"Bind layer(s): {', '.join(sorted(missing))}"
+            return f"Bind: {', '.join(sorted(missing))}"
         return None
+
+    def _revalidate(self) -> None:
+        err = self._validate()
+        ok_btn = self._buttons.button(QDialogButtonBox.StandardButton.Ok)
+        ok_btn.setEnabled(err is None)
+        if err:
+            self._result_lbl.setText(err)
+            self._result_lbl.setStyleSheet(f"color: {_TK_DANGER};")
+        elif not self._result_lbl.text() or self._result_lbl.text() in (
+                "Give the layer a name.", "Enter an expression."):
+            self._result_lbl.setText("ready")
+            self._result_lbl.setStyleSheet(f"color: {_TK_TEXT_SEC};")
 
     def _on_preview(self) -> None:
         err = self._validate()
@@ -3540,6 +3713,8 @@ class MainWindow(QMainWindow):
         # Wire signals.
         self.layer_panel.layers_changed.connect(self._on_layers_changed)
         self.layer_panel.add_expression_requested.connect(self._on_add_expression)
+        self.layer_panel.edit_expression_requested.connect(self._on_edit_recipe)
+        self.layer_panel.delete_expression_requested.connect(self._on_delete_recipe)
         self.layer_panel.pois_changed.connect(self._on_pois_changed)
         self.canvas.cursor_pos_nm.connect(self._on_cursor)
         self.canvas.defect_clicked.connect(self._on_defect_clicked)
@@ -3588,6 +3763,12 @@ class MainWindow(QMainWindow):
         self._roi_center: Optional[tuple[float, float]] = None
         # Color cycle for synthetic expression layers.
         self._expr_color_idx = 0
+        # F4: synthetic-layer "recipes" — the single source of truth for
+        # expression layers. Each is {"name", "expr", "bindings", "color"};
+        # bindings values are tagged ("raw", l, d) / ("ref", name). The doc's
+        # synthetic LayerEntries are derived from these and re-evaluated against
+        # each new FOV (ROI load / cache load) so they follow the defect.
+        self._recipes: list[dict] = []
         # M4b fine align: chosen POI layer + per-image refined offset.
         self._poi_entries: list[LayerEntry] = []
         self._refined: dict = {}     # image_id -> (dx_nm, dy_nm, score)
@@ -4203,13 +4384,15 @@ class MainWindow(QMainWindow):
         arr = cv2.imread(str(img.file_path), cv2.IMREAD_GRAYSCALE)
         return arr
 
-    @staticmethod
-    def _entry_spec(e):
-        """One POI layer as a batch-walkable spec, or None (F3)."""
+    def _entry_spec(self, e):
+        """One POI layer as a batch-walkable spec, or None (F3). Synthetic
+        layers carry a recipe snapshot so nested refs can be resolved over
+        the ROI during batch fine align."""
         if e.key.synthetic:
             if not e.expr_text or not e.expr_bindings:
                 return None
-            return ("expr", e.expr_text, dict(e.expr_bindings))
+            return ("expr", e.expr_text, dict(e.expr_bindings),
+                    self._recipes_map())
         return ("raw", e.key.layer, e.key.datatype)
 
     def _poi_specs(self):
@@ -4503,6 +4686,9 @@ class MainWindow(QMainWindow):
         self._doc = doc
         self.layer_panel.set_document(doc)
         self.canvas.set_document(doc)
+        # F4: re-evaluate the Boolean recipes against this defect's ROI so the
+        # synthetic layers follow the FOV (instead of being lost on reload).
+        expr_errs = self._recompute_recipes(doc.bbox_nm)
         # Keep the user's current (overview) view; just refresh the FOV box.
         # Don't re-centre/zoom onto the ROI — that's what made the marker
         # look stuck in the middle of the screen. Zoom in manually to
@@ -4520,6 +4706,8 @@ class MainWindow(QMainWindow):
                f"{total_polys} polys ({pruned:,} instances pruned)")
         if errs:
             msg += f" · ⚠ {errs} cell decode error(s) — run with --debug"
+        if expr_errs:
+            msg += f" · ⚠ expr: {'; '.join(expr_errs)}"
         self._status_doc.setText(msg)
         if total_rects == 0 and total_polys == 0:
             self._status_cursor.setText(
@@ -4630,6 +4818,9 @@ class MainWindow(QMainWindow):
         self._oas_path = path
         self._roi_root = root
         self._roi_layers = layer_keys
+        # New layout → drop any recipes from a previously-open file (recipes
+        # persist across ROI reloads of the SAME file, not across files).
+        self._recipes = []
         lyr_txt = ", ".join(f"L{l}/D{d}" for l, d in layer_keys)
         self._status_doc.setText(
             f"ROI mode: {Path(path).name} · root '{root}' · {lyr_txt}"
@@ -4656,24 +4847,26 @@ class MainWindow(QMainWindow):
     def _eval_expression(self, expr: str, bindings: dict,
                          fov: tuple[float, float, float, float]) -> list:
         """Evaluate ``expr`` over the polygons inside ``fov`` and return a
-        list of result polygons (each ``(n, 2)`` ndarray). Raises on parse
-        / evaluation error or missing shapely (caller shows the message)."""
+        list of result polygons (each ``(n, 2)`` ndarray). Bindings may be
+        raw layers or references to other synthetic recipes (nested). Raises
+        on parse / evaluation error or missing shapely (caller shows it)."""
         x0, y0, x1, y1 = fov
         cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
         w, h = (x1 - x0), (y1 - y0)
-        _, ast = gds_boolean.parse_expression(expr)
-        geoms: dict[str, object] = {}
-        for letter, key in bindings.items():
-            entry = (self._doc.find(LayerKey(layer=key[0], datatype=key[1]))
+
+        def raw_provider(layer: int, datatype: int):
+            entry = (self._doc.find(LayerKey(layer=layer, datatype=datatype))
                      if self._doc is not None else None)
             if entry is None or entry.bboxes is None or entry.bboxes.shape[0] == 0:
-                geoms[letter] = gds_boolean.polys_to_geometry([])
-                continue
+                return gds_boolean.polys_to_geometry([])
             idx = gds_fov.fov_overlap_indices(cx, cy, w, h, entry.bboxes)
             sel = [entry.polygons[int(i)] for i in idx]
-            geoms[letter] = gds_boolean.polys_to_geometry(sel)
-        fov_bbox = gds_boolean.fov_box(cx, cy, w, h)
-        geom = gds_boolean.evaluate(ast, geoms, fov_bbox=fov_bbox)
+            return gds_boolean.polys_to_geometry(sel)
+
+        geom = gds_boolean.resolve_expression(
+            expr, bindings, raw_provider=raw_provider,
+            recipe_provider=self._recipe_def,
+            fov_bbox=gds_boolean.fov_box(cx, cy, w, h))
         return gds_boolean.geometry_to_polygons(geom)
 
     def _next_expr_color(self) -> QColor:
@@ -4681,45 +4874,108 @@ class MainWindow(QMainWindow):
         self._expr_color_idx += 1
         return QColor(c)
 
-    def _upsert_expression_layer(self, name: str, expr: str, bindings: dict,
-                                 fov: tuple[float, float, float, float],
-                                 color: Optional[QColor] = None) -> int:
-        """Evaluate + add (or replace) a synthetic expression layer named
-        ``name``. Returns the polygon count. Does not recompute the global
-        bbox (the result lies inside the FOV, hence inside the existing
-        extent) so large raw layers aren't re-scanned."""
-        polys = self._eval_expression(expr, bindings, fov)
-        bboxes = self._bboxes_from_polys(polys)
-        key = LayerKey(layer=-1, datatype=0, name=name, synthetic=True)
-        # Reuse the existing color when replacing the same-named layer.
-        existing = self._doc.find(key) if self._doc is not None else None
+    # ── F4: synthetic-layer recipe store ────────────────────────────────────
+    def _recipe(self, name: str) -> Optional[dict]:
+        for r in self._recipes:
+            if r["name"] == name:
+                return r
+        return None
+
+    def _recipe_def(self, name: str):
+        """``(expr, bindings)`` for a recipe, or None — the recipe_provider
+        passed to :func:`gds_boolean.resolve_expression` for nested refs."""
+        r = self._recipe(name)
+        return (r["expr"], r["bindings"]) if r is not None else None
+
+    def _recipes_map(self) -> dict:
+        """Snapshot ``{name: (expr, bindings)}`` for the batch (F3) path."""
+        return {r["name"]: (r["expr"], dict(r["bindings"]))
+                for r in self._recipes}
+
+    def _register_recipe(self, name: str, expr: str, bindings: dict,
+                         color: Optional[QColor] = None,
+                         old_name: Optional[str] = None) -> None:
+        """Insert or update a recipe. When ``old_name`` is given (edit), the
+        existing recipe is replaced in place (keeping its slot / colour)."""
+        bindings = {k: gds_boolean.normalize_binding(v)
+                    for k, v in bindings.items()}
+        target = old_name or name
+        existing = self._recipe(target)
         if color is None:
-            color = existing.color if existing is not None else self._next_expr_color()
-        entry = LayerEntry(key=key, polygons=polys, visible=True,
-                           color=color, bboxes=bboxes,
-                           expr_text=expr, expr_bindings=dict(bindings))
+            color = (QColor(existing["color"]) if existing is not None
+                     else self._next_expr_color())
+        rec = {"name": name, "expr": expr, "bindings": bindings,
+               "color": QColor(color).name()}
+        if existing is not None:
+            self._recipes[self._recipes.index(existing)] = rec
+        else:
+            self._recipes.append(rec)
+
+    def _recipe_fov(self) -> tuple[float, float, float, float]:
+        """FOV to evaluate recipes over: the loaded ROI extent when present,
+        else the whole document extent."""
+        if self._doc is not None and self._doc.entries:
+            return self._doc.bbox_nm
+        return (0.0, 0.0, 0.0, 0.0)
+
+    def _recompute_recipes(self,
+                           fov: Optional[tuple[float, float, float, float]]
+                           = None) -> list[str]:
+        """Rebuild every synthetic LayerEntry from the recipes, evaluated
+        against ``fov`` (default: the current ROI / document extent). This is
+        what makes Boolean layers follow the defect — it runs after each ROI /
+        cache load. Returns a list of per-recipe error strings (empty = ok)."""
+        if self._doc is None:
+            return []
         self._doc.entries = [e for e in self._doc.entries
-                             if not (e.key.synthetic and e.key.name == name)]
-        self._doc.entries.append(entry)
+                             if not e.key.synthetic]
+        if fov is None:
+            fov = self._recipe_fov()
+        errors: list[str] = []
+        for r in self._recipes:
+            try:
+                polys = self._eval_expression(r["expr"], r["bindings"], fov)
+            except Exception as exc:
+                errors.append(f"{r['name']}: {exc}")
+                polys = []
+            key = LayerKey(layer=-1, datatype=0, name=r["name"], synthetic=True)
+            self._doc.entries.append(LayerEntry(
+                key=key, polygons=polys, visible=True, color=QColor(r["color"]),
+                bboxes=self._bboxes_from_polys(polys),
+                expr_text=r["expr"], expr_bindings=dict(r["bindings"])))
         self.layer_panel.set_document(self._doc)
         self.canvas.refresh()
-        return len(polys)
+        return errors
 
     def _preview_expression(self, name: str, expr: str,
                             bindings: dict) -> tuple[bool, str]:
         """Preview callback for ExpressionLayerDialog: evaluate over the
-        canvas's current view and draw the result live."""
+        canvas's current view and draw the result live as a temporary
+        synthetic layer (not yet committed as a recipe)."""
         if self._doc is None:
             return (False, "Load a layout first.")
         try:
-            n = self._upsert_expression_layer(
-                name or "preview", expr, bindings,
-                self.canvas.viewport_bbox_nm())
+            polys = self._eval_expression(
+                expr, bindings, self.canvas.viewport_bbox_nm())
         except Exception as exc:
             return (False, str(exc))
-        return (True, f"{n} polygons in current view")
+        key = LayerKey(layer=-1, datatype=0, name=name or "preview",
+                       synthetic=True)
+        existing = self._doc.find(key)
+        color = existing.color if existing is not None else self._next_expr_color()
+        self._doc.entries = [e for e in self._doc.entries
+                             if not (e.key.synthetic and e.key.name == key.name)]
+        self._doc.entries.append(LayerEntry(
+            key=key, polygons=polys, visible=True, color=color,
+            bboxes=self._bboxes_from_polys(polys),
+            expr_text=expr, expr_bindings=dict(bindings)))
+        self.layer_panel.set_document(self._doc)
+        self.canvas.refresh()
+        return (True, f"{len(polys)} polygons in current view")
 
-    def _on_add_expression(self) -> None:
+    def _open_expression_dialog(self, recipe: Optional[dict] = None) -> None:
+        """Open the compose dialog to create a new recipe (``recipe`` None) or
+        edit an existing one (prefilled)."""
         if self._doc is None or not self._doc.entries:
             QMessageBox.information(self, "No layout",
                                     "Load a GDS / OASIS file first.")
@@ -4729,19 +4985,54 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "No raw layers",
                                     "There are no raw layers to compose.")
             return
-        dlg = ExpressionLayerDialog(self, keys,
-                                    preview_cb=self._preview_expression)
+        # Synthetic layers available to reference (exclude the one being edited
+        # so a recipe can't bind to itself).
+        refs = [r["name"] for r in self._recipes
+                if recipe is None or r["name"] != recipe["name"]]
+        dlg = ExpressionLayerDialog(
+            self, keys, ref_names=refs, preview_cb=self._preview_expression,
+            recipe=recipe)
         if dlg.exec() != QDialog.DialogCode.Accepted:
+            # Cancel after a preview drew a temp layer — recompute to discard it.
+            self._recompute_recipes()
             return
-        try:
-            n = self._upsert_expression_layer(
-                dlg.name(), dlg.expression(), dlg.bindings(),
-                self.canvas.viewport_bbox_nm())
-        except Exception as exc:
-            QMessageBox.critical(self, "Expression failed", str(exc))
+        old_name = recipe["name"] if recipe is not None else None
+        self._register_recipe(dlg.name(), dlg.expression(), dlg.bindings(),
+                              old_name=old_name)
+        errors = self._recompute_recipes()
+        n = len(self._recipe(dlg.name())["bindings"])
+        if errors:
+            self._status_doc.setText("expression error · " + "; ".join(errors))
+        else:
+            self._status_doc.setText(
+                f"expression layer '{dlg.name()}' · {n} binding(s)")
+
+    def _on_add_expression(self) -> None:
+        self._open_expression_dialog(None)
+
+    def _on_edit_recipe(self, name: str) -> None:
+        rec = self._recipe(name)
+        if rec is not None:
+            self._open_expression_dialog(rec)
+
+    def _on_delete_recipe(self, name: str) -> None:
+        rec = self._recipe(name)
+        if rec is None:
             return
-        self._status_doc.setText(
-            f"expression layer '{dlg.name()}' · {n} polygons")
+        # Block deleting a recipe still referenced by another (would orphan it).
+        dependents = [r["name"] for r in self._recipes
+                      if r is not rec and any(
+                          gds_boolean.normalize_binding(v)[:2] == ("ref", name)
+                          for v in r["bindings"].values())]
+        if dependents:
+            QMessageBox.warning(
+                self, "Cannot delete",
+                f"'{name}' is referenced by: {', '.join(dependents)}. "
+                f"Delete or edit those first.")
+            return
+        self._recipes.remove(rec)
+        self._recompute_recipes()
+        self._status_doc.setText(f"deleted expression layer '{name}'")
 
     # ── M2.1: layer cache export / import ───────────────────────────────────
     def _on_export_cache(self) -> None:
@@ -4782,20 +5073,16 @@ class MainWindow(QMainWindow):
         self._status_doc.setText(f"cache exported · {Path(path).name}")
 
     def _save_expr_sidecar(self, npz_path: str) -> None:
-        """Write expression-layer definitions next to the cache as
-        ``<stem>_expr.json`` (plan M2.6)."""
-        exprs = []
-        for e in self._doc.entries:
-            if e.key.synthetic and e.expr_text:
-                exprs.append({
-                    "name": e.key.name,
-                    "expr": e.expr_text,
-                    "bindings": {k: list(v)
-                                 for k, v in (e.expr_bindings or {}).items()},
-                    "color": e.color.name(),
-                })
-        if not exprs:
+        """Write expression-layer recipes next to the cache as
+        ``<stem>_expr.json`` (plan M2.6 / F4)."""
+        if not self._recipes:
             return
+        exprs = [{
+            "name": r["name"],
+            "expr": r["expr"],
+            "bindings": {k: list(v) for k, v in r["bindings"].items()},
+            "color": r["color"],
+        } for r in self._recipes]
         sidecar = Path(npz_path).with_name(Path(npz_path).stem + "_expr.json")
         sidecar.write_text(json.dumps(exprs, indent=2), encoding="utf-8")
 
@@ -4843,8 +5130,11 @@ class MainWindow(QMainWindow):
         self.sem_panel.set_coord_collapsed(True)
 
     def _restore_expr_sidecar(self, npz_path: str) -> None:
-        """Recreate expression layers from ``<stem>_expr.json`` by
-        re-evaluating over the loaded document's full extent."""
+        """Recreate expression-layer recipes from ``<stem>_expr.json`` and
+        re-evaluate them over the loaded document's extent."""
+        # A freshly-loaded cache fully owns the recipe set — clear any from a
+        # previously-open file even when this cache has no sidecar.
+        self._recipes = []
         sidecar = Path(npz_path).with_name(Path(npz_path).stem + "_expr.json")
         if not sidecar.exists():
             return
@@ -4853,17 +5143,12 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError):
             return
         for d in defs:
-            bindings = {k: tuple(v) for k, v in d.get("bindings", {}).items()}
-            color = QColor(d.get("color") or "#d44fa0")
-            try:
-                self._upsert_expression_layer(
-                    d.get("name", "expr"), d.get("expr", ""), bindings,
-                    self._doc.bbox_nm, color=color)
-            except Exception:
-                # A definition that no longer evaluates (e.g. its bound
-                # layer wasn't included in this cache) is skipped rather
-                # than aborting the whole restore.
-                pass
+            bindings = {k: gds_boolean.normalize_binding(tuple(v))
+                        for k, v in d.get("bindings", {}).items()}
+            self._register_recipe(
+                d.get("name", "expr"), d.get("expr", ""), bindings,
+                color=QColor(d.get("color") or "#d44fa0"))
+        self._recompute_recipes(self._doc.bbox_nm)
 
     def _show_about(self) -> None:
         dlg = QDialog(self)

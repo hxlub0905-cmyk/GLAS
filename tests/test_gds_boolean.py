@@ -23,6 +23,9 @@ from gds_boolean import (  # noqa: E402
     geometry_to_polygons,
     make_mask,
     compose,
+    normalize_binding,
+    recipe_dependency_order,
+    resolve_expression,
 )
 
 shapely = pytest.importorskip("shapely")
@@ -276,3 +279,103 @@ class TestCompose:
                            {"A": box(0, 0, 10, 10), "B": box(5, 0, 15, 10)})
         assert name == "L0"
         assert g.area == pytest.approx(50.0)
+
+
+# ── F4: tagged bindings + nested recipes ─────────────────────────────
+
+
+class TestNormalizeBinding:
+
+    def test_legacy_pair_becomes_raw(self):
+        assert normalize_binding((17, 101)) == ("raw", 17, 101)
+
+    def test_tagged_raw_passes_through(self):
+        assert normalize_binding(("raw", 3, 0)) == ("raw", 3, 0)
+
+    def test_ref_passes_through(self):
+        assert normalize_binding(("ref", "L0")) == ("ref", "L0")
+
+    def test_ref_coerces_name_to_str(self):
+        assert normalize_binding(["ref", "X"]) == ("ref", "X")
+
+    def test_bad_binding_raises(self):
+        with pytest.raises(BooleanExprError):
+            normalize_binding(("nope", 1, 2, 3))
+
+
+class TestRecipeDependencyOrder:
+
+    def test_independent_recipes(self):
+        order = recipe_dependency_order({"A": set(), "B": set()})
+        assert set(order) == {"A", "B"}
+
+    def test_dependency_before_dependent(self):
+        order = recipe_dependency_order({"L0": set(), "L1": {"L0"}})
+        assert order.index("L0") < order.index("L1")
+
+    def test_chain(self):
+        order = recipe_dependency_order(
+            {"A": set(), "B": {"A"}, "C": {"B"}})
+        assert order == ["A", "B", "C"]
+
+    def test_cycle_raises(self):
+        with pytest.raises(BooleanExprError):
+            recipe_dependency_order({"A": {"B"}, "B": {"A"}})
+
+    def test_self_cycle_raises(self):
+        with pytest.raises(BooleanExprError):
+            recipe_dependency_order({"A": {"A"}})
+
+    def test_unknown_reference_raises(self):
+        with pytest.raises(BooleanExprError):
+            recipe_dependency_order({"A": {"ghost"}})
+
+
+class TestResolveExpression:
+
+    def _raw(self, layer, datatype):
+        # Two unit-ish squares keyed by (layer, datatype).
+        table = {
+            (1, 0): box(0, 0, 10, 10),
+            (2, 0): box(5, 0, 15, 10),
+            (3, 0): box(0, 0, 4, 10),
+        }
+        return table[(layer, datatype)]
+
+    def test_raw_only(self):
+        g = resolve_expression(
+            "A & B", {"A": ("raw", 1, 0), "B": ("raw", 2, 0)},
+            raw_provider=self._raw, recipe_provider=lambda n: None)
+        assert g.area == pytest.approx(50.0)
+
+    def test_legacy_pair_binding(self):
+        g = resolve_expression(
+            "A", {"A": (1, 0)},
+            raw_provider=self._raw, recipe_provider=lambda n: None)
+        assert g.area == pytest.approx(100.0)
+
+    def test_nested_reference(self):
+        # L0 = A & B (area 50, x 5..15). L1 = L0 - C (C = x 0..4 -> no overlap).
+        recipes = {"L0": ("A & B", {"A": ("raw", 1, 0), "B": ("raw", 2, 0)})}
+        g = resolve_expression(
+            "L0 - C", {"L0": ("ref", "L0"), "C": ("raw", 3, 0)},
+            raw_provider=self._raw,
+            recipe_provider=lambda n: recipes.get(n))
+        assert g.area == pytest.approx(50.0)
+
+    def test_circular_reference_raises(self):
+        recipes = {
+            "L0": ("L1", {"L1": ("ref", "L1")}),
+            "L1": ("L0", {"L0": ("ref", "L0")}),
+        }
+        with pytest.raises(BooleanExprError):
+            resolve_expression(
+                "L0", {"L0": ("ref", "L0")},
+                raw_provider=self._raw,
+                recipe_provider=lambda n: recipes.get(n))
+
+    def test_unknown_reference_raises(self):
+        with pytest.raises(BooleanExprError):
+            resolve_expression(
+                "X", {"X": ("ref", "ghost")},
+                raw_provider=self._raw, recipe_provider=lambda n: None)

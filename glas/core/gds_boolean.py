@@ -271,6 +271,110 @@ def referenced_layers(ast: object) -> set[str]:
     return out
 
 
+# ── Bindings + nested-recipe resolution (F4) ─────────────────────────
+#
+# A binding maps an expression letter to a source of geometry. Two forms:
+#
+#   ("raw", layer, datatype)   -- a raw layout layer
+#   ("ref", name)              -- another synthetic (expression) layer,
+#                                 enabling nested composition L1 = L0 - C
+#
+# The legacy form ``(layer, datatype)`` (a 2-tuple) is read as ``("raw",
+# layer, datatype)`` so older caches / sidecars keep working.
+
+
+def normalize_binding(val) -> tuple:
+    """Coerce a binding value into tagged form (see module note).
+
+    ``(layer, datatype)`` -> ``("raw", layer, datatype)``; tagged tuples
+    pass through unchanged. Raises :class:`BooleanExprError` otherwise."""
+    t = tuple(val)
+    if len(t) == 2 and t[0] not in ("raw", "ref"):
+        return ("raw", int(t[0]), int(t[1]))
+    if t and t[0] == "raw" and len(t) == 3:
+        return ("raw", int(t[1]), int(t[2]))
+    if t and t[0] == "ref" and len(t) == 2:
+        return ("ref", str(t[1]))
+    raise BooleanExprError(f"bad binding {val!r}")
+
+
+def recipe_dependency_order(ref_map: Mapping[str, set]) -> list[str]:
+    """Topologically order synthetic recipes so dependencies come first.
+
+    ``ref_map`` maps each recipe name to the set of OTHER recipe names it
+    references (via ``("ref", name)`` bindings). Returns the names in an
+    order safe to evaluate in. Raises :class:`BooleanExprError` on a
+    circular reference or a reference to an unknown recipe."""
+    order: list[str] = []
+    state: dict[str, int] = {}   # name -> 0 (on stack) / 1 (done)
+
+    def visit(n: str, stack: list[str]) -> None:
+        st = state.get(n)
+        if st == 1:
+            return
+        if st == 0:
+            cyc = " -> ".join(stack[stack.index(n):] + [n])
+            raise BooleanExprError(f"circular reference: {cyc}")
+        state[n] = 0
+        for dep in sorted(ref_map.get(n, ())):
+            if dep not in ref_map:
+                raise BooleanExprError(
+                    f"binding references unknown synthetic layer {dep!r}")
+            visit(dep, stack + [n])
+        state[n] = 1
+        order.append(n)
+
+    for name in ref_map:
+        visit(name, [])
+    return order
+
+
+def resolve_expression(expr: str,
+                       bindings: Mapping[str, tuple],
+                       *,
+                       raw_provider,
+                       recipe_provider,
+                       fov_bbox: Optional["BaseGeometry"] = None,
+                       _cache: Optional[dict] = None,
+                       _visiting: Optional[set] = None) -> "BaseGeometry":
+    """Evaluate ``expr`` whose ``bindings`` may reference raw layers AND
+    other synthetic recipes (nested composition).
+
+    ``raw_provider(layer, datatype) -> geometry`` supplies a raw layer's
+    geometry; ``recipe_provider(name) -> (expr, bindings) | None`` supplies
+    a referenced recipe's definition. Referenced recipes are evaluated
+    recursively and memoized in ``_cache``; cycles raise
+    :class:`BooleanExprError`."""
+    cache = {} if _cache is None else _cache
+    visiting = set() if _visiting is None else _visiting
+    _, ast = parse_expression(expr)
+    geoms: dict[str, "BaseGeometry"] = {}
+    for letter, raw_val in bindings.items():
+        val = normalize_binding(raw_val)
+        if val[0] == "raw":
+            geoms[letter] = raw_provider(val[1], val[2])
+            continue
+        name = val[1]
+        if name in cache:
+            geoms[letter] = cache[name]
+            continue
+        if name in visiting:
+            raise BooleanExprError(f"circular reference to {name!r}")
+        rec = recipe_provider(name)
+        if rec is None:
+            raise BooleanExprError(
+                f"binding references unknown synthetic layer {name!r}")
+        visiting.add(name)
+        g = resolve_expression(rec[0], rec[1], raw_provider=raw_provider,
+                               recipe_provider=recipe_provider,
+                               fov_bbox=fov_bbox, _cache=cache,
+                               _visiting=visiting)
+        visiting.discard(name)
+        cache[name] = g
+        geoms[letter] = g
+    return evaluate(ast, geoms, fov_bbox=fov_bbox)
+
+
 # ── Geometry helpers ─────────────────────────────────────────────────
 
 

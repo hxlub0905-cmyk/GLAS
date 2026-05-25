@@ -2,6 +2,41 @@
 
 ---
 
+## [2026-05-25] [F4] 實作：Boolean 強化（食譜化重算 + 巢狀 + 編輯 + 對話框重設計）
+
+**變更類型：** 功能（新功能 + 重構）
+
+**動機現象：** synthetic（Boolean 表達式）layer 只算一次、載新 ROI（跳 defect）就遺失、
+無法編輯、binding 只能綁 raw layer（無法巢狀）。
+
+**修復實作：**
+- **引擎（`gds_boolean.py`）**：新增 `normalize_binding`（舊 `(layer,datatype)` →
+  `("raw",l,d)`、支援 `("ref",name)`）、`recipe_dependency_order`（拓樸排序 + 循環/未知
+  ref 偵測，純函式）、`resolve_expression`（raw/recipe provider 抽象 + 遞迴解析巢狀 ref +
+  cache memoize + 循環防護）。core 維持無 Qt。
+- **app（`gds_align_tool.py`）**：MainWindow 新增 `self._recipes` 作 synthetic 層唯一事實
+  來源；`_recompute_recipes()` 在 `_on_roi_finished`（每次載 ROI/跳 defect 的 FOV）與
+  cache 還原時自動重算所有 recipe → synthetic 層跟著 defect 走。`_eval_expression` 改用
+  `resolve_expression`（display 路徑）；`poi_polys_for_roi`（F3 batch）同步支援巢狀 +
+  recipe 快照。`_LayerRow` 加編輯/刪除按鈕（雙擊=編輯），刪除被其他 recipe 引用時擋下。
+  `ExpressionLayerDialog` 重設計：layer/synthetic chip + 運算子按鈕插入 token、即時語法
+  檢查（disable OK + inline 錯誤）、binding 下拉含 raw + ref、編輯預填。cache sidecar
+  改由 recipe 序列化/還原（tagged binding，含舊格式遷移）；開新 OASIS(ROI)/載新 cache 會
+  清掉前一檔的 recipe，ROI reload 則保留。
+- **tests**：`tests/test_gds_boolean.py` 加 `normalize_binding` / `recipe_dependency_order`
+  / `resolve_expression`（巢狀、循環、未知 ref、舊格式）測試。
+
+**測試：** `py_compile` 三檔皆過。**sandbox 無 numpy/shapely → 未跑 pytest；GUI 互動未驗。**
+待 user 本地 `pytest tests/test_gds_boolean.py -v` + GUI 驗收（定義 L0/L1 巢狀、跳 defect
+自動重算、編輯連動、刪除、新對話框）。
+
+**影響檔案：** `glas/core/gds_boolean.py`、`glas/app/gds_align_tool.py`、
+`tests/test_gds_boolean.py`、`docs/plans/F4-boolean-enhance.md`。
+
+**Branch：** `claude/compassionate-dijkstra-84Gjd`（PR #3）
+
+---
+
 ## [2026-05-25] [F4] 規劃：Boolean 強化（食譜化重算 + 巢狀 + 編輯 + 對話框重設計）
 
 **變更類型：** 文件（plan，尚未動工）

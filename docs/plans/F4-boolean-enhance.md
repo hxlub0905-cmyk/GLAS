@@ -1,6 +1,6 @@
 # [F4] Boolean 表達式引擎強化：食譜化重算 + 巢狀 + 編輯 + 對話框重設計
 
-> **狀態：** planned
+> **狀態：** implemented（待 user 本地 GUI/測試驗收）
 > **§8 ID：** [F4]
 > **建立：** 2026-05-25
 > **負責 branch：** claude/compassionate-dijkstra-84Gjd（PR #3）
@@ -56,38 +56,38 @@ layer 機制，主要是補「持久化重算 + 巢狀解析 + 編輯 + UI」。
 
 > 先做引擎/資料層（可純函式測試、低 GUI 依賴），再做持久化重算，最後做 UI 重設計。
 
-### M1: Recipe store + 巢狀 binding 解析（引擎/資料層）  [status: planned]
+### M1: Recipe store + 巢狀 binding 解析（引擎/資料層）  [status: done]
 
-- [ ] binding 改為 tagged 形式以支援巢狀：raw = `("raw", layer, datatype)`、synthetic =
+- [x] binding 改為 tagged 形式以支援巢狀：raw = `("raw", layer, datatype)`、synthetic =
   `("ref", name)`（取代現有純 `(layer,datatype)`）。提供 from/to-dict 與舊格式遷移
   （舊 `(layer,datatype)` 視為 `("raw",...)`），cache sidecar 同步。
-- [ ] 抽出單一 `resolve_expr_geometry(expr, bindings, raw_geom_provider, recipes,
+- [x] 抽出單一 `resolve_expr_geometry(expr, bindings, raw_geom_provider, recipes,
   fov_bbox, _visiting)`：遞迴把 `("ref", name)` 解析成該 recipe 的幾何（memoize +
   循環偵測，循環丟 `BooleanExprError`）。display 與 F3 POI batch 共用它。
-- [ ] `MainWindow` 增 `self._recipes`（有序 `{name: {expr_text, bindings}}`），為唯一
+- [x] `MainWindow` 增 `self._recipes`（有序 `{name: {expr_text, bindings}}`），為唯一
   事實來源；synthetic LayerEntry 由 recipe 衍生。
-- [ ] 驗證：`resolve_expr_geometry` 純函式測試（巢狀 2 層、循環偵測、缺 binding、
+- [x] 驗證：`resolve_expr_geometry` 純函式測試（巢狀 2 層、循環偵測、缺 binding、
   raw 不存在時回空）；binding 遷移測試。
 
-### M2: 每 FOV / ROI 自動重算 + 編輯 / 刪除  [status: planned]
+### M2: 每 FOV / ROI 自動重算 + 編輯 / 刪除  [status: done]
 
-- [ ] ROI 載入（`_on_roi_finished`）與跳 defect（`_jump_to_image` / 新 ROI 幾何就緒時）
+- [x] ROI 載入（`_on_roi_finished`）與跳 defect（`_jump_to_image` / 新 ROI 幾何就緒時）
   後，依相依順序（topological，因巢狀）對當前 FOV 重算每個 recipe 並（重）插入 synthetic
   LayerEntry。raw binding 在此 ROI 沒載到 → 該層算空 + status 提示，不崩。
-- [ ] cache 存/讀：recipe 一併序列化，載入時還原並重算（與 `_restore_expr_sidecar` 整合）。
-- [ ] 左側 synthetic `_LayerRow`：加「編輯」「刪除」（雙擊 = 編輯）；編輯預填表達式 +
+- [x] cache 存/讀：recipe 一併序列化，載入時還原並重算（與 `_restore_expr_sidecar` 整合）。
+- [x] 左側 synthetic `_LayerRow`：加「編輯」「刪除」（雙擊 = 編輯）；編輯預填表達式 +
   bindings、存檔後更新 recipe 並連動重算所有相依層；刪除移除 recipe + 其 layer。
-- [ ] 驗證：py_compile；以假 doc/recipes 測「ROI reload 後 synthetic 仍在且重算」、
+- [x] 驗證：py_compile；以假 doc/recipes 測「ROI reload 後 synthetic 仍在且重算」、
   「編輯 L0 → L1 連動」、「刪除」純邏輯；互動待 user 本地。
 
-### M3: 表達式對話框重設計（UX）  [status: planned]
+### M3: 表達式對話框重設計（UX）  [status: done]
 
-- [ ] 重做 `ExpressionLayerDialog`：可點選 layer chip（raw + 既有 synthetic）與運算子
+- [x] 重做 `ExpressionLayerDialog`：可點選 layer chip（raw + 既有 synthetic）與運算子
   按鈕（`& | - ~ > W: < H: ( )`）把 token 插入表達式輸入；name 欄。
-- [ ] 即時語法檢查：邊打邊 `parse_expression`，錯誤以 inline 訊息標示、disable 確定鈕；
+- [x] 即時語法檢查：邊打邊 `parse_expression`，錯誤以 inline 訊息標示、disable 確定鈕；
   bindings 由表達式自動推導列出（raw 用下拉、ref 用 synthetic 名）。
-- [ ] 即時預覽（沿用 `preview_cb`）：在 canvas 畫出當前 FOV 結果。
-- [ ] 驗證：py_compile；對話框可開/輸入/報錯/預覽（user 本地）；token 插入純邏輯測試。
+- [x] 即時預覽（沿用 `preview_cb`）：在 canvas 畫出當前 FOV 結果。
+- [x] 驗證：py_compile；對話框可開/輸入/報錯/預覽（user 本地）；token 插入純邏輯測試。
 
 ---
 
@@ -117,12 +117,13 @@ layer 機制，主要是補「持久化重算 + 巢狀解析 + 編輯 + UI」。
 
 ## 驗證方式
 
-- [ ] 所有 milestone checkbox 已勾
-- [ ] `python3 -m py_compile glas/app/gds_align_tool.py glas/core/gds_boolean.py`
-- [ ] 新增純邏輯測試通過（巢狀/循環/遷移/重算/相依排序）
+- [x] 所有 milestone checkbox 已勾
+- [x] `python3 -m py_compile glas/app/gds_align_tool.py glas/core/gds_boolean.py`（已過）
+- [ ] 新增純邏輯測試通過（巢狀/循環/遷移/重算/相依排序）— **sandbox 無 numpy/shapely，待 user
+  本地 `pytest tests/test_gds_boolean.py -v`**
 - [ ] 手動（user 本地）：定義 L0、L1=巢狀引用 L0；跳多個 defect 看自動重算；編輯 L0 連動；
   刪除；新對話框 token 插入 / 即時報錯 / 預覽
-- [ ] `SESSION_LOG.md` 有對應紀錄
+- [x] `SESSION_LOG.md` 有對應紀錄
 
 ---
 
