@@ -2,6 +2,28 @@
 
 ---
 
+## [2026-05-25] [F6] 規劃：OAS 讀取 + 批次 fine-align 加速（待核准）
+
+**變更類型：** 文件（plan，尚未動工）
+
+**內容：** user 要求在「功能完全不變」前提下找 OAS 讀取與批次 fine-align 的加速點。探索熱路徑後
+（`OasisStream` slurp `oasis_streamer.py:214`、`RandomAccessReader` 雙重 slurp `oasis_random.py:215`、
+`FineAlignAllWorker` 刻意單執行緒 `gds_align_tool.py:1116`）與 user 用 AskUserQuestion 收斂三個岔路：
+(1) 批次平行化用 **thread pool**（per-thread reader + 共享 mmap；cv2 釋放 GIL）、(2) worker 數
+**自動**（cpu_count 上限 8）、(3) mmap **只用在 ROI/隨機存取路徑**（bulk decode 維持 slurp）。
+產出 `docs/plans/F6-readwalk-batch-accel.md`（4 milestone：M1 mmap-backed OasisStream + fallback、
+M2 單一 map 共享去雙重 slurp、M3 thread-pool 批次、M4 等價總驗收），核心驗收條件為 **golden-output
+逐 byte／逐數值等價測試**（mmap↔slurp 幾何相等、共享map↔獨立scan index 相等、循序↔並行批次結果
+相等），強調不改演算法與 §7 不變式。§8 註冊 [F6]。**待 user 核准後才開工。**
+
+**測試：** 無（純 plan）。
+
+**影響檔案：** `docs/plans/F6-readwalk-batch-accel.md`、`CLAUDE.md`（§8）、`SESSION_LOG.md`。
+
+**Branch：** `claude/dazzling-cori-5T7XE`
+
+---
+
 ## [2026-05-25] [F5] PR#4 review fix：非 ok 批次狀態清掉舊 refined offset
 
 **變更類型：** bug fix
