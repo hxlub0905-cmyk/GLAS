@@ -68,7 +68,7 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFrame, QGridLayout,
     QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton, QScrollArea,
-    QSizePolicy, QSlider, QSpinBox, QSplitter, QStatusBar, QStyledItemDelegate,
+    QSizePolicy, QSpinBox, QSplitter, QStatusBar, QStyle, QStyledItemDelegate,
     QToolButton, QVBoxLayout, QWidget,
 )
 
@@ -1389,9 +1389,9 @@ def write_alignment_json(path, rows, synthetic_layers=None):
 # ── LayerPanel widget ────────────────────────────────────────────────────────
 
 class _LayerRow(QWidget):
-    """One LayerPanel row: visibility checkbox + colour swatch + label +
-    per-layer opacity slider (plan M6.2). Mutates the bound ``LayerEntry``
-    in place and emits ``changed`` so the canvas / SEM overlay redraw."""
+    """One LayerPanel row: visibility checkbox + POI toggle + colour swatch +
+    label. Mutates the bound ``LayerEntry`` in place and emits ``changed`` so
+    the canvas / SEM overlay redraw."""
 
     changed = pyqtSignal()
     poi_toggled = pyqtSignal(bool)   # M4b: this row chosen / cleared as POI
@@ -1442,19 +1442,6 @@ class _LayerRow(QWidget):
         self._lbl.setToolTip(label)
         h.addWidget(self._lbl, 1)
 
-        self._slider = QSlider(Qt.Orientation.Horizontal, self)
-        self._slider.setRange(0, 100)
-        self._slider.setValue(int(entry.opacity))
-        self._slider.setFixedWidth(64)
-        self._slider.setToolTip("Fill opacity (0 = fully transparent, outline only)")
-        self._slider.valueChanged.connect(self._on_opacity)
-        h.addWidget(self._slider)
-
-        self._pct = QLabel(f"{int(entry.opacity)}%", self)
-        self._pct.setFixedWidth(34)
-        self._pct.setStyleSheet(_hint_qss(_FS_CAPTION))
-        h.addWidget(self._pct)
-
     def _apply_swatch(self) -> None:
         c = self._entry.color
         self._swatch.setStyleSheet(
@@ -1472,11 +1459,6 @@ class _LayerRow(QWidget):
             self._entry.color = new_color
             self._apply_swatch()
             self.changed.emit()
-
-    def _on_opacity(self, value: int) -> None:
-        self._entry.opacity = int(value)
-        self._pct.setText(f"{int(value)}%")
-        self.changed.emit()
 
 
 class LayerPanel(QFrame):
@@ -1520,7 +1502,7 @@ class LayerPanel(QFrame):
         btn_row.addWidget(self._expr_btn)
         layout.addLayout(btn_row)
 
-        hint = QLabel("checkbox: show/hide  ·  POI: fine-align template  ·  slider: opacity  ·  swatch: colour")
+        hint = QLabel("checkbox: show/hide  ·  POI: fine-align template  ·  swatch: colour")
         hint.setStyleSheet(_hint_qss(_FS_MICRO, pad="6px 10px"))
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -3497,7 +3479,7 @@ class MainWindow(QMainWindow):
         center_layout = QVBoxLayout(center)
         center_layout.setContentsMargins(0, 0, 0, 0)
         center_layout.setSpacing(0)
-        toolbar = self._build_toolbar()
+        toolbar = self._wrap_toolbar(self._build_toolbar())
         center_layout.addWidget(toolbar)
 
         # Workflow guidance strip (M6.6): shows the next step to take; hides
@@ -3767,12 +3749,31 @@ class MainWindow(QMainWindow):
 
         h.addStretch(1)
         # Bolder labels (user request) — set per-button so it can't bleed
-        # background like a parent stylesheet would.
+        # background like a parent stylesheet would. Then pin each button's
+        # minimum width to its (bold) hint so a non-maximized window can never
+        # squeeze a button narrower than its text — the toolbar scrolls
+        # horizontally instead (see _wrap_toolbar). (F3 fix)
         for b in bar.findChildren(QPushButton):
             fb = b.font()
             fb.setBold(True)
             b.setFont(fb)
+            b.setMinimumWidth(b.sizeHint().width())
         return bar
+
+    def _wrap_toolbar(self, bar: QWidget) -> QScrollArea:
+        """Put the toolbar in a horizontal scroll area so a narrow window
+        scrolls it instead of clipping button text (F3 fix)."""
+        sa = QScrollArea(self)
+        sa.setObjectName("gdsToolbarScroll")
+        sa.setFrameShape(QFrame.Shape.NoFrame)
+        sa.setWidgetResizable(True)
+        sa.setWidget(bar)
+        sa.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        sa.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        sa.setStyleSheet(f"QScrollArea#gdsToolbarScroll {{ background: {_TK_TOOLBAR_BG}; }}")
+        sb = sa.style().pixelMetric(QStyle.PixelMetric.PM_ScrollBarExtent)
+        sa.setFixedHeight(bar.sizeHint().height() + sb)
+        return sa
 
     _NUDGE_NM = 10.0   # δ step per arrow-key press
 

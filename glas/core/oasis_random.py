@@ -137,20 +137,39 @@ def _iv_contains(iv: tuple, v: int) -> bool:
     return v >= lo and (hi < 0 or v <= hi)
 
 
+def _iv_width(iv: tuple) -> float:
+    """Width of an OASIS interval; ``inf`` for an unbounded (``..INF``) one."""
+    lo, hi = iv
+    return (hi - lo) if hi >= 0 else float("inf")
+
+
+def _iv_is_all_layers(iv: tuple) -> bool:
+    """An ``(0, INF)`` interval — matches every layer, so a LAYERNAME using it
+    is a file-wide default/placeholder that can't distinguish layers."""
+    return iv[0] == 0 and iv[1] < 0
+
+
 def resolve_layer_name(layernames: list, layer: int, datatype: int) -> str:
     """Name for ``(layer, datatype)`` from LAYERNAME records, or "" (F3 M2).
 
-    ``layernames`` is ``[(name, layer_iv, datatype_iv), ...]``. Prefer the most
-    specific record (single-value intervals beat ranges) so a broad catch-all
-    doesn't mask an exact label."""
+    ``layernames`` is ``[(name, layer_iv, datatype_iv), ...]``. Among the
+    records containing ``(layer, datatype)`` the *most specific* wins (narrowest
+    layer interval, then narrowest datatype interval) so a broad range never
+    masks an exact label. An all-layers ``(0, INF)`` catch-all is skipped
+    entirely — otherwise a single placeholder LAYERNAME would label every layer
+    the same (the observed "every layer shows the first name" bug)."""
     best: Optional[str] = None
-    best_rank = -1
+    best_key: Optional[tuple] = None
     for name, liv, div in layernames:
+        if not name:
+            continue
         if not (_iv_contains(liv, layer) and _iv_contains(div, datatype)):
             continue
-        rank = (1 if liv[0] == liv[1] else 0) + (1 if div[0] == div[1] else 0)
-        if name and rank > best_rank:
-            best, best_rank = name, rank
+        if _iv_is_all_layers(liv):
+            continue
+        key = (_iv_width(liv), _iv_width(div))
+        if best is None or key < best_key:
+            best, best_key = name, key
     return best or ""
 
 

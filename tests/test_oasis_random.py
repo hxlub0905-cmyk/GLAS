@@ -432,7 +432,7 @@ class TestResolveLayerName:
 
     LN = [("METAL1", (17, 17), (0, 0)),
           ("VIA", (20, 20), (0, -1)),       # datatype INF
-          ("ALL", (0, -1), (0, -1))]        # catch-all range
+          ("ALL", (0, -1), (0, -1))]        # all-layers catch-all (skipped)
 
     def test_exact_single_value(self):
         assert orx.resolve_layer_name(self.LN, 17, 0) == "METAL1"
@@ -440,8 +440,16 @@ class TestResolveLayerName:
     def test_datatype_inf(self):
         assert orx.resolve_layer_name(self.LN, 20, 5) == "VIA"
 
-    def test_catch_all_range(self):
-        assert orx.resolve_layer_name(self.LN, 99, 0) == "ALL"
+    def test_all_layers_catch_all_skipped(self):
+        # An (0, INF) layer interval is a placeholder; it must NOT label an
+        # arbitrary layer (the "every layer shows the first name" bug).
+        assert orx.resolve_layer_name(self.LN, 99, 0) == ""
+
+    def test_catch_all_does_not_mask_specific(self):
+        # The catch-all coexists with a specific record; the specific wins and
+        # the catch-all never bleeds onto other layers.
+        assert orx.resolve_layer_name(self.LN, 17, 0) == "METAL1"
+        assert orx.resolve_layer_name(self.LN, 20, 0) == "VIA"
 
     def test_no_match_or_empty(self):
         assert orx.resolve_layer_name([], 1, 2) == ""

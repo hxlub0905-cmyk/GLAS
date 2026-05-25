@@ -2,6 +2,35 @@
 
 ---
 
+## [2026-05-25] [F3] 後續：toolbar 不裁切、layer name catch-all 修正、移除透明度 slider
+
+**變更類型：** UI 修正 + bug fix（PR #3 後續 user 回饋 1/2/3）
+
+**動機/現象：**
+1. 視窗非最大化時中間 toolbar 按鈕（Open OASIS / Load Cache / Export Cache…）文字被裁切。
+2. 讀 OASIS LAYERNAME 時所有 layer 都顯示同一個名字（NW）。
+3. Layers 列的透明度搖桿沒實際用途，要移除。
+
+**修復：**
+1. `_build_toolbar` 結尾把每顆按鈕 `setMinimumWidth(sizeHint().width())`（在設粗體後），
+   並新增 `_wrap_toolbar()` 用橫向 `QScrollArea`（v-scroll off、h-scroll as-needed、
+   高度 = bar + scrollbar extent）包住，窄視窗改為橫向捲動而非裁字。
+2. `resolve_layer_name` 改為「最具體（最窄 layer 區間，其次 datatype 區間）優先」，
+   並跳過 `(0, INF)` 全層 catch-all（placeholder 名稱不再蓋到每一層）。
+   注意：LAYERNAME 表若在檔尾（scan_cell_offsets 於首個 CELL 即停）仍可能收不到，
+   屆時退回 L/D；若仍有問題需後續加讀檔尾 name table。
+3. `_LayerRow` 移除 opacity slider/`_pct`/`_on_opacity`（`LayerEntry.opacity` 保留，
+   渲染用預設值）；移除未用的 `QSlider` import；hint 文字更新。
+
+**測試：** py_compile 全通過；更新 `test_oasis_random.py::TestResolveLayerName`（catch-all
+跳過、不蓋其他層）、移除 `test_gds_align_m6.py::test_slider_sets_opacity_and_emits`。
+sandbox 無 PyQt6/numpy/cv2，toolbar 捲動/透明度移除等 GUI 行為待 user 本地驗收。
+
+**影響檔案：** `glas/app/gds_align_tool.py`、`glas/core/oasis_random.py`、
+`tests/test_oasis_random.py`、`tests/test_gds_align_m6.py`。
+
+**Branch：** `claude/compassionate-dijkstra-84Gjd`（PR #3）
+
 ## [2026-05-25] [F3] 修正：多 POI 選取以 row 狀態重建，避免 ndarray __eq__ 報錯
 
 **變更類型：** Bug fix（PR #3 review，P1）
