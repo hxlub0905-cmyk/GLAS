@@ -2,6 +2,25 @@
 
 ---
 
+## [2026-05-25] [F7] 規劃：批次對位工作區（Batch view-mode + inline 進度 + 進度條質感）（待核准）
+
+**變更類型：** 文件（plan，尚未動工）
+
+**內容：** user 提出批次對位的 UI/UX 想改善（批次結果是否該有專屬畫面、進度條不夠質感）。探索現有
+view-mode（`_VIEW_MODES`+`QButtonGroup`+`_set_view_mode` 切 `_center_split`）、`FineAlignResultsDialog`、
+`_AnimatedBar`/`LoadProgressDialog`、批次接線後，用 AskUserQuestion 收斂三個岔路：(1) 批次結果放
+**第四個 view-mode「Batch」**（中央左=結果表/直方圖/散點、右=SEM overlay、點列就地換 overlay）、
+(2) 批次跑時 **inline 進度+結果 streaming**（取代 modal）、(3) 進度條 **漸層+發光+條內 %**。產出
+`docs/plans/F7-batch-workspace-ui.md`（5 milestone：M1 `_AnimatedBar` 質感、M2 抽 `BatchResultsPanel`、
+M3 加 Batch view-mode、M4 批次接線改 inline、M5 收尾）。強調純 UI 重新安置+視覺，**不動 F6 批次運算
+與 §7 不變式**。§8 註冊 [F7]。**待 user 核准後才開工。**
+
+**測試：** 無（純 plan）。
+
+**影響檔案：** `docs/plans/F7-batch-workspace-ui.md`、`CLAUDE.md`（§8）、`SESSION_LOG.md`。
+
+**Branch：** `claude/dazzling-cori-5T7XE`
+
 ## [2026-05-25] [F6] 實作 M1–M3：mmap 讀取 + 單一 map 共享 + thread-pool 批次（待本地驗收）
 
 **變更類型：** 功能（效能加速，行為不變）
