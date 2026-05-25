@@ -1588,13 +1588,10 @@ class LayerPanel(QFrame):
     def _on_poi_toggled(self, on: bool, row: "_LayerRow",
                         entry: "LayerEntry") -> None:
         """F3: POI is multi-select — several layers can be active POIs at once.
-        Emit the current set in panel order."""
-        if on:
-            if entry not in self._poi_entries:
-                self._poi_entries.append(entry)
-        elif entry in self._poi_entries:
-            self._poi_entries.remove(entry)
-        # Re-emit in document/panel order for a stable composite ordering.
+        Rebuild the set from the rows' checked state (in panel order) so the
+        composite ordering is stable. Driven by row state rather than list
+        membership because ``LayerEntry`` holds NumPy arrays, whose dataclass
+        ``__eq__`` makes ``in`` / ``remove`` raise on array truth-value."""
         ordered = [r._entry for r in self._rows if r.poi_btn.isChecked()]
         self._poi_entries = ordered
         self.pois_changed.emit(list(ordered))

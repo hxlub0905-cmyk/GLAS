@@ -2,6 +2,26 @@
 
 ---
 
+## [2026-05-25] [F3] 修正：多 POI 選取以 row 狀態重建，避免 ndarray __eq__ 報錯
+
+**變更類型：** Bug fix（PR #3 review，P1）
+
+**動機/現象：** `LayerEntry` 是含 NumPy 陣列（polygons/bboxes）的 dataclass，
+`_on_poi_toggled` 用 `entry not in self._poi_entries` / `.remove(entry)` 會觸發
+dataclass `__eq__` 對陣列比較，實際 ROI 資料下選/取消第二個 POI 會丟
+`ValueError: truth value of an array ... is ambiguous`，破壞多 POI 互動。
+
+**修復（`glas/app/gds_align_tool.py`）：** 移除多餘且有 bug 的 append/remove 區塊，
+直接由各 row 的 `poi_btn.isChecked()` 以 panel 順序重建 `_poi_entries`（原本下方
+本就有此重建，append/remove 為冗餘）。不再對 LayerEntry 做相等比較。
+
+**測試：** py_compile 通過；既有 `test_gds_align_m4b.py::test_multi_select_and_run_enabled`
+覆蓋多選 toggle 路徑。
+
+**影響檔案：** `glas/app/gds_align_tool.py`。
+
+**Branch：** `claude/compassionate-dijkstra-84Gjd`（PR #3）
+
 ## [2026-05-25] [F3] M3–M5：多 POI fine align（合成樣板）＋ POI 鈕／預覽彈窗
 
 **變更類型：** 功能（fine align 多 POI / UI）
