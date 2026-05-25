@@ -2,6 +2,26 @@
 
 ---
 
+## [2026-05-25] [F5] 規劃再擴充：納入 setup 持久化 / cancel 修復 / overlay 匯出 / 命名（6 milestone，待核准）
+
+**變更類型：** 文件（plan，尚未動工）
+
+**內容：** user 回饋四項 fine-align 工作流痛點，探索後收斂並擴充 F5：
+(#1) `BG grey`→`Background GL`、`FG`→`Foreground GL`（命名）；
+(#2) 切 DID 走 `set_document(新doc)` 用全新 `LayerEntry` 重建 → POI 勾選/可見性/顏色遺失，
+決策「記住 setup、新 doc 自動重套、user 手動按一次 Run fine align」；
+(#3) batch cancel 跑不停根因 = worker 緊迴圈內 `cancel()` 是 queued slot 永不執行，
+決策改 `threading.Event` 直接旗標 + 進度對話框 ETA + cancel 後保留已完成結果；
+(#4) overlay+image 匯出，決策「可勾選 raw / 對位後 overlay PNG / 兩者 + manifest（image_id join）」
+供 MMH 串接，複用 M1 overlay helper。plan 由 3 → 6 milestone（新增 M4 持久化+命名、M5 cancel/ETA、
+M6 overlay 匯出）。§8 條目同步。**待 user 核准後才開工。**
+
+**影響檔案：** `docs/plans/F5-finealign-diagnostics.md`、`CLAUDE.md`。
+
+**Branch：** `claude/sharp-lamport-YIk3z`
+
+---
+
 ## [2026-05-25] [F5] 規劃擴充：診斷範圍收斂為 3 milestone（待核准）
 
 **變更類型：** 文件（plan，尚未動工）

@@ -1,9 +1,9 @@
-# [F5] Fine align 診斷：殘差疊圖 + 批次總覽 + 殘差分析
+# [F5] Fine align 診斷 + 工作流：殘差疊圖 + 批次總覽 + setup 持久化 + cancel/ETA + overlay 匯出
 
 > **狀態：** planned（待核准）
 > **§8 ID：** [F5]
-> **建立：** 2026-05-25（2026-05-25 擴充範圍）
-> **負責 branch：** claude/compassionate-dijkstra-84Gjd（PR #3）
+> **建立：** 2026-05-25（2026-05-25 擴充範圍；2026-05-25 再納入 setup 持久化 / cancel 修復 / overlay 匯出 / 命名）
+> **負責 branch：** claude/sharp-lamport-YIk3z
 
 ---
 
@@ -35,8 +35,20 @@ helper）；無常駐結果表；單張路徑現在丟掉 `used_r`。
 - C2 中位殘差 → origin δ 一鍵套用 — 看完能修的閉環。
 - C3 狀態/失敗原因、C4 顯示 used search radius — 讓表格可讀、可信。
 
-**未選（暫不做）：** 信心指標 PSR / peak sharpness、診斷影像 PNG 匯出、常駐結果面板、
+**未選（暫不做）：** 信心指標 PSR / peak sharpness、常駐結果面板、
 旋轉/縮放 fine align、score 熱圖。如之後要再開 milestone。
+
+### Q3: 工作流擴充（2026-05-25 user 回饋）
+1. **命名（#1）**：`BG grey` → `Background GL`、每個 POI 列的 `FG` → `Foreground GL`（**兩者都改**）。
+2. **切換 DID 重設很煩（#2）**：現況切 defect 走 `_on_roi_finished → set_document(新doc)`，每次用全新
+   `LayerEntry` 重建列 → **POI 勾選 / 可見性 / 顏色遺失**（recipe / offset δ / FG-BG 參數本來就有保留）。
+   **決策：重套設定、user 手動按一次** —— 記住 fine-align setup（哪些層當 POI、可見性、各 POI FG），
+   新 doc 載入時自動重套，user 只需按一次 Run fine align（不自動跑）。
+3. **batch cancel 跑不停 + 要 ETA + 預覽已完成（#3）**：根因 = worker 在 `run()` 緊迴圈，`cancel()` 是
+   跨執行緒 **queued slot**，迴圈不回 event loop 永遠不執行。**決策：改 `threading.Event` 直接旗標**，
+   進度對話框顯示 ETA（已用時間 × 剩餘比例）+ 即時看已完成結果。
+4. **overlay+image 匯出（#4）**：**決策：可勾選 raw / 對位後 overlay PNG / 兩者，附 manifest**
+   （image_id ↔ 檔名 ↔ dx/dy/score）供 MMH 用 image_id join。複用 M1 的 `overlay_outlines_on_sem`。
 
 ---
 
@@ -77,14 +89,51 @@ helper）；無常駐結果表；單張路徑現在丟掉 `used_r`。
   `_refined`（讓 user 比較前後）。
 - [ ] 驗證：py_compile；median 計算（含忽略非 ok）純函式測；套用後 δ 數值/符號正確待 user。
 
+### M4: Fine-align setup 持久化 + 命名（#1 #2）  [status: planned]
+
+- [ ] **命名（#1）**：`FineAlignPanel` 的 `BG grey` caption → `Background GL`；`set_pois` 每列的
+  `FG` 標籤 → `Foreground GL`（tooltip 同步）。純標籤字串改，不動 `values()` 的 key（`bg_glv` 等）
+  避免動到匯出 / cache schema。
+- [ ] **setup 記憶（#2）**：MainWindow 新增 `self._fa_setup`（by layer key：是否 POI / 可見 / 顏色 /
+  FG），在 user 改 POI 勾選 / 可見性 / FG 時更新；`pois_changed` 與 `set_pois` 路徑寫回。
+- [ ] **重套**：`_on_roi_finished` 在 `set_document(doc)` 後，依 `self._fa_setup` 用 layer key 比對
+  新 doc 的 entries，重設可見性 / 顏色 / 重勾 POI、並把記住的 FG 餵回 `FineAlignPanel.set_pois`。
+  key 不存在於新 ROI 的層則略過（該 defect 沒有該層）。**不自動 run**——只還原設定。
+- [ ] 驗證：py_compile；`_fa_setup` 套用邏輯（by-key 比對 / 缺層略過 / FG 還原）純函式測；
+  互動（切 DID 後 POI 仍勾、按一次 Run fine align 即可）待 user。
+
+### M5: Batch cancel 即時生效 + ETA + 已完成預覽（#3）  [status: planned]
+
+- [ ] **cancel 修復**：`FineAlignAllWorker` 改用 `threading.Event`（GUI 執行緒 `set()`、worker 迴圈
+  與 `cancel_cb` 直接讀 `is_set()`），取代靠 queued slot 設 `self._cancel`。`_on_run_fine_align_all`
+  連線改 `cancel_requested → event.set`（DirectConnection 或直接呼叫）。確保按下立刻停（含中斷
+  正在進行的 ROI walk，已有 `WalkCancelled` 機制）。
+- [ ] **ETA**：worker `progress` 多帶起始時間或在主視窗記 `t0`；`_on_fa_progress` 依 done/total 與
+  已用時間估剩餘，進度對話框顯示「done/total · elapsed · ETA ~ mm:ss」。
+- [ ] **已完成預覽**：batch 進行中每收一筆 `result` 即更新 `self._refined` + badge（現已如此），
+  cancel 後保留已完成結果（不清空）；M2 的 `FineAlignResultsDialog` cancel 後也能開看部分結果。
+- [ ] 驗證：py_compile；ETA 估算純函式測（done/total/elapsed → 剩餘秒）；cancel 即時性與
+  進度文字待 user。
+
+### M6: Overlay + image 匯出（#4）  [status: planned]
+
+- [ ] `AlignmentExportDialog`（或新分頁）加「影像匯出」選項：勾選 **raw image** / **對位後 overlay
+  PNG** / **兩者**；overlay 重用 M1 `overlay_outlines_on_sem`（對位後 anchor = coarse + `_refined`）。
+- [ ] 匯出 worker（避免凍 UI）：逐張讀 SEM → 視勾選輸出 `*_raw.png` / `*_overlay.png` 到選定資料夾，
+  並寫 **manifest**（CSV/JSON，含 image_id ↔ raw 檔名 ↔ overlay 檔名 ↔ dx/dy/score/status），
+  供 MMH 以 image_id join。沿用既有 alignment schema 欄位命名。
+- [ ] 驗證：py_compile；manifest 列組裝 + 檔名規則純函式測；實際 PNG 落點 / overlay 對齊待 user。
+
 ---
 
 ## Affected Files
 
 - `glas/app/gds_align_tool.py`（overlay helper、`TemplatePreviewDialog` 擴充、
-  `FineAlignResultsDialog`、批次 worker 回傳狀態、`_on_fa_result/_finished`、Results 按鈕、
-  median→δ 接線）
-- `tests/`（overlay helper / 建表 / 分箱 / 散點 median / status 判定 純邏輯測試）
+  `FineAlignResultsDialog`、批次 worker 回傳狀態 + `threading.Event` cancel + ETA、
+  `_on_fa_result/_finished`、Results 按鈕、median→δ 接線、`FineAlignPanel` 命名、
+  `_fa_setup` 持久化 + `_on_roi_finished` 重套、`AlignmentExportDialog` 影像匯出 + manifest worker）
+- `tests/`（overlay helper / 建表 / 分箱 / 散點 median / status 判定 / `_fa_setup` by-key 套用 /
+  ETA 估算 / manifest 列組裝 純邏輯測試）
 
 ---
 
