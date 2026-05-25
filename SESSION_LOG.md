@@ -2,6 +2,29 @@
 
 ---
 
+## [2026-05-25] [F5-M5部分] Batch 進度條動態化 + ETA
+
+**變更類型：** 功能（UI）
+
+**動機現象：** batch（Run all）進度對話框只有 Braille spinner + elapsed，缺乏「正在做事」的
+實感與剩餘時間。user 要求進度條精美、有動態感。
+
+**修復實作：** `glas/app/gds_align_tool.py` 新增自繪 `_AnimatedBar`（QWidget）：圓角軌道 +
+橘色填充，填充上有一條淺色光澤帶隨 `advance()`（每 120ms tick）掃過 → 動態感；支援
+determinate（依 fraction 填充）與 indeterminate（滑塊 ping-pong，給 ROI 載入等未知總量階段）。
+全自繪不受 app QSS 影響（解掉先前避用 `QProgressBar` 的 chunk 動畫被壓平問題）。
+`LoadProgressDialog` 嵌入該 bar + 新增 `set_progress(done,total)`：切 determinate 並由
+`_refresh_detail` 顯示「done/total · NN% · Elapsed m:ss · ETA m:ss」（ETA 用 elapsed/done×剩餘）。
+`_on_fa_progress` 改呼叫 `set_progress`，title 顯示當前 image_id。對應 F5 M5 的 ETA checkbox 勾掉。
+
+**注意：** M5 其餘兩項（threading.Event 即時 cancel、cancel 後 results 預覽）尚未做。
+
+**測試：** `py_compile` 過。沙箱無 PyQt6 → GUI 動畫/ETA 待 user 本地驗。
+
+**影響檔案：** `glas/app/gds_align_tool.py`、`docs/plans/F5-finealign-diagnostics.md`。
+
+**Branch：** `claude/sharp-lamport-YIk3z`
+
 ## [2026-05-25] [F5] 規劃再擴充：納入 setup 持久化 / cancel 修復 / overlay 匯出 / 命名（6 milestone，待核准）
 
 **變更類型：** 文件（plan，尚未動工）

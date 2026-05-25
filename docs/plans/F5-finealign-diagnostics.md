@@ -108,8 +108,9 @@ helper）；無常駐結果表；單張路徑現在丟掉 `used_r`。
   與 `cancel_cb` 直接讀 `is_set()`），取代靠 queued slot 設 `self._cancel`。`_on_run_fine_align_all`
   連線改 `cancel_requested → event.set`（DirectConnection 或直接呼叫）。確保按下立刻停（含中斷
   正在進行的 ROI walk，已有 `WalkCancelled` 機制）。
-- [ ] **ETA**：worker `progress` 多帶起始時間或在主視窗記 `t0`；`_on_fa_progress` 依 done/total 與
-  已用時間估剩餘，進度對話框顯示「done/total · elapsed · ETA ~ mm:ss」。
+- [x] **ETA + 動態進度條**：`LoadProgressDialog` 加自繪 `_AnimatedBar`（掃光填充，避開 QSS 殺
+  chunk 動畫的雷）+ `set_progress(done,total)`；`_on_fa_progress` 依 done/total 與已用時間估剩餘，
+  detail 顯示「done/total · NN% · Elapsed m:ss · ETA m:ss」。（2026-05-25 user 直接要求先做）
 - [ ] **已完成預覽**：batch 進行中每收一筆 `result` 即更新 `self._refined` + badge（現已如此），
   cancel 後保留已完成結果（不清空）；M2 的 `FineAlignResultsDialog` cancel 後也能開看部分結果。
 - [ ] 驗證：py_compile；ETA 估算純函式測（done/total/elapsed → 剩餘秒）；cancel 即時性與

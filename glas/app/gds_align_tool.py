@@ -60,7 +60,8 @@ import numpy as np
 
 from PyQt6.QtCore import Qt, QObject, QPointF, QRect, QRectF, QSize, QThread, QTimer, QElapsedTimer, pyqtSignal
 from PyQt6.QtGui import (
-    QAction, QBrush, QColor, QFontMetrics, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap,
+    QAction, QBrush, QColor, QFontMetrics, QIcon, QImage, QKeySequence,
+    QLinearGradient, QPainter, QPainterPath, QPen, QPixmap,
     QPolygonF, QMouseEvent, QShortcut, QWheelEvent,
 )
 from PyQt6.QtWidgets import (
@@ -708,16 +709,90 @@ class LayerFilterDialog(QDialog):
         self.accept()
 
 
+class _AnimatedBar(QWidget):
+    """Self-painted progress bar with a sweeping sheen, so it looks alive.
+
+    Two modes: *determinate* (fill to a fraction) and *indeterminate* (a
+    sliding block, for phases where total work is unknown). A lighter band
+    sweeps across the filled portion on every ``advance()`` tick, giving the
+    "something is happening" motion even between progress updates. Painting is
+    fully self-contained so the app QSS can't flatten the animation (the reason
+    the old dialog avoided ``QProgressBar`` entirely)."""
+
+    _TRACK = QColor("#ece0d2")
+    _FILL = QColor("#e0863a")
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setFixedHeight(14)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding,
+                           QSizePolicy.Policy.Fixed)
+        self._frac = 0.0
+        self._indeterminate = True
+        self._phase = 0.0   # 0..1, position of the sweeping sheen
+
+    def set_fraction(self, frac: float) -> None:
+        self._indeterminate = False
+        self._frac = max(0.0, min(1.0, frac))
+        self.update()
+
+    def set_indeterminate(self, on: bool = True) -> None:
+        self._indeterminate = on
+        self.update()
+
+    def advance(self) -> None:
+        self._phase = (self._phase + 0.045) % 1.0
+        self.update()
+
+    def paintEvent(self, ev) -> None:  # type: ignore[override]
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w = float(self.width())
+        h = float(self.height())
+        r = h / 2.0
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(self._TRACK)
+        p.drawRoundedRect(QRectF(0, 0, w, h), r, r)
+        if self._indeterminate:
+            bw = max(48.0, w * 0.30)
+            t = self._phase
+            tri = 2.0 * t if t < 0.5 else 2.0 * (1.0 - t)   # ping-pong
+            self._fill(p, tri * (w - bw), bw, h, r)
+        elif self._frac > 0:
+            self._fill(p, 0.0, self._frac * w, h, r)
+        p.end()
+
+    def _fill(self, p: QPainter, x: float, fw: float, h: float,
+              r: float) -> None:
+        if fw <= 0:
+            return
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(x, 0, fw, h), min(r, fw / 2.0), r)
+        p.save()
+        p.setClipPath(path)
+        p.fillRect(QRectF(x, 0, fw, h), self._FILL)
+        # Sweeping highlight band across the filled portion.
+        band = max(32.0, fw * 0.4)
+        sx = x - band + self._phase * (fw + band)
+        grad = QLinearGradient(sx, 0, sx + band, 0)
+        grad.setColorAt(0.0, QColor(255, 255, 255, 0))
+        grad.setColorAt(0.5, QColor(255, 255, 255, 95))
+        grad.setColorAt(1.0, QColor(255, 255, 255, 0))
+        p.fillRect(QRectF(x, 0, fw, h), QBrush(grad))
+        p.restore()
+
+
 class LoadProgressDialog(QDialog):
     """Custom progress dialog for the GDS loader.
 
     QProgressDialog with the main app's QSS produced an empty-looking dialog
-    (the styled ``QProgressBar::chunk`` background killed the indeterminate
-    animation, and the inherited label sometimes rendered with no visible
-    text). This dialog avoids QProgressBar entirely: a Braille spinner +
-    elapsed clock prove the worker is alive even during gdstk's opaque
-    read-phase, and the status label is explicitly styled so users can never
-    miss it. Cancel emits ``cancel_requested``."""
+    (the styled ``QProgressBar::chunk`` background killed the animation, and the
+    inherited label sometimes rendered with no visible text). This dialog uses a
+    self-painted :class:`_AnimatedBar` instead: a sweeping fill bar + Braille
+    spinner + elapsed clock prove the worker is alive even during opaque
+    read-phases. When the caller knows the total work (e.g. batch fine-align),
+    :meth:`set_progress` switches the bar to a determinate fill with percent and
+    ETA; otherwise it stays indeterminate. Cancel emits ``cancel_requested``."""
 
     cancel_requested = pyqtSignal()
 
@@ -750,6 +825,9 @@ class LoadProgressDialog(QDialog):
         self._title.setWordWrap(True)
         layout.addWidget(self._title)
 
+        self._bar = _AnimatedBar(self)
+        layout.addWidget(self._bar)
+
         row = QHBoxLayout()
         row.setSpacing(12)
         self._spinner = QLabel(self._SPINNER[0], self)
@@ -770,6 +848,7 @@ class LoadProgressDialog(QDialog):
 
         self._cancelled = False
         self._spin_idx = 0
+        self._progress: Optional[tuple] = None   # (done, total) when known
         self._elapsed = QElapsedTimer()
         self._elapsed.start()
         self._tick = QTimer(self)
@@ -780,6 +859,13 @@ class LoadProgressDialog(QDialog):
     def set_text(self, text: str) -> None:
         self._title.setText(text)
 
+    def set_progress(self, done: int, total: int) -> None:
+        """Switch the bar to a determinate fill (done / total). The detail line
+        then shows count, percent and an ETA estimated from elapsed time."""
+        self._progress = (done, total)
+        self._bar.set_fraction(done / total if total else 0.0)
+        self._refresh_detail()
+
     def shutdown(self) -> None:
         """Stop the spinner timer (call before close to avoid late updates)."""
         self._tick.stop()
@@ -787,11 +873,26 @@ class LoadProgressDialog(QDialog):
     def _on_tick(self) -> None:
         self._spin_idx = (self._spin_idx + 1) % len(self._SPINNER)
         self._spinner.setText(self._SPINNER[self._spin_idx])
+        self._bar.advance()
+        self._refresh_detail()
+
+    def _refresh_detail(self) -> None:
         secs = int(self._elapsed.elapsed() / 1000)
-        self._detail.setText(
-            f"Elapsed: {secs // 60}:{secs % 60:02d}"
-            + ("  ·  cancelling at next checkpoint…" if self._cancelled else "")
-        )
+        elapsed = f"Elapsed {secs // 60}:{secs % 60:02d}"
+        if self._progress is not None:
+            done, total = self._progress
+            pct = int(100 * done / total) if total else 0
+            eta = ""
+            el = self._elapsed.elapsed() / 1000.0
+            if 0 < done < total and el > 0:
+                rem = el / done * (total - done)
+                eta = f"  ·  ETA {int(rem) // 60}:{int(rem) % 60:02d}"
+            detail = f"{done} / {total}  ·  {pct}%  ·  {elapsed}{eta}"
+        else:
+            detail = elapsed
+        if self._cancelled:
+            detail += "  ·  cancelling at next checkpoint…"
+        self._detail.setText(detail)
 
     def _on_cancel(self) -> None:
         if self._cancelled:
@@ -4601,7 +4702,8 @@ class MainWindow(QMainWindow):
     def _on_fa_progress(self, done: int, total: int, image_id: str) -> None:
         if self._fa_progress is not None:
             self._fa_progress.set_text(
-                f"Fine aligning all images…\n{done} / {total}  ({image_id})")
+                f"Fine aligning all images…\ncurrent: {image_id}")
+            self._fa_progress.set_progress(done, total)
 
     def _on_fa_result(self, image_id: str, dx: float, dy: float,
                       score: float) -> None:
