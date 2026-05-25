@@ -2,6 +2,19 @@
 
 ---
 
+## [2026-05-25] [F4] 規劃：Fine align 診斷（殘差疊圖 + 批次結果總覽）
+
+**變更類型：** 文件（plan，尚未動工）
+
+**內容：** 經 Q&A 收斂 fine align 強化方向＝結果可視化/診斷，具體交付兩項：殘差疊圖
+overlay（對位前/後輪廓畫在 SEM）與批次結果總覽（可排序/篩選/點列跳轉的表格）。
+新增 `docs/plans/F4-finealign-diagnostics.md`（2 milestone），於 CLAUDE.md §8 註冊 [F4]。
+**待 user 核准後才開工。**
+
+**影響檔案：** `docs/plans/F4-finealign-diagnostics.md`、`CLAUDE.md`。
+
+**Branch：** `claude/compassionate-dijkstra-84Gjd`（PR #3）
+
 ## [2026-05-25] [F3] 後續：toolbar 不裁切、layer name catch-all 修正、移除透明度 slider
 
 **變更類型：** UI 修正 + bug fix（PR #3 後續 user 回饋 1/2/3）
