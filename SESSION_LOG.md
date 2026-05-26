@@ -2,6 +2,20 @@
 
 ---
 
+## [2026-05-26] [F9] 規劃 v2：改為 OASIS 匯出 + ROI 裁剪（待核准）
+
+**變更類型：** 文件（plan 修訂，尚未動工）
+
+**修訂動機：** user 提出公司流程統一 .oas、要求更深的 GDSII vs OASIS 優缺點分析來說服。核對
+`oasis_streamer` 後修正先前評估：(1) **格式決定因素是下游消費端**（公司 .oas）非 writer 難度；
+(2) 自寫 OASIS writer 風險其實**可控且有界**——validation scheme 可為 0（無 CRC，`oasis_streamer.py:1510`）、
+CBLOCK 選用、modal 非強制、encoder 是既有 decoder 的逆、且可用自家 reader 做 round-trip oracle。
+**Q2 定案改為 OASIS (.oas)**。user 並澄清範圍：本 feature 專注「匯出 raw layer + Boolean layer 同檔 +
+給 GDS 座標裁剪特定 ROI 區域」；「下游接水確認每張 SEM ROI」是**另一題**（對位資訊輸出，後續討論），移出 F9。
+plan 重寫：M1 core OASIS writer（最小合規）、M2 幾何蒐集+ROI 裁剪 helper、M3 app 匯出動作、M4 測試收尾。
+
+---
+
 ## [2026-05-26] [F9] 規劃：Layout 匯出（Boolean 合成 layer 反向寫出成 layout 檔）（待核准）
 
 **變更類型：** 文件（plan，尚未動工）
