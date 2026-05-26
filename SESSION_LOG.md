@@ -2,6 +2,25 @@
 
 ---
 
+## [2026-05-26] [F6] 等價測試本地全綠（170 passed），勾 M4 測試 checkbox
+
+**變更類型：** 文件（測試驗收記錄，無程式碼變更）
+
+**動機現象：** F6 加速（mmap 讀取 / 單一 map 共享 / thread-pool 批次）等價測試先前只在沙箱跑過
+numpy-free 子集。user 本次在本地 Python 3.9.7 跑
+`pytest tests/test_accel_equivalence.py tests/test_oasis_random.py tests/test_oasis_streamer.py -v`
+→ **170 passed**（含三組等價：mmap↔slurp、共享map↔獨立scan、循序↔4-worker 並行）。
+
+**修復實作：** F6 plan M4「本地 pytest 全綠」與「驗證方式」對應 checkbox `[ ]→[x]`、標註日期與
+170 passed；M4 status 更新為「等價測試本地全綠；實機效能/GUI/mmap 記憶體驗收待本地」。**F6 仍留在
+§8**——尚缺實機效能、GUI 批次加速、大檔 mmap 記憶體下降的本地驗收。
+
+**測試：** 即本次驗收事件本身（170 passed）。無程式碼變更。
+
+**影響檔案：** `docs/plans/F6-readwalk-batch-accel.md`、`SESSION_LOG.md`。
+
+**Branch：** `claude/practical-pascal-AtKLm`
+
 ## [2026-05-26] 完成 [F5]：本地驗收通過，收尾 plan + §8
 
 **變更類型：** 文件（任務收尾，無程式碼變更）

@@ -95,11 +95,11 @@ mmap 與 thread-pool 都帶 fallback（無 fileno → slurp；cv2 缺 → 既有
 - [x] 驗證：py_compile + `TestBatchParallelEquivalence`（循序 vs 4-worker pool 每張 tuple 相等）；沙箱無
   numpy/cv2/PyQt6 → 待本地實跑。
 
-### M4: 等價性與效能總驗收  [status: in progress — 測試齊備，實機/相依驗收待本地]
+### M4: 等價性與效能總驗收  [status: in progress — 等價測試本地全綠（170 passed）；實機效能/GUI/mmap 記憶體驗收待本地]
 
 - [x] golden 測試彙整於 `tests/test_accel_equivalence.py`（mmap↔slurp / 共享map↔獨立scan / 循序↔並行）。
-- [ ] 本地 `pytest tests/test_accel_equivalence.py tests/test_oasis_random.py tests/test_oasis_streamer.py -v`
-  全綠（含 numpy/cv2/PyQt6-gated）。
+- [x] 本地 `pytest tests/test_accel_equivalence.py tests/test_oasis_random.py tests/test_oasis_streamer.py -v`
+  全綠（含 numpy/cv2/PyQt6-gated）。（2026-05-26 user 本地 Python 3.9.7：170 passed）
 - [ ] 實機效能、GUI 批次加速、大檔 mmap 記憶體下降由 user 本地驗收。
 
 ---
@@ -135,8 +135,8 @@ mmap 與 thread-pool 都帶 fallback（無 fileno → slurp；cv2 缺 → 既有
 
 - [ ] 所有 milestone checkbox 已勾
 - [ ] `python3 -m py_compile glas/core/oasis_streamer.py glas/core/oasis_random.py glas/app/gds_align_tool.py`
-- [ ] `pytest tests/test_oasis_random.py tests/test_oasis_streamer.py tests/test_accel_equivalence.py -v`
-      全綠（含三組等價測試）
+- [x] `pytest tests/test_oasis_random.py tests/test_oasis_streamer.py tests/test_accel_equivalence.py -v`
+      全綠（含三組等價測試）（2026-05-26 本地：170 passed）
 - [ ] 手動（user 本地）：開大 OASIS ROI 模式記憶體明顯下降；`Run all` 在多核機批次明顯變快、
       結果與加速前逐張一致；按終止仍即時停。
 - [ ] `SESSION_LOG.md` 有對應紀錄
