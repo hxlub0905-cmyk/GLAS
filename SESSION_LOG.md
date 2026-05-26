@@ -2,165 +2,48 @@
 
 ---
 
-## [2026-05-26] 修第三個過時測試 test_batch_run（非 F8 回歸）
+## [2026-05-26] F5 收尾 + F6 測試驗收 + F8 全程（規劃→實作→修測試→驗收）
 
-**變更類型：** test fix（只動測試，不動程式）
+**變更類型：** 收尾(F5) + 測試驗收(F6) + 功能/效能(F8) + test fix。本次對話（同日）累積數件，合併記錄。
 
-**動機現象：** clone 回歸修好後，`test_gds_align_m4b.py::TestRunAllWorker::test_batch_run` 露出另一個過時
-斷言 `assert "D2" not in results`。D2 是 no-coords job，但 F5 M2/M5 起 `_fine_align_image` 對 no-coords
-**回 status tuple（非 None）**，worker 會 emit 結果列（供批次表列出狀態）——此為 F5 設計、F8 逐字搬移未變，
-故此失敗自 F5 起即存在（先前被 clone 回歸的 KeyError 遮住）。測試還停在「no-coords 靜默跳過」舊語意，且
-result lambda 只收 4 參數（signal 已是 6：含 used_r + status）。
+**1. 完成 [F5]**（純文件收尾）：user 本地 GUI 驗收 fine-align 診斷工作流（Preview before/after、總覽表、
+直方圖/散點、median→δ 收斂）全通過。`F5-finealign-diagnostics.md` checkbox/status 標註驗收；`CLAUDE.md`
+§8 移除 [F5]（plan 留作 design history）。
 
-**修復實作：** result lambda 改收 6 參數、記錄 status；斷言改為 `results["D2"] == (0,0,0,"no-coords")`、
-D1 status == "ok"。程式碼未動。
+**2. [F6] 等價測試本地全綠**（文件）：本地 Python 3.9.7 跑 accel/oasis_random/oasis_streamer → 170 passed
+（mmap↔slurp、共享map↔獨立scan、循序↔4-worker 並行）。F6 plan M4 測試 checkbox 勾起；F6 thread-pool 之後
+由 F8 取代，連同 F7 一併待收尾。
 
-**測試：** py_compile 過；預期該檔全綠（待 user 重跑確認 206 全綠）。
+**3. [F8] Batch 反應性與加速**（plan + 實作 M1–M4）：user 回報 Batch Align 非常卡、運算久、進度條花俏。
+查出三根因：(a) `_on_fa_result` 每張整表重建 + 圖刪重生 = O(N²) 主執行緒重繪；(b) F6 thread-pool 8 條純
+Python 解碼 thread 搶 GIL；(c) `_AnimatedBar` 漸層/發光/掃光/動畫。AskUserQuestion 收斂後產
+`docs/plans/F8-batch-responsiveness.md` 並實作：
+- **M1 扁平進度條**：`_AnimatedBar` 重寫成單色軌道+單色填充（去漸層/發光/掃光/in-bar%），高 20→14、
+  determinate `advance()` 不重繪；API 不變→全 app 同步；移除無用 `QLinearGradient`/`QPainterPath` import。
+- **M2 節流串流（修 O(N²)）**：`_batch_refresh_timer`（single-shot 300ms）合併刷新（~3x/sec）；
+  `set_rows(..., rebuild_charts=False)` 串流時跳過直方圖/散點重建，只在 finished/cancelled/Results…/起跑 完整刷新。
+- **M3 ProcessPool（抽 Qt-free core）**：新增 `glas/core/fine_align.py`，rasterize/template/matchTemplate/
+  ROI-walk/`_fine_align_image` 等 10 個純函式逐字搬入（app re-export 取回，呼叫端與 m4b/accel 測試相容；
+  `overlay_outlines_on_sem` 留 app）。`FineAlignAllWorker` 由 `ThreadPoolExecutor` 改 `ProcessPoolExecutor`
+  (spawn)：worker 由**路徑**重建 reader（避開 Windows spawn 拉 PyQt6）、SEM 子行程自讀；cancel 用
+  `fut.cancel()`（張邊界粒度、保留已完成）；`n<=2`/單核走 in-thread fallback（直接用 `self._rar`）。
+- **M4 測試**：`test_accel_equivalence.py` 新增 `TestProcessPoolEquivalence`（`_pool_init` 由路徑重建 reader +
+  `_pool_task` 每張 result 與循序 `_fine_align_image` 完全相等）。
 
-**影響檔案：** `tests/test_gds_align_m4b.py`、`SESSION_LOG.md`。
+**4. 修 4 個測試失敗**：1 個 F8 回歸——`_run_in_thread` 誤用 `self._rar.clone()`（`_FakeRar` 無 clone）→ 改回
+直接用 `self._rar`；3 個既有過時/過嚴測試（git diff 確認受測函式 F8 前後逐字相同）——`test_expr_spec`
+（斷言改 4-tuple 含 recipes 快照）、`test_draws_outline_colour`（`cv2.LINE_AA` 反鋸齒→改斷言「明顯偏紅」非
+精確 255,0,0）、`test_batch_run`（F5 起 no-coords 會回 status 列→lambda 收 6 參數、斷言 D2 為 no-coords）。
 
-**Branch：** `claude/practical-pascal-AtKLm`
+**測試：** 本地全量 **206 passed**（含 ProcessPool 等價）。**F8 實機驗收通過**：UI 不卡、多核生效（工作管理員
+見多個 python 子行程）、明顯變快、取消等待可接受、結果正確、進度條扁平 OK。
 
-## [2026-05-26] 修兩個既有過時/過嚴測試（非 F8 回歸）
-
-**變更類型：** test fix（只動測試，不動程式）
-
-**動機現象：** user 本地全量測試另有兩個失敗，經 git diff 確認受測函式 F8 前後逐字相同 → 既有問題、非
-F8 造成。調查結論：程式行為正確，是測試過時/過嚴：
-- `test_gds_align_m4b.py::TestPoiSpecs::test_expr_spec`：`_entry_spec` 對 synthetic layer 刻意回 **4-tuple**
-  `("expr", text, bindings, recipes_map)`（recipes 快照供批次 fine-align 解析巢狀 synthetic 參照，
-  `poi_polys_for_roi` 讀 `poi_spec[3]`）；測試還斷言舊 3-tuple。
-- `test_gds_align_f5.py::TestOverlayOutlines::test_draws_outline_colour`：`overlay_outlines_on_sem` 用
-  `cv2.LINE_AA`，反鋸齒把 1px 紅線與灰底混色 → 無精確 `(255,0,0)` 像素；測試斷言精確純紅太嚴。
-
-**修復實作：** 純測試修正——`test_expr_spec` 斷言改 4-tuple（含空 recipes `{}`）；`test_draws_outline_colour`
-改斷言「明顯偏紅」像素（R>120 且 R 比 G、B 各高 40 以上）而非精確 `(255,0,0)`。程式碼一行未動。
-
-**測試：** py_compile 過；兩測試預期轉綠（待 user 重跑全量確認 206 全綠）。
-
-**影響檔案：** `tests/test_gds_align_f5.py`、`tests/test_gds_align_m4b.py`、`SESSION_LOG.md`。
-
-**Branch：** `claude/practical-pascal-AtKLm`
-
-## [2026-05-26] [F8] M3 修回歸：批次 in-thread fallback 誤用 clone()
-
-**變更類型：** bug fix（F8 自身回歸）
-
-**動機現象：** user 本地跑 `tests/test_gds_align_m4b.py` 出現 `TestRunAllWorker::test_batch_run`（KeyError
-'c'，finished 未發）與 `test_cancel_stops_early`（cancelled 未發）。原因：F8 M3 新增的小批次 fallback
-`FineAlignAllWorker._run_in_thread()` 用了 `self._rar.clone()`，但測試的 `_FakeRar` 沒有 `clone()` →
-拋 AttributeError 走 `failed` 分支，finished/cancelled 都不發。pre-F6 的循序路徑本來就直接用 `self._rar`。
-
-**修復實作：** `_run_in_thread` 改回**直接用 `self._rar`**（不 clone、不 close；reader 由 app 擁有），與
-pre-F6 循序語意一致。ProcessPool 路徑不受影響（子行程仍由路徑自建 reader）。
-
-**測試：** py_compile 過。等價測試（`TestProcessPoolEquivalence` 等）本地已 202 passed；此修預期讓
-`test_batch_run` / `test_cancel_stops_early` 轉綠（待 user 重跑）。
-
-**另：兩個既有失敗非 F8 造成**（`_poi_specs()` 與 `overlay_outlines_on_sem` 經 git diff 確認與 F8 前逐字
-相同）：`test_expr_spec`（測試斷言舊 3-tuple，但程式已回 4-tuple 含 recipes）、`test_draws_outline_colour`
-（`cv2.LINE_AA` 反鋸齒無純紅像素）——屬既有測試過時/過脆，待 user 決定是否另行修。
-
-**影響檔案：** `glas/app/gds_align_tool.py`、`SESSION_LOG.md`。
-
-**Branch：** `claude/practical-pascal-AtKLm`
-
-## [2026-05-26] [F8] 實作 M1–M4：扁平進度條 + 節流串流 + ProcessPool 批次（待本地驗收）
-
-**變更類型：** 功能（效能/UX；批次計算結果不變）
-
-**動機現象：** user 回報跑 Batch Align 時 UI 非常卡、不敢點、運算久、進度條太花俏。調查確認三根因
-（plan F8）：(1) `_on_fa_result` 每張都整表重建 + 直方圖/散點刪掉重生 = O(N²) GUI 重繪；(2) F6 thread-pool
-8 條純 Python 解碼 thread 與 Qt 主執行緒搶 GIL；(3) `_AnimatedBar` 漸層/發光/掃光/動畫重繪。
-
-**修復實作（依核准的 F8 plan）：**
-- **M1 扁平進度條**：`_AnimatedBar` 重寫 paintEvent 為單色軌道 + 單色填充（拿掉漸層/雙層發光/掃光帶/
-  in-bar % 雙描邊），bar 高 20→14；`advance()` 在 determinate 模式直接 return（批次跑時不再每 tick 燒繪圖）；
-  API 不變 → 全 app 進度條同步扁平。移除已無用的 `QLinearGradient`/`QPainterPath` import。
-- **M2 節流串流（修 O(N²)）**：新增 `self._batch_refresh_timer`（QTimer single-shot 300ms）；`_on_fa_result`
-  只更新資料 + badge，未啟動時 kick timer → 最多 ~3x/sec 重填表。`BatchResultsPanel.set_rows(...,
-  rebuild_charts=True)`：串流時傳 False 跳過直方圖/散點 teardown+rebuild，只在 finished/cancelled/failed/
-  Results…/起跑 的完整刷新時重建圖。finished/cancelled/failed 先 stop timer 再做最後一次完整刷新。
-- **M3 ProcessPool（抽 Qt-free core）**：新增 `glas/core/fine_align.py`，把 rasterize/template/matchTemplate/
-  ROI-walk/`_fine_align_image` 等 10 個純函式逐字搬入（app `import fine_align` + re-export 取回，呼叫端與
-  m4b/accel 測試全相容；GUI-only 的 `overlay_outlines_on_sem` 留 app）。`FineAlignAllWorker.run()` 由
-  `ThreadPoolExecutor` 改 `ProcessPoolExecutor(spawn)`：worker 由**路徑**重建 reader（`_pool_init`/`_pool_task`，
-  避開 Windows spawn 拉 PyQt6）、SEM 子行程自讀不跨行程傳；cancel 用 `fut.cancel()` 掉未開始 future（張邊界
-  粒度，已完成結果保留）；`n<=2`/單核走 in-thread 循序 fallback。
-- **M4 測試**：`tests/test_accel_equivalence.py` 新增 `TestProcessPoolEquivalence`——`_pool_init`（由路徑重建
-  reader）+ `_pool_task` 每張 result tuple 與循序 `_fine_align_image` 完全相等（in-process 跑進入點）。
-
-**不動：** 批次計算純函式（只搬家）、fine-align 符號、SemViewer 折疊、CE early-stop、median→δ（§7 不變式）。
-取捨：cancel 粒度由逐 node 即時改為單張影像邊界（多行程無法中斷 in-flight 單張）。
-
-**測試：** `py_compile` 全過（`fine_align.py` / `gds_align_tool.py` / 測試）。沙箱無 numpy/cv2/PyQt6 →
-fine_align 等價、ProcessPool 進入點、GUI 外觀/順暢/即時 cancel 待 user 本地跑
-`pytest tests/test_accel_equivalence.py tests/test_oasis_random.py tests/test_oasis_streamer.py
-tests/test_gds_align_f5.py tests/test_gds_align_m4b.py -v` + 大批次實機驗收。
+**不動（§7 不變式）：** 批次計算純函式只搬家、結果 byte/value 不變、fine-align 符號、SemViewer 折疊、
+CE early-stop、median→δ。取捨：cancel 粒度由逐 node 即時改為單張影像邊界。
 
 **影響檔案：** `glas/core/fine_align.py`（新）、`glas/app/gds_align_tool.py`、`tests/test_accel_equivalence.py`、
-`docs/plans/F8-batch-responsiveness.md`。
-
-**Branch：** `claude/practical-pascal-AtKLm`
-
-## [2026-05-26] [F8] 規劃：Batch Align 反應性與加速（待核准）
-
-**變更類型：** 文件（plan，尚未動工）
-
-**動機現象：** user 回報跑 Batch Align 時 UI 非常卡、不敢點、運算久，進度條太花俏想回歸簡潔。調查
-`gds_align_tool.py` 後確認三個獨立卡頓來源：(1) `_on_fa_result` 每張結果都 `_refresh_batch_panel()`
-→ 整表重建 + 直方圖/散點刪掉重生 = **O(N²)** 主執行緒重繪（最大元兇、bug）；(2) F6 thread-pool 8 條純
-Python 解碼 thread 與 Qt 主執行緒搶 GIL；(3) `_AnimatedBar` 漸層/發光/掃光/動畫重繪成本。expression POI
-每張要 ROI walk + shapely 布林，thread-pool 只平行到 cv2/GEOS、純 Python 解碼仍序列化。
-
-**規劃內容：** 用 AskUserQuestion 收斂三個岔路——(Q1) 進度條→簡潔扁平版（全 app）、(Q2) 加速→
-ProcessPool（繞 GIL、子行程不碰 GUI）、(Q3) 串流→節流即時更新。產出
-`docs/plans/F8-batch-responsiveness.md`（4 milestone：M1 扁平進度條、M2 節流串流修 O(N²)、M3 抽 Qt-free
-`glas/core/fine_align.py` + ProcessPool 批次、M4 等價+效能驗收）。修訂 F6 M3（thread→process）與 F7
-M1/M4（進度條回退、串流節流）；計算純函式不改、結果 byte/value 不變、§7 不變式不動。已知取捨：cancel 粒度
-由逐 node 即時改為單張影像邊界。Windows spawn 故須把計算抽到 Qt-free core 模組（子行程不可 import
-PyQt6）。§8 註冊 [F8]。**待 user 核准後才開工。**
-
-**測試：** 無（純 plan）。
-
-**影響檔案：** `docs/plans/F8-batch-responsiveness.md`、`CLAUDE.md`（§8）、`SESSION_LOG.md`。
-
-**Branch：** `claude/practical-pascal-AtKLm`
-
-## [2026-05-26] [F6] 等價測試本地全綠（170 passed），勾 M4 測試 checkbox
-
-**變更類型：** 文件（測試驗收記錄，無程式碼變更）
-
-**動機現象：** F6 加速（mmap 讀取 / 單一 map 共享 / thread-pool 批次）等價測試先前只在沙箱跑過
-numpy-free 子集。user 本次在本地 Python 3.9.7 跑
-`pytest tests/test_accel_equivalence.py tests/test_oasis_random.py tests/test_oasis_streamer.py -v`
-→ **170 passed**（含三組等價：mmap↔slurp、共享map↔獨立scan、循序↔4-worker 並行）。
-
-**修復實作：** F6 plan M4「本地 pytest 全綠」與「驗證方式」對應 checkbox `[ ]→[x]`、標註日期與
-170 passed；M4 status 更新為「等價測試本地全綠；實機效能/GUI/mmap 記憶體驗收待本地」。**F6 仍留在
-§8**——尚缺實機效能、GUI 批次加速、大檔 mmap 記憶體下降的本地驗收。
-
-**測試：** 即本次驗收事件本身（170 passed）。無程式碼變更。
-
-**影響檔案：** `docs/plans/F6-readwalk-batch-accel.md`、`SESSION_LOG.md`。
-
-**Branch：** `claude/practical-pascal-AtKLm`
-
-## [2026-05-26] 完成 [F5]：本地驗收通過，收尾 plan + §8
-
-**變更類型：** 文件（任務收尾，無程式碼變更）
-
-**動機現象：** F5（fine-align 診斷 + 工作流，M1–M6）程式碼早已完成，先前狀態為「待 user 本地 GUI
-驗收」。user 本次 session 回報本地實機驗收（單張 Preview before/after 貼合、Run all 總覽表排序/篩選/
-點列跳轉、直方圖/散點、median→δ 套用後重跑殘差收斂）**全部通過**。
-
-**修復實作：** 依 CLAUDE.md §10 收尾——`docs/plans/F5-finealign-diagnostics.md` 將「所有 milestone
-checkbox 已勾」「手動本地驗證」兩項 `[ ]→[x]`、6 個 milestone status 標註「2026-05-26 user 本地驗收
-通過」；`CLAUDE.md` §8 移除 [F5] 條目（plan 檔保留作 design history）。
-
-**測試：** 無程式碼變更（純文件收尾）。
-
-**影響檔案：** `docs/plans/F5-finealign-diagnostics.md`、`CLAUDE.md`、`SESSION_LOG.md`。
+`tests/test_gds_align_f5.py`、`tests/test_gds_align_m4b.py`、`docs/plans/F5-*.md`、`docs/plans/F6-*.md`、
+`docs/plans/F8-batch-responsiveness.md`、`CLAUDE.md`、`SESSION_LOG.md`。
 
 **Branch：** `claude/practical-pascal-AtKLm`
 
