@@ -2,6 +2,35 @@
 
 ---
 
+## [2026-05-26] [F9] M1 實作：core OASIS writer（最小合規）+ M4 測試
+
+**變更類型：** 功能（新增 core 模組 + 測試）
+
+**動機：** F9 plan 核准後開工。M1 = 自寫最小合規 OASIS writer，把 raw / Boolean layer 反向寫出 .oas。
+
+**實作（`glas/core/oasis_writer.py`，純標準庫、無 Qt/numpy/shapely）：** encode 原語為 `oasis_streamer`
+decode 的逆——`encode_unsigned_int`（7-bit varint）、`encode_signed_int`（mag<<1|sign）、`encode_real`
+（整數 type0/1、非整數 type7 double）、`encode_string`、`encode_g_delta`（arbitrary form）。`serialize_oasis`/
+`write_oasis` 輸出最小合規序列：MAGIC → START(unit, offset_flag=0, 6×(0,0)) → CELLNAME_IMP → CELL_REFNUM 0
+→ XYABSOLUTE → 幾何 → END(validation scheme 0)。幾何分支（Q4）：`_axis_rect` 偵測 axis-aligned 矩形走
+RECTANGLE(info `0x7b`)、其餘走 POLYGON(info `0x3b`, point-list type4 g-delta)；閉合重複頂點自動去除、
+degenerate(<3) 略過。**設計依據**：逐項核對 `oasis_streamer` 的 decode（unsigned/signed/real/point-list/
+RECTANGLE/POLYGON/START/END）+ 測試套件手組 OASIS 黃金 fixture（`test_oasis_streamer.py` 的 START/RECT
+`0x7b`/CELL_REFNUM/END `uint0`）。offset_flag 選 0（表在 START）因 offset_flag=1 + 全 0 offset 會讓 reader
+的 peek heuristic 把 0 誤判成 validation scheme。
+
+**測試（`tests/test_oasis_writer.py`）：** encode 原語對 reader round-trip、黃金 fixture **byte 逐位元吻合**、
+writer→`oasis_streamer` 幾何 round-trip（矩形/三角/45°/多 layer）、RECTANGLE vs POLYGON 偵測、閉合 ring、
+空/degenerate 略過、deterministic。沙箱獨立驗證 writer byte 輸出 == 黃金 fixture（無 numpy 故 reader
+round-trip 待 user 本地 `pytest`）。`py_compile` 全過。
+
+**進度：** plan M1 done、M4 大部分 done（ROI 裁剪測試併入 M2）。**未完**：M2 幾何蒐集+ROI 裁剪（含
+holes 決策 O-holes，已記 plan Risks 待 user 定）、M3 app 匯出、M5 開發者模式、M6 收尾。
+
+**影響檔案：** `glas/core/oasis_writer.py`（新）、`tests/test_oasis_writer.py`（新）、`docs/plans/F9-layout-export.md`。
+
+**Branch：** `claude/adoring-cannon-oKZKo`
+
 ## [2026-05-26] [F9] 規劃 v2：改為 OASIS 匯出 + ROI 裁剪（待核准）
 
 **變更類型：** 文件（plan 修訂，尚未動工）
