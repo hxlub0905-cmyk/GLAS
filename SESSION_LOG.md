@@ -2,6 +2,41 @@
 
 ---
 
+## [2026-05-26] [F9] M2/M3/M5/M6 實作：ROI 裁剪 + app 匯出對話框 + 開發者模式 + 文件
+
+**變更類型：** 功能（新增 core 模組 + app UI + 文件）
+
+**M2（`glas/core/layout_export.py`，shapely+numpy，獨立於純 stdlib 的 writer）：** `clip_polygons`/
+`clip_layers`/`export_layers` + `shapely_to_rings`。`crop_bbox=(x1,y1,x2,y2)`（角點任意序）用
+shapely `intersection(box)` 裁切；`None` → 整張。**O-holes 決議（user 選）**：`shapely_to_rings` 只取
+外環、丟內環（= `gds_boolean.geometry_to_polygons` 慣例，匯出「所見即所得」無洞）；裁剪無洞多邊形不會
+生洞。測試 `tests/test_layout_export.py`（passthrough/內框裁切/角點任意序/全外略過/holes 丟棄/Multi/
+drop-empty/clip→write→read round-trip）。
+
+**M3（app 匯出 UI）：** `OasisExportDialog`——每 layer 一列（checkbox + 輸出 layer/datatype spin；
+synthetic 內部 layer=-1 不可寫 OASIS → 給可編輯輸出值，預設 1000+；raw 預填原值）+ 四個 GDS 座標輸入框
+（留空=整張、部分/非數字/零面積→warning 擋下）。`_on_export_oasis` 仿 `_on_export_cache`：getSaveFileName
+(*.oas) → `layout_export.export_layers`，unit=1000（GLAS 全程座標當 nm、1 DBU=1 nm；doc 未存來源 unit，
+1000 自洽），cellname=doc.top_cell_name；成功更新 `_status_doc`。
+
+**M5（開發者模式 gating）：** `self._dev_mode` 由 `QSettings("GLAS","GLAS")` 載入（預設 False、持久化）；
+About 對話框 icon `_attach_dev_toggle` 點 5 次 → `_set_dev_mode` 切換 + 寫回 QSettings + QMessageBox 回饋；
+Export OASIS 按鈕 `setVisible(self._dev_mode)`、`_refresh_dev_ui` 切換。匯出入口預設隱藏。
+
+**M6（文件）：** README Features + CLAUDE §1 能力 5 + §4 目錄（oasis_writer/layout_export）。
+
+**測試：** `py_compile` 全過（writer/layout_export/app/兩測試檔）。沙箱無 numpy/shapely/PyQt6 →
+`pytest` 與 GUI/KLayout 驗收待 user 本地。
+
+**不動（§7 不變式）：** 純新增，未改 OASIS decode、座標換算、對位符號、SemViewer、CE early-stop。
+
+**影響檔案：** `glas/core/layout_export.py`（新）、`tests/test_layout_export.py`（新）、
+`glas/app/gds_align_tool.py`、`README.md`、`CLAUDE.md`、`docs/plans/F9-layout-export.md`、`SESSION_LOG.md`。
+
+**進度：** F9 M1–M6 程式碼完成，**待 user 本地驗收**後從 §8 移除。
+
+**Branch：** `claude/adoring-cannon-oKZKo`
+
 ## [2026-05-26] [F9] M1 實作：core OASIS writer（最小合規）+ M4 測試
 
 **變更類型：** 功能（新增 core 模組 + 測試）

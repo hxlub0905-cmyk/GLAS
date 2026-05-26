@@ -61,7 +61,7 @@ from typing import Optional
 
 import numpy as np
 
-from PyQt6.QtCore import Qt, QObject, QPointF, QRect, QRectF, QSize, QThread, QTimer, QElapsedTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QObject, QPointF, QRect, QRectF, QSettings, QSize, QThread, QTimer, QElapsedTimer, pyqtSignal
 from PyQt6.QtGui import (
     QAction, QBrush, QColor, QFontMetrics, QIcon, QImage, QKeySequence,
     QPainter, QPen, QPixmap,
@@ -123,6 +123,7 @@ import gds_boolean      # noqa: E402
 import gds_layer_cache  # noqa: E402
 import sem_loader       # noqa: E402
 import oasis_random     # noqa: E402
+import layout_export     # noqa: E402  (F9: OASIS export — shapely guarded inside)
 # F8: the Qt-free fine-align compute lives in glas/core/fine_align.py so a
 # spawn-based ProcessPool worker can import it without pulling in PyQt6. Pull
 # the functions back into this namespace so existing call sites and tests
@@ -4267,6 +4268,105 @@ class SemPanel(QFrame):
             self.image_selected.emit(img)
 
 
+class OasisExportDialog(QDialog):
+    """F9 M3: pick layers (raw + Boolean) and an optional GDS-coordinate crop
+    region, then export to OASIS. Synthetic layers get an editable output
+    layer/datatype (their internal layer is -1, not writable to OASIS)."""
+
+    def __init__(self, parent, entries, doc_bbox) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Export OASIS")
+        self.setMinimumWidth(_capped_min_width(420))
+        self._rows: list[tuple] = []
+        self._crop: Optional[tuple] = None
+        self._sel: list[tuple] = []
+
+        v = QVBoxLayout(self)
+        v.addWidget(QLabel("Layers to export"))
+
+        grid = QGridLayout()
+        grid.addWidget(QLabel("Layer"), 0, 2)
+        grid.addWidget(QLabel("Datatype"), 0, 3)
+        synth_default = 1000
+        for i, e in enumerate(entries, start=1):
+            cb = QCheckBox(e.key.label())
+            cb.setChecked(True)
+            if e.display_name:
+                cb.setText(f"{e.key.label()}  ({e.display_name})")
+            ls = QSpinBox()
+            ls.setRange(0, 65535)
+            ds = QSpinBox()
+            ds.setRange(0, 65535)
+            if e.key.synthetic:
+                ls.setValue(synth_default)
+                ds.setValue(0)
+                synth_default += 1
+            else:
+                ls.setValue(max(0, int(e.key.layer)))
+                ds.setValue(max(0, int(e.key.datatype)))
+            grid.addWidget(cb, i, 0, 1, 2)
+            grid.addWidget(ls, i, 2)
+            grid.addWidget(ds, i, 3)
+            self._rows.append((e, cb, ls, ds))
+        v.addLayout(grid)
+
+        v.addSpacing(10)
+        v.addWidget(QLabel("Crop region (GDS nm) — leave all blank to export whole layout"))
+        crop_grid = QGridLayout()
+        self._crop_edits = {}
+        x0, y0, x1, y1 = doc_bbox if doc_bbox else (0, 0, 0, 0)
+        fields = [("x1 (left)", x0), ("y1 (bottom)", y0),
+                  ("x2 (right)", x1), ("y2 (top)", y1)]
+        for col, (lbl, ph) in enumerate(fields):
+            crop_grid.addWidget(QLabel(lbl), 0, col)
+            ed = QLineEdit()
+            ed.setPlaceholderText(f"{ph:.0f}" if doc_bbox else "")
+            crop_grid.addWidget(ed, 1, col)
+            self._crop_edits[lbl] = ed
+        v.addLayout(crop_grid)
+
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            self)
+        bb.accepted.connect(self._on_accept)
+        bb.rejected.connect(self.reject)
+        v.addWidget(bb)
+
+    def _on_accept(self) -> None:
+        raw = [ed.text().strip() for ed in self._crop_edits.values()]
+        filled = [t for t in raw if t]
+        if filled and len(filled) != 4:
+            QMessageBox.warning(
+                self, "Incomplete crop region",
+                "Enter all four coordinates, or leave all blank to export the "
+                "whole layout.")
+            return
+        if filled:
+            try:
+                x1, y1, x2, y2 = (float(t) for t in raw)
+            except ValueError:
+                QMessageBox.warning(self, "Invalid crop region",
+                                    "Coordinates must be numbers.")
+                return
+            if x1 == x2 or y1 == y2:
+                QMessageBox.warning(self, "Invalid crop region",
+                                    "The region has zero width or height.")
+                return
+            self._crop = (x1, y1, x2, y2)
+        else:
+            self._crop = None
+
+        self._sel = [(ls.value(), ds.value(), list(e.polygons))
+                     for e, cb, ls, ds in self._rows if cb.isChecked()]
+        self.accept()
+
+    def selected_layers(self) -> list:
+        return self._sel
+
+    def crop_bbox(self):
+        return self._crop
+
+
 class AlignmentExportDialog(QDialog):
     """Pick the format (CSV / JSON) and which images to export (plan M5).
     Defaults to every image checked."""
@@ -4353,6 +4453,12 @@ class MainWindow(QMainWindow):
         # Coordinate Setup starts collapsed (see SemPanel); don't auto-collapse
         # again so a user re-expanding it sticks.
         self._coord_collapsed_once = True
+
+        # F9: developer mode gates advanced features (OASIS export). Off by
+        # default; enabled by clicking the About-dialog icon 5 times. Persisted
+        # in QSettings so it survives a restart.
+        self._dev_mode = bool(
+            QSettings("GLAS", "GLAS").value("dev_mode", False, type=bool))
 
         _icon_path = Path(__file__).resolve().parent / "icons" / "glas_icon_32.svg"
         if _icon_path.exists():
@@ -4676,6 +4782,15 @@ class MainWindow(QMainWindow):
             "CSV / JSON for a future Recipe to anchor its ROI (M5).")
         align_btn.clicked.connect(self._on_export_alignment)
         h.addWidget(align_btn)
+
+        # F9: OASIS export — advanced, hidden unless developer mode is on.
+        self._export_oasis_btn = QPushButton(_qicon("save"), " Export OASIS…")
+        self._export_oasis_btn.setToolTip(
+            "Export selected raw / Boolean layers to an OASIS (.oas) file, "
+            "optionally cropped to a GDS-coordinate region (developer mode).")
+        self._export_oasis_btn.clicked.connect(self._on_export_oasis)
+        self._export_oasis_btn.setVisible(self._dev_mode)
+        h.addWidget(self._export_oasis_btn)
 
         h.addStretch(1)
         # Bolder labels (user request) — set per-button so it can't bleed
@@ -6084,6 +6199,42 @@ class MainWindow(QMainWindow):
             return
         self._status_doc.setText(f"cache exported · {Path(path).name}")
 
+    def _on_export_oasis(self) -> None:
+        """F9 M3: export selected raw / Boolean layers to OASIS, optionally
+        cropped to a GDS-coordinate region. Developer-mode only."""
+        if self._doc is None or not self._doc.entries:
+            QMessageBox.information(self, "Nothing to export",
+                                    "Load a layout first.")
+            return
+        dlg = OasisExportDialog(self, self._doc.entries, self._doc.bbox_nm)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        layers = dlg.selected_layers()
+        if not layers:
+            QMessageBox.information(self, "Nothing selected",
+                                    "Select at least one layer to export.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export OASIS", "", "OASIS (*.oas)")
+        if not path:
+            return
+        if not path.lower().endswith(".oas"):
+            path += ".oas"
+        try:
+            n = layout_export.export_layers(
+                path, layers, crop_bbox=dlg.crop_bbox(),
+                unit=1000.0, cellname=self._doc.top_cell_name or "TOP")
+        except Exception as exc:
+            QMessageBox.critical(self, "OASIS export failed", str(exc))
+            return
+        if n == 0:
+            QMessageBox.information(
+                self, "Nothing exported",
+                "No geometry fell inside the crop region.")
+            return
+        self._status_doc.setText(
+            f"OASIS exported · {Path(path).name} ({n} layer{'s' if n != 1 else ''})")
+
     def _save_expr_sidecar(self, npz_path: str) -> None:
         """Write expression-layer recipes next to the cache as
         ``<stem>_expr.json`` (plan M2.6 / F4)."""
@@ -6162,6 +6313,39 @@ class MainWindow(QMainWindow):
                 color=QColor(d.get("color") or "#d44fa0"))
         self._recompute_recipes(self._doc.bbox_nm)
 
+    # ── F9: developer mode ───────────────────────────────────────────────────
+
+    def _attach_dev_toggle(self, widget: QWidget, dlg: QDialog) -> None:
+        """Make ``widget`` count clicks; 5 clicks toggles developer mode."""
+        widget.setCursor(Qt.CursorShape.PointingHandCursor)
+        clicks = {"n": 0}
+
+        def on_click(_event) -> None:
+            clicks["n"] += 1
+            if clicks["n"] < 5:
+                return
+            clicks["n"] = 0
+            self._set_dev_mode(not self._dev_mode)
+            state = "enabled" if self._dev_mode else "disabled"
+            QMessageBox.information(
+                dlg, "Developer mode",
+                f"Developer mode {state}.\n\n"
+                "Advanced features (OASIS export) are now "
+                f"{'available' if self._dev_mode else 'hidden'}.")
+
+        widget.mousePressEvent = on_click
+
+    def _set_dev_mode(self, on: bool) -> None:
+        self._dev_mode = bool(on)
+        QSettings("GLAS", "GLAS").setValue("dev_mode", self._dev_mode)
+        self._refresh_dev_ui()
+
+    def _refresh_dev_ui(self) -> None:
+        """Show / hide developer-only controls to match ``self._dev_mode``."""
+        btn = getattr(self, "_export_oasis_btn", None)
+        if btn is not None:
+            btn.setVisible(self._dev_mode)
+
     def _show_about(self) -> None:
         dlg = QDialog(self)
         dlg.setWindowTitle("About GLAS")
@@ -6180,6 +6364,8 @@ class MainWindow(QMainWindow):
             icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             v.addWidget(icon_lbl)
             v.addSpacing(12)
+            # F9: click the icon 5 times to toggle developer mode.
+            self._attach_dev_toggle(icon_lbl, dlg)
 
         name_lbl = QLabel("GLAS", dlg)
         name_lbl.setStyleSheet(
