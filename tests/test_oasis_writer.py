@@ -148,3 +148,22 @@ def test_empty_and_degenerate_skipped(tmp_path):
 def test_serialize_is_deterministic():
     layers = [(17, 0, [[(0, 0), (10, 0), (10, 10), (0, 10)]])]
     assert w.serialize_oasis(layers, unit=1000) == w.serialize_oasis(layers, unit=1000)
+
+
+def test_end_record_padded_to_256():
+    # KLayout requires the END record to occupy exactly 256 bytes; verify the
+    # serialized stream ends with a 256-byte END (id 2 + scheme 0 + pad).
+    data = w.serialize_oasis([(17, 0, [[(0, 0), (10, 0), (10, 10), (0, 10)]])],
+                             unit=1000)
+    end_id = data.rfind(bytes([w._END]))
+    # the END record (from its id byte to EOF) must be exactly 256 bytes
+    assert len(data) - end_id == 256
+    assert data[end_id:end_id + 2] == bytes([w._END, 0])   # id + scheme 0
+
+
+def test_padded_end_still_roundtrips(tmp_path):
+    p = tmp_path / "padded.oas"
+    w.write_oasis(p, [(17, 0, [[(0, 0), (40, 0), (40, 30), (0, 30)]])], unit=1000)
+    rids, rects, _ = _read_back(p)
+    assert oas.END in rids
+    assert rects == [(17, 0, 0, 0, 40, 30)]

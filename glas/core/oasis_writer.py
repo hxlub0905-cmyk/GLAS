@@ -65,6 +65,13 @@ _RECT_INFO = 0x7B
 # POLYGON info byte: P(0x20), X(0x10), Y(0x08), D(0x02), L(0x01)
 _POLY_INFO = 0x3B
 
+# SEMI P39 §14: the END record is padded to a fixed total length (256 bytes
+# including the record-id byte). Lenient readers (our oasis_streamer) ignore
+# the trailing pad, but KLayout *requires* it and otherwise rejects the file
+# with "too few bytes after END record". Pad with 0x00 (PAD records) after the
+# validation scheme; iter_records returns at END so the pad is never decoded.
+_END_RECORD_LEN = 256
+
 
 # ── Encode primitives (inverse of oasis_streamer decoders) ───────────────────
 
@@ -214,7 +221,8 @@ def serialize_oasis(layers: Iterable,
     for layer, datatype, polygons in layers:
         body += _emit_geometry(int(layer), int(datatype), polygons)
 
-    end = bytes([_END]) + encode_unsigned_int(0)   # validation scheme 0
+    end = bytes([_END]) + encode_unsigned_int(0)    # validation scheme 0
+    end += b"\x00" * (_END_RECORD_LEN - len(end))   # pad to fixed 256 bytes
     return MAGIC + start + cellname_rec + cell + bytes(body) + end
 
 

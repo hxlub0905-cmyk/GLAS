@@ -41,11 +41,15 @@ def main() -> int:
     w.write_oasis(good, layers, unit=1000, cellname="SAMPLE")
     print(f"wrote {good}  ({good.stat().st_size} bytes)")
 
-    # Chop the tail so the stream desyncs -> exercises the diagnose error path.
+    # Make a genuinely broken file: cut into the LAST geometry record (just
+    # before the 256-byte END record) so the stream desyncs / hits EOF
+    # mid-record. (Chopping the END pad alone wouldn't error — the reader
+    # returns at END before reading the pad.)
     data = good.read_bytes()
+    cut = max(0, len(data) - w._END_RECORD_LEN - 6)
     broken = out_dir / "sample_broken.oas"
-    broken.write_bytes(data[: max(0, len(data) - 5)])
-    print(f"wrote {broken}  (truncated, for testing Diagnose)")
+    broken.write_bytes(data[:cut])
+    print(f"wrote {broken}  (truncated mid-geometry, for testing Diagnose)")
 
     print("\nNext:")
     print(f"  - open {good.name} in KLayout (layers 17/0, 25/0, 40/1)")

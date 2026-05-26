@@ -2,6 +2,30 @@
 
 ---
 
+## [2026-05-26] [F9] 修 KLayout 接受度：END record 補滿到 256 bytes
+
+**變更類型：** bug fix（writer 正確性）
+
+**動機現象：** user 本地用 KLayout 開匯出的 `sample_good.oas` 被拒：
+`Format error (too few bytes after END record) (position=92)`。SEMI P39 §14 規定 END record 必須補滿到
+固定長度（含 id 共 256 bytes）；我們最小 END 只寫 `[2, scheme0]`（2 bytes），自家 lenient reader 接受、
+但 KLayout 嚴格要求 256 bytes 故拒檔。
+
+**修復（`oasis_writer.serialize_oasis`）：** END = `[2] + uint(0)` 後補 `0x00` 到整個 END record 共 256 bytes
+（`_END_RECORD_LEN=256`）。自家 reader 不受影響——`iter_records` 在 END `return`、padding 永不被 decode；
+`_read_end` peek 機制讀到 scheme=0 即止。檔案尾端從 2 bytes → 256 bytes（sample_good 93→347 bytes）。
+
+**連帶修 `scripts/make_sample_oas.py`：** 因 reader 在 END 即停，原本砍尾 5 bytes 只砍到 padding 不再出錯；
+改成砍進最後一個幾何 record（`len - 256 - 6`），sample_broken 才會真正觸發 decode error 供測 Diagnose。
+
+**測試：** 新增 `test_end_record_padded_to_256`（END record 從 id 到 EOF 恰 256 bytes）+
+`test_padded_end_still_roundtrips`（padding 後 reader 仍正確 round-trip）。沙箱驗證 byte 長度；
+reader round-trip 待 user 本地 `pytest` + **KLayout 重開 347-byte sample_good.oas 確認接受**。
+
+**影響檔案：** `glas/core/oasis_writer.py`、`tests/test_oasis_writer.py`、`scripts/make_sample_oas.py`、`SESSION_LOG.md`。
+
+**Branch：** `claude/adoring-cannon-oKZKo`（PR #7）
+
 ## [2026-05-26] [F9/F10] 加測試輔助腳本 `scripts/make_sample_oas.py`
 
 **變更類型：** 工具（測試輔助，不影響 app/core 行為）
