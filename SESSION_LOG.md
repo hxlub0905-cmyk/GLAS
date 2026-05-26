@@ -2,6 +2,20 @@
 
 ---
 
+## [2026-05-26] [F9/F10] 加測試輔助腳本 `scripts/make_sample_oas.py`
+
+**變更類型：** 工具（測試輔助，不影響 app/core 行為）
+
+**動機：** user 手上尚無 production .oas，需要快速產測試檔來驗 KLayout 接受度（F9）與 diagnose 抓錯（F10）。
+
+**內容：** `scripts/make_sample_oas.py` 用 `oasis_writer` 產 `sample_good.oas`（矩形→RECTANGLE、三角→POLYGON、
+45° 多邊形→g-delta POLYGON，多 layer）+ `sample_broken.oas`（砍尾 5 byte，供測 Diagnose 錯誤捕捉）。
+沙箱驗證標頭正確（MAGIC/START unit=1000/CELLNAME/CELL/XYABSOLUTE/RECTANGLE 0x7b）。
+
+**影響檔案：** `scripts/make_sample_oas.py`（新）、`SESSION_LOG.md`。
+
+**Branch：** `claude/adoring-cannon-oKZKo`（PR #7）
+
 ## [2026-05-26] [F9] PR#7 review fix（P2）：匯出 UI layer/datatype 上限放寬，避免靜默截斷
 
 **變更類型：** bug fix
