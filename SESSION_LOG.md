@@ -2,6 +2,27 @@
 
 ---
 
+## [2026-05-26] 修兩個既有過時/過嚴測試（非 F8 回歸）
+
+**變更類型：** test fix（只動測試，不動程式）
+
+**動機現象：** user 本地全量測試另有兩個失敗，經 git diff 確認受測函式 F8 前後逐字相同 → 既有問題、非
+F8 造成。調查結論：程式行為正確，是測試過時/過嚴：
+- `test_gds_align_m4b.py::TestPoiSpecs::test_expr_spec`：`_entry_spec` 對 synthetic layer 刻意回 **4-tuple**
+  `("expr", text, bindings, recipes_map)`（recipes 快照供批次 fine-align 解析巢狀 synthetic 參照，
+  `poi_polys_for_roi` 讀 `poi_spec[3]`）；測試還斷言舊 3-tuple。
+- `test_gds_align_f5.py::TestOverlayOutlines::test_draws_outline_colour`：`overlay_outlines_on_sem` 用
+  `cv2.LINE_AA`，反鋸齒把 1px 紅線與灰底混色 → 無精確 `(255,0,0)` 像素；測試斷言精確純紅太嚴。
+
+**修復實作：** 純測試修正——`test_expr_spec` 斷言改 4-tuple（含空 recipes `{}`）；`test_draws_outline_colour`
+改斷言「明顯偏紅」像素（R>120 且 R 比 G、B 各高 40 以上）而非精確 `(255,0,0)`。程式碼一行未動。
+
+**測試：** py_compile 過；兩測試預期轉綠（待 user 重跑全量確認 206 全綠）。
+
+**影響檔案：** `tests/test_gds_align_f5.py`、`tests/test_gds_align_m4b.py`、`SESSION_LOG.md`。
+
+**Branch：** `claude/practical-pascal-AtKLm`
+
 ## [2026-05-26] [F8] M3 修回歸：批次 in-thread fallback 誤用 clone()
 
 **變更類型：** bug fix（F8 自身回歸）

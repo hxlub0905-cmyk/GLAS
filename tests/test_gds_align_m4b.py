@@ -344,8 +344,11 @@ class TestPoiSpecs:
         mw._poi_entries = [gat.LayerEntry(
             key=gat.LayerKey(-1, 0, name="L0", synthetic=True), polygons=[],
             expr_text="A & B", expr_bindings={"A": (17, 0), "B": (6, 0)})]
+        # Synthetic POIs carry a recipes snapshot (4th element) so nested
+        # synthetic refs resolve over the ROI during batch fine align; with no
+        # other synthetic layers defined the snapshot is empty.
         assert mw._poi_specs() == [
-            (("expr", "A & B", {"A": (17, 0), "B": (6, 0)}), 200)]
+            (("expr", "A & B", {"A": (17, 0), "B": (6, 0)}, {}), 200)]
 
     def test_none_spec(self, mw):
         mw._poi_entries = []
