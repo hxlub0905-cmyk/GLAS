@@ -2,6 +2,24 @@
 
 ---
 
+## [2026-05-26] 完成 [F5]：本地驗收通過，收尾 plan + §8
+
+**變更類型：** 文件（任務收尾，無程式碼變更）
+
+**動機現象：** F5（fine-align 診斷 + 工作流，M1–M6）程式碼早已完成，先前狀態為「待 user 本地 GUI
+驗收」。user 本次 session 回報本地實機驗收（單張 Preview before/after 貼合、Run all 總覽表排序/篩選/
+點列跳轉、直方圖/散點、median→δ 套用後重跑殘差收斂）**全部通過**。
+
+**修復實作：** 依 CLAUDE.md §10 收尾——`docs/plans/F5-finealign-diagnostics.md` 將「所有 milestone
+checkbox 已勾」「手動本地驗證」兩項 `[ ]→[x]`、6 個 milestone status 標註「2026-05-26 user 本地驗收
+通過」；`CLAUDE.md` §8 移除 [F5] 條目（plan 檔保留作 design history）。
+
+**測試：** 無程式碼變更（純文件收尾）。
+
+**影響檔案：** `docs/plans/F5-finealign-diagnostics.md`、`CLAUDE.md`、`SESSION_LOG.md`。
+
+**Branch：** `claude/practical-pascal-AtKLm`
+
 ## [2026-05-25] [F6] PR#5 review fix（P1）：批次 cancel 後保留所有已完成結果
 
 **變更類型：** bug fix
