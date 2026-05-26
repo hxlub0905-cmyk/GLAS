@@ -2,6 +2,29 @@
 
 ---
 
+## [2026-05-26] [F8] M3 修回歸：批次 in-thread fallback 誤用 clone()
+
+**變更類型：** bug fix（F8 自身回歸）
+
+**動機現象：** user 本地跑 `tests/test_gds_align_m4b.py` 出現 `TestRunAllWorker::test_batch_run`（KeyError
+'c'，finished 未發）與 `test_cancel_stops_early`（cancelled 未發）。原因：F8 M3 新增的小批次 fallback
+`FineAlignAllWorker._run_in_thread()` 用了 `self._rar.clone()`，但測試的 `_FakeRar` 沒有 `clone()` →
+拋 AttributeError 走 `failed` 分支，finished/cancelled 都不發。pre-F6 的循序路徑本來就直接用 `self._rar`。
+
+**修復實作：** `_run_in_thread` 改回**直接用 `self._rar`**（不 clone、不 close；reader 由 app 擁有），與
+pre-F6 循序語意一致。ProcessPool 路徑不受影響（子行程仍由路徑自建 reader）。
+
+**測試：** py_compile 過。等價測試（`TestProcessPoolEquivalence` 等）本地已 202 passed；此修預期讓
+`test_batch_run` / `test_cancel_stops_early` 轉綠（待 user 重跑）。
+
+**另：兩個既有失敗非 F8 造成**（`_poi_specs()` 與 `overlay_outlines_on_sem` 經 git diff 確認與 F8 前逐字
+相同）：`test_expr_spec`（測試斷言舊 3-tuple，但程式已回 4-tuple 含 recipes）、`test_draws_outline_colour`
+（`cv2.LINE_AA` 反鋸齒無純紅像素）——屬既有測試過時/過脆，待 user 決定是否另行修。
+
+**影響檔案：** `glas/app/gds_align_tool.py`、`SESSION_LOG.md`。
+
+**Branch：** `claude/practical-pascal-AtKLm`
+
 ## [2026-05-26] [F8] 實作 M1–M4：扁平進度條 + 節流串流 + ProcessPool 批次（待本地驗收）
 
 **變更類型：** 功能（效能/UX；批次計算結果不變）

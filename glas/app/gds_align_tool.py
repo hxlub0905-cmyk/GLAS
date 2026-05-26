@@ -1180,30 +1180,26 @@ class FineAlignAllWorker(QObject):
             self.failed.emit(str(exc))
 
     def _run_in_thread(self) -> None:
-        """Sequential fallback for tiny batches: one cloned reader, in this
-        worker thread. The walk's ``cancel_cb`` reads the event so a mid-walk
-        cancel still bails promptly."""
+        """Sequential fallback for tiny batches: run in this worker thread on
+        the shared reader (like the pre-F6 path). The walk's ``cancel_cb`` reads
+        the event so a mid-walk cancel still bails promptly."""
         n = len(self._jobs)
-        rar = self._rar.clone()
         done = 0
-        try:
-            for job in self._jobs:
-                if self._cancel.is_set():
-                    self.cancelled.emit()
-                    return
-                try:
-                    res = fine_align._fine_align_image(
-                        job, rar, self._root, self._poi_specs, self._cfg,
-                        self._cancel.is_set)
-                except oasis_random.WalkCancelled:
-                    self.cancelled.emit()
-                    return
-                done += 1
-                if res is not None:
-                    self.progress.emit(done, n, res[0])
-                    self.result.emit(*res)
-        finally:
-            rar.close()
+        for job in self._jobs:
+            if self._cancel.is_set():
+                self.cancelled.emit()
+                return
+            try:
+                res = fine_align._fine_align_image(
+                    job, self._rar, self._root, self._poi_specs, self._cfg,
+                    self._cancel.is_set)
+            except oasis_random.WalkCancelled:
+                self.cancelled.emit()
+                return
+            done += 1
+            if res is not None:
+                self.progress.emit(done, n, res[0])
+                self.result.emit(*res)
         self.finished.emit(done)
 
     def _run_process_pool(self, workers: int) -> None:
