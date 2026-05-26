@@ -2,6 +2,20 @@
 
 ---
 
+## [2026-05-26] [F9/F10] 本地驗收通過：KLayout 接受 + Diagnose 抓錯確認
+
+**變更類型：** 文件（驗收記錄，無程式碼變更）
+
+**結果：** user 本地驗收——(1) `pytest` 45 passed；(2) KLayout 開 256-byte-END 修正後的 `sample_good.oas`，
+三 layer（17/0 RECTANGLE 方形、25/0 POLYGON 三角、40/1 g-delta POLYGON 斜四邊形）**正確渲染**，writer
+OASIS 格式確認 KLayout 接受（最大風險點解除）；(3) Diagnose 對 broken 檔精準捕捉 decode error + hex + traceback；
+(4) 開發者模式開關 OK。**剩餘**：GUI Export+Debug 端到端需載入 layout（cache .npz / production .oas），
+待 user 有資料時測（F9 3c）。plan checkbox 同步更新。
+
+**影響檔案：** `docs/plans/F9-layout-export.md`、`docs/plans/F10-debug-mode.md`、`SESSION_LOG.md`。
+
+**Branch：** `claude/adoring-cannon-oKZKo`（PR #7）
+
 ## [2026-05-26] [F9] 修 KLayout 接受度：END record 補滿到 256 bytes
 
 **變更類型：** bug fix（writer 正確性）
