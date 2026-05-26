@@ -2,6 +2,44 @@
 
 ---
 
+## [2026-05-26] [F8] 實作 M1–M4：扁平進度條 + 節流串流 + ProcessPool 批次（待本地驗收）
+
+**變更類型：** 功能（效能/UX；批次計算結果不變）
+
+**動機現象：** user 回報跑 Batch Align 時 UI 非常卡、不敢點、運算久、進度條太花俏。調查確認三根因
+（plan F8）：(1) `_on_fa_result` 每張都整表重建 + 直方圖/散點刪掉重生 = O(N²) GUI 重繪；(2) F6 thread-pool
+8 條純 Python 解碼 thread 與 Qt 主執行緒搶 GIL；(3) `_AnimatedBar` 漸層/發光/掃光/動畫重繪。
+
+**修復實作（依核准的 F8 plan）：**
+- **M1 扁平進度條**：`_AnimatedBar` 重寫 paintEvent 為單色軌道 + 單色填充（拿掉漸層/雙層發光/掃光帶/
+  in-bar % 雙描邊），bar 高 20→14；`advance()` 在 determinate 模式直接 return（批次跑時不再每 tick 燒繪圖）；
+  API 不變 → 全 app 進度條同步扁平。移除已無用的 `QLinearGradient`/`QPainterPath` import。
+- **M2 節流串流（修 O(N²)）**：新增 `self._batch_refresh_timer`（QTimer single-shot 300ms）；`_on_fa_result`
+  只更新資料 + badge，未啟動時 kick timer → 最多 ~3x/sec 重填表。`BatchResultsPanel.set_rows(...,
+  rebuild_charts=True)`：串流時傳 False 跳過直方圖/散點 teardown+rebuild，只在 finished/cancelled/failed/
+  Results…/起跑 的完整刷新時重建圖。finished/cancelled/failed 先 stop timer 再做最後一次完整刷新。
+- **M3 ProcessPool（抽 Qt-free core）**：新增 `glas/core/fine_align.py`，把 rasterize/template/matchTemplate/
+  ROI-walk/`_fine_align_image` 等 10 個純函式逐字搬入（app `import fine_align` + re-export 取回，呼叫端與
+  m4b/accel 測試全相容；GUI-only 的 `overlay_outlines_on_sem` 留 app）。`FineAlignAllWorker.run()` 由
+  `ThreadPoolExecutor` 改 `ProcessPoolExecutor(spawn)`：worker 由**路徑**重建 reader（`_pool_init`/`_pool_task`，
+  避開 Windows spawn 拉 PyQt6）、SEM 子行程自讀不跨行程傳；cancel 用 `fut.cancel()` 掉未開始 future（張邊界
+  粒度，已完成結果保留）；`n<=2`/單核走 in-thread 循序 fallback。
+- **M4 測試**：`tests/test_accel_equivalence.py` 新增 `TestProcessPoolEquivalence`——`_pool_init`（由路徑重建
+  reader）+ `_pool_task` 每張 result tuple 與循序 `_fine_align_image` 完全相等（in-process 跑進入點）。
+
+**不動：** 批次計算純函式（只搬家）、fine-align 符號、SemViewer 折疊、CE early-stop、median→δ（§7 不變式）。
+取捨：cancel 粒度由逐 node 即時改為單張影像邊界（多行程無法中斷 in-flight 單張）。
+
+**測試：** `py_compile` 全過（`fine_align.py` / `gds_align_tool.py` / 測試）。沙箱無 numpy/cv2/PyQt6 →
+fine_align 等價、ProcessPool 進入點、GUI 外觀/順暢/即時 cancel 待 user 本地跑
+`pytest tests/test_accel_equivalence.py tests/test_oasis_random.py tests/test_oasis_streamer.py
+tests/test_gds_align_f5.py tests/test_gds_align_m4b.py -v` + 大批次實機驗收。
+
+**影響檔案：** `glas/core/fine_align.py`（新）、`glas/app/gds_align_tool.py`、`tests/test_accel_equivalence.py`、
+`docs/plans/F8-batch-responsiveness.md`。
+
+**Branch：** `claude/practical-pascal-AtKLm`
+
 ## [2026-05-26] [F8] 規劃：Batch Align 反應性與加速（待核准）
 
 **變更類型：** 文件（plan，尚未動工）

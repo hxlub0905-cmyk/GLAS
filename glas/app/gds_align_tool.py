@@ -54,7 +54,7 @@ import os
 import sys
 import threading
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -64,7 +64,7 @@ import numpy as np
 from PyQt6.QtCore import Qt, QObject, QPointF, QRect, QRectF, QSize, QThread, QTimer, QElapsedTimer, pyqtSignal
 from PyQt6.QtGui import (
     QAction, QBrush, QColor, QFontMetrics, QIcon, QImage, QKeySequence,
-    QLinearGradient, QPainter, QPainterPath, QPen, QPixmap,
+    QPainter, QPen, QPixmap,
     QPolygonF, QMouseEvent, QShortcut, QWheelEvent,
 )
 from PyQt6.QtWidgets import (
@@ -123,6 +123,16 @@ import gds_boolean      # noqa: E402
 import gds_layer_cache  # noqa: E402
 import sem_loader       # noqa: E402
 import oasis_random     # noqa: E402
+# F8: the Qt-free fine-align compute lives in glas/core/fine_align.py so a
+# spawn-based ProcessPool worker can import it without pulling in PyQt6. Pull
+# the functions back into this namespace so existing call sites and tests
+# (which reference gds_align_tool.<fn>) keep working unchanged.
+import fine_align       # noqa: E402
+from fine_align import (  # noqa: E402,F401
+    _fine_align_image, _fit_mask, _parabola_subpx, _walk_roi_polys,
+    fine_align_one, make_template, poi_polys_for_roi,
+    rasterize_layer, render_composite_template, render_poi_template,
+)
 
 # Design-system styling / widgets / icons (glas/app). Soft-imported so the tool
 # still launches if the GUI helpers are unavailable.
@@ -714,28 +724,28 @@ class LayerFilterDialog(QDialog):
 
 
 class _AnimatedBar(QWidget):
-    """Self-painted progress bar with a sweeping sheen, so it looks alive.
+    """Flat, self-painted progress bar (F8: reverted from the gradient/glow/
+    sheen version, which was costly to repaint during a busy batch).
 
-    Two modes: *determinate* (fill to a fraction) and *indeterminate* (a
-    sliding block, for phases where total work is unknown). A lighter band
-    sweeps across the filled portion on every ``advance()`` tick, giving the
-    "something is happening" motion even between progress updates. Painting is
-    fully self-contained so the app QSS can't flatten the animation (the reason
-    the old dialog avoided ``QProgressBar`` entirely)."""
+    Two modes: *determinate* (single flat fill to a fraction, with a centred
+    percent label) and *indeterminate* (a single flat block sliding back and
+    forth, for phases where total work is unknown). Painting is self-contained
+    (a few rounded rects) so the app QSS can't flatten it, but there is no
+    animation on a determinate bar — only the indeterminate slider advances, so
+    a running batch doesn't burn repaints on the bar. API is unchanged
+    (``set_fraction`` / ``set_indeterminate`` / ``advance``)."""
 
     _TRACK = QColor("#ece0d2")
-    _FILL = QColor("#e0863a")        # mid tone, used for the soft glow
-    _FILL_HI = QColor("#f2a85d")     # glossy top of the gradient
-    _FILL_LO = QColor("#cf6a1f")     # deeper bottom of the gradient
+    _FILL = QColor("#e0863a")
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self.setFixedHeight(20)
+        self.setFixedHeight(14)
         self.setSizePolicy(QSizePolicy.Policy.Expanding,
                            QSizePolicy.Policy.Fixed)
         self._frac = 0.0
         self._indeterminate = True
-        self._phase = 0.0   # 0..1, position of the sweeping sheen
+        self._phase = 0.0   # 0..1, position of the indeterminate slider
 
     def set_fraction(self, frac: float) -> None:
         self._indeterminate = False
@@ -747,6 +757,10 @@ class _AnimatedBar(QWidget):
         self.update()
 
     def advance(self) -> None:
+        # Only the indeterminate slider animates; a determinate bar is static
+        # between set_fraction calls, so don't burn repaints on it (F8).
+        if not self._indeterminate:
+            return
         self._phase = (self._phase + 0.045) % 1.0
         self.update()
 
@@ -755,70 +769,23 @@ class _AnimatedBar(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         w = float(self.width())
         H = float(self.height())
-        m = 3.0                     # vertical margin so the soft glow can bleed
-        y = m
-        h = H - 2.0 * m
+        y = 0.0
+        h = H
         r = h / 2.0
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(self._TRACK)
         p.drawRoundedRect(QRectF(0, y, w, h), r, r)
+        p.setBrush(self._FILL)
         if self._indeterminate:
             bw = max(48.0, w * 0.30)
             t = self._phase
             tri = 2.0 * t if t < 0.5 else 2.0 * (1.0 - t)   # ping-pong
-            self._fill(p, tri * (w - bw), bw, y, h, r, None)
+            x = tri * (w - bw)
+            p.drawRoundedRect(QRectF(x, y, bw, h), r, r)
         elif self._frac > 0:
-            self._fill(p, 0.0, self._frac * w, y, h, r, self._frac)
+            fw = self._frac * w
+            p.drawRoundedRect(QRectF(0, y, fw, h), min(r, fw / 2.0), r)
         p.end()
-
-    def _fill(self, p: QPainter, x: float, fw: float, y: float, h: float,
-              r: float, frac_text: Optional[float]) -> None:
-        if fw <= 0:
-            return
-        rect = QRectF(x, y, fw, h)
-        rr = min(r, fw / 2.0)
-        # Soft outer glow: a couple of expanding low-alpha rounded rects behind
-        # the fill give the bar a lit, raised feel.
-        p.setPen(Qt.PenStyle.NoPen)
-        for grow, alpha in ((3.0, 38), (1.5, 70)):
-            gc = QColor(self._FILL)
-            gc.setAlpha(alpha)
-            p.setBrush(gc)
-            p.drawRoundedRect(rect.adjusted(-grow, -grow, grow, grow),
-                              rr + grow, rr + grow)
-        # Glossy vertical gradient fill (lighter top -> deeper bottom).
-        path = QPainterPath()
-        path.addRoundedRect(rect, rr, r)
-        p.save()
-        p.setClipPath(path)
-        grad = QLinearGradient(0, y, 0, y + h)
-        grad.setColorAt(0.0, self._FILL_HI)
-        grad.setColorAt(1.0, self._FILL_LO)
-        p.fillRect(rect, QBrush(grad))
-        # Sweeping highlight band across the filled portion.
-        band = max(32.0, fw * 0.4)
-        sx = x - band + self._phase * (fw + band)
-        sheen = QLinearGradient(sx, 0, sx + band, 0)
-        sheen.setColorAt(0.0, QColor(255, 255, 255, 0))
-        sheen.setColorAt(0.5, QColor(255, 255, 255, 110))
-        sheen.setColorAt(1.0, QColor(255, 255, 255, 0))
-        p.fillRect(rect, QBrush(sheen))
-        p.restore()
-        # Inline percent (determinate only): drawn dark everywhere then white
-        # clipped to the fill, so it reads on both the track and the fill.
-        if frac_text is not None:
-            txt = f"{int(round(frac_text * 100))}%"
-            f = self.font()
-            f.setBold(True)
-            p.setFont(f)
-            trect = QRectF(0, y, float(self.width()), h)
-            p.setPen(QColor("#6f5236"))
-            p.drawText(trect, Qt.AlignmentFlag.AlignCenter, txt)
-            p.save()
-            p.setClipPath(path)
-            p.setPen(QColor(255, 255, 255, 240))
-            p.drawText(trect, Qt.AlignmentFlag.AlignCenter, txt)
-            p.restore()
 
 
 class LoadProgressDialog(QDialog):
@@ -1156,54 +1123,21 @@ def _auto_batch_workers() -> int:
     return max(1, min(os.cpu_count() or 1, 8))
 
 
-def _fine_align_image(job, rar, root, poi_specs, cfg, cancel_is_set):
-    """Process ONE image: walk the POI ROI, render the template, match.
-
-    Pure per-image work with no shared mutable state (``rar`` is the calling
-    thread's private reader), so the result is independent of execution order
-    — identical whether run sequentially or across a thread pool (F6 M3).
-    Returns ``(image_id, dx, dy, score, used_radius_px, status)`` or ``None``
-    if cancelled before any work was done."""
-    image_id, anchor, path, exists = job
-    if cancel_is_set():
-        return None
-    c = cfg
-    if anchor is None:
-        return (str(image_id), 0.0, 0.0, 0.0, 0, "no-coords")
-    sem = (cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
-           if (cv2 and exists) else None)
-    if sem is None:
-        return (str(image_id), 0.0, 0.0, 0.0, 0, "missing-file")
-    H, W = sem.shape[:2]
-    nm_per_px = (c["nm_manual"] if (not c["nm_auto"] and
-                 c["nm_manual"] > 0) else c["fov_w"] / max(1, W))
-    if nm_per_px <= 0:
-        return (str(image_id), 0.0, 0.0, 0.0, 0, "no-scale")
-    roi = (anchor[0] - c["fov_w"], anchor[1] - c["fov_h"],
-           anchor[0] + c["fov_w"], anchor[1] + c["fov_h"])
-    poi_layers = []
-    for spec, fg in poi_specs:
-        polys = poi_polys_for_roi(rar, root, roi, spec, cancel_cb=cancel_is_set)
-        if polys:
-            poi_layers.append((polys, fg))
-    if not poi_layers:
-        return (str(image_id), 0.0, 0.0, 0.0, 0, "flat")
-    template = render_composite_template(
-        poi_layers, anchor, W, H, nm_per_px, c["bg_glv"], c["blur_sigma_px"])
-    radius_px = c["search_radius_nm"] / nm_per_px
-    dx, dy, score, used_r = fine_align_one(sem, template, nm_per_px, radius_px)
-    return (str(image_id), dx, dy, score, int(used_r), "ok")
-
-
 class FineAlignAllWorker(QObject):
     """Batch fine align (plan M4b "Run all"): for every SEM image with
     coordinates, walk the POI ROI, render a template and run
-    ``cv2.matchTemplate``. F6 M3: parallelised across a thread pool — each
-    worker thread clones the reader (private ``_memo`` / cursor, no shared
-    mutable state), and the heavy cv2 calls release the GIL. Per-image results
-    are independent of order, so the output is identical to the old sequential
-    path; signals are emitted from this (single) worker thread as futures
-    complete, keeping the UI responsive."""
+    ``cv2.matchTemplate``.
+
+    F8: parallelised across a *process* pool. OASIS ROI decoding is a tight
+    pure-Python loop that holds the GIL, so a thread pool neither sped it up
+    nor left the Qt UI thread any GIL time (the source of the batch "lag").
+    Processes run the decode truly in parallel and can't touch the GUI
+    interpreter at all. Each worker process rebuilds its own reader from the
+    file path (``fine_align._pool_init``); per-image work is independent of
+    order, so the output is byte/value identical to the old sequential /
+    thread-pool path (§7). Results are emitted from this (single) worker thread
+    as futures complete. Tiny batches skip the pool and run in-thread, since
+    spawning processes would cost more than it saves."""
 
     progress = pyqtSignal(int, int, str)        # (done, total, image_id)
     # (image_id, dx, dy, score, used_radius_px, status); status is objective:
@@ -1222,9 +1156,8 @@ class FineAlignAllWorker(QObject):
         self._poi_specs = list(poi_specs)
         self._jobs = jobs        # list of (image_id, anchor|None, path, exists)
         self._cfg = cfg          # dict: fov_w/h, nm_auto, nm_manual, bg/blur, search_radius_nm
-        # threading.Event: a cancel from the GUI thread is read by every pool
-        # task (start of work + walk cancel_cb), so it takes effect promptly
-        # without relying on a queued slot (F5 M5 / F6 M3).
+        # threading.Event set from the GUI thread; the orchestrator reads it to
+        # stop submitting / drop pending futures (F8 cancel is image-grained).
         self._cancel = threading.Event()
 
     def cancel(self) -> None:
@@ -1233,60 +1166,84 @@ class FineAlignAllWorker(QObject):
     def run(self) -> None:
         try:
             n = len(self._jobs)
-            workers = min(_auto_batch_workers(), max(1, n))
-            # Per-thread private reader: cloned lazily on first use by each pool
-            # thread, tracked so we can close every map at the end.
-            tl = threading.local()
-            created: list = []
-            clock = threading.Lock()
-
-            def reader_for_thread():
-                r = getattr(tl, "rar", None)
-                if r is None:
-                    r = self._rar.clone()
-                    with clock:
-                        created.append(r)
-                    tl.rar = r
-                return r
-
-            def task(job):
-                return _fine_align_image(
-                    job, reader_for_thread(), self._root, self._poi_specs,
-                    self._cfg, self._cancel.is_set)
-
-            done = 0
-            try:
-                with ThreadPoolExecutor(max_workers=workers) as ex:
-                    futures = [ex.submit(task, job) for job in self._jobs]
-                    # Always drain every future, even after a cancel: once the
-                    # event is set, not-yet-started tasks return None immediately
-                    # (they check cancel at the top) and in-flight walks bail
-                    # fast via cancel_cb, so this stays responsive — but futures
-                    # whose work already completed still emit their result, so
-                    # "partial results kept" holds deterministically for
-                    # workers > 1 (PR#5 review).
-                    for fut in as_completed(futures):
-                        try:
-                            res = fut.result()
-                        except oasis_random.WalkCancelled:
-                            res = None      # walk bailed on cancel — no result
-                        done += 1
-                        if res is not None:
-                            self.progress.emit(done, n, res[0])
-                            self.result.emit(*res)
-            finally:
-                for r in created:
-                    try:
-                        r.close()
-                    except Exception:
-                        pass
-            if self._cancel.is_set():
-                self.cancelled.emit()
+            if n == 0:
+                self.finished.emit(0)
                 return
-        except oasis_random.WalkCancelled:
-            self.cancelled.emit()
+            workers = min(_auto_batch_workers(), n)
+            # Small batches: process spawn + per-process reader build costs more
+            # than it saves, so run them in-thread on a single cloned reader.
+            if n <= 2 or workers <= 1:
+                self._run_in_thread()
+            else:
+                self._run_process_pool(workers)
         except Exception as exc:                       # noqa: BLE001
             self.failed.emit(str(exc))
+
+    def _run_in_thread(self) -> None:
+        """Sequential fallback for tiny batches: one cloned reader, in this
+        worker thread. The walk's ``cancel_cb`` reads the event so a mid-walk
+        cancel still bails promptly."""
+        n = len(self._jobs)
+        rar = self._rar.clone()
+        done = 0
+        try:
+            for job in self._jobs:
+                if self._cancel.is_set():
+                    self.cancelled.emit()
+                    return
+                try:
+                    res = fine_align._fine_align_image(
+                        job, rar, self._root, self._poi_specs, self._cfg,
+                        self._cancel.is_set)
+                except oasis_random.WalkCancelled:
+                    self.cancelled.emit()
+                    return
+                done += 1
+                if res is not None:
+                    self.progress.emit(done, n, res[0])
+                    self.result.emit(*res)
+        finally:
+            rar.close()
+        self.finished.emit(done)
+
+    def _run_process_pool(self, workers: int) -> None:
+        """Parallel path: fan the per-image jobs out to a spawn-based process
+        pool. Each worker rebuilds its reader once via the initializer. On
+        cancel, futures that haven't started are dropped; in-flight images run
+        to completion and their results are still kept (deterministic partial
+        results, like the old thread-pool drain)."""
+        n = len(self._jobs)
+        rar = self._rar
+        # Reader params (not the live reader, which owns an unpicklable mmap):
+        # each worker rebuilds an identical reader from these.
+        initargs = (str(rar._path), rar._init_wanted, rar._dtype,
+                    rar._bbox_layer, self._root, self._poi_specs, self._cfg)
+        ctx = mp.get_context("spawn")
+        ex = ProcessPoolExecutor(max_workers=workers, mp_context=ctx,
+                                 initializer=fine_align._pool_init,
+                                 initargs=initargs)
+        done = 0
+        dropped = False
+        try:
+            futures = [ex.submit(fine_align._pool_task, job)
+                       for job in self._jobs]
+            for fut in as_completed(futures):
+                if self._cancel.is_set() and not dropped:
+                    for f in futures:
+                        f.cancel()          # drop not-yet-started tasks
+                    dropped = True
+                try:
+                    res = fut.result()
+                except CancelledError:
+                    continue                # a pending task we just dropped
+                done += 1
+                if res is not None:
+                    self.progress.emit(done, n, res[0])
+                    self.result.emit(*res)
+        finally:
+            ex.shutdown(wait=True)
+        if self._cancel.is_set():
+            self.cancelled.emit()
         else:
             self.finished.emit(done)
 
@@ -1404,73 +1361,8 @@ class OverlayExportWorker(QObject):
         return str(csv_path)
 
 
-# ── Rasterization helper (used by M2 Boolean / M4 template) ──────────────────
-
-
-def rasterize_layer(
-    polygons: list[np.ndarray],
-    bbox_nm: tuple[float, float, float, float],
-    nm_per_px: float,
-) -> np.ndarray:
-    """Rasterize a set of polygons (nm coords) into a uint8 binary mask.
-
-    The mask is sized to the bbox at the requested ``nm_per_px``. Pixels inside
-    any polygon are 255, outside are 0. Y is flipped so the resulting image
-    follows screen / SEM convention (origin top-left, y increasing downward),
-    keeping it directly comparable to a SEM frame after coarse offset.
-
-    Falls back to a pure-numpy scanline fill if cv2 is unavailable.
-    """
-    x0, y0, x1, y1 = bbox_nm
-    w_nm = max(1.0, x1 - x0)
-    h_nm = max(1.0, y1 - y0)
-    W = max(1, int(round(w_nm / nm_per_px)))
-    H = max(1, int(round(h_nm / nm_per_px)))
-    mask = np.zeros((H, W), dtype=np.uint8)
-    if not polygons:
-        return mask
-
-    if cv2 is not None:
-        cv_polys: list[np.ndarray] = []
-        for poly in polygons:
-            px = (poly[:, 0] - x0) / nm_per_px
-            # Y flip so image y=0 is at top; nm bbox y0 (low) maps to bottom.
-            py = (y1 - poly[:, 1]) / nm_per_px
-            pts = np.stack([px, py], axis=1).round().astype(np.int32)
-            cv_polys.append(pts)
-        cv2.fillPoly(mask, cv_polys, color=255)
-        return mask
-
-    # Pure-numpy fallback (slower; only hit when cv2 unavailable in dev env).
-    for poly in polygons:
-        px = (poly[:, 0] - x0) / nm_per_px
-        py = (y1 - poly[:, 1]) / nm_per_px
-        _scanline_fill(mask, np.stack([px, py], axis=1))
-    return mask
-
-
-def _scanline_fill(mask: np.ndarray, pts: np.ndarray) -> None:
-    """Even-odd scanline polygon fill into ``mask`` (numpy fallback)."""
-    H, W = mask.shape[:2]
-    n = pts.shape[0]
-    if n < 3:
-        return
-    y_min = max(0, int(np.floor(pts[:, 1].min())))
-    y_max = min(H - 1, int(np.ceil(pts[:, 1].max())))
-    for y in range(y_min, y_max + 1):
-        xs: list[float] = []
-        for i in range(n):
-            x0, y0 = pts[i]
-            x1, y1 = pts[(i + 1) % n]
-            if (y0 <= y < y1) or (y1 <= y < y0):
-                t = (y - y0) / (y1 - y0) if y1 != y0 else 0.0
-                xs.append(x0 + t * (x1 - x0))
-        xs.sort()
-        for j in range(0, len(xs) - 1, 2):
-            xs0 = max(0, int(np.floor(xs[j])))
-            xs1 = min(W - 1, int(np.ceil(xs[j + 1])))
-            if xs1 >= xs0:
-                mask[y, xs0:xs1 + 1] = 255
+# ── GUI overlay-outline helper (raster stroking; rasterize_layer + template /
+#    fine-align compute moved to glas/core/fine_align.py in F8) ───────────────
 
 
 def _draw_polyline_np(rgb: np.ndarray, pts: np.ndarray, color: tuple) -> None:
@@ -1522,165 +1414,6 @@ def overlay_outlines_on_sem(sem_gray: np.ndarray, entries: list, anchor: tuple,
             else:
                 _draw_polyline_np(rgb, pts, col)
     return rgb
-
-
-# ── M4b: POI template + cv2.matchTemplate fine alignment ─────────────────────
-
-
-def make_template(mask: np.ndarray, fg_glv: int = 200, bg_glv: int = 80,
-                  blur_sigma_px: float = 1.0) -> np.ndarray:
-    """Synthesize a SEM-like template from a binary POI ``mask``: structure
-    pixels get ``fg_glv``, background ``bg_glv``, then an optional Gaussian
-    blur softens the edges so it matches a real (band-limited) SEM frame
-    (plan M4b)."""
-    img = np.where(mask > 0, np.uint8(fg_glv), np.uint8(bg_glv)).astype(np.uint8)
-    if blur_sigma_px and blur_sigma_px > 0 and cv2 is not None:
-        k = int(max(1, round(blur_sigma_px * 3))) * 2 + 1
-        img = cv2.GaussianBlur(img, (k, k), float(blur_sigma_px))
-    return img
-
-
-def _fit_mask(mask: np.ndarray, height_px: int, width_px: int) -> np.ndarray:
-    """Clamp/pad a rasterized mask to exactly ``(height_px, width_px)``."""
-    if mask.shape == (height_px, width_px):
-        return mask
-    fixed = np.zeros((height_px, width_px), dtype=np.uint8)
-    h = min(mask.shape[0], height_px)
-    w = min(mask.shape[1], width_px)
-    fixed[:h, :w] = mask[:h, :w]
-    return fixed
-
-
-def render_composite_template(poi_layers: list, anchor: tuple, width_px: int,
-                              height_px: int, nm_per_px: float,
-                              bg_glv: int = 80,
-                              blur_sigma_px: float = 1.0) -> np.ndarray:
-    """Composite several POI layers into one SEM-like grey template (plan F3).
-
-    ``poi_layers`` is ``[(polygons, fg_glv), ...]`` — each layer's polygons
-    (nm) are rasterized over the FOV centred on ``anchor`` and painted at that
-    layer's ``fg_glv`` onto a shared ``bg_glv`` background (later layers paint
-    over earlier ones where they overlap). One Gaussian blur softens the edges
-    so the result matches a band-limited SEM frame. With a single layer this is
-    identical to the old single-POI template."""
-    gx, gy = anchor
-    half_w = width_px / 2.0 * nm_per_px
-    half_h = height_px / 2.0 * nm_per_px
-    bbox = (gx - half_w, gy - half_h, gx + half_w, gy + half_h)
-    img = np.full((height_px, width_px), np.uint8(bg_glv), dtype=np.uint8)
-    for polygons, fg_glv in poi_layers:
-        if not polygons:
-            continue
-        mask = _fit_mask(rasterize_layer(polygons, bbox, nm_per_px),
-                         height_px, width_px)
-        img[mask > 0] = np.uint8(fg_glv)
-    if blur_sigma_px and blur_sigma_px > 0 and cv2 is not None:
-        k = int(max(1, round(blur_sigma_px * 3))) * 2 + 1
-        img = cv2.GaussianBlur(img, (k, k), float(blur_sigma_px))
-    return img
-
-
-def render_poi_template(polygons: list, anchor: tuple, width_px: int,
-                        height_px: int, nm_per_px: float,
-                        fg_glv: int = 200, bg_glv: int = 80,
-                        blur_sigma_px: float = 1.0) -> np.ndarray:
-    """Single-POI template (plan M4b) — thin wrapper over
-    :func:`render_composite_template` with one layer."""
-    return render_composite_template(
-        [(polygons, fg_glv)], anchor, width_px, height_px, nm_per_px,
-        bg_glv, blur_sigma_px)
-
-
-def _parabola_subpx(res: np.ndarray, bx: int, by: int, axis: int) -> float:
-    """Sub-pixel peak offset (∈ [-1, 1]) from a 3-point parabola fit around
-    the score-map peak along ``axis`` (0 = x, 1 = y)."""
-    h, w = res.shape
-    if axis == 0:
-        if bx <= 0 or bx >= w - 1:
-            return 0.0
-        a, b, c = float(res[by, bx - 1]), float(res[by, bx]), float(res[by, bx + 1])
-    else:
-        if by <= 0 or by >= h - 1:
-            return 0.0
-        a, b, c = float(res[by - 1, bx]), float(res[by, bx]), float(res[by + 1, bx])
-    denom = a - 2.0 * b + c
-    if denom == 0.0:
-        return 0.0
-    off = 0.5 * (a - c) / denom
-    return off if abs(off) <= 1.0 else 0.0
-
-
-def fine_align_one(sem_img: np.ndarray, template_full: np.ndarray,
-                   nm_per_px: float, search_radius_px: float) -> tuple:
-    """Refine the SEM↔GDS alignment by template matching (plan M4b).
-
-    ``template_full`` is the synthetic POI rendered at the *expected* (coarse)
-    position, the same size as ``sem_img``. Its centre is cropped (leaving a
-    ``search_radius_px`` border) and slid over the SEM with
-    ``TM_CCOEFF_NORMED``; the peak's displacement from the centred position is
-    the residual misalignment. Returns ``(dx_nm, dy_nm, score, used_radius_px)``
-    where ``(dx_nm, dy_nm)`` is the correction to add to the overlay anchor so
-    the GDS lands on the SEM structure."""
-    if cv2 is None:
-        raise RuntimeError("opencv (cv2) is required for fine alignment")
-    H, W = sem_img.shape[:2]
-    if template_full.shape[:2] != (H, W):
-        raise ValueError("template must match the SEM image size")
-    r = int(round(search_radius_px))
-    r = max(1, min(r, (min(H, W) - 1) // 2))
-    tmpl = np.ascontiguousarray(template_full[r:H - r, r:W - r])
-    sem = np.ascontiguousarray(sem_img)
-    if tmpl.size == 0 or float(tmpl.std()) < 1e-6 or float(sem.std()) < 1e-6:
-        return 0.0, 0.0, 0.0, r          # flat template/image → no signal
-    res = cv2.matchTemplate(sem.astype(np.uint8), tmpl.astype(np.uint8),
-                            cv2.TM_CCOEFF_NORMED)
-    _, maxv, _, maxloc = cv2.minMaxLoc(res)
-    bx, by = int(maxloc[0]), int(maxloc[1])
-    sx = _parabola_subpx(res, bx, by, 0)
-    sy = _parabola_subpx(res, bx, by, 1)
-    ex = (bx + sx) - r            # SEM structure offset from GDS, +x = right
-    ey = (by + sy) - r            # +y = down (image row)
-    # Anchor correction: move the overlay onto the SEM structure. Image x is
-    # right, GDS x is right (so anchor.x decreases to shift right); image y is
-    # down, GDS y is up (so anchor.y increases to shift down).
-    return (-ex * nm_per_px, ey * nm_per_px, float(maxv), r)
-
-
-def _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb=None):
-    """Walk one layer's ROI geometry into a list of polygon ndarrays (nm)."""
-    res = oasis_random.walk_roi(rar, root, roi_bbox, layer, datatype,
-                                cancel_cb=cancel_cb)
-    polys = [np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float64)
-             for x1, y1, x2, y2 in res["rects"].tolist()]
-    polys += [np.asarray(p, dtype=np.float64) for p in res["polys"]]
-    return polys
-
-
-def poi_polys_for_roi(rar, root, roi_bbox, poi_spec, cancel_cb=None):
-    """POI polygons (nm, root coords) for a given ROI, for batch fine align
-    (plan M4b "Run all"). ``poi_spec`` is ``('raw', layer, datatype)`` or
-    ``('expr', expr_text, bindings[, recipes])``; the latter walks each bound
-    layer over the ROI and evaluates the Boolean expression, resolving any
-    nested synthetic references via ``recipes`` (``{name: (expr, bindings)}``)."""
-    kind = poi_spec[0]
-    if kind == "raw":
-        _, layer, datatype = poi_spec
-        return _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb)
-    # expression POI
-    expr, bindings = poi_spec[1], poi_spec[2]
-    recipes = poi_spec[3] if len(poi_spec) > 3 else {}
-    x0, y0, x1, y1 = roi_bbox
-    cx, cy, w, h = (x0 + x1) / 2.0, (y0 + y1) / 2.0, (x1 - x0), (y1 - y0)
-
-    def raw_provider(layer: int, datatype: int):
-        ps = _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb)
-        return gds_boolean.polys_to_geometry(ps)
-
-    geom = gds_boolean.resolve_expression(
-        expr, bindings, raw_provider=raw_provider,
-        recipe_provider=lambda n: recipes.get(n),
-        fov_bbox=gds_boolean.fov_box(cx, cy, w, h))
-    return gds_boolean.geometry_to_polygons(geom)
 
 
 # ── M5: per-image alignment export ───────────────────────────────────────────
@@ -4135,7 +3868,8 @@ class BatchResultsPanel(QWidget):
         v.addLayout(btn_row)
 
     # ── data ────────────────────────────────────────────────────────────────
-    def set_rows(self, rows, threshold: float) -> None:
+    def set_rows(self, rows, threshold: float,
+                 rebuild_charts: bool = True) -> None:
         self._rows = list(rows)
         self._threshold = threshold
         n_ok = sum(1 for r in self._rows if r["status"] == "ok")
@@ -4144,7 +3878,11 @@ class BatchResultsPanel(QWidget):
             f"{len(self._rows)} images  ·  {n_ok} ok  ·  {n_low} low-score  ·  "
             f"threshold {threshold:.2f}")
         self._fill_table()
-        self._rebuild_charts()
+        # F8: the histogram/scatter teardown+rebuild is the expensive part;
+        # skip it during streaming (rebuild_charts=False) and only redraw the
+        # charts on the final refresh.
+        if rebuild_charts:
+            self._rebuild_charts()
         self._apply_btn.setEnabled(self._median_residual() is not None)
 
     def _visible_rows(self) -> list:
@@ -4778,6 +4516,15 @@ class MainWindow(QMainWindow):
         # M4b "Run all" batch worker state.
         self._fa_thread: Optional[QThread] = None
         self._fa_worker = None
+        # F8: coalesce streaming result-table refreshes. Each incoming result
+        # only updates the data; this single-shot timer rebuilds the panel at
+        # most ~3x/sec instead of once per image (the old per-result refresh was
+        # O(N^2) on the GUI thread and froze the UI on big batches).
+        self._batch_refresh_timer = QTimer(self)
+        self._batch_refresh_timer.setSingleShot(True)
+        self._batch_refresh_timer.setInterval(300)
+        self._batch_refresh_timer.timeout.connect(
+            lambda: self._refresh_batch_panel(rebuild_charts=False))
         # F5 M6 overlay/image export worker state.
         self._ov_thread: Optional[QThread] = None
         self._ov_worker = None
@@ -5567,6 +5314,7 @@ class MainWindow(QMainWindow):
         }
         # F7: run inside the batch workspace with inline progress, instead of a
         # modal dialog. Show the (initial) results table and the progress strip.
+        self._batch_refresh_timer.stop()     # clear any pending refresh (F8)
         self._enter_batch_workspace()
         self._refresh_batch_panel()
         self.batch_panel.start_progress()
@@ -5594,13 +5342,15 @@ class MainWindow(QMainWindow):
         if self._fa_worker is not None:
             self._fa_worker.cancel()
 
-    def _refresh_batch_panel(self) -> None:
+    def _refresh_batch_panel(self, rebuild_charts: bool = True) -> None:
         """Rebuild the batch panel rows from the current refined offsets +
-        per-image meta (used during streaming and after finish)."""
+        per-image meta (used during streaming and after finish). F8: during
+        streaming ``rebuild_charts=False`` skips the (costly) histogram/scatter
+        teardown+rebuild — those are only redrawn on the final refresh."""
         thr = self.sem_panel.fine_align.values()["score_threshold"]
         rows = fine_align_result_rows(
             self._sem_images, self._refined, self._fa_meta, thr)
-        self.batch_panel.set_rows(rows, thr)
+        self.batch_panel.set_rows(rows, thr, rebuild_charts=rebuild_charts)
 
     def _on_fa_progress(self, done: int, total: int, image_id: str) -> None:
         self.batch_panel.set_progress(done, total, image_id)
@@ -5617,25 +5367,32 @@ class MainWindow(QMainWindow):
             # rendered/exported with outdated alignment (PR#4 review).
             self._refined.pop(image_id, None)
             self.sem_panel.clear_score(image_id)
-        # Stream the new row into the batch panel as it arrives (F7).
-        self._refresh_batch_panel()
+        # Stream the new row into the batch panel as it arrives (F7), but
+        # coalesce the rebuilds (F8): kick the single-shot timer so a burst of
+        # results refreshes the table at most ~3x/sec, not once per image.
+        if not self._batch_refresh_timer.isActive():
+            self._batch_refresh_timer.start()
 
     def _on_fa_finished(self, count: int) -> None:
+        self._batch_refresh_timer.stop()      # final refresh supersedes it
         self.batch_panel.end_progress()
         self._status_doc.setText(f"fine align: processed {count} image(s)")
         self._refresh_overview_defects()      # recolour all dots by score
         if self._current_sem is not None:
             self.sem_viewer.reset_drag()
             self._jump_to_image(self._current_sem)
-        self._refresh_batch_panel()           # final rows + median enabled
+        self._refresh_batch_panel()           # final rows + charts + median
 
     def _on_fa_failed(self, msg: str) -> None:
+        self._batch_refresh_timer.stop()
         self.batch_panel.end_progress()
+        self._refresh_batch_panel()           # show whatever finished
         QMessageBox.critical(self, "Run all failed", msg)
 
     def _on_fa_cancelled(self) -> None:
         # Partial results are kept (not cleared), so the overview still reflects
         # whatever finished before the cancel (F5 M5).
+        self._batch_refresh_timer.stop()
         self.batch_panel.end_progress()
         self._status_doc.setText("fine align: cancelled (partial results kept)")
         self._refresh_overview_defects()

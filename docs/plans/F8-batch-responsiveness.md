@@ -62,56 +62,65 @@ O(N²) 降為 O(N × 有限次數)。
 
 > 每個 milestone 以「一個 session 可完成」為粒度切。
 
-### M1: 扁平進度條（拿掉漸層/發光/掃光/動畫）  [status: planned]
+### M1: 扁平進度條（拿掉漸層/發光/掃光/動畫）  [status: done — code 完成，GUI 待本地驗收]
 
-- [ ] `_AnimatedBar.paintEvent` 改為：軌道（圓角單色）+ 單色扁平填充（`_FILL` 一色，無漸層、無發光
-  矩形、無掃光帶）；determinate 時填充寬 = `frac×w`。
-- [ ] % 顯示改為**單純一行**（置中、單色描邊一次；或移到 bar 外側 label——以最簡為準），不再雙描邊 + clip。
-- [ ] indeterminate 模式保留一個**極簡**滑塊（單色、無發光），或直接以靜態「處理中」呈現；`advance()` 維持
-  API 但不做高成本重繪。
-- [ ] **API 不變**（`set_fraction` / `set_indeterminate` / `advance`），呼叫端（`LoadProgressDialog`、
-  `BatchResultsPanel`）零改動 → 全 app 進度條同步變扁平。
-- [ ] 驗證：py_compile；GUI 外觀（扁平、% 可讀、無動畫殘留）user 本地驗收。
+- [x] `_AnimatedBar.paintEvent` 改為：軌道（圓角單色 `_TRACK`）+ 單色扁平填充（`_FILL` 一色，無漸層、
+  無發光矩形、無掃光帶）；determinate 時填充寬 = `frac×w`。bar 高度 20→14（更纖細清新）。
+- [x] % 不再畫在 bar 內（兩個呼叫端的 detail label 已顯示 `pct%`，bar 內重複又擁擠）→ 直接移除 in-bar
+  文字與雙描邊/clip，bar 純粹一條填充。
+- [x] indeterminate 保留**極簡單色滑塊**（ping-pong，無發光/漸層）；`advance()` 維持 API，但 determinate
+  模式直接 return 不重繪（批次跑時不再每 tick 燒繪圖）。
+- [x] **API 不變**（`set_fraction` / `set_indeterminate` / `advance`），呼叫端零改動 → 全 app 進度條同步扁平。
+  順手移除已不再使用的 `QLinearGradient` / `QPainterPath` import。
+- [x] 驗證：py_compile 過；GUI 外觀（扁平、無動畫殘留）user 本地驗收。
 
-### M2: 節流串流刷新（修 O(N²)）  [status: planned]
+### M2: 節流串流刷新（修 O(N²)）  [status: done — code 完成，GUI 待本地驗收]
 
-- [ ] `_on_fa_result`：只更新 `self._refined` / `self._fa_meta` / badge，**不再每張呼叫**
-  `_refresh_batch_panel()`；改為 `self._batch_refresh_timer`（QTimer，單發、約 300ms）合併觸發一次表更新。
-- [ ] `BatchResultsPanel`：表更新與圖重建解耦——新增「只重填表、不動圖」路徑（`set_rows(..., rebuild_charts=False)`
-  或等義），`_rebuild_charts()` 只在 `_on_fa_finished` / `_on_fa_cancelled` / `_open_fa_results` 末尾呼叫一次。
-- [ ] finished/cancelled/failed：取消待觸發 timer，做**最後一次**完整刷新（表 + 圖 + median 鈕狀態）。
-- [ ] 驗證：py_compile；既有 `tests/test_gds_align_f5.py` 純函式測仍綠；GUI 大批次捲動/點選順暢 user 本地驗收。
+- [x] `_on_fa_result`：只更新 `self._refined` / `self._fa_meta` / badge，**不再每張呼叫**
+  `_refresh_batch_panel()`；改為 `self._batch_refresh_timer`（QTimer single-shot、300ms）未啟動時 start →
+  一串結果最多 ~3x/sec 重填表。
+- [x] `set_rows(rows, threshold, rebuild_charts=True)`：`rebuild_charts=False` 時跳過
+  `_rebuild_charts()`（直方圖/散點 widget teardown+rebuild 才是貴的部分）；timer 觸發時傳 False。
+- [x] finished/cancelled/failed：`_batch_refresh_timer.stop()` + 最後一次 `_refresh_batch_panel()`
+  （預設 rebuild_charts=True → 表 + 圖 + median 鈕）；`_open_fa_results` 與起跑初次刷新亦走完整版；起跑
+  先 stop 清掉殘留 timer。
+- [x] 驗證：py_compile 過；測試無直接呼叫 `set_rows`（新增參數有預設值、向後相容）；GUI 大批次順暢
+  user 本地驗收。
 
-### M3: 抽 Qt-free fine-align 至 core + ProcessPool 批次  [status: planned]
+### M3: 抽 Qt-free fine-align 至 core + ProcessPool 批次  [status: done — code 完成，相依/實機待本地]
 
-- [ ] **M3a 抽核心**：新增 `glas/core/fine_align.py`（Qt-free，僅 numpy/cv2/shapely/sibling core），把
-  `rasterize_layer`(+其 helper)、`make_template`、`_fit_mask`、`render_composite_template`、
+- [x] **M3a 抽核心**：新增 `glas/core/fine_align.py`（Qt-free，僅 numpy/cv2/gds_boolean/oasis_random），把
+  `rasterize_layer`(+`_scanline_fill`)、`make_template`、`_fit_mask`、`render_composite_template`、
   `render_poi_template`、`_parabola_subpx`、`fine_align_one`、`_walk_roi_polys`、`poi_polys_for_roi`、
-  `_fine_align_image` 從 `gds_align_tool.py` 搬入；app 端改 `from fine_align import (...)` 取回（line 5495
-  等呼叫端與測試 import 路徑都要相容）。**邏輯一字不改，純搬移。**
-- [ ] **M3b ProcessPool 進入點**（在 `fine_align.py`，module-level、可被 spawn re-import）：
-  `_pool_init(path, wanted, dtype, bbox_layer, root, poi_specs, cfg)` → 在子行程建一個
-  `RandomAccessReader`（由路徑+filter 重建，非傳入 live reader）存到 module global；`_pool_task(job)` →
-  呼叫 `_fine_align_image(job, _G_RAR, _G_ROOT, _G_SPECS, _G_CFG, _never_cancel)` 回傳 tuple。
-- [ ] **M3c worker 改線**：`FineAlignAllWorker.run()` 由 `ThreadPoolExecutor` 改 `ProcessPoolExecutor`
-  （**明確 `mp_context="spawn"`** 跨平台一致），initargs 傳 reader 參數（path/`_init_wanted`/dtype/
-  `_bbox_layer`）+ root + poi_specs + cfg（皆 picklable）。結果 tuple 在 run() 單一 thread 隨 `as_completed`
-  emit（沿用節流串流）。
-- [ ] **cancel**：orchestrator 端 `threading.Event` + `ex.shutdown(wait=False, cancel_futures=True)`（Py3.9+）
-  →未開始 task 直接取消、in-flight（≤ workers 張）跑完即止、**已完成結果保留**。粒度為**單張影像邊界**
-  （非 F6 之前的逐 node 即時 bail）——見 Risks。
-- [ ] **小批次 fallback**：`n` 很小（如 `n <= 2` 或 `n <= workers`）時走 in-thread 循序，規避 spawn 啟動開銷。
-- [ ] **SEM 影像不跨行程傳**：子行程自己 `cv2.imread(path)`（job 只帶 path）→ 不序列化大圖。
-- [ ] 驗證：py_compile；見 M4 等價測試。
+  `_fine_align_image` 從 `gds_align_tool.py` **逐字搬入**；app 端 `import fine_align` + `from fine_align
+  import (...)` 把 10 個名字取回 namespace → 既有呼叫端（render/`_fit_mask`/rasterize 於 5149/5188/5242、
+  OverlayExportWorker 的 poi_polys_for_roi）與測試（`gat.X`：m4b + accel）全相容。GUI-only 的
+  `overlay_outlines_on_sem`/`_draw_polyline_np` 留在 app（子行程用不到）。
+- [x] **M3b ProcessPool 進入點**（`fine_align.py` module-level、spawn 可 re-import）：`_pool_init(path,
+  wanted, dtype, bbox_layer, root, poi_specs, cfg)` 在子行程建 `RandomAccessReader`（由**路徑+filter 重建**，
+  非傳 live reader）存 module global `_G`；`_pool_task(job)` → `_fine_align_image(..., _never_cancel)`。
+- [x] **M3c worker 改線**：`FineAlignAllWorker.run()` 由 `ThreadPoolExecutor` 改 `ProcessPoolExecutor`
+  （`mp.get_context("spawn")`），initargs 傳 reader 參數（`str(_path)`/`_init_wanted`/`_dtype`/`_bbox_layer`）
+  + root + poi_specs + cfg（皆 picklable）；結果 tuple 在 run() 單一 thread 隨 `as_completed` emit（接 M2 節流）。
+- [x] **cancel**：orchestrator `threading.Event`；觸發時 `fut.cancel()` 掉所有未開始 future（`CancelledError`
+  略過）、in-flight 跑完即止、**已完成結果保留**；末尾 `ex.shutdown(wait=True)`。粒度=**單張影像邊界**
+  （非 F6 逐 node 即時 bail）——見 Risks。小批次走 `_run_in_thread`（仍逐 node cancel）。
+- [x] **小批次 fallback**：`n == 0` 直接 finished(0)；`n <= 2` 或 `workers <= 1` 走 in-thread 循序（clone
+  一個 reader、用完 close），規避 spawn 啟動開銷。
+- [x] **SEM 影像不跨行程傳**：子行程自己 `cv2.imread(path)`（job 只帶 path）→ 不序列化大圖。
+- [x] 驗證：py_compile（fine_align.py + gds_align_tool.py）過；app 對 10 個搬移名字的引用全部解析到 import
+  回來的名稱（grep 核對）；見 M4 等價測試。
 
-### M4: 等價性 + 效能驗收  [status: planned]
+### M4: 等價性 + 效能驗收  [status: in progress — 測試齊備，本地相依/實機待跑]
 
-- [ ] `tests/test_accel_equivalence.py`：compute 函式 import 改自 `fine_align`（core）；新增
-  `TestProcessPoolEquivalence`（循序 vs ProcessPool 每張 result tuple 完全相等，沿用既有假 SEM/jobs/specs）。
-- [ ] 既有 `TestBatchParallelEquivalence`（thread-pool）：保留或改寫為對 `fine_align._fine_align_image` 的
-  循序 baseline（確保搬移後純函式行為不變）。
+- [x] `tests/test_accel_equivalence.py`：新增 `TestProcessPoolEquivalence::test_pool_entry_matches_sequential`
+  ——`_pool_init`（由**路徑**重建 reader）+ `_pool_task` 每張 result tuple 與循序 `_fine_align_image` 完全相等
+  （含 no-coords / missing-file 狀態）。**在 in-process 跑 pool 進入點**（不真的 spawn——pytest 下 spawn 慢/脆；
+  真正的跨行程 transport 是 std-lib，分歧只會來自「由路徑重建 reader + 任務接線」，此測已涵蓋）。
+- [x] 既有 `TestBatchParallelEquivalence`（thread-pool）保留：經 `gat._fine_align_image`（已 re-export）仍驗
+  搬移後純函式行為不變。
 - [ ] 本地 `pytest tests/test_accel_equivalence.py tests/test_oasis_random.py tests/test_oasis_streamer.py
-  tests/test_gds_align_f5.py -v` 全綠。
+  tests/test_gds_align_f5.py tests/test_gds_align_m4b.py -v` 全綠。
 - [ ] 手動（user 本地）：大批次 Run all → UI 順、進度條扁平、結果值與改前逐張一致、多核明顯變快、按終止
   在一張影像時間內停、已完成結果保留。
 
