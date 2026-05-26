@@ -1,7 +1,7 @@
 # [F6] OAS 讀取與批次 fine-align 加速（mmap + 共享 map + thread-pool 批次）
 
-> **狀態：** in progress（M1–M3 程式碼完成，沙箱已過 numpy-free 等價驗證；numpy/cv2/PyQt6
-> 相依的等價測試與實機效能待 user 本地驗收）
+> **狀態：** done (2026-05-26)（M1/M2 mmap 仍在用；M3 thread-pool 已由 F8 ProcessPool 取代；
+> 等價測試本地全綠 + 實機驗收通過）
 > **§8 ID：** [F6]
 > **建立：** 2026-05-25
 > **負責 branch：** claude/dazzling-cori-5T7XE
@@ -95,12 +95,14 @@ mmap 與 thread-pool 都帶 fallback（無 fileno → slurp；cv2 缺 → 既有
 - [x] 驗證：py_compile + `TestBatchParallelEquivalence`（循序 vs 4-worker pool 每張 tuple 相等）；沙箱無
   numpy/cv2/PyQt6 → 待本地實跑。
 
-### M4: 等價性與效能總驗收  [status: in progress — 測試齊備，實機/相依驗收待本地]
+### M4: 等價性與效能總驗收  [status: done — 2026-05-26 等價測試全綠 + 實機驗收（M3 thread-pool 由 F8 取代）]
 
 - [x] golden 測試彙整於 `tests/test_accel_equivalence.py`（mmap↔slurp / 共享map↔獨立scan / 循序↔並行）。
-- [ ] 本地 `pytest tests/test_accel_equivalence.py tests/test_oasis_random.py tests/test_oasis_streamer.py -v`
-  全綠（含 numpy/cv2/PyQt6-gated）。
-- [ ] 實機效能、GUI 批次加速、大檔 mmap 記憶體下降由 user 本地驗收。
+- [x] 本地 `pytest tests/test_accel_equivalence.py tests/test_oasis_random.py tests/test_oasis_streamer.py -v`
+  全綠（含 numpy/cv2/PyQt6-gated）。（2026-05-26 user 本地：全量 206 passed）
+- [x] 實機效能、GUI 批次加速由 user 本地驗收（2026-05-26 隨 F8 通過：批次明顯變快、UI 順）。**M3 的
+  thread-pool 已由 F8 ProcessPool 取代**（GIL 競爭問題）；**M1/M2 的 mmap 讀取/單一 map 共享仍在用**
+  （ProcessPool 每個 worker 由路徑建 `RandomAccessReader`、走 mmap），大檔 ROI 模式記憶體未爆、UI 順。
 
 ---
 
@@ -133,13 +135,13 @@ mmap 與 thread-pool 都帶 fallback（無 fileno → slurp；cv2 缺 → 既有
 
 ## 驗證方式
 
-- [ ] 所有 milestone checkbox 已勾
-- [ ] `python3 -m py_compile glas/core/oasis_streamer.py glas/core/oasis_random.py glas/app/gds_align_tool.py`
-- [ ] `pytest tests/test_oasis_random.py tests/test_oasis_streamer.py tests/test_accel_equivalence.py -v`
-      全綠（含三組等價測試）
-- [ ] 手動（user 本地）：開大 OASIS ROI 模式記憶體明顯下降；`Run all` 在多核機批次明顯變快、
-      結果與加速前逐張一致；按終止仍即時停。
-- [ ] `SESSION_LOG.md` 有對應紀錄
+- [x] 所有 milestone checkbox 已勾（M3 thread-pool 由 F8 ProcessPool 取代）
+- [x] `python3 -m py_compile glas/core/oasis_streamer.py glas/core/oasis_random.py glas/app/gds_align_tool.py`
+- [x] `pytest tests/test_oasis_random.py tests/test_oasis_streamer.py tests/test_accel_equivalence.py -v`
+      全綠（含三組等價測試）（2026-05-26 本地全量：206 passed）
+- [x] 手動（user 本地）：開大 OASIS ROI 模式 UI 順、記憶體未爆；`Run all` 在多核機批次明顯變快、
+      結果與加速前逐張一致；按終止即時停（2026-05-26 隨 F8 驗收通過）。
+- [x] `SESSION_LOG.md` 有對應紀錄
 
 ---
 

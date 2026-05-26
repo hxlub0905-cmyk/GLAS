@@ -127,9 +127,13 @@ class TestOverlayOutlines:
                         dtype=np.float64)
         rgb = gat.overlay_outlines_on_sem(
             sem, [([poly], (255, 0, 0))], anchor=(0.0, 0.0), nm_per_px=1.0)
-        # Some pixel must now carry the red outline colour.
-        red = (rgb[:, :, 0] == 255) & (rgb[:, :, 1] == 0) & (rgb[:, :, 2] == 0)
-        assert red.any()
+        # Some pixel must now carry the (anti-aliased) red outline. The stroke
+        # uses cv2.LINE_AA, which blends edge pixels with the grey background,
+        # so assert "clearly reddened" (R dominant, lifted well above the grey
+        # 60 floor) rather than an exact (255, 0, 0) that AA never produces.
+        r, g, b = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
+        reddish = (r > 120) & (r > g.astype(int) + 40) & (r > b.astype(int) + 40)
+        assert reddish.any()
 
 
 # ── OverlayExportWorker manifest ─────────────────────────────────────

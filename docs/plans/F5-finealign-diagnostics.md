@@ -54,7 +54,7 @@ helper）；無常駐結果表；單張路徑現在丟掉 `used_r`。
 
 ## Milestones
 
-### M1: 殘差疊圖（Preview 彈窗 before/after）  [status: done — code 完成；GUI 待 user 驗收]
+### M1: 殘差疊圖（Preview 彈窗 before/after）  [status: done — code 完成；GUI 2026-05-26 user 本地驗收通過]
 
 - [x] 新 helper `overlay_outlines_on_sem(sem_gray, entries, anchor, nm_per_px)`：把可見層
   （或合成樣板）的**輪廓**以層色畫在 SEM 灰階轉 RGB 上，回傳 `(H,W,3) uint8`。不碰
@@ -64,7 +64,7 @@ helper）；無常駐結果表；單張路徑現在丟掉 `used_r`。
 - [x] `_on_preview_template` 準備 before/after 兩 anchor + entries 傳入。
 - [x] 驗證：py_compile；helper 以小 mask 純函式測（輪廓像素落點/層色正確）；彈窗顯示待 user。
 
-### M2: 批次結果總覽彈窗（表 + 直方圖 + 散點圖）  [status: done — code 完成；GUI 待 user 驗收]
+### M2: 批次結果總覽彈窗（表 + 直方圖 + 散點圖）  [status: done — code 完成；GUI 2026-05-26 user 本地驗收通過]
 
 - [x] 新 `FineAlignResultsDialog`：
   - **表格** `QTableWidget`：image_id / score / dx_nm / dy_nm / **used_radius(C4)** /
@@ -80,7 +80,7 @@ helper）；無常駐結果表；單張路徑現在丟掉 `used_r`。
 - [x] 驗證：py_compile；以假 `_refined`＋狀態建表/直方圖分箱/散點 median 的純函式測；
   互動跳轉待 user。
 
-### M3: 中位殘差 → origin δ 一鍵套用（C2）  [status: done — code 完成；GUI 待 user 驗收]
+### M3: 中位殘差 → origin δ 一鍵套用（C2）  [status: done — code 完成；GUI 2026-05-26 user 本地驗收通過]
 
 - [x] `FineAlignResultsDialog` 加「Apply median residual to origin δ」鈕：取所有 ok 影像的
   median(dx,dy)，加進 `self._origin_dx/dy`（沿用 Set Offset 的 δ 機制與符號），更新
@@ -89,7 +89,7 @@ helper）；無常駐結果表；單張路徑現在丟掉 `used_r`。
   `_refined`（讓 user 比較前後）。
 - [x] 驗證：py_compile；median 計算（含忽略非 ok）純函式測；套用後 δ 數值/符號正確待 user。
 
-### M4: Fine-align setup 持久化 + 命名（#1 #2）  [status: done — code 完成；GUI 待 user 驗收]
+### M4: Fine-align setup 持久化 + 命名（#1 #2）  [status: done — code 完成；GUI 2026-05-26 user 本地驗收通過]
 
 - [x] **命名（#1）**：`FineAlignPanel` 的 `BG grey` caption → `Background GL`；`set_pois` 每列的
   `FG` 標籤 → `Foreground GL`（tooltip 同步）。純標籤字串改，不動 `values()` 的 key（`bg_glv` 等）
@@ -102,7 +102,7 @@ helper）；無常駐結果表；單張路徑現在丟掉 `used_r`。
 - [x] 驗證：py_compile；`_fa_setup` 套用邏輯（by-key 比對 / 缺層略過 / FG 還原）純函式測；
   互動（切 DID 後 POI 仍勾、按一次 Run fine align 即可）待 user。
 
-### M5: Batch cancel 即時生效 + ETA + 已完成預覽（#3）  [status: done — code 完成；GUI 待 user 驗收]
+### M5: Batch cancel 即時生效 + ETA + 已完成預覽（#3）  [status: done — code 完成；GUI 2026-05-26 user 本地驗收通過]
 
 - [x] **cancel 修復**：`FineAlignAllWorker` 改用 `threading.Event`（GUI 執行緒 `set()`、worker 迴圈
   與 `cancel_cb` 直接讀 `is_set()`），取代靠 queued slot 設 `self._cancel`。`_on_run_fine_align_all`
@@ -116,7 +116,7 @@ helper）；無常駐結果表；單張路徑現在丟掉 `used_r`。
 - [x] 驗證：py_compile；ETA 估算純函式測（done/total/elapsed → 剩餘秒）；cancel 即時性與
   進度文字待 user。
 
-### M6: Overlay + image 匯出（#4）  [status: done — code 完成；GUI 待 user 驗收]
+### M6: Overlay + image 匯出（#4）  [status: done — code 完成；GUI 2026-05-26 user 本地驗收通過]
 
 - [x] `AlignmentExportDialog`（或新分頁）加「影像匯出」選項：勾選 **raw image** / **對位後 overlay
   PNG** / **兩者**；overlay 重用 M1 `overlay_outlines_on_sem`（對位後 anchor = coarse + `_refined`）。
@@ -154,11 +154,11 @@ helper）；無常駐結果表；單張路徑現在丟掉 `used_r`。
 
 ## 驗證方式
 
-- [ ] 所有 milestone checkbox 已勾
+- [x] 所有 milestone checkbox 已勾
 - [x] `python3 -m py_compile glas/app/gds_align_tool.py`
 - [x] 新增純函式測試通過（overlay 落點 / 建表 / 分箱 / median / status）
-- [ ] 手動（user 本地）：單張 Preview 看 before/after 貼合；Run all 後總覽表排序/篩選/點列
-  跳轉、看直方圖與散點、按 median→δ 後重跑看殘差收斂
+- [x] 手動（user 本地）：單張 Preview 看 before/after 貼合；Run all 後總覽表排序/篩選/點列
+  跳轉、看直方圖與散點、按 median→δ 後重跑看殘差收斂（2026-05-26 user 本地驗收通過）
 - [x] `SESSION_LOG.md` 有對應紀錄
 
 ---

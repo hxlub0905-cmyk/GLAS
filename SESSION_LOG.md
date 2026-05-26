@@ -2,6 +2,55 @@
 
 ---
 
+## [2026-05-26] F5/F6/F7/F8 收尾 + F8 全程（規劃→實作→修測試→驗收→收尾）
+
+**變更類型：** 收尾(F5) + 測試驗收(F6) + 功能/效能(F8) + test fix。本次對話（同日）累積數件，合併記錄。
+
+**1. 完成 [F5]**（純文件收尾）：user 本地 GUI 驗收 fine-align 診斷工作流（Preview before/after、總覽表、
+直方圖/散點、median→δ 收斂）全通過。`F5-finealign-diagnostics.md` checkbox/status 標註驗收；`CLAUDE.md`
+§8 移除 [F5]（plan 留作 design history）。
+
+**2. [F6] 等價測試本地全綠**（文件）：本地 Python 3.9.7 跑 accel/oasis_random/oasis_streamer → 170 passed
+（mmap↔slurp、共享map↔獨立scan、循序↔4-worker 並行）。F6 thread-pool 之後由 F8 取代（M1/M2 mmap 仍在用），
+F6/F7 連同 F8 於本次一併收尾（見第 5 點）。
+
+**3. [F8] Batch 反應性與加速**（plan + 實作 M1–M4）：user 回報 Batch Align 非常卡、運算久、進度條花俏。
+查出三根因：(a) `_on_fa_result` 每張整表重建 + 圖刪重生 = O(N²) 主執行緒重繪；(b) F6 thread-pool 8 條純
+Python 解碼 thread 搶 GIL；(c) `_AnimatedBar` 漸層/發光/掃光/動畫。AskUserQuestion 收斂後產
+`docs/plans/F8-batch-responsiveness.md` 並實作：
+- **M1 扁平進度條**：`_AnimatedBar` 重寫成單色軌道+單色填充（去漸層/發光/掃光/in-bar%），高 20→14、
+  determinate `advance()` 不重繪；API 不變→全 app 同步；移除無用 `QLinearGradient`/`QPainterPath` import。
+- **M2 節流串流（修 O(N²)）**：`_batch_refresh_timer`（single-shot 300ms）合併刷新（~3x/sec）；
+  `set_rows(..., rebuild_charts=False)` 串流時跳過直方圖/散點重建，只在 finished/cancelled/Results…/起跑 完整刷新。
+- **M3 ProcessPool（抽 Qt-free core）**：新增 `glas/core/fine_align.py`，rasterize/template/matchTemplate/
+  ROI-walk/`_fine_align_image` 等 10 個純函式逐字搬入（app re-export 取回，呼叫端與 m4b/accel 測試相容；
+  `overlay_outlines_on_sem` 留 app）。`FineAlignAllWorker` 由 `ThreadPoolExecutor` 改 `ProcessPoolExecutor`
+  (spawn)：worker 由**路徑**重建 reader（避開 Windows spawn 拉 PyQt6）、SEM 子行程自讀；cancel 用
+  `fut.cancel()`（張邊界粒度、保留已完成）；`n<=2`/單核走 in-thread fallback（直接用 `self._rar`）。
+- **M4 測試**：`test_accel_equivalence.py` 新增 `TestProcessPoolEquivalence`（`_pool_init` 由路徑重建 reader +
+  `_pool_task` 每張 result 與循序 `_fine_align_image` 完全相等）。
+
+**4. 修 4 個測試失敗**：1 個 F8 回歸——`_run_in_thread` 誤用 `self._rar.clone()`（`_FakeRar` 無 clone）→ 改回
+直接用 `self._rar`；3 個既有過時/過嚴測試（git diff 確認受測函式 F8 前後逐字相同）——`test_expr_spec`
+（斷言改 4-tuple 含 recipes 快照）、`test_draws_outline_colour`（`cv2.LINE_AA` 反鋸齒→改斷言「明顯偏紅」非
+精確 255,0,0）、`test_batch_run`（F5 起 no-coords 會回 status 列→lambda 收 6 參數、斷言 D2 為 no-coords）。
+
+**5. 收尾 [F6][F7][F8]**：驗收通過後依 §10 收尾——三個 plan checkbox/status 標 done（F6 註記 M3 thread-pool
+已由 F8 ProcessPool 取代、M1/M2 mmap 仍在用；F7 註記進度條質感由 F8 回退扁平、串流由 F8 節流），`CLAUDE.md`
+§8「進行中」清空（F6/F7/F8 移除）。三份 plan 保留作 design history。
+
+**測試：** 本地全量 **206 passed**（含 ProcessPool 等價）。**F8 實機驗收通過**：UI 不卡、多核生效（工作管理員
+見多個 python 子行程）、明顯變快、取消等待可接受、結果正確、進度條扁平 OK。
+
+**不動（§7 不變式）：** 批次計算純函式只搬家、結果 byte/value 不變、fine-align 符號、SemViewer 折疊、
+CE early-stop、median→δ。取捨：cancel 粒度由逐 node 即時改為單張影像邊界。
+
+**影響檔案：** `glas/core/fine_align.py`（新）、`glas/app/gds_align_tool.py`、`tests/test_accel_equivalence.py`、
+`tests/test_gds_align_f5.py`、`tests/test_gds_align_m4b.py`、`docs/plans/F5-*.md`、`docs/plans/F6-*.md`、
+`docs/plans/F7-batch-workspace-ui.md`、`docs/plans/F8-batch-responsiveness.md`、`CLAUDE.md`、`SESSION_LOG.md`。
+
+**Branch：** `claude/practical-pascal-AtKLm`
+
 ## [2026-05-25] [F6] PR#5 review fix（P1）：批次 cancel 後保留所有已完成結果
 
 **變更類型：** bug fix

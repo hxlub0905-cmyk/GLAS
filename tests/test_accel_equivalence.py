@@ -322,3 +322,72 @@ class TestBatchParallelEquivalence:
         # sanity: the deterministic non-anchored / missing cases are present
         assert seq["img2"][5] == "no-coords"
         assert seq["img3"][5] == "missing-file"
+
+
+# ── F8: ProcessPool batch == sequential batch (numpy/cv2-gated) ──────────────
+
+
+class TestProcessPoolEquivalence:
+    """F8 moved the batch from a thread pool to a process pool. A worker
+    process rebuilds its reader from the file *path* (the live reader isn't
+    picklable) via ``fine_align._pool_init`` and runs the same per-image work
+    via ``fine_align._pool_task``. This pins that the pool entry points
+    reproduce the sequential per-image result exactly — the reader rebuilt from
+    path + the task wiring must not change a single value (§7).
+
+    The std-lib process transport itself is not re-tested here (spawning real
+    workers under pytest is slow/fragile); the entry points are exercised
+    in-process, which is where any divergence would come from."""
+
+    def test_pool_entry_matches_sequential(self, tmp_path):
+        np = pytest.importorskip("numpy")
+        cv2 = pytest.importorskip("cv2")
+        import fine_align as fa
+        import oasis_random as orx
+
+        data, _, _ = _build_two_cell()
+        p = tmp_path / "two.oas"
+        p.write_bytes(data)
+        base = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
+        root = next(iter(base._by_name))
+
+        frames = []
+        for i in range(3):
+            img = (np.tile(np.arange(64, dtype=np.uint8), (64, 1)) + i * 4)
+            fp = tmp_path / f"sem_{i}.png"
+            cv2.imwrite(str(fp), img)
+            frames.append(fp)
+        jobs = [
+            ("img0", (50.0, 50.0), str(frames[0]), True),
+            ("img1", (110.0, 110.0), str(frames[1]), True),
+            ("img2", None, str(frames[2]), True),       # no-coords
+            ("img3", (60.0, 60.0), str(tmp_path / "nope.png"), False),  # missing
+        ]
+        cfg = {
+            "fov_w": 200.0, "fov_h": 200.0, "nm_auto": True, "nm_manual": 0.0,
+            "bg_glv": 80, "blur_sigma_px": 1.0, "search_radius_nm": 20.0,
+        }
+        specs = [(("raw", 17, 0), 200)]
+
+        # Sequential baseline on the live base reader.
+        never = lambda: False
+        seq = {}
+        for job in jobs:
+            r = fa._fine_align_image(job, base, root, specs, cfg, never)
+            seq[r[0]] = r
+
+        # Pool entry points: _pool_init rebuilds the reader from the PATH only
+        # (exactly what a spawned worker does), _pool_task runs the per-image
+        # work against that rebuilt reader.
+        fa._pool_init(str(p), base._init_wanted, base._dtype,
+                      base._bbox_layer, root, specs, cfg)
+        pool = {}
+        for job in jobs:
+            r = fa._pool_task(job)
+            pool[r[0]] = r
+        fa._G["rar"].close()
+        base.close()
+
+        assert seq == pool
+        assert seq["img2"][5] == "no-coords"
+        assert seq["img3"][5] == "missing-file"
