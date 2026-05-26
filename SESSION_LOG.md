@@ -2,6 +2,25 @@
 
 ---
 
+## [2026-05-26] 修第三個過時測試 test_batch_run（非 F8 回歸）
+
+**變更類型：** test fix（只動測試，不動程式）
+
+**動機現象：** clone 回歸修好後，`test_gds_align_m4b.py::TestRunAllWorker::test_batch_run` 露出另一個過時
+斷言 `assert "D2" not in results`。D2 是 no-coords job，但 F5 M2/M5 起 `_fine_align_image` 對 no-coords
+**回 status tuple（非 None）**，worker 會 emit 結果列（供批次表列出狀態）——此為 F5 設計、F8 逐字搬移未變，
+故此失敗自 F5 起即存在（先前被 clone 回歸的 KeyError 遮住）。測試還停在「no-coords 靜默跳過」舊語意，且
+result lambda 只收 4 參數（signal 已是 6：含 used_r + status）。
+
+**修復實作：** result lambda 改收 6 參數、記錄 status；斷言改為 `results["D2"] == (0,0,0,"no-coords")`、
+D1 status == "ok"。程式碼未動。
+
+**測試：** py_compile 過；預期該檔全綠（待 user 重跑確認 206 全綠）。
+
+**影響檔案：** `tests/test_gds_align_m4b.py`、`SESSION_LOG.md`。
+
+**Branch：** `claude/practical-pascal-AtKLm`
+
 ## [2026-05-26] 修兩個既有過時/過嚴測試（非 F8 回歸）
 
 **變更類型：** test fix（只動測試，不動程式）

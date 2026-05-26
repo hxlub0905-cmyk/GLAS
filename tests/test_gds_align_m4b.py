@@ -294,7 +294,7 @@ class TestRunAllWorker:
         p = tmp_path / "d1.png"
         cv2.imwrite(str(p), sem)
         jobs = [("D1", anchor, str(p), True),
-                ("D2", None, "", False)]            # no-coords -> skipped
+                ("D2", None, "", False)]            # no-coords -> status row
         cfg = {"fov_w": 8000.0, "fov_h": 8000.0, "nm_auto": True,
                "nm_manual": 0.0, "bg_glv": 80,
                "blur_sigma_px": 0.0, "search_radius_nm": 1000.0,
@@ -304,14 +304,18 @@ class TestRunAllWorker:
         results = {}
         prog = []
         done = {}
-        w.result.connect(lambda i, dx, dy, s: results.__setitem__(i, (dx, dy, s)))
+        w.result.connect(
+            lambda i, dx, dy, s, r, st: results.__setitem__(i, (dx, dy, s, st)))
         w.progress.connect(lambda d, n, i: prog.append((d, n)))
         w.finished.connect(lambda c: done.__setitem__("c", c))
         w.run()
         assert done["c"] == 2                       # both visited
         assert prog == [(1, 2), (2, 2)]
-        assert "D2" not in results                  # skipped (no coords)
-        dx, dy, s = results["D1"]
+        # F5 M2/M5: a no-coords image still emits a result row carrying the
+        # objective status (so the batch table can list it), with zero offset.
+        assert results["D2"] == (0.0, 0.0, 0.0, "no-coords")
+        dx, dy, s, st = results["D1"]
+        assert st == "ok"
         assert dx == pytest.approx(-500.0, abs=1.0)
         assert dy == pytest.approx(300.0, abs=1.0)
         assert s > 0.9
