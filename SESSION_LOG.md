@@ -2,6 +2,23 @@
 
 ---
 
+## [2026-05-26] [F9] PR#7 review fix（P2）：匯出 UI layer/datatype 上限放寬，避免靜默截斷
+
+**變更類型：** bug fix
+
+**動機現象：** PR#7 review（chatgpt-codex-connector，P2）指出 `OasisExportDialog` 的 layer/datatype
+QSpinBox 限 `0..65535`，但 OASIS layer/datatype 是無上限 unsigned int、writer 也支援更大值——載入的
+raw layer 若 ID > 65535 會被**靜默截斷**，使用者按預設匯出就把 layer 重映射成錯誤 ID。
+
+**修復：** 兩個 spinbox `setRange(0, 65535)` → `setRange(0, 2_147_483_647)`（QSpinBox int 上限，涵蓋所有
+真實 OASIS layer 號），prefilled 大 ID 不再被截斷。
+
+**測試：** `py_compile` 過；行為驗收併入 F9 GUI 本地驗收。
+
+**影響檔案：** `glas/app/gds_align_tool.py`、`SESSION_LOG.md`。
+
+**Branch：** `claude/adoring-cannon-oKZKo`（PR #7）
+
 ## [2026-05-26] [F10] OASIS debug mode：載入/匯出雙向診斷（可複製報告 + sidecar）
 
 **變更類型：** 功能（新增 core 模組 + app UI）

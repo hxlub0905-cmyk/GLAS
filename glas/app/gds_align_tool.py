@@ -4328,10 +4328,13 @@ class OasisExportDialog(QDialog):
             cb.setChecked(True)
             if e.display_name:
                 cb.setText(f"{e.key.label()}  ({e.display_name})")
+            # OASIS layer/datatype are unbounded unsigned ints (the writer
+            # supports large values); use the full QSpinBox int range so a
+            # prefilled raw ID > 65535 isn't silently clamped and remapped.
             ls = QSpinBox()
-            ls.setRange(0, 65535)
+            ls.setRange(0, 2_147_483_647)
             ds = QSpinBox()
-            ds.setRange(0, 65535)
+            ds.setRange(0, 2_147_483_647)
             if e.key.synthetic:
                 ls.setValue(synth_default)
                 ds.setValue(0)
