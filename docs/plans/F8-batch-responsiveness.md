@@ -1,6 +1,6 @@
 # [F8] Batch Align 反應性與加速：ProcessPool + 節流串流 + 扁平進度條
 
-> **狀態：** planned
+> **狀態：** done (2026-05-26)
 > **§8 ID：** [F8]
 > **建立：** 2026-05-26
 > **負責 branch：** claude/practical-pascal-AtKLm
@@ -87,7 +87,7 @@ O(N²) 降為 O(N × 有限次數)。
 - [x] 驗證：py_compile 過；測試無直接呼叫 `set_rows`（新增參數有預設值、向後相容）；GUI 大批次順暢
   user 本地驗收。
 
-### M3: 抽 Qt-free fine-align 至 core + ProcessPool 批次  [status: done — code 完成，相依/實機待本地]
+### M3: 抽 Qt-free fine-align 至 core + ProcessPool 批次  [status: done — 2026-05-26 本地 206 passed + 實機驗收通過]
 
 - [x] **M3a 抽核心**：新增 `glas/core/fine_align.py`（Qt-free，僅 numpy/cv2/gds_boolean/oasis_random），把
   `rasterize_layer`(+`_scanline_fill`)、`make_template`、`_fit_mask`、`render_composite_template`、
@@ -111,7 +111,7 @@ O(N²) 降為 O(N × 有限次數)。
 - [x] 驗證：py_compile（fine_align.py + gds_align_tool.py）過；app 對 10 個搬移名字的引用全部解析到 import
   回來的名稱（grep 核對）；見 M4 等價測試。
 
-### M4: 等價性 + 效能驗收  [status: in progress — 測試齊備，本地相依/實機待跑]
+### M4: 等價性 + 效能驗收  [status: done — 2026-05-26 本地 206 passed + 實機驗收通過]
 
 - [x] `tests/test_accel_equivalence.py`：新增 `TestProcessPoolEquivalence::test_pool_entry_matches_sequential`
   ——`_pool_init`（由**路徑**重建 reader）+ `_pool_task` 每張 result tuple 與循序 `_fine_align_image` 完全相等
@@ -119,10 +119,10 @@ O(N²) 降為 O(N × 有限次數)。
   真正的跨行程 transport 是 std-lib，分歧只會來自「由路徑重建 reader + 任務接線」，此測已涵蓋）。
 - [x] 既有 `TestBatchParallelEquivalence`（thread-pool）保留：經 `gat._fine_align_image`（已 re-export）仍驗
   搬移後純函式行為不變。
-- [ ] 本地 `pytest tests/test_accel_equivalence.py tests/test_oasis_random.py tests/test_oasis_streamer.py
-  tests/test_gds_align_f5.py tests/test_gds_align_m4b.py -v` 全綠。
-- [ ] 手動（user 本地）：大批次 Run all → UI 順、進度條扁平、結果值與改前逐張一致、多核明顯變快、按終止
-  在一張影像時間內停、已完成結果保留。
+- [x] 本地 `pytest tests/test_accel_equivalence.py tests/test_oasis_random.py tests/test_oasis_streamer.py
+  tests/test_gds_align_f5.py tests/test_gds_align_m4b.py -v` 全綠（2026-05-26：206 passed）。
+- [x] 手動（user 本地）：大批次 Run all → UI 順、進度條扁平、結果值與改前逐張一致、多核明顯變快、按終止
+  在一張影像時間內停、已完成結果保留（2026-05-26 驗收通過）。
 
 ---
 
@@ -152,12 +152,13 @@ O(N²) 降為 O(N × 有限次數)。
 
 ## 驗證方式
 
-- [ ] 所有 milestone checkbox 已勾
-- [ ] `python3 -m py_compile glas/core/fine_align.py glas/app/gds_align_tool.py`
-- [ ] `pytest tests/test_accel_equivalence.py tests/test_oasis_random.py tests/test_oasis_streamer.py
-  tests/test_gds_align_f5.py -v` 全綠（含 ProcessPool 等價）
-- [ ] 手動（user 本地）：大批次 Run all UI 順暢 + 扁平進度條 + 結果逐張一致 + 多核變快 + 取消即時（張邊界）
-- [ ] `SESSION_LOG.md` 有對應紀錄
+- [x] 所有 milestone checkbox 已勾
+- [x] `python3 -m py_compile glas/core/fine_align.py glas/app/gds_align_tool.py`
+- [x] `pytest tests/test_accel_equivalence.py tests/test_oasis_random.py tests/test_oasis_streamer.py
+  tests/test_gds_align_f5.py tests/test_gds_align_m4b.py -v` 全綠（含 ProcessPool 等價）→ 2026-05-26 本地 206 passed
+- [x] 手動（user 本地）：大批次 Run all UI 順暢 + 扁平進度條 + 結果逐張一致 + 多核變快（工作管理員見多個
+  python 子行程）+ 取消即時（張邊界）→ 2026-05-26 user 本地驗收通過
+- [x] `SESSION_LOG.md` 有對應紀錄
 
 ---
 

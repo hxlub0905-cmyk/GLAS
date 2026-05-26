@@ -1,6 +1,6 @@
 # [F7] 批次對位工作區：Batch view-mode + inline 進度/即時結果表 + 進度條質感升級
 
-> **狀態：** in progress（M1–M4 程式碼完成、py_compile 過；GUI/外觀/互動待 user 本地驗收）
+> **狀態：** done (2026-05-26)（隨 F8 一併本地驗收；進度條質感後由 F8 回退為扁平、串流由 F8 節流）
 > **§8 ID：** [F7]
 > **建立：** 2026-05-25
 > **負責 branch：** claude/dazzling-cori-5T7XE
@@ -108,12 +108,15 @@ streaming 進表，不彈 modal。**OASIS 載入 / overlay 匯出仍用原 modal
 - [x] 驗證：py_compile；端到端（跑 Batch 自動進 batch view、inline 進度/ETA、streaming 表、即時
   cancel、median→δ、點列就地換 overlay）user 本地驗收。
 
-### M5: 收尾驗收  [status: planned]
+### M5: 收尾驗收  [status: done — 2026-05-26 隨 F8 一併本地驗收通過]
 
-- [ ] 全部 milestone checkbox 已勾。
-- [ ] `python3 -m py_compile glas/app/gds_align_tool.py` + `pytest tests/test_gds_align_f5.py -v`
-  （純函式不受影響）user 本地全綠。
-- [ ] GUI 端到端 user 本地驗收（上述 M1–M4 互動 + 外觀）。
+- [x] 全部 milestone checkbox 已勾。
+- [x] `python3 -m py_compile glas/app/gds_align_tool.py` + `pytest tests/test_gds_align_f5.py -v`
+  （純函式不受影響）user 本地全綠（2026-05-26 全量 206 passed）。
+- [x] GUI 端到端 user 本地驗收（Batch 工作區進出、結果表/直方圖/散點、點列換 overlay、← 回對位、
+  即時 cancel 保留部分結果、median→δ、三 view 切換）——2026-05-26 隨 F8 大批次驗收一併通過。**註：F7 M1
+  的「漸層/發光/%」進度條質感已於 F8 M1 回退為扁平單色版、串流改 F8 M2 節流**（F7 本檔 Risk「streaming 重填
+  表效能…節流」即由 F8 落實）。
 
 ---
 
@@ -141,13 +144,14 @@ streaming 進表，不彈 modal。**OASIS 載入 / overlay 匯出仍用原 modal
 
 ## 驗證方式
 
-- [ ] 所有 milestone checkbox 已勾
-- [ ] `python3 -m py_compile glas/app/gds_align_tool.py`
-- [ ] `pytest tests/test_gds_align_f5.py -v`（純函式不受影響）
-- [ ] 手動（user 本地）：Run all / Results… 進入 Batch 工作區、inline 進度條（漸層/發光/%/ETA）、
-  結果 streaming 進表、即時 cancel 保留部分結果、點列右側 overlay 就地換、「← 回對位」/點 View 鈕離開、
-  median→δ；SEM/GDS/Minimap 三 view 切換正常；OASIS 載入仍用原 modal 進度。
-- [ ] `SESSION_LOG.md` 有對應紀錄
+- [x] 所有 milestone checkbox 已勾
+- [x] `python3 -m py_compile glas/app/gds_align_tool.py`
+- [x] `pytest tests/test_gds_align_f5.py -v`（純函式不受影響）→ 2026-05-26 全量 206 passed
+- [x] 手動（user 本地）：Run all / Results… 進入 Batch 工作區、inline 進度條（**F8 已改扁平**）、
+  結果 streaming 進表（**F8 已節流**）、即時 cancel 保留部分結果、點列右側 overlay 就地換、「← 回對位」/
+  點 View 鈕離開、median→δ；SEM/GDS/Minimap 三 view 切換正常；OASIS 載入仍用原 modal 進度
+  → 2026-05-26 隨 F8 驗收通過。
+- [x] `SESSION_LOG.md` 有對應紀錄
 
 ---
 
