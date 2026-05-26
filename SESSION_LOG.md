@@ -2,6 +2,30 @@
 
 ---
 
+## [2026-05-26] [F8] 規劃：Batch Align 反應性與加速（待核准）
+
+**變更類型：** 文件（plan，尚未動工）
+
+**動機現象：** user 回報跑 Batch Align 時 UI 非常卡、不敢點、運算久，進度條太花俏想回歸簡潔。調查
+`gds_align_tool.py` 後確認三個獨立卡頓來源：(1) `_on_fa_result` 每張結果都 `_refresh_batch_panel()`
+→ 整表重建 + 直方圖/散點刪掉重生 = **O(N²)** 主執行緒重繪（最大元兇、bug）；(2) F6 thread-pool 8 條純
+Python 解碼 thread 與 Qt 主執行緒搶 GIL；(3) `_AnimatedBar` 漸層/發光/掃光/動畫重繪成本。expression POI
+每張要 ROI walk + shapely 布林，thread-pool 只平行到 cv2/GEOS、純 Python 解碼仍序列化。
+
+**規劃內容：** 用 AskUserQuestion 收斂三個岔路——(Q1) 進度條→簡潔扁平版（全 app）、(Q2) 加速→
+ProcessPool（繞 GIL、子行程不碰 GUI）、(Q3) 串流→節流即時更新。產出
+`docs/plans/F8-batch-responsiveness.md`（4 milestone：M1 扁平進度條、M2 節流串流修 O(N²)、M3 抽 Qt-free
+`glas/core/fine_align.py` + ProcessPool 批次、M4 等價+效能驗收）。修訂 F6 M3（thread→process）與 F7
+M1/M4（進度條回退、串流節流）；計算純函式不改、結果 byte/value 不變、§7 不變式不動。已知取捨：cancel 粒度
+由逐 node 即時改為單張影像邊界。Windows spawn 故須把計算抽到 Qt-free core 模組（子行程不可 import
+PyQt6）。§8 註冊 [F8]。**待 user 核准後才開工。**
+
+**測試：** 無（純 plan）。
+
+**影響檔案：** `docs/plans/F8-batch-responsiveness.md`、`CLAUDE.md`（§8）、`SESSION_LOG.md`。
+
+**Branch：** `claude/practical-pascal-AtKLm`
+
 ## [2026-05-26] [F6] 等價測試本地全綠（170 passed），勾 M4 測試 checkbox
 
 **變更類型：** 文件（測試驗收記錄，無程式碼變更）
