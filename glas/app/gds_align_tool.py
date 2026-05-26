@@ -71,7 +71,8 @@ from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QColorDialog,
     QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFrame,
     QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton,
+    QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
+    QPlainTextEdit, QPushButton,
     QScrollArea, QSizePolicy, QSpinBox, QSplitter, QStatusBar, QStyle,
     QStyledItemDelegate, QTableWidget, QTableWidgetItem, QToolButton,
     QVBoxLayout, QWidget,
@@ -124,6 +125,7 @@ import gds_layer_cache  # noqa: E402
 import sem_loader       # noqa: E402
 import oasis_random     # noqa: E402
 import layout_export     # noqa: E402  (F9: OASIS export — shapely guarded inside)
+import oasis_debug        # noqa: E402  (F10: OASIS diagnostics — Qt-free)
 # F8: the Qt-free fine-align compute lives in glas/core/fine_align.py so a
 # spawn-based ProcessPool worker can import it without pulling in PyQt6. Pull
 # the functions back into this namespace so existing call sites and tests
@@ -4268,6 +4270,39 @@ class SemPanel(QFrame):
             self.image_selected.emit(img)
 
 
+class DebugReportDialog(QDialog):
+    """F10: show a copyable plain-text diagnostic report; optionally note the
+    sidecar file it was saved to."""
+
+    def __init__(self, parent, title: str, text: str,
+                 saved_path: Optional[str] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(min(720, _screen_avail()[0]), min(560, _screen_avail()[1]))
+        v = QVBoxLayout(self)
+        if saved_path:
+            v.addWidget(QLabel(f"Saved to: {saved_path}"))
+        edit = QPlainTextEdit(self)
+        edit.setPlainText(text)
+        edit.setReadOnly(True)
+        edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        mono = edit.font()
+        mono.setFamily("monospace")
+        edit.setFont(mono)
+        v.addWidget(edit, 1)
+        row = QHBoxLayout()
+        copy_btn = QPushButton(" Copy to clipboard", self)
+        copy_btn.clicked.connect(
+            lambda: QApplication.clipboard().setText(text))
+        row.addWidget(copy_btn)
+        row.addStretch(1)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, self)
+        bb.rejected.connect(self.reject)
+        bb.accepted.connect(self.accept)
+        row.addWidget(bb)
+        v.addLayout(row)
+
+
 class OasisExportDialog(QDialog):
     """F9 M3: pick layers (raw + Boolean) and an optional GDS-coordinate crop
     region, then export to OASIS. Synthetic layers get an editable output
@@ -4325,6 +4360,11 @@ class OasisExportDialog(QDialog):
             self._crop_edits[lbl] = ed
         v.addLayout(crop_grid)
 
+        v.addSpacing(8)
+        self._debug_cb = QCheckBox(
+            "Debug: re-read the written file and append a diagnostic report")
+        v.addWidget(self._debug_cb)
+
         bb = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
             self)
@@ -4365,6 +4405,9 @@ class OasisExportDialog(QDialog):
 
     def crop_bbox(self):
         return self._crop
+
+    def debug_enabled(self) -> bool:
+        return self._debug_cb.isChecked()
 
 
 class AlignmentExportDialog(QDialog):
@@ -4940,6 +4983,12 @@ class MainWindow(QMainWindow):
         open_action.setShortcut("Ctrl+O")
         open_action.triggered.connect(self._on_open_roi)
         menu.addAction(open_action)
+        menu.addSeparator()
+        # F10: developer-only OASIS diagnostics. Hidden unless dev mode is on.
+        self._diagnose_action = QAction("&Diagnose OASIS file…", self)
+        self._diagnose_action.triggered.connect(self._on_diagnose_oasis)
+        self._diagnose_action.setVisible(self._dev_mode)
+        menu.addAction(self._diagnose_action)
         menu.addSeparator()
         quit_action = QAction("&Quit", self)
         quit_action.setShortcut("Ctrl+Q")
@@ -5856,7 +5905,31 @@ class MainWindow(QMainWindow):
                       flush=True)
 
     def _on_roi_failed(self, msg: str) -> None:
-        QMessageBox.critical(self, "ROI load failed", msg)
+        self._show_load_error("ROI load failed", msg)
+
+    def _show_load_error(self, title: str, detail: str) -> None:
+        """F10: in developer mode, show a copyable report (the error plus an
+        automatic structural scan of the offending file) and drop a
+        ``.debug.txt`` sidecar; otherwise a plain critical box."""
+        if not self._dev_mode:
+            QMessageBox.critical(self, title, detail)
+            return
+        path = getattr(self, "_roi_load_path", None)
+        parts = [f"=== {title} ===", "", detail]
+        if path:
+            try:
+                parts += ["", "--- automatic file diagnosis ---",
+                          oasis_debug.report_file(path)]
+            except Exception as exc:  # noqa: BLE001
+                parts += ["", f"(diagnosis scan failed: {exc})"]
+        text = "\n".join(parts)
+        sidecar = (path + ".debug.txt") if path else None
+        if sidecar:
+            try:
+                Path(sidecar).write_text(text, encoding="utf-8")
+            except OSError:
+                sidecar = None
+        DebugReportDialog(self, title, text, saved_path=sidecar).exec()
 
     def _on_roi_cancelled(self) -> None:
         self._status_doc.setText("ROI load cancelled")
@@ -5884,6 +5957,7 @@ class MainWindow(QMainWindow):
             "OASIS files (*.oas *.oasis);;All files (*)")
         if not path:
             return
+        self._roi_load_path = path   # F10: remembered for debug-mode diagnostics
         # Scan the file for available layers and let the user multi-select
         # (same flow the old full-load entry used), instead of typing
         # layer/datatype pairs by hand.
@@ -5904,7 +5978,7 @@ class MainWindow(QMainWindow):
                 bbox_layer=oasis_random.DEFAULT_BBOX_LAYER)
         except Exception as exc:
             QApplication.restoreOverrideCursor()
-            QMessageBox.critical(self, "ROI open failed", str(exc))
+            self._show_load_error("ROI open failed", str(exc))
             return
         QApplication.restoreOverrideCursor()
         if not rar.has_offsets():
@@ -6221,9 +6295,10 @@ class MainWindow(QMainWindow):
         if not path.lower().endswith(".oas"):
             path += ".oas"
         try:
-            n = layout_export.export_layers(
+            n, report = layout_export.export_layers(
                 path, layers, crop_bbox=dlg.crop_bbox(),
-                unit=1000.0, cellname=self._doc.top_cell_name or "TOP")
+                unit=1000.0, cellname=self._doc.top_cell_name or "TOP",
+                debug=dlg.debug_enabled())
         except Exception as exc:
             QMessageBox.critical(self, "OASIS export failed", str(exc))
             return
@@ -6234,6 +6309,14 @@ class MainWindow(QMainWindow):
             return
         self._status_doc.setText(
             f"OASIS exported · {Path(path).name} ({n} layer{'s' if n != 1 else ''})")
+        if report is not None:
+            sidecar = path + ".debug.txt"
+            try:
+                Path(sidecar).write_text(report, encoding="utf-8")
+            except OSError:
+                sidecar = None
+            DebugReportDialog(self, "OASIS export — debug report",
+                              report, saved_path=sidecar).exec()
 
     def _save_expr_sidecar(self, npz_path: str) -> None:
         """Write expression-layer recipes next to the cache as
@@ -6345,6 +6428,30 @@ class MainWindow(QMainWindow):
         btn = getattr(self, "_export_oasis_btn", None)
         if btn is not None:
             btn.setVisible(self._dev_mode)
+        act = getattr(self, "_diagnose_action", None)
+        if act is not None:
+            act.setVisible(self._dev_mode)
+
+    def _on_diagnose_oasis(self) -> None:
+        """F10: scan a chosen .oas and show a copyable diagnostic report
+        (record histogram, per-layer counts, decode error context)."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Diagnose OASIS file", "",
+            "OASIS files (*.oas *.oasis);;All files (*)")
+        if not path:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            report = oasis_debug.report_file(path)
+        finally:
+            QApplication.restoreOverrideCursor()
+        sidecar = path + ".debug.txt"
+        try:
+            Path(sidecar).write_text(report, encoding="utf-8")
+        except OSError:
+            sidecar = None
+        DebugReportDialog(self, "OASIS diagnostics", report,
+                          saved_path=sidecar).exec()
 
     def _show_about(self) -> None:
         dlg = QDialog(self)

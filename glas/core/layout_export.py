@@ -97,10 +97,17 @@ def clip_layers(layers: Iterable,
 
 
 def export_layers(path: Union[str, Path], layers: Iterable,
-                   *, crop_bbox: Optional[Bbox] = None,
-                   unit: float = 1000.0, cellname: str = "TOP") -> int:
+                  *, crop_bbox: Optional[Bbox] = None,
+                  unit: float = 1000.0, cellname: str = "TOP",
+                  debug: bool = False) -> tuple[int, Optional[str]]:
     """Clip ``layers`` to ``crop_bbox`` (or whole when ``None``) and write
-    OASIS. Returns the number of non-empty layers written."""
+    OASIS. Returns ``(layers_written, report)`` where ``report`` is a
+    diagnostic string when ``debug`` is set (re-reads the written file and
+    cross-checks geometry counts), else ``None``."""
     clipped = clip_layers(layers, crop_bbox)
     oasis_writer.write_oasis(path, clipped, unit=unit, cellname=cellname)
-    return len(clipped)
+    report = None
+    if debug:
+        import oasis_debug
+        report = oasis_debug.report_file(path, sent_layers=clipped)
+    return len(clipped), report

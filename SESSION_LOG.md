@@ -2,6 +2,38 @@
 
 ---
 
+## [2026-05-26] [F10] OASIS debug mode：載入/匯出雙向診斷（可複製報告 + sidecar）
+
+**變更類型：** 功能（新增 core 模組 + app UI）
+
+**動機：** user 反映開發 OASIS streamer 時 parse 常出錯、F9 又加了 writer；手上尚無 production .oas，
+希望先備 debug mode，拿到資料一出錯就能第一時間貼回診斷。Q&A 收斂：**兩端都要**（載入+匯出）、
+**兩種輸出都要**（sidecar .debug.txt + app 內可複製對話框）。
+
+**實作：**
+- **`glas/core/oasis_debug.py`（新，Qt-free）**：`report_file(path, sent_layers=None, max_records)`——走
+  `oasis_streamer` 統計 record histogram / per-layer rect+poly / START unit+offset_flag / cell names；
+  **永不拋例外**，decode 出錯把 streamer 的 hex-context（`OasisFormatError` 內建）+ traceback 收進報告；
+  給 `sent_layers` 時做送出 vs 讀回 round-trip 比對（OK/MISMATCH）。
+- **`layout_export.export_layers`**：加 `debug` 參數，回傳改 `(layers_written, report|None)`，debug 時回讀
+  寫出檔產報告。
+- **app**：`DebugReportDialog`（唯讀 monospace + Copy to clipboard + Saved-to）；`OasisExportDialog` 加
+  Debug checkbox；`_on_export_oasis` 取報告→落 `<檔>.oas.debug.txt`+顯示；File 選單 dev-only
+  「Diagnose OASIS file…」(`_on_diagnose_oasis`)；載入失敗（`_on_open_roi` except、`_on_roi_failed`）
+  在 dev mode 經 `_show_load_error` 自動對該檔跑 `report_file`→sidecar+可複製框（非 dev 維持 critical box）。
+  載入路徑記 `self._roi_load_path` 供診斷。
+
+**測試：** `tests/test_oasis_debug.py`（well-formed/round-trip/truncated 捕捉/缺檔）；`test_layout_export.py`
+更新 `(n, report)` 回傳 + debug 報告測試。`py_compile` 全過（沙箱無 numpy/PyQt6 → pytest/GUI 待本地）。
+
+**不動（§7 不變式）：** 純新增診斷，未改 OASIS decode / 座標換算 / 對位 / CE early-stop。
+
+**影響檔案：** `glas/core/oasis_debug.py`（新）、`glas/core/layout_export.py`、`glas/app/gds_align_tool.py`、
+`tests/test_oasis_debug.py`（新）、`tests/test_layout_export.py`、`docs/plans/F10-debug-mode.md`（新）、
+`README.md`、`CLAUDE.md`、`SESSION_LOG.md`。
+
+**Branch：** `claude/adoring-cannon-oKZKo`（PR #7）
+
 ## [2026-05-26] [F9] M2/M3/M5/M6 實作：ROI 裁剪 + app 匯出對話框 + 開發者模式 + 文件
 
 **變更類型：** 功能（新增 core 模組 + app UI + 文件）

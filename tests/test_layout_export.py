@@ -107,14 +107,24 @@ def test_clip_layers_drops_empty():
 
 def test_export_whole_roundtrip(tmp_path):
     p = tmp_path / "whole.oas"
-    n = lx.export_layers(p, [(17, 0, [_square(0, 0, 40, 30)])], unit=1000)
-    assert n == 1
+    n, report = lx.export_layers(p, [(17, 0, [_square(0, 0, 40, 30)])], unit=1000)
+    assert n == 1 and report is None
     assert _read_rect_bboxes(p) == [(0, 0, 40, 30)]
 
 
 def test_export_cropped_roundtrip(tmp_path):
     p = tmp_path / "crop.oas"
-    n = lx.export_layers(p, [(17, 0, [_square(0, 0, 100, 100)])],
-                         crop_bbox=(20, 20, 60, 60), unit=1000)
+    n, _ = lx.export_layers(p, [(17, 0, [_square(0, 0, 100, 100)])],
+                            crop_bbox=(20, 20, 60, 60), unit=1000)
     assert n == 1
     assert _read_rect_bboxes(p) == [(20, 20, 60, 60)]
+
+
+def test_export_debug_report(tmp_path):
+    p = tmp_path / "dbg.oas"
+    n, report = lx.export_layers(
+        p, [(17, 0, [_square(0, 0, 40, 30)])], unit=1000, debug=True)
+    assert n == 1
+    assert report is not None
+    assert "round-trip check" in report
+    assert "OK" in report
