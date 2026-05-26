@@ -2,6 +2,32 @@
 
 ---
 
+## [2026-05-26] [F9] 規劃：Layout 匯出（Boolean 合成 layer 反向寫出成 layout 檔）（待核准）
+
+**變更類型：** 文件（plan，尚未動工）
+
+**動機現象：** user 提出應用可擴充性，想做「GDS 匯出」。探索後確認 GLAS 幾何資料流目前「只進不出」——
+OASIS reader → numpy/shapely → rasterize 成 mask → 只匯出 alignment offset（CSV/JSON），無任何 layout
+writer。使用者投入合成的 Boolean layer（L0）無法存檔、無法丟回 KLayout、無法給下游工具當 ROI 來源。
+
+**內容：** 用 AskUserQuestion 收斂三岔路——(1) 匯出對象主要為 **Boolean 合成 layer L0**（+ 允許選原始
+layer）、(2) 格式 user 要求「評估一下」、(3) 走到先產 plan 再核准。探索 `gds_boolean`（evaluate→shapely
+geom）、`oasis_store`/`oasis_streamer`（unit/grid、1 DBU≈1 nm）、`oasis_random`/`gds_fov`（root nm 座標）、
+app 端 layer entry `.polygons` + synthetic `expr_text` + 既有 `_on_export_alignment`/`_on_export_cache`
+接點後，產出 `docs/plans/F9-layout-export.md`（4 milestone：M1 Qt-free GDSII writer、M2 app 匯出動作、
+M3 下游/對齊語意定案+文件、M4 測試收尾）。
+
+**格式評估結論：建議先做 GDSII（非 user 初始講的 .OAS）**——目標「KLayout 能開 + 下游能接」GDSII 100%
+達成，而自寫 OASIS writer 複雜度/正確性風險高一個量級（專案只寫過 reader），且 L0/ROI 小幾何用不到 OASIS
+緊湊優勢。writer 介面設計成格式後端可分離，日後要加 OASIS 不需重寫上層。**此項與 O1（對齊後 layout 語意）
+留待 user 核准時定案。**
+
+**測試：** 無（純文件）。
+
+**影響檔案：** `docs/plans/F9-layout-export.md`（新）、`CLAUDE.md`（§8 註冊 [F9]）、`SESSION_LOG.md`。
+
+**Branch：** `claude/adoring-cannon-oKZKo`
+
 ## [2026-05-26] F5/F6/F7/F8 收尾 + F8 全程（規劃→實作→修測試→驗收→收尾）
 
 **變更類型：** 收尾(F5) + 測試驗收(F6) + 功能/效能(F8) + test fix。本次對話（同日）累積數件，合併記錄。
