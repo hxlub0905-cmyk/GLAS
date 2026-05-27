@@ -2,6 +2,29 @@
 
 ---
 
+## [2026-05-27] [F11] M1：GDS 座標可見性（常駐讀數 + 裁剪框一鍵帶入）
+
+**變更類型：** 功能（UI）
+
+**動機：** user 要 clip 特定區域需知 GDS 座標，但讀數不明顯——既有 `_status_cursor` 只接 GDS 畫布 hover、
+SEM 模式看不到、且被其他訊息蓋掉。
+
+**實作（`gds_align_tool.py`）：** (1) 新增獨立常駐讀數 `self._coord_readout`（粗體、addPermanentWidget），
+與 `_status_cursor`（暫時訊息）分離；`_on_coord(w)` 接受 (x,y) 或 None，顯示 µm + nm。(2) SemViewer 新增
+`cursor_gds = pyqtSignal(object)`，mouseMove emit `_view_to_world`、leaveEvent emit None；GDS 畫布
+`cursor_pos_nm` 經 `_on_cursor`→`_on_coord`、SemViewer `cursor_gds` 直接接 `_on_coord`——**SEM/GDS 兩模式
+都看得到座標**。(3) `OasisExportDialog` 裁剪區加「Use current view / ROI bounds」鈕（`_fill_crop_from_bbox`
+以 doc.bbox_nm 填四格）。
+
+**測試：** `py_compile` 過；GUI 待 user 本地驗收（沙箱無 PyQt6）。
+
+**進度：** F11 M1 done（待驗收）。**未動**：M2 整 chip raw 匯出、M3 整 chip boolean 重算（32GB RAM，
+全域 boolean 對中型 chip 可行、tiled 留後備）、M4 對話框 scope、M5 測試。
+
+**影響檔案：** `glas/app/gds_align_tool.py`、`docs/plans/F11-whole-chip-export.md`、`SESSION_LOG.md`。
+
+**Branch：** `claude/adoring-cannon-oKZKo`（PR #7）
+
 ## [2026-05-27] [F11] 規劃：整顆 chip 匯出 + GDS 座標可見性（待核准）
 
 **變更類型：** 文件（plan，尚未動工）

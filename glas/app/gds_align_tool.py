@@ -2727,6 +2727,7 @@ class SemViewer(QWidget):
     dragged view with drag reset — the invariant Set Offset relies on."""
 
     drag_changed = pyqtSignal()
+    cursor_gds = pyqtSignal(object)   # F11 M1: (x_nm, y_nm) or None
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -2981,6 +2982,7 @@ class SemViewer(QWidget):
 
     def leaveEvent(self, ev) -> None:  # type: ignore[override]
         self._cursor_screen = None
+        self.cursor_gds.emit(None)
         self.update()
 
     def mousePressEvent(self, ev: QMouseEvent) -> None:  # type: ignore[override]
@@ -2997,6 +2999,8 @@ class SemViewer(QWidget):
 
     def mouseMoveEvent(self, ev: QMouseEvent) -> None:  # type: ignore[override]
         self._cursor_screen = ev.position()
+        self.cursor_gds.emit(self._view_to_world(ev.position().x(),
+                                                 ev.position().y()))
         if self._press is None:
             self.update()        # refresh the cursor-coordinate readout
             return
@@ -4363,6 +4367,12 @@ class OasisExportDialog(QDialog):
             self._crop_edits[lbl] = ed
         v.addLayout(crop_grid)
 
+        self._doc_bbox = doc_bbox
+        fill_btn = QPushButton(" Use current view / ROI bounds")
+        fill_btn.setEnabled(bool(doc_bbox))
+        fill_btn.clicked.connect(self._fill_crop_from_bbox)
+        v.addWidget(fill_btn)
+
         v.addSpacing(8)
         self._debug_cb = QCheckBox(
             "Debug: re-read the written file and append a diagnostic report")
@@ -4374,6 +4384,15 @@ class OasisExportDialog(QDialog):
         bb.accepted.connect(self._on_accept)
         bb.rejected.connect(self.reject)
         v.addWidget(bb)
+
+    def _fill_crop_from_bbox(self) -> None:
+        if not self._doc_bbox:
+            return
+        x0, y0, x1, y1 = self._doc_bbox
+        vals = {"x1 (left)": x0, "y1 (bottom)": y0,
+                "x2 (right)": x1, "y2 (top)": y1}
+        for lbl, ed in self._crop_edits.items():
+            ed.setText(f"{vals[lbl]:.0f}")
 
     def _on_accept(self) -> None:
         raw = [ed.text().strip() for ed in self._crop_edits.values()]
@@ -4583,8 +4602,18 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self._status_bar)
         self._status_doc = QLabel("no GDS loaded")
         self._status_cursor = QLabel("")
+        # F11 M1: dedicated, always-visible GDS cursor coordinate readout (both
+        # SEM and GDS panes feed it). Kept separate from _status_cursor so the
+        # coordinate isn't clobbered by transient hints.
+        self._coord_readout = QLabel("GDS: —")
+        self._coord_readout.setStyleSheet(
+            "font-weight: 600; padding: 0 8px; color: #3f3428;")
+        self._coord_readout.setToolTip(
+            "Cursor position in GDS coordinates — type these into the OASIS "
+            "export crop fields (nm).")
         self._status_bar.addWidget(self._status_doc, 1)
-        self._status_bar.addPermanentWidget(self._status_cursor)
+        self._status_bar.addWidget(self._status_cursor)
+        self._status_bar.addPermanentWidget(self._coord_readout)
 
         self._build_menu()
         self._build_shortcuts()
@@ -4597,6 +4626,7 @@ class MainWindow(QMainWindow):
         self.layer_panel.pois_changed.connect(self._on_pois_changed)
         self.canvas.cursor_pos_nm.connect(self._on_cursor)
         self.canvas.defect_clicked.connect(self._on_defect_clicked)
+        self.sem_viewer.cursor_gds.connect(self._on_coord)   # F11 M1
         self.sem_panel.load_klarf_requested.connect(self._on_load_klarf)
         self.sem_panel.load_folder_requested.connect(self._on_load_folder)
         self.sem_panel.load_roi_requested.connect(self._on_load_roi_clicked)
@@ -5006,7 +5036,18 @@ class MainWindow(QMainWindow):
     # ── actions ────────────────────────────────────────────────────────────
 
     def _on_cursor(self, x_nm: float, y_nm: float) -> None:
-        self._status_cursor.setText(f"cursor: {x_nm:,.0f}, {y_nm:,.0f} nm")
+        self._on_coord((x_nm, y_nm))
+
+    def _on_coord(self, w) -> None:
+        """F11 M1: update the dedicated GDS coordinate readout from either
+        pane. ``w`` is an ``(x_nm, y_nm)`` tuple or ``None`` (cursor left)."""
+        if w is None:
+            self._coord_readout.setText("GDS: —")
+            return
+        x_nm, y_nm = w
+        self._coord_readout.setText(
+            f"GDS: {x_nm / 1e3:,.3f}, {y_nm / 1e3:,.3f} µm  "
+            f"({x_nm:,.0f}, {y_nm:,.0f} nm)")
 
     # ── M7-ov: defect map on the GDS overview ────────────────────────────────
     def _refresh_overview_defects(self) -> None:

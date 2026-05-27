@@ -35,14 +35,15 @@ boolean layer 也看得到）。但 user 真正要的是：
 
 ## Milestones
 
-### M1: GDS 座標可見性（快速里程碑，先做）  [status: planned]
+### M1: GDS 座標可見性（快速里程碑，先做）  [status: done, 待本地驗收]
 
-- [ ] 常駐、明顯的 cursor GDS 座標讀數，**SEM 與 GDS 兩模式都可見**：SEM viewer 也 emit GDS 座標
-      （overlay anchor 換算）；主視窗用獨立常駐 widget 顯示，不被其他 status 訊息蓋掉（與 `_status_cursor`
-      的暫時訊息分離）。同時顯示 µm + nm（裁剪框用 nm）。
-- [ ] `OasisExportDialog` 裁剪區加「**帶入目前視窗/ROI 範圍**」鈕 → 自動填四格（doc.bbox_nm 或
-      canvas viewport bbox）。
-- [ ] 驗證：SEM/GDS 移動滑鼠都看得到座標；裁剪框一鍵帶入正確。
+- [x] 常駐、明顯的 cursor GDS 座標讀數：新增 `self._coord_readout`（粗體、addPermanentWidget、獨立於
+      `_status_cursor` 暫時訊息）；SemViewer 新增 `cursor_gds` signal（`_view_to_world` 換算，mouseMove emit、
+      leave emit None），GDS 畫布 `cursor_pos_nm` 與 SemViewer `cursor_gds` 都接到 `_on_coord`。
+      同時顯示 µm + nm。**SEM 與 GDS 兩模式都可見**。
+- [x] `OasisExportDialog` 裁剪區加「**Use current view / ROI bounds**」鈕 → `_fill_crop_from_bbox` 以
+      doc.bbox_nm 填四格（無 doc 時 disabled）。
+- [ ] 驗證：SEM/GDS 移動滑鼠都看得到座標；裁剪框一鍵帶入正確。**待 user 本地 GUI。**
 
 ### M2: 整 chip RAW layer 匯出（worker + 進度）  [status: planned]
 
