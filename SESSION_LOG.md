@@ -2,6 +2,24 @@
 
 ---
 
+## [2026-05-27] [F11] M2 基礎：oasis_random 唯讀 reachable_bbox accessor（chip 全域 bbox）
+
+**變更類型：** 功能（core，§7 敏感區）
+
+**動機：** 整 chip 匯出要切 tile，需先知整 chip 範圍 = `reachable_bbox(root)`。原計算埋在 walk_roi closure。
+user 選「加唯讀 accessor」+「自動分格」。
+
+**實作（`oasis_random.py`）：** 新增 `RandomAccessReader.reachable_bbox(cell_id)`（grid frame）+
+`reachable_bbox_nm`（scale 成 nm），以 `_reachable_bbox` 遞迴**忠實複製** walk_roi 內 closure 邏輯
+（own bbox + 子 cell transform + repetition extent，共用 `self._reach_memo`）。**刻意做成獨立唯讀方法、
+完全不改 walk_roi / CE early-stop 熱路徑**（§7：walk 用完整 load_cell、reachable 用 load_cell_bbox 的分工不變）。
+測試 `TestReachableBbox`（placements 聯集 grid bbox、nm scale、unknown cell→None）。
+
+**影響檔案：** `glas/core/oasis_random.py`、`tests/test_oasis_random.py`、`docs/plans/F11-whole-chip-export.md`、
+`SESSION_LOG.md`。
+
+**Branch：** `claude/adoring-cannon-oKZKo`（PR #7）
+
 ## [2026-05-27] [F11] M2 部分：串流 OASIS writer（OasisStreamWriter）
 
 **變更類型：** 功能（core）

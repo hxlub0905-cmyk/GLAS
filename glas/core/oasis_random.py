@@ -398,6 +398,58 @@ class RandomAccessReader:
         self._bbox_memo[cell_id] = content
         return content
 
+    # ── F11: read-only reachable-bbox accessor (whole-chip extent) ──────────
+    #
+    # Mirrors the reachable_bbox closure inside walk_roi (own + children over
+    # repetition extent, memoized in self._reach_memo) but is a standalone,
+    # geometry-read-only method so it never touches the walk / CE early-stop
+    # hot path (CLAUDE.md §7). Used to size the whole-chip export tile grid.
+    def reachable_bbox(self, cell_id: object, *, cancel_cb=None):
+        """Bbox in the cell's local *grid* frame of all geometry reachable
+        from ``cell_id`` (own + placed children over repetition extent), or
+        ``None`` for an empty / cyclic cell. Shares the walk's ``_reach_memo``
+        cache."""
+        return self._reachable_bbox(cell_id, set(), cancel_cb)
+
+    def _reachable_bbox(self, cid, computing, cancel_cb):
+        if cid in self._reach_memo:
+            return self._reach_memo[cid]
+        if cid in computing:
+            return None
+        if cancel_cb is not None and cancel_cb():
+            raise WalkCancelled()
+        computing.add(cid)
+        content = self.load_cell_bbox(cid)
+        boxes: list = []
+        if content.bbox is not None:
+            boxes.append(content.bbox)
+        for pl in content.placements:
+            T = Transform.from_placement(pl.x, pl.y, pl.angle, pl.flip,
+                                         pl.magnification)
+            if T is None:
+                continue
+            cb = self._reachable_bbox(pl.target, computing, cancel_cb)
+            if cb is None:
+                continue
+            placed = _xform_bbox(T, cb)
+            ex0, ey0, ex1, ey1 = oas.repetition_extent(
+                pl.repetition_type, pl.repetition_raw)
+            boxes.append((placed[0] + ex0, placed[1] + ey0,
+                          placed[2] + ex1, placed[3] + ey1))
+        computing.discard(cid)
+        res = _union_bbox(boxes)
+        self._reach_memo[cid] = res
+        return res
+
+    def reachable_bbox_nm(self, cell_id: object, *, cancel_cb=None):
+        """:meth:`reachable_bbox` scaled to nm (root coordinates), or
+        ``None``. The whole-chip extent for ``root``."""
+        b = self.reachable_bbox(cell_id, cancel_cb=cancel_cb)
+        if b is None:
+            return None
+        s = getattr(self, "_nm_per_grid", 1.0) or 1.0
+        return (b[0] * s, b[1] * s, b[2] * s, b[3] * s)
+
     # ── internal ────────────────────────────────────────────────────────────
     def _decode_bbox_at(self, offset: int) -> CellContent:
         """Decode a cell only far enough to know its placements + own bbox,

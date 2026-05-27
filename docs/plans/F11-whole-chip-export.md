@@ -56,7 +56,11 @@ boolean layer 也看得到）。但 user 真正要的是：
       append → `close()` 寫 256-byte END；context manager）。沙箱驗證輸出與 `serialize_oasis` **byte 一致** +
       reader round-trip；測試 `test_stream_writer_matches_serialize` / `_roundtrips`。現有 `serialize_oasis`
       保留給 FOV 小量匯出。
-- [ ] 整 chip RAW 走訪（需 chip bbox + 分 tile walk_roi）→ 串流寫出。**待：chip-bbox 取得方式 + tile 大小（Q4）。**
+- [ ] 整 chip RAW 走訪（需 chip bbox + 分 tile walk_roi）→ 串流寫出。
+  - [x] chip bbox：`oasis_random` 加唯讀 `reachable_bbox` / `reachable_bbox_nm`（忠實複製 walk_roi closure，
+        **不改 walk/early-stop 熱路徑**，共用 `_reach_memo`）+ 測試 `TestReachableBbox`。
+  - [x] tile 策略：**自動分格**（user 選）——依 chip span 自動切，無使用者旋鈕。
+  - [ ] app worker：分 tile walk_roi → clip_polygons 到 tile → `OasisStreamWriter` 串流寫。
 - [ ] worker + `LoadProgressDialog` + cancel。
 
 ### M3: tiled Boolean 重算 + 匯出  [status: planned]
