@@ -2,6 +2,18 @@
 
 ---
 
+## [2026-05-27] [F11] M5 文件：README / CLAUDE 更新（FOV / 整 chip 匯出範圍）
+
+**變更類型：** 文件
+
+**內容：** README OASIS 匯出條目 + CLAUDE §1 能力 5 補「範圍可選目前 FOV（含裁剪）或整顆 chip（tile 串流 +
+全 chip 重算 boolean）」；§4 oasis_writer/layout_export 描述補 F11 串流 writer / tile_grid。F11 plan M5 勾選。
+**剩餘待 user 本地**：`pytest` 綠 + 整 chip 端到端（worker/GUI/真實檔 KLayout 比對）+ OOM/效能實測。
+
+**影響檔案：** `README.md`、`CLAUDE.md`、`docs/plans/F11-whole-chip-export.md`、`SESSION_LOG.md`。
+
+**Branch：** `claude/adoring-cannon-oKZKo`（PR #7）
+
 ## [2026-05-27] [F11] M2/M3/M4：整顆 chip 匯出（tiled raw + boolean 重算 + 串流 + dialog scope）
 
 **變更類型：** 功能（core + app）

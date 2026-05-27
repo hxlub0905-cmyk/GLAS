@@ -18,8 +18,9 @@
    即時合成 layer，輸出 shapely polygon + uint8 mask。
 4. **SEM↔GDS overlay 對位** — 手動拖動 + `cv2.matchTemplate` 自動 fine-align，
    匯出 per-image alignment offset（CSV / JSON）。
-5. **OASIS 匯出**（F9，開發者模式）— 自寫 OASIS writer（`oasis_streamer` decode 的逆），把選定
-   raw / Boolean layer 反向寫出 `.oas`（KLayout 可開），可選 GDS 座標框裁剪 ROI。
+5. **OASIS 匯出**（F9/F11，開發者模式）— 自寫 OASIS writer（`oasis_streamer` decode 的逆），把選定
+   raw / Boolean layer 反向寫出 `.oas`（KLayout 可開）。範圍可選目前 FOV（含 GDS 座標框裁剪 ROI）或
+   整顆 chip（分 tile 串流 + 全 chip 重算 Boolean，記憶體受單 tile 控制）。
 
 - **語言/框架**：Python 3.9+、PyQt6 6.5+
 - **科學計算**：NumPy 1.24+、OpenCV 4.8+、shapely 2.0+
@@ -83,8 +84,8 @@ GLAS/
 ├── glas/
 │   ├── core/                # ⚙️ 無 Qt 引擎（純運算，可被任何專案複用）
 │   │   ├── oasis_streamer.py    # OASIS byte-stream decoder（record 0–34 + CBLOCK + repetition）
-│   │   ├── oasis_writer.py      # OASIS writer（F9，decode 的逆；RECTANGLE/POLYGON，純 stdlib）
-│   │   ├── layout_export.py     # F9 ROI 裁剪 + shapely→rings + 呼叫 writer（shapely）
+│   │   ├── oasis_writer.py      # OASIS writer（F9，decode 的逆；RECTANGLE/POLYGON + F11 串流 writer，純 stdlib）
+│   │   ├── layout_export.py     # F9 ROI 裁剪 + shapely→rings + F11 tile_grid（shapely）
 │   │   ├── oasis_debug.py       # F10 診斷報告（record histogram / round-trip / 錯誤上下文）
 │   │   ├── oasis_store.py       # per-cell / per-layer geometry storage（chunked ndarray）
 │   │   ├── oasis_walker.py      # cell-graph walker + transform 展開 → root 座標

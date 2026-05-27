@@ -86,10 +86,13 @@ boolean layer 也看得到）。但 user 真正要的是：
 - [ ] 整 chip 模式走 M2/M3 的 worker 流程；FOV 模式維持 F9 既有路徑。
 - [ ] Debug 報告 / sidecar 沿用 F10。
 
-### M5: 測試 + 文件  [status: planned]
+### M5: 測試 + 文件  [status: in progress]
 
-- [ ] core 全 chip 遍歷 + 整 chip boolean 重算的單元測試（小型合成 OASIS）。
-- [ ] `py_compile` + `pytest`；README/CLAUDE 更新。
+- [x] core 單元測試：`tile_grid`（layout_export）、`reachable_bbox`（oasis_random `TestReachableBbox`）、
+      串流 writer（oasis_writer）。
+- [x] README / CLAUDE §1·§4 更新（FOV / 整 chip 範圍）。
+- [ ] `pytest` 綠 + 整 chip 端到端（worker/GUI/真實檔）→ **待 user 本地**（沙箱無 numpy/shapely/PyQt6）。
+- [ ] OOM/效能實測（大檔、32GB）→ 待 user；不足時調 `target_nm`（tile 大小）。
 
 ---
 
