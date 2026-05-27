@@ -2,6 +2,33 @@
 
 ---
 
+## [2026-05-27] [F11] M2/M3/M4：整顆 chip 匯出（tiled raw + boolean 重算 + 串流 + dialog scope）
+
+**變更類型：** 功能（core + app）
+
+**實作：**
+- **`layout_export.tile_grid(bbox, target=250µm, max 64/axis)`**：依 chip span 自動分格（user 選自動），
+  覆蓋到角落、相鄰無縫。+ 測試（single/covers-exactly/degenerate）。
+- **`WholeChipExportWorker`（app，QThread）**：分 tile 走訪——raw layer `walk_roi(tile)` → `clip_polygons`
+  到 tile → `OasisStreamWriter` 串流寫；boolean 以 haloed tile（外擴 `_whole_chip_halo_nm` = 最大
+  morph 距離 +1µm）建 tile-scoped `raw_provider`（per layer walk haloed 區 + cache）呼叫
+  `gds_boolean.resolve_expression(fov_bbox=haloed)`，結果 clip 回 tile 串流寫。一次只持有一 tile 的
+  shapely 物件 → 峰值受 tile 控制（解 OOM 顧慮）。`_walk_res_to_polys` helper（rects→4點 + polys）。
+- **`OasisExportDialog`**：加 scope 下拉（Current FOV / Whole chip，whole 僅 rar+root 在時出現）；whole 停用
+  裁剪欄位；`selected_specs()` 回 (entry, out_l, out_d) 供 worker 還原來源（raw 用 key、synthetic 用 expr/bindings）。
+- **`_on_export_oasis` 分流** + `_start_whole_chip_export` worker 啟動（LoadProgressDialog per-tile 進度 +
+  cancel + finished/failed/cancelled handler + cleanup；debug 完成後對輸出跑 `report_file`）。`import re` 新增。
+
+**測試：** `py_compile` 全過；core tile_grid 有單元測試。**沙箱無 numpy/shapely/PyQt6 → worker/GUI 與真實
+整 chip 匯出待 user 本地驗收**（含 KLayout 與原檔比對、OOM/效能實測）。
+
+**不動（§7）：** reachable_bbox 為獨立唯讀方法、未改 walk_roi/early-stop。
+
+**影響檔案：** `glas/core/layout_export.py`、`glas/app/gds_align_tool.py`、`tests/test_layout_export.py`、
+`docs/plans/F11-whole-chip-export.md`、`SESSION_LOG.md`。
+
+**Branch：** `claude/adoring-cannon-oKZKo`（PR #7）
+
 ## [2026-05-27] [F11] M2 基礎：oasis_random 唯讀 reachable_bbox accessor（chip 全域 bbox）
 
 **變更類型：** 功能（core，§7 敏感區）

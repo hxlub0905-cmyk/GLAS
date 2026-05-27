@@ -120,6 +120,23 @@ def test_export_cropped_roundtrip(tmp_path):
     assert _read_rect_bboxes(p) == [(20, 20, 60, 60)]
 
 
+def test_tile_grid_single_when_small():
+    assert lx.tile_grid((0, 0, 1000, 1000), 250000) == [(0, 0, 1000, 1000)]
+
+
+def test_tile_grid_covers_exactly():
+    tiles = lx.tile_grid((0, 0, 600000, 300000), 250000)
+    assert len(tiles) == 6                      # 3 x 2
+    assert tiles[0][:2] == (0, 0)
+    assert tiles[-1][2:] == (600000, 300000)    # reaches the far corner
+    # tiles partition the bbox with no gap at the shared edges
+    assert tiles[0][2] == tiles[1][0]
+
+
+def test_tile_grid_degenerate_bbox():
+    assert lx.tile_grid((0, 0, 0, 0)) == [(0, 0, 0, 0)]
+
+
 def test_export_debug_report(tmp_path):
     p = tmp_path / "dbg.oas"
     n, report = lx.export_layers(

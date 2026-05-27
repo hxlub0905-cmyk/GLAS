@@ -56,22 +56,29 @@ boolean layer 也看得到）。但 user 真正要的是：
       append → `close()` 寫 256-byte END；context manager）。沙箱驗證輸出與 `serialize_oasis` **byte 一致** +
       reader round-trip；測試 `test_stream_writer_matches_serialize` / `_roundtrips`。現有 `serialize_oasis`
       保留給 FOV 小量匯出。
-- [ ] 整 chip RAW 走訪（需 chip bbox + 分 tile walk_roi）→ 串流寫出。
+- [x] 整 chip RAW 走訪：
   - [x] chip bbox：`oasis_random` 加唯讀 `reachable_bbox` / `reachable_bbox_nm`（忠實複製 walk_roi closure，
         **不改 walk/early-stop 熱路徑**，共用 `_reach_memo`）+ 測試 `TestReachableBbox`。
-  - [x] tile 策略：**自動分格**（user 選）——依 chip span 自動切，無使用者旋鈕。
-  - [ ] app worker：分 tile walk_roi → clip_polygons 到 tile → `OasisStreamWriter` 串流寫。
-- [ ] worker + `LoadProgressDialog` + cancel。
+  - [x] tile 策略：**自動分格** `layout_export.tile_grid(bbox, target=250µm)`（依 span 自動切、max 64/axis）+ 測試。
+  - [x] `WholeChipExportWorker`：分 tile `walk_roi` → `clip_polygons` 到 tile → `OasisStreamWriter` 串流寫。
+- [x] worker + `LoadProgressDialog`（per-tile 進度）+ cancel。
+- [ ] 驗證：整 chip raw → KLayout 與原檔同區比對一致。**待 user 本地。**
 
-### M3: tiled Boolean 重算 + 匯出  [status: planned]
+### M3: tiled Boolean 重算 + 匯出  [status: done, 待本地驗收]
 
-- [ ] 把 chip bbox 切成 grid tiles；每 tile：
-  - 載入 **haloed bbox**（tile 外擴 margin ≥ 運算式最大 morph 距離；含跨界完整多邊形）的 bound 幾何；
-  - 以 `fov = haloed bbox` 重算 recipes（沿用 `_eval_expression`，morph bbox 用 haloed）；
-  - 結果 **clip 回 tile 精確邊界** → 串流寫出（相鄰 tile 無縫、不重疊；跨界圖形切成相鄰塊，幾何正確）。
-- [ ] 一次只持有一個 tile 的 shapely 物件 → 峰值受 tile 大小控制。
-- [ ] tile 大小：可設定，預設依記憶體預算自動（見 Q4）；halo 由運算式 morph 距離推導 + 最小值。
-- [ ] worker + 進度（per-tile）+ cancel。驗證：tiled 結果與單塊小範圍 global 結果一致（無邊界假影）。
+- [x] `WholeChipExportWorker._export_recipes_for_tile`：每 tile 以 **haloed bbox**（外擴 `halo_nm`）建
+      tile-scoped `raw_provider`（per (layer,dt) walk_roi haloed 區、cache），呼叫
+      `gds_boolean.resolve_expression(..., fov_bbox=haloed)` 重算 recipe，結果 `clip_polygons` 回 tile 串流寫。
+- [x] halo `_whole_chip_halo_nm`：掃 recipe 運算式最大 `[<>][WH]:n` morph 距離 + 1µm margin。
+- [x] 一次只持有一 tile 的 shapely 物件 → 峰值受 tile 大小控制。
+- [ ] 驗證：tiled 結果與小範圍 FOV 結果一致（無邊界假影）；KLayout 比對。**待 user 本地。**
+
+### M4: 匯出對話框 scope 選項 + 接線  [status: done, 待本地驗收]
+
+- [x] `OasisExportDialog` 加 scope 下拉（Current FOV / Whole chip；whole 僅在 rar+root 在時出現）；
+      whole 模式停用裁剪欄位；`selected_specs()` 回 (entry, out_l, out_d) 供 worker 還原來源。
+- [x] `_on_export_oasis` 依 scope 分流：FOV 走 F9 既有路徑、whole 走 `_start_whole_chip_export` worker
+      （進度 + cancel + 完成/失敗/取消 handler + cleanup）；debug 完成後對輸出檔跑 `report_file`。
 
 ### M4: 匯出對話框 scope 選項 + 接線  [status: planned]
 

@@ -51,6 +51,7 @@ import csv
 import json
 import multiprocessing as mp
 import os
+import re
 import sys
 import threading
 import traceback
@@ -1118,6 +1119,101 @@ class RoiWalkWorker(QObject):
             self.failed.emit(str(exc))
         else:
             self.finished.emit(doc, per_layer)
+
+
+def _walk_res_to_polys(res) -> list:
+    """walk_roi result dict -> flat list of (N,2) float64 polygon rings
+    (rectangles expanded to 4-point rings). Mirrors _roi_entry."""
+    polys: list = []
+    for x1, y1, x2, y2 in res["rects"].tolist():
+        polys.append(np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+                              dtype=np.float64))
+    for p in res["polys"]:
+        polys.append(np.asarray(p, dtype=np.float64))
+    return polys
+
+
+class WholeChipExportWorker(QObject):
+    """F11 M2/M3: export the whole chip to OASIS, tiled + streamed so peak
+    memory is bounded by one tile. Per tile: walk selected raw layers and
+    clip to the tile; recompute each Boolean recipe over a haloed tile
+    (halo ≥ max morph reach so grown geometry from neighbours is included)
+    and clip the result back to the exact tile. Reads only."""
+
+    progress = pyqtSignal(int, int)     # (tiles done, total)
+    finished = pyqtSignal(int)          # total tiles written
+    failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    def __init__(self, *, rar, root, path, unit, cellname, chip_bbox,
+                 raw_specs, recipe_specs, recipe_def, target_nm, halo_nm) -> None:
+        super().__init__()
+        self._rar = rar
+        self._root = root
+        self._path = path
+        self._unit = unit
+        self._cellname = cellname
+        self._chip_bbox = chip_bbox
+        self._raw_specs = raw_specs        # [(out_l, out_d, src_l, src_d)]
+        self._recipe_specs = recipe_specs  # [(out_l, out_d, expr, bindings)]
+        self._recipe_def = recipe_def
+        self._target_nm = target_nm
+        self._halo_nm = halo_nm
+        self._cancel = False
+
+    def cancel(self) -> None:
+        self._cancel = True
+
+    def run(self) -> None:
+        cc = lambda: self._cancel          # noqa: E731
+        try:
+            tiles = layout_export.tile_grid(self._chip_bbox, self._target_nm)
+            total = len(tiles)
+            with oasis_writer.OasisStreamWriter(
+                    self._path, unit=self._unit, cellname=self._cellname) as w:
+                for i, tile in enumerate(tiles):
+                    if self._cancel:
+                        raise oasis_random.WalkCancelled()
+                    for out_l, out_d, src_l, src_d in self._raw_specs:
+                        res = oasis_random.walk_roi(
+                            self._rar, self._root, tile, src_l, src_d,
+                            cancel_cb=cc)
+                        rings = layout_export.clip_polygons(
+                            _walk_res_to_polys(res), tile)
+                        w.add_polygons(out_l, out_d, rings)
+                    if self._recipe_specs:
+                        self._export_recipes_for_tile(w, tile, cc)
+                    self.progress.emit(i + 1, total)
+            self.finished.emit(total)
+        except oasis_random.WalkCancelled:
+            self.cancelled.emit()
+        except Exception as exc:                       # noqa: BLE001
+            self.failed.emit(f"{exc}\n\n{traceback.format_exc()}")
+
+    def _export_recipes_for_tile(self, w, tile, cc) -> None:
+        m = self._halo_nm
+        hx0, hy0, hx1, hy1 = tile[0] - m, tile[1] - m, tile[2] + m, tile[3] + m
+        cache: dict = {}
+
+        def raw_provider(layer: int, datatype: int):
+            key = (layer, datatype)
+            if key not in cache:
+                res = oasis_random.walk_roi(self._rar, self._root,
+                                            (hx0, hy0, hx1, hy1),
+                                            layer, datatype, cancel_cb=cc)
+                cache[key] = gds_boolean.polys_to_geometry(
+                    _walk_res_to_polys(res))
+            return cache[key]
+
+        fov_box = gds_boolean.fov_box((hx0 + hx1) / 2.0, (hy0 + hy1) / 2.0,
+                                      hx1 - hx0, hy1 - hy0)
+        for out_l, out_d, expr, bindings in self._recipe_specs:
+            geom = gds_boolean.resolve_expression(
+                expr, bindings, raw_provider=raw_provider,
+                recipe_provider=self._recipe_def, fov_bbox=fov_box)
+            rings = layout_export.clip_polygons(
+                gds_boolean.geometry_to_polygons(geom), tile)
+            w.add_polygons(out_l, out_d, rings)
 
 
 def _auto_batch_workers() -> int:
@@ -4312,15 +4408,27 @@ class OasisExportDialog(QDialog):
     region, then export to OASIS. Synthetic layers get an editable output
     layer/datatype (their internal layer is -1, not writable to OASIS)."""
 
-    def __init__(self, parent, entries, doc_bbox) -> None:
+    def __init__(self, parent, entries, doc_bbox,
+                 whole_chip_available: bool = False) -> None:
         super().__init__(parent)
         self.setWindowTitle("Export OASIS")
         self.setMinimumWidth(_capped_min_width(420))
         self._rows: list[tuple] = []
         self._crop: Optional[tuple] = None
         self._sel: list[tuple] = []
+        self._specs: list[tuple] = []
 
         v = QVBoxLayout(self)
+
+        v.addWidget(QLabel("Export scope"))
+        self._scope = QComboBox()
+        self._scope.addItem("Current FOV (loaded geometry)", "fov")
+        if whole_chip_available:
+            self._scope.addItem("Whole chip (re-walk + recompute, tiled)", "whole")
+        self._scope.currentIndexChanged.connect(self._on_scope_changed)
+        v.addWidget(self._scope)
+        v.addSpacing(8)
+
         v.addWidget(QLabel("Layers to export"))
 
         grid = QGridLayout()
@@ -4353,7 +4461,9 @@ class OasisExportDialog(QDialog):
         v.addLayout(grid)
 
         v.addSpacing(10)
-        v.addWidget(QLabel("Crop region (GDS nm) — leave all blank to export whole layout"))
+        self._crop_label = QLabel(
+            "Crop region (GDS nm) — leave all blank to export whole layout")
+        v.addWidget(self._crop_label)
         crop_grid = QGridLayout()
         self._crop_edits = {}
         x0, y0, x1, y1 = doc_bbox if doc_bbox else (0, 0, 0, 0)
@@ -4368,10 +4478,10 @@ class OasisExportDialog(QDialog):
         v.addLayout(crop_grid)
 
         self._doc_bbox = doc_bbox
-        fill_btn = QPushButton(" Use current view / ROI bounds")
-        fill_btn.setEnabled(bool(doc_bbox))
-        fill_btn.clicked.connect(self._fill_crop_from_bbox)
-        v.addWidget(fill_btn)
+        self._fill_btn = QPushButton(" Use current view / ROI bounds")
+        self._fill_btn.setEnabled(bool(doc_bbox))
+        self._fill_btn.clicked.connect(self._fill_crop_from_bbox)
+        v.addWidget(self._fill_btn)
 
         v.addSpacing(8)
         self._debug_cb = QCheckBox(
@@ -4394,36 +4504,59 @@ class OasisExportDialog(QDialog):
         for lbl, ed in self._crop_edits.items():
             ed.setText(f"{vals[lbl]:.0f}")
 
-    def _on_accept(self) -> None:
-        raw = [ed.text().strip() for ed in self._crop_edits.values()]
-        filled = [t for t in raw if t]
-        if filled and len(filled) != 4:
-            QMessageBox.warning(
-                self, "Incomplete crop region",
-                "Enter all four coordinates, or leave all blank to export the "
-                "whole layout.")
-            return
-        if filled:
-            try:
-                x1, y1, x2, y2 = (float(t) for t in raw)
-            except ValueError:
-                QMessageBox.warning(self, "Invalid crop region",
-                                    "Coordinates must be numbers.")
-                return
-            if x1 == x2 or y1 == y2:
-                QMessageBox.warning(self, "Invalid crop region",
-                                    "The region has zero width or height.")
-                return
-            self._crop = (x1, y1, x2, y2)
-        else:
-            self._crop = None
+    def _on_scope_changed(self) -> None:
+        # Whole-chip ignores the crop region (it covers the entire chip).
+        whole = self.scope() == "whole"
+        self._crop_label.setEnabled(not whole)
+        self._fill_btn.setEnabled(not whole and bool(self._doc_bbox))
+        for ed in self._crop_edits.values():
+            ed.setEnabled(not whole)
 
-        self._sel = [(ls.value(), ds.value(), list(e.polygons))
-                     for e, cb, ls, ds in self._rows if cb.isChecked()]
+    def _on_accept(self) -> None:
+        if self.scope() == "fov":
+            raw = [ed.text().strip() for ed in self._crop_edits.values()]
+            filled = [t for t in raw if t]
+            if filled and len(filled) != 4:
+                QMessageBox.warning(
+                    self, "Incomplete crop region",
+                    "Enter all four coordinates, or leave all blank to export "
+                    "the whole layout.")
+                return
+            if filled:
+                try:
+                    x1, y1, x2, y2 = (float(t) for t in raw)
+                except ValueError:
+                    QMessageBox.warning(self, "Invalid crop region",
+                                        "Coordinates must be numbers.")
+                    return
+                if x1 == x2 or y1 == y2:
+                    QMessageBox.warning(self, "Invalid crop region",
+                                        "The region has zero width or height.")
+                    return
+                self._crop = (x1, y1, x2, y2)
+            else:
+                self._crop = None
+        else:
+            self._crop = None     # whole chip — no crop
+
+        checked = [(e, ls.value(), ds.value())
+                   for e, cb, ls, ds in self._rows if cb.isChecked()]
+        self._specs = checked
+        self._sel = [(out_l, out_d, list(e.polygons))
+                     for e, out_l, out_d in checked]
         self.accept()
 
+    def scope(self) -> str:
+        return self._scope.currentData()
+
     def selected_layers(self) -> list:
+        """(out_layer, out_datatype, polygons) for the FOV path."""
         return self._sel
+
+    def selected_specs(self) -> list:
+        """(LayerEntry, out_layer, out_datatype) — lets the whole-chip path
+        recover each layer's source (raw layer/datatype or recipe)."""
+        return self._specs
 
     def crop_bbox(self):
         return self._crop
@@ -4669,6 +4802,12 @@ class MainWindow(QMainWindow):
         self._roi_thread: Optional[QThread] = None
         self._roi_worker = None
         self._roi_progress = None
+        # F11: whole-chip export worker (set during a running export).
+        self._wc_thread: Optional[QThread] = None
+        self._wc_worker = None
+        self._wc_progress = None
+        self._wc_path = None
+        self._wc_debug = False
         self._roi_progress_timer: Optional[QTimer] = None
         self._roi_center: Optional[tuple[float, float]] = None
         # Color cycle for synthetic expression layers.
@@ -6324,11 +6463,12 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Nothing to export",
                                     "Load a layout first.")
             return
-        dlg = OasisExportDialog(self, self._doc.entries, self._doc.bbox_nm)
+        whole_ok = self._rar is not None and self._roi_root is not None
+        dlg = OasisExportDialog(self, self._doc.entries, self._doc.bbox_nm,
+                                whole_chip_available=whole_ok)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        layers = dlg.selected_layers()
-        if not layers:
+        if not dlg.selected_specs():
             QMessageBox.information(self, "Nothing selected",
                                     "Select at least one layer to export.")
             return
@@ -6338,6 +6478,11 @@ class MainWindow(QMainWindow):
             return
         if not path.lower().endswith(".oas"):
             path += ".oas"
+        if dlg.scope() == "whole":
+            self._start_whole_chip_export(path, dlg.selected_specs(),
+                                          dlg.debug_enabled())
+            return
+        layers = dlg.selected_layers()
         try:
             n, report = layout_export.export_layers(
                 path, layers, crop_bbox=dlg.crop_bbox(),
@@ -6361,6 +6506,96 @@ class MainWindow(QMainWindow):
                 sidecar = None
             DebugReportDialog(self, "OASIS export — debug report",
                               report, saved_path=sidecar).exec()
+
+    @staticmethod
+    def _whole_chip_halo_nm(exprs: list) -> float:
+        """Tile halo (nm) = the largest morph distance in any recipe (so a
+        grown shape from a neighbouring tile is included) plus a margin."""
+        biggest = 0
+        for e in exprs:
+            for m in re.finditer(r"[<>]\s*[WHwh]\s*:\s*(\d+)", e or ""):
+                biggest = max(biggest, int(m.group(1)))
+        return biggest + 1000.0      # +1 µm margin
+
+    def _start_whole_chip_export(self, path, specs, debug: bool) -> None:
+        """F11 M2/M3: launch the tiled whole-chip export worker."""
+        if self._roi_thread is not None or getattr(self, "_wc_thread", None):
+            QMessageBox.information(self, "Busy", "A load/export is running.")
+            return
+        chip = self._rar.reachable_bbox_nm(self._roi_root)
+        if chip is None:
+            QMessageBox.critical(self, "Whole-chip export failed",
+                                 "Could not determine the chip extent.")
+            return
+        raw_specs = [(ol, od, e.key.layer, e.key.datatype)
+                     for e, ol, od in specs if not e.key.synthetic]
+        recipe_specs = [(ol, od, e.expr_text, e.expr_bindings)
+                        for e, ol, od in specs
+                        if e.key.synthetic and e.expr_text]
+        halo = self._whole_chip_halo_nm([r[2] for r in recipe_specs])
+
+        self._wc_path = path
+        self._wc_debug = debug
+        self._wc_progress = LoadProgressDialog(self)
+        self._wc_progress.set_text(
+            "Exporting whole chip…\nWalking + recomputing per tile "
+            "(streamed to disk; bounded memory). Cancellable.")
+        self._wc_thread = QThread(self)
+        self._wc_worker = WholeChipExportWorker(
+            rar=self._rar, root=self._roi_root, path=path, unit=1000.0,
+            cellname=self._doc.top_cell_name or "TOP", chip_bbox=chip,
+            raw_specs=raw_specs, recipe_specs=recipe_specs,
+            recipe_def=self._recipe_def, target_nm=250_000.0, halo_nm=halo)
+        self._wc_worker.moveToThread(self._wc_thread)
+        self._wc_thread.started.connect(self._wc_worker.run)
+        self._wc_worker.progress.connect(self._wc_progress.set_progress)
+        self._wc_worker.finished.connect(self._on_wc_finished)
+        self._wc_worker.failed.connect(self._on_wc_failed)
+        self._wc_worker.cancelled.connect(self._on_wc_cancelled)
+        self._wc_progress.cancel_requested.connect(self._wc_worker.cancel)
+        for sig in (self._wc_worker.finished, self._wc_worker.failed,
+                    self._wc_worker.cancelled):
+            sig.connect(self._wc_thread.quit)
+        self._wc_thread.finished.connect(self._cleanup_wc)
+        self._wc_progress.show()
+        QApplication.processEvents()
+        self._wc_thread.start()
+
+    def _on_wc_finished(self, n_tiles: int) -> None:
+        if self._wc_progress is not None:
+            self._wc_progress.close()
+        path = self._wc_path
+        self._status_doc.setText(
+            f"OASIS whole-chip exported · {Path(path).name} ({n_tiles} tiles)")
+        if self._wc_debug:
+            report = oasis_debug.report_file(path)
+            sidecar = path + ".debug.txt"
+            try:
+                Path(sidecar).write_text(report, encoding="utf-8")
+            except OSError:
+                sidecar = None
+            DebugReportDialog(self, "Whole-chip export — debug report",
+                              report, saved_path=sidecar).exec()
+
+    def _on_wc_failed(self, msg: str) -> None:
+        if self._wc_progress is not None:
+            self._wc_progress.close()
+        if self._dev_mode:
+            DebugReportDialog(self, "Whole-chip export failed", msg).exec()
+        else:
+            QMessageBox.critical(self, "Whole-chip export failed", msg)
+
+    def _on_wc_cancelled(self) -> None:
+        if self._wc_progress is not None:
+            self._wc_progress.close()
+        self._status_doc.setText("whole-chip export cancelled")
+
+    def _cleanup_wc(self) -> None:
+        for attr in ("_wc_progress", "_wc_worker", "_wc_thread"):
+            obj = getattr(self, attr, None)
+            if obj is not None:
+                obj.deleteLater()
+            setattr(self, attr, None)
 
     def _save_expr_sidecar(self, npz_path: str) -> None:
         """Write expression-layer recipes next to the cache as

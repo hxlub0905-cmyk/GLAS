@@ -59,6 +59,31 @@ def shapely_to_rings(geom: "BaseGeometry") -> list[np.ndarray]:
     return out
 
 
+def tile_grid(bbox: Bbox, target_nm: float = 250_000.0,
+              max_per_axis: int = 64) -> list[Bbox]:
+    """Split ``bbox`` into a row-major grid of tiles each ~``target_nm`` on a
+    side (F11 whole-chip export). Auto-chooses the tile count per axis from
+    the span; clamped to ``max_per_axis`` so a giant chip can't explode into
+    millions of tiles. Returns a list of ``(x0, y0, x1, y1)``."""
+    x0, y0, x1, y1 = bbox
+    span_x, span_y = float(x1 - x0), float(y1 - y0)
+    if span_x <= 0 or span_y <= 0:
+        return [(x0, y0, x1, y1)]
+    import math
+    nx = min(max_per_axis, max(1, math.ceil(span_x / target_nm)))
+    ny = min(max_per_axis, max(1, math.ceil(span_y / target_nm)))
+    tw, th = span_x / nx, span_y / ny
+    tiles: list[Bbox] = []
+    for j in range(ny):
+        ty0 = y0 + j * th
+        ty1 = y1 if j == ny - 1 else ty0 + th
+        for i in range(nx):
+            tx0 = x0 + i * tw
+            tx1 = x1 if i == nx - 1 else tx0 + tw
+            tiles.append((tx0, ty0, tx1, ty1))
+    return tiles
+
+
 def clip_polygons(polygons: Iterable[Sequence],
                   crop_bbox: Optional[Bbox]) -> list[np.ndarray]:
     """Clip a layer's polygons to ``crop_bbox``.
