@@ -2,6 +2,26 @@
 
 ---
 
+## [2026-05-27] [F11] 規劃：整顆 chip 匯出 + GDS 座標可見性（待核准）
+
+**變更類型：** 文件（plan，尚未動工）
+
+**動機：** F9 FOV 匯出已驗收 OK（含 boolean，KLayout 可開）。user 進一步要 (1) 匯出**整顆 chip**（原始 +
+boolean 新 layer），目前只能匯出當前 FOV；(2) UI 沒有明顯的 GDS 座標可看，難填裁剪座標。Q&A 收斂：
+boolean **全 chip 重算**、目標檔**蠻大**、座標顯示**常駐讀數 + 裁剪框一鍵帶入兩者都要**。
+
+**探索發現：** GLAS 刻意移除 full-load 走 ROI（`gds_align_tool.py:12`）、boolean 為 FOV-local
+（`:46`、`_recompute_recipes(fov)`）；座標讀數 `_status_cursor` 只接 GDS 畫布 hover、且被其他訊息蓋掉。
+
+**plan（`docs/plans/F11-whole-chip-export.md`）：** M1 座標可見性（快速；SEM/GDS 兩模式常駐讀數 + 裁剪框帶入鈕）、
+M2 整 chip raw 全遍歷匯出（worker+進度+cancel）、M3 整 chip boolean 重算（最高效能風險，tiled 為 fallback）、
+M4 匯出對話框 scope（FOV/整 chip）、M5 測試+文件。**最高風險：全 chip 重算 boolean + 大檔的全域 shapely 效能/記憶體。**
+
+**影響檔案（規劃）：** `glas/app/gds_align_tool.py`、`glas/core/layout_export.py`（或新模組）、可能
+`oasis_random.py`、測試、`docs/plans/F11-whole-chip-export.md`、`CLAUDE.md`、`SESSION_LOG.md`。
+
+**Branch：** `claude/adoring-cannon-oKZKo`（PR #7）
+
 ## [2026-05-26] [F9/F10] 本地驗收通過：KLayout 接受 + Diagnose 抓錯確認
 
 **變更類型：** 文件（驗收記錄，無程式碼變更）
