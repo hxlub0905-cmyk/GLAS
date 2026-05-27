@@ -200,6 +200,24 @@ def _emit_geometry(layer: int, datatype: int,
 # ── Public writer ─────────────────────────────────────────────────────────────
 
 
+def _oasis_header(unit: float, cellname: str) -> bytes:
+    """MAGIC + START + CELLNAME + CELL + XYABSOLUTE — everything before the
+    geometry records."""
+    start = (bytes([_START])
+             + encode_string("1.0")
+             + encode_real(unit)
+             + encode_unsigned_int(0)        # offset_flag = 0
+             + b"\x00" * 12)                 # 6 (strict=0, offset=0) pairs
+    cellname_rec = bytes([_CELLNAME_IMP]) + encode_string(cellname)
+    cell = bytes([_CELL_REFNUM]) + encode_unsigned_int(0) + bytes([_XYABSOLUTE])
+    return MAGIC + start + cellname_rec + cell
+
+
+def _oasis_end() -> bytes:
+    end = bytes([_END]) + encode_unsigned_int(0)    # validation scheme 0
+    return end + b"\x00" * (_END_RECORD_LEN - len(end))   # pad to fixed 256 bytes
+
+
 def serialize_oasis(layers: Iterable,
                     *, unit: float = 1000.0,
                     cellname: str = "TOP") -> bytes:
@@ -209,21 +227,10 @@ def serialize_oasis(layers: Iterable,
     ``polygons`` is an iterable of ``(N, 2)`` vertex sequences. Empty
     layers contribute nothing. See module docstring for the format subset.
     """
-    start = (bytes([_START])
-             + encode_string("1.0")
-             + encode_real(unit)
-             + encode_unsigned_int(0)        # offset_flag = 0
-             + b"\x00" * 12)                 # 6 (strict=0, offset=0) pairs
-    cellname_rec = bytes([_CELLNAME_IMP]) + encode_string(cellname)
-    cell = bytes([_CELL_REFNUM]) + encode_unsigned_int(0) + bytes([_XYABSOLUTE])
-
     body = bytearray()
     for layer, datatype, polygons in layers:
         body += _emit_geometry(int(layer), int(datatype), polygons)
-
-    end = bytes([_END]) + encode_unsigned_int(0)    # validation scheme 0
-    end += b"\x00" * (_END_RECORD_LEN - len(end))   # pad to fixed 256 bytes
-    return MAGIC + start + cellname_rec + cell + bytes(body) + end
+    return _oasis_header(unit, cellname) + bytes(body) + _oasis_end()
 
 
 def write_oasis(path: Union[str, Path], layers: Iterable,
@@ -231,3 +238,49 @@ def write_oasis(path: Union[str, Path], layers: Iterable,
     """Write ``layers`` to ``path`` as OASIS. See :func:`serialize_oasis`."""
     data = serialize_oasis(layers, unit=unit, cellname=cellname)
     Path(path).write_bytes(data)
+
+
+class OasisStreamWriter:
+    """Incremental OASIS writer (F11): write the header once, then append
+    geometry record-by-record, then close with the padded END. Keeps peak
+    memory bounded for whole-chip / tiled export — never holds the whole
+    file in memory like :func:`serialize_oasis`.
+
+    Usage::
+
+        with OasisStreamWriter(path, unit=1000) as w:
+            for layer, dt, polygons in tiles():
+                w.add_polygons(layer, dt, polygons)
+    """
+
+    def __init__(self, path: Union[str, Path], *,
+                 unit: float = 1000.0, cellname: str = "TOP") -> None:
+        self._f = open(path, "wb")
+        self._closed = False
+        self._f.write(_oasis_header(unit, cellname))
+
+    def add_polygons(self, layer: int, datatype: int, polygons: Iterable) -> None:
+        """Append one layer's polygons (an iterable of ``(N, 2)`` rings).
+        Axis-aligned rectangles become RECTANGLE records, others POLYGON."""
+        chunk = _emit_geometry(int(layer), int(datatype), polygons)
+        if chunk:
+            self._f.write(chunk)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._f.write(_oasis_end())
+        self._f.close()
+        self._closed = True
+
+    def __enter__(self) -> "OasisStreamWriter":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        # On a clean exit finalize with END; on error close the handle but
+        # leave the (incomplete) file for the caller to discard.
+        if exc_type is None:
+            self.close()
+        elif not self._closed:
+            self._f.close()
+            self._closed = True

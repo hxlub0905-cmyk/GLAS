@@ -50,13 +50,14 @@ boolean layer 也看得到）。但 user 真正要的是：
 > **更新（user 顧慮 OOM）：** M2/M3 改採 **tiled + 串流寫出**為主（非 fallback）。全域 shapely 的
 > OOM 風險來自中間的數百萬 shapely 物件；tile 切算讓峰值受單一 tile 控制。
 
-### M2: 串流 OASIS writer + 整 chip RAW 匯出  [status: planned]
+### M2: 串流 OASIS writer + 整 chip RAW 匯出  [status: in progress]
 
-- [ ] `oasis_writer` 加**串流/增量**模式（open 檔 → 寫 MAGIC/START/CELL → 逐 layer/逐多邊形 append
-      RECTANGLE/POLYGON → 寫 256-byte END）。現有 `serialize_oasis`（一次組包）保留給 FOV 小量匯出。
-- [ ] 整 chip RAW：走訪整 chip（oasis_random ROI=root bbox，或分區走訪）→ **逐多邊形串流寫出**，
-      記憶體只佔約一個 cell。不污染對位中的 `self._doc`。
-- [ ] worker + `LoadProgressDialog` + cancel。驗證：整 chip raw → KLayout 與原檔同區比對一致。
+- [x] `oasis_writer` 加**串流/增量**模式 `OasisStreamWriter`（open → header → `add_polygons` 逐 layer
+      append → `close()` 寫 256-byte END；context manager）。沙箱驗證輸出與 `serialize_oasis` **byte 一致** +
+      reader round-trip；測試 `test_stream_writer_matches_serialize` / `_roundtrips`。現有 `serialize_oasis`
+      保留給 FOV 小量匯出。
+- [ ] 整 chip RAW 走訪（需 chip bbox + 分 tile walk_roi）→ 串流寫出。**待：chip-bbox 取得方式 + tile 大小（Q4）。**
+- [ ] worker + `LoadProgressDialog` + cancel。
 
 ### M3: tiled Boolean 重算 + 匯出  [status: planned]
 

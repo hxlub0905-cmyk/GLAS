@@ -167,3 +167,26 @@ def test_padded_end_still_roundtrips(tmp_path):
     rids, rects, _ = _read_back(p)
     assert oas.END in rids
     assert rects == [(17, 0, 0, 0, 40, 30)]
+
+
+def test_stream_writer_matches_serialize(tmp_path):
+    layers = [
+        (17, 0, [[(0, 0), (40, 0), (40, 30), (0, 30)]]),
+        (25, 0, [[(0, 0), (20, 0), (0, 15)]]),
+    ]
+    p = tmp_path / "stream.oas"
+    with w.OasisStreamWriter(p, unit=1000, cellname="SAMPLE") as sw:
+        for layer, dt, polys in layers:
+            sw.add_polygons(layer, dt, polys)
+    assert p.read_bytes() == w.serialize_oasis(layers, unit=1000, cellname="SAMPLE")
+
+
+def test_stream_writer_roundtrips(tmp_path):
+    p = tmp_path / "stream_rt.oas"
+    with w.OasisStreamWriter(p, unit=1000) as sw:
+        sw.add_polygons(17, 0, [[(0, 0), (40, 0), (40, 30), (0, 30)]])
+        sw.add_polygons(25, 0, [[(0, 0), (20, 0), (0, 15)]])
+    rids, rects, polys = _read_back(p)
+    assert oas.END in rids
+    assert rects == [(17, 0, 0, 0, 40, 30)]
+    assert len(polys) == 1 and polys[0][0] == 25

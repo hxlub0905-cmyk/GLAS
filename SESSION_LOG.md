@@ -2,6 +2,24 @@
 
 ---
 
+## [2026-05-27] [F11] M2 部分：串流 OASIS writer（OasisStreamWriter）
+
+**變更類型：** 功能（core）
+
+**實作（`oasis_writer.py`）：** 抽出 `_oasis_header` / `_oasis_end`，`serialize_oasis` 沿用；新增
+`OasisStreamWriter`（open→header→`add_polygons` 逐 layer append RECTANGLE/POLYGON→`close()` 寫 256-byte
+END；context manager，錯誤時不 finalize 留半檔給呼叫端丟棄）。讓整 chip / tiled 匯出能增量寫、不持有整檔。
+沙箱驗證輸出與 `serialize_oasis` **byte 完全一致**。測試 `test_stream_writer_matches_serialize` /
+`test_stream_writer_roundtrips`。
+
+**未完（M2 剩餘）：** 整 chip 走訪需 (1) chip 全域 bbox（來自 `oasis_random` reachable_bbox，§7 敏感，
+擬加唯讀 accessor）+ (2) tile 大小決策（Q4，待 user）。故先 checkpoint writer，待 user 確認再動 §7 走訪。
+
+**影響檔案：** `glas/core/oasis_writer.py`、`tests/test_oasis_writer.py`、`docs/plans/F11-whole-chip-export.md`、
+`SESSION_LOG.md`。
+
+**Branch：** `claude/adoring-cannon-oKZKo`（PR #7）
+
 ## [2026-05-27] [F11] plan 修訂：M2/M3 改 tiled + 串流寫出（user 顧慮 OOM）
 
 **變更類型：** 文件（plan 修訂）
