@@ -2,6 +2,22 @@
 
 ---
 
+## [2026-05-27] [F11] plan 修訂：M2/M3 改 tiled + 串流寫出（user 顧慮 OOM）
+
+**變更類型：** 文件（plan 修訂）
+
+**動機：** user 確認 M1 OK，但顧慮整 chip 全域 boolean 會 OOM、傾向 tile 切算。OOM 風險主因是全域
+shapely 的數百萬中間物件。
+
+**修訂：** M2 改為「串流/增量 OASIS writer + 整 chip raw 串流寫出」（記憶體只佔約一 cell）；M3 改為
+**tiled boolean**——每 tile 載 haloed bbox（外擴 ≥ 最大 morph 距離、含跨界完整多邊形）算 boolean、結果
+clip 回 tile 精確邊界串流寫出（相鄰 tile 無縫、跨界切成相鄰塊幾何正確），峰值受單 tile 控制。tile 大小
+策略（自動 vs 指定）待 user 定（Q4）。
+
+**影響檔案：** `docs/plans/F11-whole-chip-export.md`、`SESSION_LOG.md`。
+
+**Branch：** `claude/adoring-cannon-oKZKo`（PR #7）
+
 ## [2026-05-27] [F11] M1：GDS 座標可見性（常駐讀數 + 裁剪框一鍵帶入）
 
 **變更類型：** 功能（UI）

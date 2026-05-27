@@ -29,7 +29,9 @@ boolean layer 也看得到）。但 user 真正要的是：
 
 - **Q1 Boolean 範圍：** 全 chip 重算（正確的全域合成）。
 - **Q2 檔案大小：** 蠻大 → 效能/記憶體是首要風險；必須 worker thread + 進度 + cancel；保留 tiled fallback。
-- **Q3 座標顯示：** 常駐 cursor GDS 讀數 **且** 裁剪框「帶入目前視窗/ROI 範圍」鈕。
+- **Q3 座標顯示：** 常駐 cursor GDS 讀數 **且** 裁剪框「帶入目前視窗/ROI 範圍」鈕。（M1 已完成）
+- **Q4 OOM/tiled（user 後續顧慮）：** 改採 tiled + 串流寫出為主，避免全域 shapely OOM。tile 大小策略待定
+  （自動依記憶體預算 vs 使用者指定）。
 
 ---
 
@@ -45,20 +47,26 @@ boolean layer 也看得到）。但 user 真正要的是：
       doc.bbox_nm 填四格（無 doc 時 disabled）。
 - [ ] 驗證：SEM/GDS 移動滑鼠都看得到座標；裁剪框一鍵帶入正確。**待 user 本地 GUI。**
 
-### M2: 整 chip RAW layer 匯出（worker + 進度）  [status: planned]
+> **更新（user 顧慮 OOM）：** M2/M3 改採 **tiled + 串流寫出**為主（非 fallback）。全域 shapely 的
+> OOM 風險來自中間的數百萬 shapely 物件；tile 切算讓峰值受單一 tile 控制。
 
-- [ ] core helper：對選定 raw layer 做**全 chip 遍歷**取幾何（oasis_random ROI=root bbox 全走，或復用
-      walker/store 全展開）；回 `(layer, datatype, polygons)`。不污染對位中的 `self._doc`（獨立結構）。
-- [ ] 放 QThread worker + `LoadProgressDialog` + cancel（仿 ROI load worker），避免凍 UI。
-- [ ] 驗證：整 chip raw 匯出 → KLayout 開、與原檔同區比對一致。
+### M2: 串流 OASIS writer + 整 chip RAW 匯出  [status: planned]
 
-### M3: 整 chip Boolean 重算 + 匯出  [status: planned]
+- [ ] `oasis_writer` 加**串流/增量**模式（open 檔 → 寫 MAGIC/START/CELL → 逐 layer/逐多邊形 append
+      RECTANGLE/POLYGON → 寫 256-byte END）。現有 `serialize_oasis`（一次組包）保留給 FOV 小量匯出。
+- [ ] 整 chip RAW：走訪整 chip（oasis_random ROI=root bbox，或分區走訪）→ **逐多邊形串流寫出**，
+      記憶體只佔約一個 cell。不污染對位中的 `self._doc`。
+- [ ] worker + `LoadProgressDialog` + cancel。驗證：整 chip raw → KLayout 與原檔同區比對一致。
 
-- [ ] 在 M2 取得的整 chip raw 幾何上，以**整 chip bbox** 重算 recipes（沿用 `_eval_expression` /
-      `_recompute_recipes` 的邏輯，fov=whole-chip）；morph shrink 的 bbox 用整 chip extent。
-- [ ] 與 raw 一起寫出 .oas。
-- [ ] **效能風險（最高）**：全域 shapely 在大 chip 可能慢/OOM。緩解：worker + cancel + 事前估算幾何量
-      並警告；若實測不可行 → 退回 tiled（Q1 次選）做為逃生口（另開子里程碑）。
+### M3: tiled Boolean 重算 + 匯出  [status: planned]
+
+- [ ] 把 chip bbox 切成 grid tiles；每 tile：
+  - 載入 **haloed bbox**（tile 外擴 margin ≥ 運算式最大 morph 距離；含跨界完整多邊形）的 bound 幾何；
+  - 以 `fov = haloed bbox` 重算 recipes（沿用 `_eval_expression`，morph bbox 用 haloed）；
+  - 結果 **clip 回 tile 精確邊界** → 串流寫出（相鄰 tile 無縫、不重疊；跨界圖形切成相鄰塊，幾何正確）。
+- [ ] 一次只持有一個 tile 的 shapely 物件 → 峰值受 tile 大小控制。
+- [ ] tile 大小：可設定，預設依記憶體預算自動（見 Q4）；halo 由運算式 morph 距離推導 + 最小值。
+- [ ] worker + 進度（per-tile）+ cancel。驗證：tiled 結果與單塊小範圍 global 結果一致（無邊界假影）。
 
 ### M4: 匯出對話框 scope 選項 + 接線  [status: planned]
 
