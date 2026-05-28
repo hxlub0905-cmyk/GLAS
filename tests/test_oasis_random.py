@@ -220,6 +220,31 @@ class TestBigGridRepetition:
         assert res["stats"].instances_pruned == 1_000_000   # whole array culled
 
 
+class TestReachableBbox:
+    """F11: the read-only reachable_bbox accessor returns the whole-cell
+    extent (own + placed children), for sizing the whole-chip export grid."""
+
+    def test_union_of_placements_grid(self, tmp_path):
+        # child A = 10x10 rect at origin, placed at 3 points -> union extent.
+        p = tmp_path / "hier.oas"
+        p.write_bytes(_build_hierarchy([(0, 0), (100, 0), (0, 100)]))
+        rar = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
+        assert tuple(rar.reachable_bbox(0)) == (0, 0, 110, 110)
+
+    def test_nm_scaled(self, tmp_path):
+        p = tmp_path / "hier2.oas"
+        p.write_bytes(_build_hierarchy([(0, 0)]))
+        rar = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
+        s = getattr(rar, "_nm_per_grid", 1.0) or 1.0
+        assert tuple(rar.reachable_bbox_nm(0)) == (0, 0, 10 * s, 10 * s)
+
+    def test_unknown_cell_none(self, tmp_path):
+        p = tmp_path / "hier3.oas"
+        p.write_bytes(_build_hierarchy([(0, 0)]))
+        rar = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
+        assert rar.reachable_bbox(999) is None
+
+
 class TestRectRepetition:
     """M3.5e correctness: a RECTANGLE with repetition must expand into N
     rects (previously _decode_at kept only the first → lost geometry)."""

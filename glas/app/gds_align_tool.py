@@ -51,6 +51,7 @@ import csv
 import json
 import multiprocessing as mp
 import os
+import re
 import sys
 import threading
 import traceback
@@ -61,7 +62,7 @@ from typing import Optional
 
 import numpy as np
 
-from PyQt6.QtCore import Qt, QObject, QPointF, QRect, QRectF, QSize, QThread, QTimer, QElapsedTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QObject, QPointF, QRect, QRectF, QSettings, QSize, QThread, QTimer, QElapsedTimer, pyqtSignal
 from PyQt6.QtGui import (
     QAction, QBrush, QColor, QFontMetrics, QIcon, QImage, QKeySequence,
     QPainter, QPen, QPixmap,
@@ -71,7 +72,8 @@ from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QColorDialog,
     QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFrame,
     QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton,
+    QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
+    QPlainTextEdit, QPushButton,
     QScrollArea, QSizePolicy, QSpinBox, QSplitter, QStatusBar, QStyle,
     QStyledItemDelegate, QTableWidget, QTableWidgetItem, QToolButton,
     QVBoxLayout, QWidget,
@@ -123,6 +125,8 @@ import gds_boolean      # noqa: E402
 import gds_layer_cache  # noqa: E402
 import sem_loader       # noqa: E402
 import oasis_random     # noqa: E402
+import layout_export     # noqa: E402  (F9: OASIS export — shapely guarded inside)
+import oasis_debug        # noqa: E402  (F10: OASIS diagnostics — Qt-free)
 # F8: the Qt-free fine-align compute lives in glas/core/fine_align.py so a
 # spawn-based ProcessPool worker can import it without pulling in PyQt6. Pull
 # the functions back into this namespace so existing call sites and tests
@@ -1115,6 +1119,101 @@ class RoiWalkWorker(QObject):
             self.failed.emit(str(exc))
         else:
             self.finished.emit(doc, per_layer)
+
+
+def _walk_res_to_polys(res) -> list:
+    """walk_roi result dict -> flat list of (N,2) float64 polygon rings
+    (rectangles expanded to 4-point rings). Mirrors _roi_entry."""
+    polys: list = []
+    for x1, y1, x2, y2 in res["rects"].tolist():
+        polys.append(np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+                              dtype=np.float64))
+    for p in res["polys"]:
+        polys.append(np.asarray(p, dtype=np.float64))
+    return polys
+
+
+class WholeChipExportWorker(QObject):
+    """F11 M2/M3: export the whole chip to OASIS, tiled + streamed so peak
+    memory is bounded by one tile. Per tile: walk selected raw layers and
+    clip to the tile; recompute each Boolean recipe over a haloed tile
+    (halo ≥ max morph reach so grown geometry from neighbours is included)
+    and clip the result back to the exact tile. Reads only."""
+
+    progress = pyqtSignal(int, int)     # (tiles done, total)
+    finished = pyqtSignal(int)          # total tiles written
+    failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    def __init__(self, *, rar, root, path, unit, cellname, chip_bbox,
+                 raw_specs, recipe_specs, recipe_def, target_nm, halo_nm) -> None:
+        super().__init__()
+        self._rar = rar
+        self._root = root
+        self._path = path
+        self._unit = unit
+        self._cellname = cellname
+        self._chip_bbox = chip_bbox
+        self._raw_specs = raw_specs        # [(out_l, out_d, src_l, src_d)]
+        self._recipe_specs = recipe_specs  # [(out_l, out_d, expr, bindings)]
+        self._recipe_def = recipe_def
+        self._target_nm = target_nm
+        self._halo_nm = halo_nm
+        self._cancel = False
+
+    def cancel(self) -> None:
+        self._cancel = True
+
+    def run(self) -> None:
+        cc = lambda: self._cancel          # noqa: E731
+        try:
+            tiles = layout_export.tile_grid(self._chip_bbox, self._target_nm)
+            total = len(tiles)
+            with oasis_writer.OasisStreamWriter(
+                    self._path, unit=self._unit, cellname=self._cellname) as w:
+                for i, tile in enumerate(tiles):
+                    if self._cancel:
+                        raise oasis_random.WalkCancelled()
+                    for out_l, out_d, src_l, src_d in self._raw_specs:
+                        res = oasis_random.walk_roi(
+                            self._rar, self._root, tile, src_l, src_d,
+                            cancel_cb=cc)
+                        rings = layout_export.clip_polygons(
+                            _walk_res_to_polys(res), tile)
+                        w.add_polygons(out_l, out_d, rings)
+                    if self._recipe_specs:
+                        self._export_recipes_for_tile(w, tile, cc)
+                    self.progress.emit(i + 1, total)
+            self.finished.emit(total)
+        except oasis_random.WalkCancelled:
+            self.cancelled.emit()
+        except Exception as exc:                       # noqa: BLE001
+            self.failed.emit(f"{exc}\n\n{traceback.format_exc()}")
+
+    def _export_recipes_for_tile(self, w, tile, cc) -> None:
+        m = self._halo_nm
+        hx0, hy0, hx1, hy1 = tile[0] - m, tile[1] - m, tile[2] + m, tile[3] + m
+        cache: dict = {}
+
+        def raw_provider(layer: int, datatype: int):
+            key = (layer, datatype)
+            if key not in cache:
+                res = oasis_random.walk_roi(self._rar, self._root,
+                                            (hx0, hy0, hx1, hy1),
+                                            layer, datatype, cancel_cb=cc)
+                cache[key] = gds_boolean.polys_to_geometry(
+                    _walk_res_to_polys(res))
+            return cache[key]
+
+        fov_box = gds_boolean.fov_box((hx0 + hx1) / 2.0, (hy0 + hy1) / 2.0,
+                                      hx1 - hx0, hy1 - hy0)
+        for out_l, out_d, expr, bindings in self._recipe_specs:
+            geom = gds_boolean.resolve_expression(
+                expr, bindings, raw_provider=raw_provider,
+                recipe_provider=self._recipe_def, fov_bbox=fov_box)
+            rings = layout_export.clip_polygons(
+                gds_boolean.geometry_to_polygons(geom), tile)
+            w.add_polygons(out_l, out_d, rings)
 
 
 def _auto_batch_workers() -> int:
@@ -2724,6 +2823,7 @@ class SemViewer(QWidget):
     dragged view with drag reset — the invariant Set Offset relies on."""
 
     drag_changed = pyqtSignal()
+    cursor_gds = pyqtSignal(object)   # F11 M1: (x_nm, y_nm) or None
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -2978,6 +3078,7 @@ class SemViewer(QWidget):
 
     def leaveEvent(self, ev) -> None:  # type: ignore[override]
         self._cursor_screen = None
+        self.cursor_gds.emit(None)
         self.update()
 
     def mousePressEvent(self, ev: QMouseEvent) -> None:  # type: ignore[override]
@@ -2994,6 +3095,8 @@ class SemViewer(QWidget):
 
     def mouseMoveEvent(self, ev: QMouseEvent) -> None:  # type: ignore[override]
         self._cursor_screen = ev.position()
+        self.cursor_gds.emit(self._view_to_world(ev.position().x(),
+                                                 ev.position().y()))
         if self._press is None:
             self.update()        # refresh the cursor-coordinate readout
             return
@@ -4267,6 +4370,201 @@ class SemPanel(QFrame):
             self.image_selected.emit(img)
 
 
+class DebugReportDialog(QDialog):
+    """F10: show a copyable plain-text diagnostic report; optionally note the
+    sidecar file it was saved to."""
+
+    def __init__(self, parent, title: str, text: str,
+                 saved_path: Optional[str] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(min(720, _screen_avail()[0]), min(560, _screen_avail()[1]))
+        v = QVBoxLayout(self)
+        if saved_path:
+            v.addWidget(QLabel(f"Saved to: {saved_path}"))
+        edit = QPlainTextEdit(self)
+        edit.setPlainText(text)
+        edit.setReadOnly(True)
+        edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        mono = edit.font()
+        mono.setFamily("monospace")
+        edit.setFont(mono)
+        v.addWidget(edit, 1)
+        row = QHBoxLayout()
+        copy_btn = QPushButton(" Copy to clipboard", self)
+        copy_btn.clicked.connect(
+            lambda: QApplication.clipboard().setText(text))
+        row.addWidget(copy_btn)
+        row.addStretch(1)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, self)
+        bb.rejected.connect(self.reject)
+        bb.accepted.connect(self.accept)
+        row.addWidget(bb)
+        v.addLayout(row)
+
+
+class OasisExportDialog(QDialog):
+    """F9 M3: pick layers (raw + Boolean) and an optional GDS-coordinate crop
+    region, then export to OASIS. Synthetic layers get an editable output
+    layer/datatype (their internal layer is -1, not writable to OASIS)."""
+
+    def __init__(self, parent, entries, doc_bbox,
+                 whole_chip_available: bool = False) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Export OASIS")
+        self.setMinimumWidth(_capped_min_width(420))
+        self._rows: list[tuple] = []
+        self._crop: Optional[tuple] = None
+        self._sel: list[tuple] = []
+        self._specs: list[tuple] = []
+
+        v = QVBoxLayout(self)
+
+        v.addWidget(QLabel("Export scope"))
+        self._scope = QComboBox()
+        self._scope.addItem("Current FOV (loaded geometry)", "fov")
+        if whole_chip_available:
+            self._scope.addItem("Whole chip (re-walk + recompute, tiled)", "whole")
+        self._scope.currentIndexChanged.connect(self._on_scope_changed)
+        v.addWidget(self._scope)
+        v.addSpacing(8)
+
+        v.addWidget(QLabel("Layers to export"))
+
+        grid = QGridLayout()
+        grid.addWidget(QLabel("Layer"), 0, 2)
+        grid.addWidget(QLabel("Datatype"), 0, 3)
+        synth_default = 1000
+        for i, e in enumerate(entries, start=1):
+            cb = QCheckBox(e.key.label())
+            cb.setChecked(True)
+            if e.display_name:
+                cb.setText(f"{e.key.label()}  ({e.display_name})")
+            # OASIS layer/datatype are unbounded unsigned ints (the writer
+            # supports large values); use the full QSpinBox int range so a
+            # prefilled raw ID > 65535 isn't silently clamped and remapped.
+            ls = QSpinBox()
+            ls.setRange(0, 2_147_483_647)
+            ds = QSpinBox()
+            ds.setRange(0, 2_147_483_647)
+            if e.key.synthetic:
+                ls.setValue(synth_default)
+                ds.setValue(0)
+                synth_default += 1
+            else:
+                ls.setValue(max(0, int(e.key.layer)))
+                ds.setValue(max(0, int(e.key.datatype)))
+            grid.addWidget(cb, i, 0, 1, 2)
+            grid.addWidget(ls, i, 2)
+            grid.addWidget(ds, i, 3)
+            self._rows.append((e, cb, ls, ds))
+        v.addLayout(grid)
+
+        v.addSpacing(10)
+        self._crop_label = QLabel(
+            "Crop region (GDS nm) — leave all blank to export whole layout")
+        v.addWidget(self._crop_label)
+        crop_grid = QGridLayout()
+        self._crop_edits = {}
+        x0, y0, x1, y1 = doc_bbox if doc_bbox else (0, 0, 0, 0)
+        fields = [("x1 (left)", x0), ("y1 (bottom)", y0),
+                  ("x2 (right)", x1), ("y2 (top)", y1)]
+        for col, (lbl, ph) in enumerate(fields):
+            crop_grid.addWidget(QLabel(lbl), 0, col)
+            ed = QLineEdit()
+            ed.setPlaceholderText(f"{ph:.0f}" if doc_bbox else "")
+            crop_grid.addWidget(ed, 1, col)
+            self._crop_edits[lbl] = ed
+        v.addLayout(crop_grid)
+
+        self._doc_bbox = doc_bbox
+        self._fill_btn = QPushButton(" Use current view / ROI bounds")
+        self._fill_btn.setEnabled(bool(doc_bbox))
+        self._fill_btn.clicked.connect(self._fill_crop_from_bbox)
+        v.addWidget(self._fill_btn)
+
+        v.addSpacing(8)
+        self._debug_cb = QCheckBox(
+            "Debug: re-read the written file and append a diagnostic report")
+        v.addWidget(self._debug_cb)
+
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            self)
+        bb.accepted.connect(self._on_accept)
+        bb.rejected.connect(self.reject)
+        v.addWidget(bb)
+
+    def _fill_crop_from_bbox(self) -> None:
+        if not self._doc_bbox:
+            return
+        x0, y0, x1, y1 = self._doc_bbox
+        vals = {"x1 (left)": x0, "y1 (bottom)": y0,
+                "x2 (right)": x1, "y2 (top)": y1}
+        for lbl, ed in self._crop_edits.items():
+            ed.setText(f"{vals[lbl]:.0f}")
+
+    def _on_scope_changed(self) -> None:
+        # Whole-chip ignores the crop region (it covers the entire chip).
+        whole = self.scope() == "whole"
+        self._crop_label.setEnabled(not whole)
+        self._fill_btn.setEnabled(not whole and bool(self._doc_bbox))
+        for ed in self._crop_edits.values():
+            ed.setEnabled(not whole)
+
+    def _on_accept(self) -> None:
+        if self.scope() == "fov":
+            raw = [ed.text().strip() for ed in self._crop_edits.values()]
+            filled = [t for t in raw if t]
+            if filled and len(filled) != 4:
+                QMessageBox.warning(
+                    self, "Incomplete crop region",
+                    "Enter all four coordinates, or leave all blank to export "
+                    "the whole layout.")
+                return
+            if filled:
+                try:
+                    x1, y1, x2, y2 = (float(t) for t in raw)
+                except ValueError:
+                    QMessageBox.warning(self, "Invalid crop region",
+                                        "Coordinates must be numbers.")
+                    return
+                if x1 == x2 or y1 == y2:
+                    QMessageBox.warning(self, "Invalid crop region",
+                                        "The region has zero width or height.")
+                    return
+                self._crop = (x1, y1, x2, y2)
+            else:
+                self._crop = None
+        else:
+            self._crop = None     # whole chip — no crop
+
+        checked = [(e, ls.value(), ds.value())
+                   for e, cb, ls, ds in self._rows if cb.isChecked()]
+        self._specs = checked
+        self._sel = [(out_l, out_d, list(e.polygons))
+                     for e, out_l, out_d in checked]
+        self.accept()
+
+    def scope(self) -> str:
+        return self._scope.currentData()
+
+    def selected_layers(self) -> list:
+        """(out_layer, out_datatype, polygons) for the FOV path."""
+        return self._sel
+
+    def selected_specs(self) -> list:
+        """(LayerEntry, out_layer, out_datatype) — lets the whole-chip path
+        recover each layer's source (raw layer/datatype or recipe)."""
+        return self._specs
+
+    def crop_bbox(self):
+        return self._crop
+
+    def debug_enabled(self) -> bool:
+        return self._debug_cb.isChecked()
+
+
 class AlignmentExportDialog(QDialog):
     """Pick the format (CSV / JSON) and which images to export (plan M5).
     Defaults to every image checked."""
@@ -4354,6 +4652,12 @@ class MainWindow(QMainWindow):
         # again so a user re-expanding it sticks.
         self._coord_collapsed_once = True
 
+        # F9: developer mode gates advanced features (OASIS export). Off by
+        # default; enabled by clicking the About-dialog icon 5 times. Persisted
+        # in QSettings so it survives a restart.
+        self._dev_mode = bool(
+            QSettings("GLAS", "GLAS").value("dev_mode", False, type=bool))
+
         _icon_path = Path(__file__).resolve().parent / "icons" / "glas_icon_32.svg"
         if _icon_path.exists():
             self.setWindowIcon(QIcon(str(_icon_path)))
@@ -4431,8 +4735,18 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self._status_bar)
         self._status_doc = QLabel("no GDS loaded")
         self._status_cursor = QLabel("")
+        # F11 M1: dedicated, always-visible GDS cursor coordinate readout (both
+        # SEM and GDS panes feed it). Kept separate from _status_cursor so the
+        # coordinate isn't clobbered by transient hints.
+        self._coord_readout = QLabel("GDS: —")
+        self._coord_readout.setStyleSheet(
+            "font-weight: 600; padding: 0 8px; color: #3f3428;")
+        self._coord_readout.setToolTip(
+            "Cursor position in GDS coordinates — type these into the OASIS "
+            "export crop fields (nm).")
         self._status_bar.addWidget(self._status_doc, 1)
-        self._status_bar.addPermanentWidget(self._status_cursor)
+        self._status_bar.addWidget(self._status_cursor)
+        self._status_bar.addPermanentWidget(self._coord_readout)
 
         self._build_menu()
         self._build_shortcuts()
@@ -4445,6 +4759,7 @@ class MainWindow(QMainWindow):
         self.layer_panel.pois_changed.connect(self._on_pois_changed)
         self.canvas.cursor_pos_nm.connect(self._on_cursor)
         self.canvas.defect_clicked.connect(self._on_defect_clicked)
+        self.sem_viewer.cursor_gds.connect(self._on_coord)   # F11 M1
         self.sem_panel.load_klarf_requested.connect(self._on_load_klarf)
         self.sem_panel.load_folder_requested.connect(self._on_load_folder)
         self.sem_panel.load_roi_requested.connect(self._on_load_roi_clicked)
@@ -4487,6 +4802,12 @@ class MainWindow(QMainWindow):
         self._roi_thread: Optional[QThread] = None
         self._roi_worker = None
         self._roi_progress = None
+        # F11: whole-chip export worker (set during a running export).
+        self._wc_thread: Optional[QThread] = None
+        self._wc_worker = None
+        self._wc_progress = None
+        self._wc_path = None
+        self._wc_debug = False
         self._roi_progress_timer: Optional[QTimer] = None
         self._roi_center: Optional[tuple[float, float]] = None
         # Color cycle for synthetic expression layers.
@@ -4677,6 +4998,15 @@ class MainWindow(QMainWindow):
         align_btn.clicked.connect(self._on_export_alignment)
         h.addWidget(align_btn)
 
+        # F9: OASIS export — advanced, hidden unless developer mode is on.
+        self._export_oasis_btn = QPushButton(_qicon("save"), " Export OASIS…")
+        self._export_oasis_btn.setToolTip(
+            "Export selected raw / Boolean layers to an OASIS (.oas) file, "
+            "optionally cropped to a GDS-coordinate region (developer mode).")
+        self._export_oasis_btn.clicked.connect(self._on_export_oasis)
+        self._export_oasis_btn.setVisible(self._dev_mode)
+        h.addWidget(self._export_oasis_btn)
+
         h.addStretch(1)
         # Bolder labels (user request) — set per-button so it can't bleed
         # background like a parent stylesheet would. Then pin each button's
@@ -4826,6 +5156,12 @@ class MainWindow(QMainWindow):
         open_action.triggered.connect(self._on_open_roi)
         menu.addAction(open_action)
         menu.addSeparator()
+        # F10: developer-only OASIS diagnostics. Hidden unless dev mode is on.
+        self._diagnose_action = QAction("&Diagnose OASIS file…", self)
+        self._diagnose_action.triggered.connect(self._on_diagnose_oasis)
+        self._diagnose_action.setVisible(self._dev_mode)
+        menu.addAction(self._diagnose_action)
+        menu.addSeparator()
         quit_action = QAction("&Quit", self)
         quit_action.setShortcut("Ctrl+Q")
         quit_action.triggered.connect(self.close)
@@ -4839,7 +5175,18 @@ class MainWindow(QMainWindow):
     # ── actions ────────────────────────────────────────────────────────────
 
     def _on_cursor(self, x_nm: float, y_nm: float) -> None:
-        self._status_cursor.setText(f"cursor: {x_nm:,.0f}, {y_nm:,.0f} nm")
+        self._on_coord((x_nm, y_nm))
+
+    def _on_coord(self, w) -> None:
+        """F11 M1: update the dedicated GDS coordinate readout from either
+        pane. ``w`` is an ``(x_nm, y_nm)`` tuple or ``None`` (cursor left)."""
+        if w is None:
+            self._coord_readout.setText("GDS: —")
+            return
+        x_nm, y_nm = w
+        self._coord_readout.setText(
+            f"GDS: {x_nm / 1e3:,.3f}, {y_nm / 1e3:,.3f} µm  "
+            f"({x_nm:,.0f}, {y_nm:,.0f} nm)")
 
     # ── M7-ov: defect map on the GDS overview ────────────────────────────────
     def _refresh_overview_defects(self) -> None:
@@ -5741,7 +6088,31 @@ class MainWindow(QMainWindow):
                       flush=True)
 
     def _on_roi_failed(self, msg: str) -> None:
-        QMessageBox.critical(self, "ROI load failed", msg)
+        self._show_load_error("ROI load failed", msg)
+
+    def _show_load_error(self, title: str, detail: str) -> None:
+        """F10: in developer mode, show a copyable report (the error plus an
+        automatic structural scan of the offending file) and drop a
+        ``.debug.txt`` sidecar; otherwise a plain critical box."""
+        if not self._dev_mode:
+            QMessageBox.critical(self, title, detail)
+            return
+        path = getattr(self, "_roi_load_path", None)
+        parts = [f"=== {title} ===", "", detail]
+        if path:
+            try:
+                parts += ["", "--- automatic file diagnosis ---",
+                          oasis_debug.report_file(path)]
+            except Exception as exc:  # noqa: BLE001
+                parts += ["", f"(diagnosis scan failed: {exc})"]
+        text = "\n".join(parts)
+        sidecar = (path + ".debug.txt") if path else None
+        if sidecar:
+            try:
+                Path(sidecar).write_text(text, encoding="utf-8")
+            except OSError:
+                sidecar = None
+        DebugReportDialog(self, title, text, saved_path=sidecar).exec()
 
     def _on_roi_cancelled(self) -> None:
         self._status_doc.setText("ROI load cancelled")
@@ -5769,6 +6140,7 @@ class MainWindow(QMainWindow):
             "OASIS files (*.oas *.oasis);;All files (*)")
         if not path:
             return
+        self._roi_load_path = path   # F10: remembered for debug-mode diagnostics
         # Scan the file for available layers and let the user multi-select
         # (same flow the old full-load entry used), instead of typing
         # layer/datatype pairs by hand.
@@ -5789,7 +6161,7 @@ class MainWindow(QMainWindow):
                 bbox_layer=oasis_random.DEFAULT_BBOX_LAYER)
         except Exception as exc:
             QApplication.restoreOverrideCursor()
-            QMessageBox.critical(self, "ROI open failed", str(exc))
+            self._show_load_error("ROI open failed", str(exc))
             return
         QApplication.restoreOverrideCursor()
         if not rar.has_offsets():
@@ -6084,6 +6456,147 @@ class MainWindow(QMainWindow):
             return
         self._status_doc.setText(f"cache exported · {Path(path).name}")
 
+    def _on_export_oasis(self) -> None:
+        """F9 M3: export selected raw / Boolean layers to OASIS, optionally
+        cropped to a GDS-coordinate region. Developer-mode only."""
+        if self._doc is None or not self._doc.entries:
+            QMessageBox.information(self, "Nothing to export",
+                                    "Load a layout first.")
+            return
+        whole_ok = self._rar is not None and self._roi_root is not None
+        dlg = OasisExportDialog(self, self._doc.entries, self._doc.bbox_nm,
+                                whole_chip_available=whole_ok)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        if not dlg.selected_specs():
+            QMessageBox.information(self, "Nothing selected",
+                                    "Select at least one layer to export.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export OASIS", "", "OASIS (*.oas)")
+        if not path:
+            return
+        if not path.lower().endswith(".oas"):
+            path += ".oas"
+        if dlg.scope() == "whole":
+            self._start_whole_chip_export(path, dlg.selected_specs(),
+                                          dlg.debug_enabled())
+            return
+        layers = dlg.selected_layers()
+        try:
+            n, report = layout_export.export_layers(
+                path, layers, crop_bbox=dlg.crop_bbox(),
+                unit=1000.0, cellname=self._doc.top_cell_name or "TOP",
+                debug=dlg.debug_enabled())
+        except Exception as exc:
+            QMessageBox.critical(self, "OASIS export failed", str(exc))
+            return
+        if n == 0:
+            QMessageBox.information(
+                self, "Nothing exported",
+                "No geometry fell inside the crop region.")
+            return
+        self._status_doc.setText(
+            f"OASIS exported · {Path(path).name} ({n} layer{'s' if n != 1 else ''})")
+        if report is not None:
+            sidecar = path + ".debug.txt"
+            try:
+                Path(sidecar).write_text(report, encoding="utf-8")
+            except OSError:
+                sidecar = None
+            DebugReportDialog(self, "OASIS export — debug report",
+                              report, saved_path=sidecar).exec()
+
+    @staticmethod
+    def _whole_chip_halo_nm(exprs: list) -> float:
+        """Tile halo (nm) = the largest morph distance in any recipe (so a
+        grown shape from a neighbouring tile is included) plus a margin."""
+        biggest = 0
+        for e in exprs:
+            for m in re.finditer(r"[<>]\s*[WHwh]\s*:\s*(\d+)", e or ""):
+                biggest = max(biggest, int(m.group(1)))
+        return biggest + 1000.0      # +1 µm margin
+
+    def _start_whole_chip_export(self, path, specs, debug: bool) -> None:
+        """F11 M2/M3: launch the tiled whole-chip export worker."""
+        if self._roi_thread is not None or getattr(self, "_wc_thread", None):
+            QMessageBox.information(self, "Busy", "A load/export is running.")
+            return
+        chip = self._rar.reachable_bbox_nm(self._roi_root)
+        if chip is None:
+            QMessageBox.critical(self, "Whole-chip export failed",
+                                 "Could not determine the chip extent.")
+            return
+        raw_specs = [(ol, od, e.key.layer, e.key.datatype)
+                     for e, ol, od in specs if not e.key.synthetic]
+        recipe_specs = [(ol, od, e.expr_text, e.expr_bindings)
+                        for e, ol, od in specs
+                        if e.key.synthetic and e.expr_text]
+        halo = self._whole_chip_halo_nm([r[2] for r in recipe_specs])
+
+        self._wc_path = path
+        self._wc_debug = debug
+        self._wc_progress = LoadProgressDialog(self)
+        self._wc_progress.set_text(
+            "Exporting whole chip…\nWalking + recomputing per tile "
+            "(streamed to disk; bounded memory). Cancellable.")
+        self._wc_thread = QThread(self)
+        self._wc_worker = WholeChipExportWorker(
+            rar=self._rar, root=self._roi_root, path=path, unit=1000.0,
+            cellname=self._doc.top_cell_name or "TOP", chip_bbox=chip,
+            raw_specs=raw_specs, recipe_specs=recipe_specs,
+            recipe_def=self._recipe_def, target_nm=250_000.0, halo_nm=halo)
+        self._wc_worker.moveToThread(self._wc_thread)
+        self._wc_thread.started.connect(self._wc_worker.run)
+        self._wc_worker.progress.connect(self._wc_progress.set_progress)
+        self._wc_worker.finished.connect(self._on_wc_finished)
+        self._wc_worker.failed.connect(self._on_wc_failed)
+        self._wc_worker.cancelled.connect(self._on_wc_cancelled)
+        self._wc_progress.cancel_requested.connect(self._wc_worker.cancel)
+        for sig in (self._wc_worker.finished, self._wc_worker.failed,
+                    self._wc_worker.cancelled):
+            sig.connect(self._wc_thread.quit)
+        self._wc_thread.finished.connect(self._cleanup_wc)
+        self._wc_progress.show()
+        QApplication.processEvents()
+        self._wc_thread.start()
+
+    def _on_wc_finished(self, n_tiles: int) -> None:
+        if self._wc_progress is not None:
+            self._wc_progress.close()
+        path = self._wc_path
+        self._status_doc.setText(
+            f"OASIS whole-chip exported · {Path(path).name} ({n_tiles} tiles)")
+        if self._wc_debug:
+            report = oasis_debug.report_file(path)
+            sidecar = path + ".debug.txt"
+            try:
+                Path(sidecar).write_text(report, encoding="utf-8")
+            except OSError:
+                sidecar = None
+            DebugReportDialog(self, "Whole-chip export — debug report",
+                              report, saved_path=sidecar).exec()
+
+    def _on_wc_failed(self, msg: str) -> None:
+        if self._wc_progress is not None:
+            self._wc_progress.close()
+        if self._dev_mode:
+            DebugReportDialog(self, "Whole-chip export failed", msg).exec()
+        else:
+            QMessageBox.critical(self, "Whole-chip export failed", msg)
+
+    def _on_wc_cancelled(self) -> None:
+        if self._wc_progress is not None:
+            self._wc_progress.close()
+        self._status_doc.setText("whole-chip export cancelled")
+
+    def _cleanup_wc(self) -> None:
+        for attr in ("_wc_progress", "_wc_worker", "_wc_thread"):
+            obj = getattr(self, attr, None)
+            if obj is not None:
+                obj.deleteLater()
+            setattr(self, attr, None)
+
     def _save_expr_sidecar(self, npz_path: str) -> None:
         """Write expression-layer recipes next to the cache as
         ``<stem>_expr.json`` (plan M2.6 / F4)."""
@@ -6162,6 +6675,63 @@ class MainWindow(QMainWindow):
                 color=QColor(d.get("color") or "#d44fa0"))
         self._recompute_recipes(self._doc.bbox_nm)
 
+    # ── F9: developer mode ───────────────────────────────────────────────────
+
+    def _attach_dev_toggle(self, widget: QWidget, dlg: QDialog) -> None:
+        """Make ``widget`` count clicks; 5 clicks toggles developer mode."""
+        widget.setCursor(Qt.CursorShape.PointingHandCursor)
+        clicks = {"n": 0}
+
+        def on_click(_event) -> None:
+            clicks["n"] += 1
+            if clicks["n"] < 5:
+                return
+            clicks["n"] = 0
+            self._set_dev_mode(not self._dev_mode)
+            state = "enabled" if self._dev_mode else "disabled"
+            QMessageBox.information(
+                dlg, "Developer mode",
+                f"Developer mode {state}.\n\n"
+                "Advanced features (OASIS export) are now "
+                f"{'available' if self._dev_mode else 'hidden'}.")
+
+        widget.mousePressEvent = on_click
+
+    def _set_dev_mode(self, on: bool) -> None:
+        self._dev_mode = bool(on)
+        QSettings("GLAS", "GLAS").setValue("dev_mode", self._dev_mode)
+        self._refresh_dev_ui()
+
+    def _refresh_dev_ui(self) -> None:
+        """Show / hide developer-only controls to match ``self._dev_mode``."""
+        btn = getattr(self, "_export_oasis_btn", None)
+        if btn is not None:
+            btn.setVisible(self._dev_mode)
+        act = getattr(self, "_diagnose_action", None)
+        if act is not None:
+            act.setVisible(self._dev_mode)
+
+    def _on_diagnose_oasis(self) -> None:
+        """F10: scan a chosen .oas and show a copyable diagnostic report
+        (record histogram, per-layer counts, decode error context)."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Diagnose OASIS file", "",
+            "OASIS files (*.oas *.oasis);;All files (*)")
+        if not path:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            report = oasis_debug.report_file(path)
+        finally:
+            QApplication.restoreOverrideCursor()
+        sidecar = path + ".debug.txt"
+        try:
+            Path(sidecar).write_text(report, encoding="utf-8")
+        except OSError:
+            sidecar = None
+        DebugReportDialog(self, "OASIS diagnostics", report,
+                          saved_path=sidecar).exec()
+
     def _show_about(self) -> None:
         dlg = QDialog(self)
         dlg.setWindowTitle("About GLAS")
@@ -6180,6 +6750,8 @@ class MainWindow(QMainWindow):
             icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             v.addWidget(icon_lbl)
             v.addSpacing(12)
+            # F9: click the icon 5 times to toggle developer mode.
+            self._attach_dev_toggle(icon_lbl, dlg)
 
         name_lbl = QLabel("GLAS", dlg)
         name_lbl.setStyleSheet(
