@@ -2,6 +2,29 @@
 
 ---
 
+## [2026-05-28] [F12] 探索後撤案：無索引表 OASIS 支援（改用 KLayout 轉檔）
+
+**變更類型：** 決策 / 還原（本 session 的 F12 程式碼變更已全數 revert，淨碼變更為 0）
+
+**背景：** user 丟一顆非 Calibre 寫出、3.9GB 的 `R8_OD_to_VC.oas`——**無 `LAYERNAME`、無 `S_CELL_OFFSET`**
+兩個索引表。症狀：Scan layers 找不到 layer、ROI random-access 索引 0 cells（F10 診斷卻列得出 layer）。
+
+**做過什麼（後來全砍）：** 開了 F12 plan + 實作 M1–M8——自建 cell offset 索引（`build_cell_index`，後改成
+`consume(skip_cblocks=True)` 跳壓縮塊加速）、`RandomAccessReader` fallback、layer 幾何掃描 + 提早停、
+index/layer/reach 三種 sidecar cache、worker 化。索引與 layer 掃描可達秒級。
+
+**為何撤案：** 卡在**根本性**效能問題——這類檔無 per-cell bbox（Calibre 靠 CE 邊界層 (108,250) 每顆只讀 1
+矩形即得大小；此檔無此層），`walk_roi` 首次載入為了剪枝必須把 root 整棵子樹每顆 cell 全解一遍 ≈ 全 chip
+解碼，對 3.9GB 等同數分鐘且 GIL 卡 UI。reach-bbox 持久化只能讓它「一次性」，第一次仍慢。user 決定不值得，
+**整批 revert 回 `e7437f1`（F11 M5）**。
+
+**結論 / 替代方案：** 不在 GLAS 原生支援無索引表 OASIS。需要開這類檔時，**先用 KLayout 開→另存 `.oas`**
+（KLayout 寫出會帶 cell offset + layer name 表），轉出的檔即可走 GLAS 現有快速路徑，零程式改動。
+
+**影響檔案：** 無（程式碼還原）；僅本檔新增此決策紀錄。
+
+**Branch：** `claude/adoring-cannon-oKZKo`
+
 ## [2026-05-27] [F11] M5 文件：README / CLAUDE 更新（FOV / 整 chip 匯出範圍）
 
 **變更類型：** 文件
