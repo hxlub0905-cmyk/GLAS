@@ -4,6 +4,48 @@
 
 ---
 
+## [2026-05-29] [B] 修 GLAS 讀不到「offset_flag=1（索引表在檔尾）」OASIS
+
+**變更類型：** Bug fix（core + app）
+
+**現象：** user 用 KLayout「Save As → OASIS (Strict mode)」把無索引檔轉成帶索引的
+`R8_OD_to_VC_NEW.oas`（1.84 GB）後，GLAS「Open OASIS (ROI)」跳「This OASIS has no
+S_CELL_OFFSET index…」。F10 診斷顯示 `offset_flag: 1`、`CELL(by refnum) x 27425`，檔頭
+50 萬筆內 `CELLNAME = 0`——索引「有」，只是 GLAS 沒讀到。
+
+**根因：** `scan_cell_offsets`（oasis_streamer.py）是「從檔頭 iter_records、碰第一個
+CELL 就 break」，假設名稱表 / S_CELL_OFFSET 在檔頭（offset_flag=0，Calibre）。SEMI P39：
+offset_flag=1 時各表位置記在 **END record**、表在**檔尾**（KLayout strict）。此時掃到第一個
+CELL 時 CELLNAME 一筆都沒讀到 → `by_refnum` 空 → 回報 no S_CELL_OFFSET。app 的
+`_scan_layers_main` 同樣「碰 CELL 就停」，讀不到檔尾 LAYERNAME。
+
+**修復（純加法，不動 offset_flag=0 既有路徑，遵守 §7）：**
+- `oasis_streamer.py`：新增 `_peek_start`（不擾動位置讀 START → 取 offset_flag）；
+  `scan_cell_offsets` 開頭 dispatch：offset_flag==1 → `_scan_tail_tables`。新增
+  `_read_end_table_offsets`（END 固定 256 bytes、在 `size-256`；含尾端掃描 fallback +
+  健全性檢查）解出 6 對 (strict, byte_offset) 表位置、`_iter_table_at`（自指定 offset 讀單一
+  表、碰非該表 record 即停，不越界到下一表）、`_scan_tail_tables`（依序讀 PROPNAME→CELLNAME
+  〔含 S_CELL_OFFSET PROPERTY〕→LAYERNAME，回填 by_refnum/by_name/layernames）。
+  byte_offset==0 視為該表不存在安全略過。
+- `gds_align_tool.py` `_scan_oas_with_streamer`：header 掃不到 layer 時 fallback 用
+  `scan_cell_offsets(p, use_mmap=True)`（mmap 避免 1.84 GB slurp）取檔尾 LAYERNAME 回填清單。
+
+**測試：** `py_compile` 全過。沙箱無 numpy/pytest → 用合成 offset_flag=1 OASIS（START
+flag=1 → 2 cells → 檔尾 PROPNAME/CELLNAME+S_CELL_OFFSET/LAYERNAME → END 帶 6 對 offset，
+padding 至 256）以純 stdlib 腳本驗證 `scan_cell_offsets` 三種開法（slurp / mmap /
+shared_buf＝RandomAccessReader 實際用法）皆正確回 by_refnum/by_name/layernames+unit，且
+`verify_cell_offsets` 確認 offset 落在 CELL record；offset_flag=0 路徑回歸不變。tests/
+新增 `TestCellOffsetIndexTailTables`（3 例：讀檔尾索引 / offset 落點 / 空表 fallback），
+以 pytest stub 跑過。**真檔（R8_OD_to_VC_NEW.oas）GUI 端到端待 user 本地 pytest + 開檔驗收。**
+
+**注意：** 此檔「有」S_CELL_OFFSET，非 F12（完全無索引、已撤案）；本修正只讓 GLAS 正確讀
+「索引表在檔尾」的合法 OASIS，未引入 F12 的自建索引 / skip-cblock / reach cache。
+
+**影響檔案：** `glas/core/oasis_streamer.py`、`glas/app/gds_align_tool.py`、
+`tests/test_oasis_streamer.py`。 **Branch：** `claude/magical-davinci-Ibo8K`
+
+---
+
 ## [2026-05-29] [F11] 修 whole-chip 匯出 `NameError` + ROI 開檔後左側 layers 提示
 
 **變更類型：** Bug fix + UX 微調（app）

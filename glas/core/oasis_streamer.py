@@ -2305,11 +2305,209 @@ class OasisReader:
 
 _CELL_OFFSET_PROP = "S_CELL_OFFSET"
 
+# SEMI P39 §14: the END record is padded to a fixed 256-byte length, so on an
+# offset_flag==1 file (name tables at the tail) END is the last record and
+# begins at ``file_size - 256``. Its body opens with the 6 (strict, byte)
+# table-offset pairs we need to locate those tail tables.
+_END_RECORD_LEN = 256
+
+# Record ids that make up each tail name table (offset_flag==1). A table read
+# stops at the first record outside its set — i.e. the next table / a CELL /
+# END — so reads never bleed from one table into the next.
+_TAIL_PROPNAME_RIDS = (PROPNAME_IMP, PROPNAME_EXP)
+_TAIL_CELLNAME_RIDS = (CELLNAME_IMP, CELLNAME_EXP,
+                       PROPERTY_NORMAL, PROPERTY_LAST)
+_TAIL_LAYERNAME_RIDS = (LAYERNAME_GEOM, LAYERNAME_TEXT)
+
 
 def _name_str(v) -> str:
     if isinstance(v, bytes):
         return v.decode("ascii", "replace")
     return v if isinstance(v, str) else str(v)
+
+
+def _peek_start(reader: "OasisReader") -> dict:
+    """Read the START record (right after MAGIC) without disturbing the
+    reader's position, so callers can branch on ``offset_flag`` before the
+    main scan. Returns the START payload (``{}`` if the first record isn't a
+    START)."""
+    f = reader._f
+    save = f.tell()
+    try:
+        f.seek(len(MAGIC))
+        if f.read_uvarint() != START:
+            return {}
+        return reader._read_start()
+    except OasisFormatError:
+        return {}
+    finally:
+        f.seek(save)
+
+
+def _try_parse_end_offsets(f, pos: int, size: int):
+    """If a valid offset_flag==1 END record starts at ``pos``, return its 6
+    ``(strict, byte_offset)`` table-offset pairs; else None."""
+    f.seek(pos)
+    try:
+        if f.read_uvarint() != END:
+            return None
+        offs: list[tuple[int, int]] = []
+        for _ in range(6):
+            strict = f.read_uvarint()
+            byte_off = f.read_uvarint()
+            offs.append((strict, byte_off))
+    except OasisFormatError:
+        return None
+    # Sanity: present tables (byte_offset != 0) must point inside the file,
+    # and at least one must be present — otherwise this 0x02 byte wasn't a
+    # real END offset table (guards the tail-scan fallback below).
+    present = [(s, o) for s, o in offs if o]
+    if not present or any(o >= size for _, o in present):
+        return None
+    return offs
+
+
+def _read_end_table_offsets(reader: "OasisReader"):
+    """Locate the END record (last record, padded to a fixed 256 bytes) and
+    return its 6 ``(strict, byte_offset)`` name-table pairs, or None. Used
+    only for offset_flag==1 files; the offset_flag==0 path never calls this."""
+    f = reader._f
+    f.clear_substreams()
+    size = f.seek(0, 2)
+    candidates: list[int] = []
+    if size >= _END_RECORD_LEN:
+        candidates.append(size - _END_RECORD_LEN)
+    # Fallback for non-standard tail padding: scan the last few hundred bytes
+    # for an END id byte. Cheap (bounded window) and the sanity checks in
+    # _try_parse_end_offsets reject false positives.
+    tail_start = max(0, size - 512)
+    f.seek(tail_start)
+    tail = f.read(size - tail_start)
+    for i, b in enumerate(tail):
+        if b == END:
+            cand = tail_start + i
+            if cand not in candidates:
+                candidates.append(cand)
+    for cand in candidates:
+        offs = _try_parse_end_offsets(f, cand, size)
+        if offs is not None:
+            return offs
+    return None
+
+
+def _iter_table_at(reader: "OasisReader", offset: int, allowed):
+    """Yield ``(rid, payload)`` for consecutive records of one tail name
+    table, starting at absolute byte ``offset`` and stopping at the first
+    record whose id isn't in ``allowed`` (next table / CELL / END / CBLOCK we
+    don't expand) or at EOF. offset_flag==1 only; the header path is
+    untouched."""
+    f = reader._f
+    f.clear_substreams()
+    f.seek(offset)
+    while True:
+        try:
+            rid = f.read_uvarint()
+        except OasisFormatError:
+            return
+        if rid not in allowed:
+            return
+        if rid in (CELLNAME_IMP, CELLNAME_EXP):
+            yield rid, reader._read_cellname(explicit=(rid == CELLNAME_EXP))
+        elif rid in (PROPNAME_IMP, PROPNAME_EXP):
+            yield rid, reader._read_propname(explicit=(rid == PROPNAME_EXP))
+        elif rid in (LAYERNAME_GEOM, LAYERNAME_TEXT):
+            yield rid, reader._read_layername()
+        elif rid in (PROPERTY_NORMAL, PROPERTY_LAST):
+            yield rid, reader._read_property(last=(rid == PROPERTY_LAST))
+        else:
+            return
+
+
+def _scan_tail_tables(reader: "OasisReader", start: dict) -> dict:
+    """offset_flag==1: the CELLNAME / PROPNAME / LAYERNAME tables live at the
+    file tail, located via the END record's offset table. Read them directly
+    (PROPNAME first, to resolve the S_CELL_OFFSET property name) and build the
+    same ``{by_refnum, by_name, layernames, ...}`` dict the header scan
+    returns. Closes the reader before returning (mirrors ``scan_cell_offsets``).
+    Empty index on a missing/unreadable offset table — caller then reports
+    'no S_CELL_OFFSET' exactly as before."""
+    by_refnum: dict[int, int] = {}
+    by_name: dict[str, int] = {}
+    layernames: list[tuple[str, tuple, tuple]] = []
+    cellnames = 0
+    try:
+        offs = _read_end_table_offsets(reader)
+        if offs:
+            cellname_t, propname_t, layername_t = offs[0], offs[2], offs[4]
+
+            # 1) PROPNAME table → refnum/index → name, so a PROPERTY that
+            #    references its propname by refnum resolves to S_CELL_OFFSET.
+            propname_by_refnum: dict[int, str] = {}
+            pn_implicit = 0
+            if propname_t[1]:
+                for rid, p in _iter_table_at(reader, propname_t[1],
+                                             _TAIL_PROPNAME_RIDS):
+                    nm = _name_str(p.get("name", ""))
+                    if rid == PROPNAME_EXP and p.get("refnum") is not None:
+                        propname_by_refnum[int(p["refnum"])] = nm
+                    else:
+                        propname_by_refnum[pn_implicit] = nm
+                        pn_implicit += 1
+
+            # 2) CELLNAME table: each CELLNAME is followed by its
+            #    PROPERTY(S_CELL_OFFSET) → fill by_refnum / by_name. Mirrors the
+            #    header-path logic so refnum numbering stays identical.
+            if cellname_t[1]:
+                cn_implicit = 0
+                last_cell_ref: Optional[int] = None
+                last_cell_name: Optional[str] = None
+                last_propname: Optional[str] = None
+                for rid, p in _iter_table_at(reader, cellname_t[1],
+                                             _TAIL_CELLNAME_RIDS):
+                    if rid in (CELLNAME_IMP, CELLNAME_EXP):
+                        cellnames += 1
+                        last_cell_name = _name_str(p.get("name", ""))
+                        if rid == CELLNAME_EXP and p.get("refnum") is not None:
+                            last_cell_ref = int(p["refnum"])
+                        else:
+                            last_cell_ref = cn_implicit
+                            cn_implicit += 1
+                    else:  # PROPERTY_NORMAL / PROPERTY_LAST
+                        pn = p.get("propname")
+                        if pn is None:
+                            name = last_propname        # modal: reuse previous
+                        elif isinstance(pn, int):
+                            name = propname_by_refnum.get(pn)
+                        else:
+                            name = _name_str(pn)
+                        last_propname = name
+                        if name == _CELL_OFFSET_PROP and last_cell_ref is not None:
+                            vals = p.get("values") or []
+                            if vals:
+                                off = int(vals[0])
+                                by_refnum[last_cell_ref] = off
+                                if last_cell_name is not None:
+                                    by_name[last_cell_name] = off
+
+            # 3) LAYERNAME table → layer labels for the UI (F3 M2 parity).
+            if layername_t[1]:
+                for _rid, p in _iter_table_at(reader, layername_t[1],
+                                              _TAIL_LAYERNAME_RIDS):
+                    layernames.append((
+                        _name_str(p.get("name", "")),
+                        tuple(p.get("layer_interval") or (0, -1)),
+                        tuple(p.get("datatype_interval") or (0, -1)),
+                    ))
+    finally:
+        reader.close()
+    return {
+        "by_refnum": by_refnum,
+        "by_name": by_name,
+        "found": len(by_refnum),
+        "cellnames": cellnames,
+        "unit": start.get("unit"),
+        "layernames": layernames,
+    }
 
 
 def scan_cell_offsets(path: str | Path, *, use_mmap: bool = False,
@@ -2331,6 +2529,16 @@ def scan_cell_offsets(path: str | Path, *, use_mmap: bool = False,
     decode)."""
     reader = OasisReader(path, capture_prop_values=True, use_mmap=use_mmap,
                          shared_buf=shared_buf)
+    # offset_flag (SEMI P39 §13.10) says where the name tables live:
+    #   0 → in the header, between START and the first CELL (the original fast
+    #       path below; verified on Calibre D2DB files — do not touch).
+    #   1 → at the file tail, located via the END record's offset table (e.g.
+    #       KLayout "Save As → OASIS, strict mode"). The header scan would hit
+    #       the first CELL with an empty index and wrongly report "no
+    #       S_CELL_OFFSET", so dispatch to a dedicated tail-table reader.
+    start = _peek_start(reader)
+    if start.get("offset_flag") == 1:
+        return _scan_tail_tables(reader, start)
     propname_by_refnum: dict[int, str] = {}
     pn_implicit = 0
     cn_implicit = 0

@@ -314,6 +314,116 @@ class TestCellOffsetIndex:
         assert idx["found"] == 0 and idx["cellnames"] == 1
 
 
+class TestCellOffsetIndexTailTables:
+    """offset_flag==1: the CELLNAME / PROPNAME / LAYERNAME tables live at the
+    file tail and are located via the END record's offset table (e.g. KLayout
+    "Save As → OASIS, strict mode"). scan_cell_offsets must read them rather
+    than stopping at the first CELL with an empty index."""
+
+    @staticmethod
+    def _uint_fixed(n: int, width: int) -> bytes:
+        out = []
+        for i in range(width):
+            b = n & 0x7F
+            n >>= 7
+            out.append(b | 0x80 if i < width - 1 else b)
+        return bytes(out)
+
+    @staticmethod
+    def _interval3(n: int) -> bytes:        # interval kind 3: n..INF
+        return _make_uint(3) + _make_uint(n)
+
+    @classmethod
+    def _layername(cls, name: str, L: int, D: int) -> bytes:
+        b = name.encode()
+        return (bytes([oas.LAYERNAME_GEOM]) + _make_uint(len(b)) + b
+                + cls._interval3(L) + cls._interval3(D))
+
+    def _prop(self, off: int) -> bytes:
+        # PROPERTY S_CELL_OFFSET: C=1 N=1 U=1 -> info 0x16; propname refnum 0;
+        # one uint value (type 8) = the byte offset, fixed-width.
+        return (bytes([oas.PROPERTY_NORMAL, 0x16]) + _make_uint(0)
+                + _make_uint(8) + self._uint_fixed(off, 4))
+
+    def _build(self):
+        # offset_flag=1 START: NO 6 table-offset pairs here (they're in END).
+        start = (bytes([oas.START]) + _make_uint(3) + b"1.0"
+                 + bytes([0]) + _make_uint(2000) + _make_uint(1))
+        # Body: two cells by refnum at the front, right after START.
+        rect_a = bytes([oas.RECTANGLE, 0x7b, 6, 0, 10, 10, 0, 0])
+        rect_b = bytes([oas.RECTANGLE, 0x7b, 17, 0, 20, 20, 100, 100])
+        cell_a = bytes([oas.CELL_REFNUM]) + _make_uint(0) + rect_a
+        cell_b = bytes([oas.CELL_REFNUM]) + _make_uint(1) + rect_b
+
+        head = oas.MAGIC + start
+        off_a = len(head)
+        off_b = len(head) + len(cell_a)
+        body = cell_a + cell_b
+
+        # Tail tables.
+        propname_tbl = bytes([oas.PROPNAME_IMP]) + _make_uint(13) + b"S_CELL_OFFSET"
+        cellname_tbl = (bytes([oas.CELLNAME_IMP]) + _make_uint(1) + b"A"
+                        + self._prop(off_a)
+                        + bytes([oas.CELLNAME_IMP]) + _make_uint(1) + b"B"
+                        + self._prop(off_b))
+        layername_tbl = (self._layername("OD", 6, 0)
+                         + self._layername("VC", 17, 0)
+                         + self._layername("M1", 82, 150))
+
+        pre = head + body
+        propname_off = len(pre)
+        cellname_off = propname_off + len(propname_tbl)
+        layername_off = cellname_off + len(cellname_tbl)
+        tables = propname_tbl + cellname_tbl + layername_tbl
+
+        # END body: 6 (strict, byte_offset) pairs in table order
+        # (CELLNAME, TEXTSTRING, PROPNAME, PROPSTRING, LAYERNAME, XNAME) +
+        # validation scheme 0, padded to the fixed 256-byte END record.
+        pairs = [(1, cellname_off), (0, 0), (1, propname_off),
+                 (0, 0), (1, layername_off), (0, 0)]
+        end_body = b"".join(_make_uint(s) + _make_uint(o) for s, o in pairs)
+        end_body += _make_uint(0)
+        end = bytes([oas.END]) + end_body
+        end += b"\x00" * (oas._END_RECORD_LEN - len(end))
+
+        return pre + tables + end, off_a, off_b
+
+    def test_reads_tail_index(self, tmp_path: Path):
+        data, off_a, off_b = self._build()
+        p = tmp_path / "tail.oas"
+        p.write_bytes(data)
+        idx = oas.scan_cell_offsets(p)
+        assert idx["by_refnum"] == {0: off_a, 1: off_b}
+        assert idx["by_name"] == {"A": off_a, "B": off_b}
+        assert idx["found"] == 2 and idx["cellnames"] == 2
+        assert idx["unit"] == 2000.0
+        layers = {(lv[0], dv[0]) for _n, lv, dv in idx["layernames"]}
+        assert layers == {(6, 0), (17, 0), (82, 150)}
+
+    def test_tail_offsets_land_on_cells(self, tmp_path: Path):
+        data, _a, _b = self._build()
+        p = tmp_path / "tail.oas"
+        p.write_bytes(data)
+        idx = oas.scan_cell_offsets(p)
+        ver = oas.verify_cell_offsets(p, idx["by_refnum"].values())
+        assert ver["ok"] == 2 and ver["bad"] == []
+
+    def test_missing_tail_tables_empty_index(self, tmp_path: Path):
+        # offset_flag=1 but END's offset table is all-zero (no tables) ->
+        # empty index, exactly as the caller's "no S_CELL_OFFSET" fallback.
+        start = (bytes([oas.START]) + _make_uint(3) + b"1.0"
+                 + bytes([0]) + _make_uint(2000) + _make_uint(1))
+        cell = bytes([oas.CELL_REFNUM]) + _make_uint(0)
+        end_body = b"".join(_make_uint(0) + _make_uint(0) for _ in range(6))
+        end_body += _make_uint(0)
+        end = bytes([oas.END]) + end_body
+        end += b"\x00" * (oas._END_RECORD_LEN - len(end))
+        p = tmp_path / "empty.oas"
+        p.write_bytes(oas.MAGIC + start + cell + end)
+        idx = oas.scan_cell_offsets(p)
+        assert idx["found"] == 0 and idx["by_refnum"] == {}
+
+
 # ── Modal-state cell-boundary reset ──────────────────────────────────────────
 
 

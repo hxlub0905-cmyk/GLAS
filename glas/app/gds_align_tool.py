@@ -1017,6 +1017,29 @@ def _scan_oas_with_streamer(path: "Path", q: "mp.Queue") -> None:
                 # End of header: every LAYERNAME has been seen by now.
                 break
 
+    # offset_flag==1 (e.g. KLayout "Save As → OASIS, strict mode"): the
+    # LAYERNAME table lives at the file *tail*, so the header scan above stops
+    # at the first CELL having seen none. scan_cell_offsets transparently reads
+    # the tail tables for such files; reuse its LAYERNAME output here so the UI
+    # still lists the layers. (No-op for offset_flag==0 files with no layers.)
+    if not layers:
+        # use_mmap so a multi-GB file is paged, not slurped into the subprocess.
+        info = oas.scan_cell_offsets(p, use_mmap=True)
+        for nm, lyr_iv, dt_iv in info.get("layernames", []):
+            name = nm if isinstance(nm, str) else nm.decode("ascii",
+                                                             "backslashreplace")
+            L = int(lyr_iv[0])
+            D = int(dt_iv[0])
+            key = (L, D)
+            if key not in seen:
+                seen.add(key)
+                layers.append({"layer": L, "datatype": D, "name": name})
+            elif name:
+                for ent in layers:
+                    if ent["layer"] == L and ent["datatype"] == D and not ent["name"]:
+                        ent["name"] = name
+                        break
+
     elapsed = _t.monotonic() - t0
     _sys.stderr.write(
         f"[gds-scan] {elapsed:.2f}s  enumerated {len(layers)} layers "
