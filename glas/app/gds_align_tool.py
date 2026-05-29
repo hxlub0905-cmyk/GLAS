@@ -1843,6 +1843,45 @@ class LayerPanel(QFrame):
         hint_item.setFont(font2)
         self.list.addItem(hint_item)
 
+    def show_roi_pending(self, layer_keys) -> None:
+        """ROI mode after Open OASIS + pick root cell: no geometry is decoded
+        until a SEM image is clicked (random-access is lazy by design), so the
+        list would otherwise still read "Open an OASIS". Instead list the
+        picked layers (so the choice is visibly registered) plus a one-line cue
+        telling the user the next step — set coordinates, then click an image."""
+        self.list.clear()
+        self._rows = []
+        self._poi_entries = []
+
+        title_item = QListWidgetItem("ROI mode ready")
+        title_item.setFlags(Qt.ItemFlag.NoItemFlags)
+        title_item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
+        title_item.setForeground(QColor(_TK_TEXT_SEC))
+        font = title_item.font()
+        font.setPixelSize(_FS_LABEL)
+        font.setBold(True)
+        title_item.setFont(font)
+        self.list.addItem(title_item)
+
+        for l, d in (layer_keys or []):
+            li = QListWidgetItem(f"L{l}/D{d}  ·  loads on click")
+            li.setFlags(Qt.ItemFlag.NoItemFlags)
+            li.setForeground(QColor(_TK_TEXT_HINT))
+            f = li.font()
+            f.setPixelSize(_FS_CAPTION)
+            li.setFont(f)
+            self.list.addItem(li)
+
+        cue = QListWidgetItem(
+            "Next: set Coordinate Setup (right) → click a defect image")
+        cue.setFlags(Qt.ItemFlag.NoItemFlags)
+        cue.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
+        cue.setForeground(QColor(_TK_TEXT_HINT))
+        f2 = cue.font()
+        f2.setPixelSize(_FS_CAPTION)
+        cue.setFont(f2)
+        self.list.addItem(cue)
+
     def set_document(self, doc: Optional[GdsDocument]) -> None:
         self._doc = doc
         self.list.clear()
@@ -6187,6 +6226,10 @@ class MainWindow(QMainWindow):
         self._oas_path = path
         self._roi_root = root
         self._roi_layers = layer_keys
+        # ROI geometry is decoded lazily (on the first SEM-image click), so the
+        # left LAYERS column has nothing to draw yet. Show the picked layers +
+        # a next-step cue so the user isn't left wondering what to press.
+        self.layer_panel.show_roi_pending(layer_keys)
         # New layout → drop any recipes from a previously-open file (recipes
         # persist across ROI reloads of the SAME file, not across files).
         self._recipes = []

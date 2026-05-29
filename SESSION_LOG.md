@@ -4,9 +4,9 @@
 
 ---
 
-## [2026-05-29] [F11] 修 whole-chip 匯出 `NameError: oasis_writer`
+## [2026-05-29] [F11] 修 whole-chip 匯出 `NameError` + ROI 開檔後左側 layers 提示
 
-**變更類型：** Bug fix（app）
+**變更類型：** Bug fix + UX 微調（app）
 
 **現象：** 選 scope=Whole chip 匯出 OASIS 時，`WholeChipExportWorker.run()` 在
 `with oasis_writer.OasisStreamWriter(...)`（gds_align_tool.py:1172）丟
@@ -15,8 +15,15 @@ core 的 `oasis_writer` 模組（FOV 匯出走 `layout_export`，內部自帶 im
 
 **修復：** 在 app 的 core import 區（layout_export 之後）補 `import oasis_writer`。
 
+**ROI 左側 layers 提示（UX）：** user 回報 Open OASIS→Scan→Pick root cell→OK 後，左側
+LAYERS 仍空（且舊 placeholder 寫「Open an OASIS」，誤導）。釐清這是 ROI 隨機存取 **lazy
+load 的正常行為**（幾何要等點 SEM 圖、座標設定後才 decode），維持不變；但加
+`LayerPanel.show_roi_pending(layer_keys)`：picked root cell 後左側即列出所選 layer（標
+「loads on click」）+ 下一步提示「set Coordinate Setup → click a defect image」，讓 user
+知道接著要按什麼。於 `_on_open_roi` 設定 `_roi_layers` 後呼叫。
+
 **測試：** `python3 -m py_compile glas/app/gds_align_tool.py` 通過（沙箱無 PyQt6，
-無法跑 GUI 端到端，待 user 本地驗收 whole-chip 匯出）。
+無法跑 GUI 端到端，待 user 本地驗收 whole-chip 匯出 + 左側提示顯示）。
 
 **影響檔案：** `glas/app/gds_align_tool.py`。 **Branch：** `claude/magical-davinci-Ibo8K`
 
