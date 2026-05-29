@@ -1904,6 +1904,11 @@ class LayerPanel(QFrame):
         f2.setPixelSize(_FS_CAPTION)
         cue.setFont(f2)
         self.list.addItem(cue)
+        # Opening a new file drops the previous layout's POIs. Emit the reset
+        # (as set_document does) so MainWindow._poi_entries + the Fine Align
+        # panel don't keep stale POIs that preview/batch paths would fine-align
+        # against before the first SEM click loads fresh geometry.
+        self.pois_changed.emit([])
 
     def set_document(self, doc: Optional[GdsDocument]) -> None:
         self._doc = doc
