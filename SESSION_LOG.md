@@ -4,6 +4,24 @@
 
 ---
 
+## [2026-05-29] [F11] 修 whole-chip 匯出 `NameError: oasis_writer`
+
+**變更類型：** Bug fix（app）
+
+**現象：** 選 scope=Whole chip 匯出 OASIS 時，`WholeChipExportWorker.run()` 在
+`with oasis_writer.OasisStreamWriter(...)`（gds_align_tool.py:1172）丟
+`NameError: name 'oasis_writer' is not defined`。F11 M2 加了 worker 卻漏 import
+core 的 `oasis_writer` 模組（FOV 匯出走 `layout_export`，內部自帶 import，所以沒被發現）。
+
+**修復：** 在 app 的 core import 區（layout_export 之後）補 `import oasis_writer`。
+
+**測試：** `python3 -m py_compile glas/app/gds_align_tool.py` 通過（沙箱無 PyQt6，
+無法跑 GUI 端到端，待 user 本地驗收 whole-chip 匯出）。
+
+**影響檔案：** `glas/app/gds_align_tool.py`。 **Branch：** `claude/magical-davinci-Ibo8K`
+
+---
+
 ## [2026-05-28] [F12] 探索後撤案：無索引表 OASIS 支援（改用 KLayout 轉檔）
 
 **變更類型：** 決策 / 還原（本 session 的 F12 程式碼變更已全數 revert，淨碼變更為 0）

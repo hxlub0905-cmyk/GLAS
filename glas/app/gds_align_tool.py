@@ -126,6 +126,7 @@ import gds_layer_cache  # noqa: E402
 import sem_loader       # noqa: E402
 import oasis_random     # noqa: E402
 import layout_export     # noqa: E402  (F9: OASIS export — shapely guarded inside)
+import oasis_writer      # noqa: E402  (F11: whole-chip streaming OASIS writer)
 import oasis_debug        # noqa: E402  (F10: OASIS diagnostics — Qt-free)
 # F8: the Qt-free fine-align compute lives in glas/core/fine_align.py so a
 # spawn-based ProcessPool worker can import it without pulling in PyQt6. Pull
