@@ -4,6 +4,25 @@
 
 ---
 
+## [2026-05-29] [B] ROI 開檔 freeze 診斷計時 + 釐清「無 LAYERNAME 表」
+
+**變更類型：** 診斷（app，純加 log）·  **狀態：待 user 跑一次回報定位**
+
+**背景：** offset_flag=1 修正後測試 141 全過，但 user 開實際 KLayout strict 檔
+（`R8_OD_to_VC_NEW.oas`，1.84 GB，27425 cells）時：(1) Scan layers 仍列不出 layer——
+經確認該檔**根本沒有 LAYERNAME 表**（KLayout 也只顯示數字如 17/101、6/0，無 name），
+非 bug；可在「Pick ROI layers」對話框直接手動輸入數字載入。(2) 手動輸入後「開檔/Pick
+root cell 當下」UI freeze（未必恢復、每次不一）。
+
+**診斷手段：** 在 `_on_open_roi` 三個主執行緒重活點之間加 `[open-roi]` 計時 print
+（stdout, flush）：建 `RandomAccessReader`（讀 27425 cell offset）→ `QInputDialog.getItem`
+塞 27425 names 的下拉（Qt 萬級項目經典卡點）→ `_fit_view_to_defects`/首次重繪。看 console
+最後停在哪行即定位 freeze 來源，再對症修（背景化 reader / 輕量 root-cell picker / etc.）。
+
+**影響檔案：** `glas/app/gds_align_tool.py`。 **Branch：** `claude/magical-davinci-Ibo8K`
+
+---
+
 ## [2026-05-29] [B] 修 GLAS 讀不到「offset_flag=1（索引表在檔尾）」OASIS
 
 **變更類型：** Bug fix（core + app）

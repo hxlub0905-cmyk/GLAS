@@ -6223,6 +6223,14 @@ class MainWindow(QMainWindow):
                                 "Pick (or type) at least one layer to load.")
             return
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        # Timing trace (stdout) to pinpoint where the open path stalls on a
+        # huge file: which [open-roi] line is the LAST one printed before the
+        # UI freezes tells us the culprit (reader build vs root-cell picker vs
+        # initial fit/redraw). Cheap; can be removed once diagnosed.
+        import time as _t
+        _t0 = _t.perf_counter()
+        print(f"[open-roi] building RandomAccessReader for "
+              f"{Path(path).name} (layers={layer_keys})…", flush=True)
         try:
             rar = oasis_random.RandomAccessReader(
                 path, wanted_layers=set(layer_keys),
@@ -6232,6 +6240,8 @@ class MainWindow(QMainWindow):
             self._show_load_error("ROI open failed", str(exc))
             return
         QApplication.restoreOverrideCursor()
+        print(f"[open-roi] reader built in {_t.perf_counter() - _t0:.2f}s "
+              f"({len(rar._by_refnum):,} cell offsets)", flush=True)
         if not rar.has_offsets():
             QMessageBox.warning(
                 self, "ROI mode unavailable",
@@ -6245,9 +6255,15 @@ class MainWindow(QMainWindow):
         default = next((n for n in names
                         if "top" in n.lower() or "merge" in n.lower()),
                        names[-1] if names else "")
+        print(f"[open-roi] opening root-cell picker with {len(names):,} "
+              f"names…  (if the UI freezes HERE, the picker combo is the "
+              f"culprit)", flush=True)
+        _t1 = _t.perf_counter()
         root, ok = QInputDialog.getItem(
             self, "ROI root cell", "Root (top) cell:", names,
             names.index(default) if default in names else 0, False)
+        print(f"[open-roi] root-cell picker closed (ok={ok}); it was on "
+              f"screen for {_t.perf_counter() - _t1:.2f}s", flush=True)
         if not ok or not root:
             return
         self._rar = rar
@@ -6267,10 +6283,15 @@ class MainWindow(QMainWindow):
             f" · {len(rar._by_refnum):,} cells indexed · click a SEM image")
         # Frame all defect positions so the marker has a visible span to
         # jump across; then jump to the current image (auto-loads its ROI).
+        print("[open-roi] fitting view to defects + initial redraw…",
+              flush=True)
+        _t2 = _t.perf_counter()
         self._fit_view_to_defects()
         if self._current_sem is not None:
             self._jump_to_image(self._current_sem)
         self._update_guidance()
+        print(f"[open-roi] fit/redraw done in {_t.perf_counter() - _t2:.2f}s; "
+              f"total open path {_t.perf_counter() - _t0:.2f}s", flush=True)
 
     # ── M2.6: expression layers ─────────────────────────────────────────────
     @staticmethod
