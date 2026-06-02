@@ -236,6 +236,14 @@ class RandomAccessReader:
         # the FOV box / KLARF / RFL all use). unit==1000 -> 1.0 (no-op).
         self._unit = idx.get("unit")
         self._layernames = idx.get("layernames") or []
+        # F13: KLayout per-cell S_BOUNDING_BOX (raw 5-int operand lists), if the
+        # file carries them. When present, std_bbox() yields each cell's full
+        # reachable bbox directly — no CE layer, no recursion, no decode. M1
+        # only loads + exposes them (std_bbox / diagnostics); wiring into the
+        # reachable_bbox prune is M2, after the operand format is confirmed on a
+        # real file. Empty dicts -> std_bbox() returns None -> prune unchanged.
+        self._sbbox_by_refnum: dict[int, list] = idx.get("sbbox_by_refnum") or {}
+        self._sbbox_by_name: dict[str, list] = idx.get("sbbox_by_name") or {}
         self._nm_per_grid = (1000.0 / self._unit) if self._unit else 1.0
         _dbg(f"OASIS unit (grid steps per micron) = {self._unit!r} "
              f"-> 1 grid = {self._nm_per_grid} nm "
@@ -287,6 +295,37 @@ class RandomAccessReader:
 
     def has_offsets(self) -> bool:
         return bool(self._by_refnum)
+
+    def has_std_bboxes(self) -> bool:
+        """True when the file carries KLayout per-cell S_BOUNDING_BOX (F13)."""
+        return bool(self._sbbox_by_refnum) or bool(self._sbbox_by_name)
+
+    def std_bbox_raw(self, cell_id: object) -> Optional[list]:
+        """Raw S_BOUNDING_BOX operand list for ``cell_id`` (refnum or name),
+        or None. Exposed for the F13 M1 diagnostic that confirms the operand
+        format on a real file before it's trusted for pruning."""
+        if isinstance(cell_id, int):
+            return self._sbbox_by_refnum.get(cell_id)
+        if isinstance(cell_id, bytes):
+            cell_id = cell_id.decode("ascii", "replace")
+        if isinstance(cell_id, str):
+            return self._sbbox_by_name.get(cell_id)
+        return None
+
+    def std_bbox(self, cell_id: object) -> Optional[Bbox]:
+        """Per-cell bounding box from S_BOUNDING_BOX in the cell-local *grid*
+        frame (same frame as ``reachable_bbox``), or None when absent.
+
+        Operand format is **assumed** ``[flag, x, y, w, h]`` (SEMI P39 §31);
+        this is verified per-file by the F13 M1 diagnostic before M2 wires it
+        into the prune. ``flag`` bit 0 marks an empty cell -> no box."""
+        raw = self.std_bbox_raw(cell_id)
+        if not raw or len(raw) < 5:
+            return None
+        flag, x, y, w, h = raw[0], raw[1], raw[2], raw[3], raw[4]
+        if flag & 1:                      # empty-cell flag -> no geometry
+            return None
+        return (float(x), float(y), float(x + w), float(y + h))
 
     def layer_display_name(self, layer: int, datatype: int) -> str:
         """OASIS LAYERNAME for ``(layer, datatype)``, or "" (F3 M2)."""

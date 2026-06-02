@@ -6255,6 +6255,15 @@ class MainWindow(QMainWindow):
                   f"{'S_BOUNDING_BOX' in _props})", flush=True)
         except Exception as _exc:                       # noqa: BLE001
             print(f"[open-roi] propname scan failed: {_exc}", flush=True)
+        # F13 M1: report how many per-cell S_BOUNDING_BOX boxes were read. If
+        # >0, the picked root's raw operands are printed below for the user to
+        # confirm the format against KLayout before M2 trusts it for pruning.
+        try:
+            print(f"[open-roi] per-cell S_BOUNDING_BOX read: "
+                  f"{len(rar._sbbox_by_name):,} by name / "
+                  f"{len(rar._sbbox_by_refnum):,} by refnum", flush=True)
+        except Exception:                               # noqa: BLE001
+            pass
         if not rar.has_offsets():
             QMessageBox.warning(
                 self, "ROI mode unavailable",
@@ -6279,6 +6288,25 @@ class MainWindow(QMainWindow):
               f"screen for {_t.perf_counter() - _t1:.2f}s", flush=True)
         if not ok or not root:
             return
+        # F13 M1: dump the root cell's S_BOUNDING_BOX so the user can verify the
+        # operand format (assumed [flag, x, y, w, h], grid units) against the
+        # cell's bbox in KLayout. nm = grid * 1000/unit. Confirm before M2 wires
+        # this into the reachable_bbox prune.
+        try:
+            _raw = rar.std_bbox_raw(root)
+            _gb = rar.std_bbox(root)
+            if _raw is not None:
+                _s = getattr(rar, "_nm_per_grid", 1.0) or 1.0
+                _nm = (tuple(round(v * _s, 1) for v in _gb)
+                       if _gb is not None else None)
+                print(f"[open-roi] root {root!r} S_BOUNDING_BOX raw={_raw} "
+                      f"-> assumed grid bbox={_gb} -> nm={_nm}", flush=True)
+            else:
+                print(f"[open-roi] root {root!r} has no S_BOUNDING_BOX",
+                      flush=True)
+        except Exception as _exc:                       # noqa: BLE001
+            print(f"[open-roi] root S_BOUNDING_BOX readout failed: {_exc}",
+                  flush=True)
         self._rar = rar
         self._oas_path = path
         self._roi_root = root

@@ -2305,6 +2305,13 @@ class OasisReader:
 
 _CELL_OFFSET_PROP = "S_CELL_OFFSET"
 
+# F13: KLayout's per-cell bounding-box standard property (written when
+# "Save As → OASIS, Standard properties = Global + per cell bounding box").
+# Attached to CELLNAME records alongside S_CELL_OFFSET; SEMI P39 §31 gives 5
+# integer operands (assumed [flag, x, y, w, h]; confirmed per-file in F13 M1).
+# Read here purely so callers can later prune walk_roi without a CE layer.
+_BBOX_PROP = "S_BOUNDING_BOX"
+
 # SEMI P39 §14: the END record is padded to a fixed 256-byte length, so on an
 # offset_flag==1 file (name tables at the tail) END is the last record and
 # begins at ``file_size - 256``. Its body opens with the 6 (strict, byte)
@@ -2433,6 +2440,8 @@ def _scan_tail_tables(reader: "OasisReader", start: dict) -> dict:
     'no S_CELL_OFFSET' exactly as before."""
     by_refnum: dict[int, int] = {}
     by_name: dict[str, int] = {}
+    sbbox_by_refnum: dict[int, list] = {}      # F13: per-cell S_BOUNDING_BOX
+    sbbox_by_name: dict[str, list] = {}
     layernames: list[tuple[str, tuple, tuple]] = []
     propname_by_refnum: dict[int, str] = {}
     cellnames = 0
@@ -2488,6 +2497,13 @@ def _scan_tail_tables(reader: "OasisReader", start: dict) -> dict:
                                 by_refnum[last_cell_ref] = off
                                 if last_cell_name is not None:
                                     by_name[last_cell_name] = off
+                        elif name == _BBOX_PROP and last_cell_ref is not None:
+                            vals = p.get("values") or []
+                            if len(vals) >= 5:
+                                bb = [int(v) for v in vals[:5]]
+                                sbbox_by_refnum[last_cell_ref] = bb
+                                if last_cell_name is not None:
+                                    sbbox_by_name[last_cell_name] = bb
 
             # 3) LAYERNAME table → layer labels for the UI (F3 M2 parity).
             if layername_t[1]:
@@ -2508,6 +2524,8 @@ def _scan_tail_tables(reader: "OasisReader", start: dict) -> dict:
         "unit": start.get("unit"),
         "layernames": layernames,
         "propnames": sorted(set(propname_by_refnum.values())),
+        "sbbox_by_refnum": sbbox_by_refnum,
+        "sbbox_by_name": sbbox_by_name,
     }
 
 
@@ -2548,6 +2566,11 @@ def scan_cell_offsets(path: str | Path, *, use_mmap: bool = False,
     last_cell_name: Optional[str] = None
     by_refnum: dict[int, int] = {}
     by_name: dict[str, int] = {}
+    # F13: per-cell S_BOUNDING_BOX raw operand lists, keyed the same way as the
+    # offset maps. Collected in the same PROPERTY pass; empty when the file has
+    # no per-cell bounding boxes (caller falls back to CE / full-decode prune).
+    sbbox_by_refnum: dict[int, list] = {}
+    sbbox_by_name: dict[str, list] = {}
     cellnames = 0
     # LAYERNAME records (11/12) map a name to a (layer, datatype) interval; they
     # live in the name-table section before any CELL, so this same pass picks
@@ -2595,6 +2618,13 @@ def scan_cell_offsets(path: str | Path, *, use_mmap: bool = False,
                     by_refnum[last_cell_ref] = off
                     if last_cell_name is not None:
                         by_name[last_cell_name] = off
+            elif name == _BBOX_PROP and last_cell_ref is not None:
+                vals = payload.get("values") or []
+                if len(vals) >= 5:
+                    bb = [int(v) for v in vals[:5]]
+                    sbbox_by_refnum[last_cell_ref] = bb
+                    if last_cell_name is not None:
+                        sbbox_by_name[last_cell_name] = bb
         elif rid in (CELL_REFNUM, CELL_NAME):
             break    # body reached; name table fully behind us
 
@@ -2607,6 +2637,8 @@ def scan_cell_offsets(path: str | Path, *, use_mmap: bool = False,
         "unit": unit,
         "layernames": layernames,
         "propnames": sorted(set(propname_by_refnum.values())),
+        "sbbox_by_refnum": sbbox_by_refnum,
+        "sbbox_by_name": sbbox_by_name,
     }
 
 

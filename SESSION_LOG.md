@@ -4,6 +4,43 @@
 
 ---
 
+## [2026-06-02] [F13] M1：讀 KLayout per-cell S_BOUNDING_BOX（收集 + accessor + 診斷）
+
+**變更類型：** 新功能 M1（core 收集 + accessor + app 診斷，純加法，未動剪枝）·
+**狀態：待 user 開檔回報 root 的 S_BOUNDING_BOX raw 數值以確認格式**
+
+**動機：** user 用 KLayout strict「Save As → OASIS」勾 `Standard properties =
+Global + per cell bounding box` 重存 `R8_OD_to_VC_NEW.oas`，GLAS 開檔已確認
+`S_BOUNDING_BOX present: True`。此 property = 每 cell 含 placement 展開後的整體
+bbox（cell-local grid），若讀進來可讓 `reachable_bbox` 直接回傳、免 CE 層免遞迴免
+decode，把無 CE 層大檔首次 walk_roi 從 10min+ 變秒級（接續 2026-05-29 [B] 的
+「有 → 實作剪枝」分支）。
+
+**實作（M1，純加法、零剪枝改動、不退化）：**
+- `oasis_streamer.scan_cell_offsets` header（offset_flag==0）與 tail（==1）兩路徑：
+  既有 S_CELL_OFFSET 的 PROPERTY 迴圈加 `elif name == S_BOUNDING_BOX` 收前 5 個
+  integer operand，回傳新增 `sbbox_by_refnum` / `sbbox_by_name`（raw int list）。
+- `oasis_random.RandomAccessReader`：載入該 map（`_sbbox_by_*`）+ `has_std_bboxes()`
+  / `std_bbox_raw()` / `std_bbox()`（假設格式 `[flag,x,y,w,h]` → cell-local grid
+  bbox，flag bit0=空 cell→None）。**尚未接進 reachable_bbox**（M2，待格式確認）。
+- `gds_align_tool._on_open_roi`：開檔印「per-cell S_BOUNDING_BOX read: N」；Pick root
+  後印 root 的 `raw=... → grid bbox → nm`，供 user 對照 KLayout 該 cell bbox 確認
+  operand 格式（順序/單位/frame）。
+
+**為何兩階段：** operand 格式若猜錯且偏小→剪枝漏幾何（§7 對位正確性風險），故 M1
+先用真檔數值確認格式，M2 才接 `reachable_bbox` 短路（命中才短路、未命中走既有
+CE/full-decode fallback→不退化）+ DEBUG `std_bbox ⊇ own-bbox` cross-check。
+
+**測試：** `py_compile` 三檔全過；`std_bbox` 換算邏輯以 stdlib 獨立驗證（含 flag
+空 cell / operand 不足 / 負座標）。沙箱無 numpy/pytest → 既有 pytest 待 user 本地跑
+（M1 對既有路徑純加 return key + elif 分支，不影響 S_CELL_OFFSET 收集）。
+
+**影響檔案：** `glas/core/oasis_streamer.py`、`glas/core/oasis_random.py`、
+`glas/app/gds_align_tool.py`、`docs/plans/F13-sbbox-prune.md`（新）。
+**Branch：** `claude/magical-davinci-Ibo8K`
+
+---
+
 ## [2026-05-29] [B] ROI 開檔 freeze 診斷 + walk_roi 慢根因（無 CE 層）+ S_BOUNDING_BOX 探查
 
 **變更類型：** 診斷（core + app，純加 log/accessor）·  **狀態：待 user 回報 propnames**
