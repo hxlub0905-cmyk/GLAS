@@ -675,6 +675,76 @@ def _roi_overlap_mask(boxes: np.ndarray, roi: Bbox) -> np.ndarray:
     return (bx1 <= roi[2]) & (bx2 >= roi[0]) & (by1 <= roi[3]) & (by2 >= roi[1])
 
 
+def _axis_index_range(p0, p1, step, n, a, t, r0, r1):
+    """For instances laid out at parent-local offset ``i*step`` (i in
+    ``[0, n)``) whose un-repeated extent along this axis is ``[p0, p1]``,
+    return the inclusive index window ``(i_lo, i_hi)`` whose transformed
+    interval ``[a*(p0+i*step)+t, a*(p1+i*step)+t]`` can overlap ``[r0, r1]``.
+
+    Used to clamp a chip-spanning regular grid to the few instances near the
+    ROI without materializing the whole array (F13). The window is rounded
+    OUTWARD and widened by 2 steps so it is always a conservative superset —
+    the caller's exact ROI mask still decides per instance. Degenerate axes
+    (``step == 0`` or ``a == 0``) fall back to the full range."""
+    if step == 0 or a == 0:
+        return 0, n - 1
+    e0 = a * p0 + t
+    e1 = a * p1 + t
+    xa = min(e0, e1)            # instance interval at i=0 (shift is uniform)
+    xb = max(e0, e1)
+    w = a * step               # root-coord shift per index step
+    lo = (r0 - xb) / w
+    hi = (r1 - xa) / w
+    if w < 0:
+        lo, hi = hi, lo
+    i_lo = max(0, int(np.floor(lo)) - 2)
+    i_hi = min(n - 1, int(np.ceil(hi)) + 2)
+    return i_lo, i_hi
+
+
+def _candidate_offsets(rtype, raw, placed, T, roi):
+    """Conservative SUPERSET of a repetition's offsets that can overlap the
+    ROI, for separable axis-aligned regular grids (types 1/2/3) under a
+    non-rotating transform. Returns an ``(m, 2)`` array (m << K near the ROI)
+    or ``None`` to signal "not handled — materialize the full grid" (rotated
+    transform, skewed/irregular repetition). Offsets are in the SAME
+    parent-local frame the full path uses, so the result is interchangeable."""
+    M = T.M
+    if abs(M[0, 1]) > 1e-9 or abs(M[1, 0]) > 1e-9:
+        return None                         # rotated -> axes not separable
+    a = M[0, 0]; d = M[1, 1]
+    tx = T.t[0]; ty = T.t[1]
+    px0, py0, px1, py1 = placed
+    rx0, ry0, rx1, ry1 = roi
+    if rtype == 1:
+        nx, ny, xs, ys = raw
+        i_lo, i_hi = _axis_index_range(px0, px1, xs, nx, a, tx, rx0, rx1)
+        j_lo, j_hi = _axis_index_range(py0, py1, ys, ny, d, ty, ry0, ry1)
+        if i_lo > i_hi or j_lo > j_hi:
+            return np.zeros((0, 2), dtype=np.float64)
+        ii = np.arange(i_lo, i_hi + 1, dtype=np.float64) * xs
+        jj = np.arange(j_lo, j_hi + 1, dtype=np.float64) * ys
+        gx, gy = np.meshgrid(ii, jj)
+        return np.column_stack((gx.ravel(), gy.ravel()))
+    if rtype == 2:
+        nx, xs = raw
+        i_lo, i_hi = _axis_index_range(px0, px1, xs, nx, a, tx, rx0, rx1)
+        if i_lo > i_hi:
+            return np.zeros((0, 2), dtype=np.float64)
+        out = np.zeros((i_hi - i_lo + 1, 2), dtype=np.float64)
+        out[:, 0] = np.arange(i_lo, i_hi + 1, dtype=np.float64) * xs
+        return out
+    if rtype == 3:
+        ny, ys = raw
+        j_lo, j_hi = _axis_index_range(py0, py1, ys, ny, d, ty, ry0, ry1)
+        if j_lo > j_hi:
+            return np.zeros((0, 2), dtype=np.float64)
+        out = np.zeros((j_hi - j_lo + 1, 2), dtype=np.float64)
+        out[:, 1] = np.arange(j_lo, j_hi + 1, dtype=np.float64) * ys
+        return out
+    return None
+
+
 def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
              layer: int, datatype: int, *, max_depth: int = 128,
              cancel_cb=None) -> dict:
@@ -719,7 +789,7 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
     _feat = {"rtype": set(), "angle": set(), "flip": False,
              "mag": set(), "name_ref": False, "rect_rtype": set(),
              "poly_rtype": set(), "ce_viol": 0, "ce_checks": 0,
-             "sbb_used": 0, "sbb_viol": 0}
+             "sbb_used": 0, "sbb_viol": 0, "clamp_checks": 0}
 
     def reachable_bbox(cid: object) -> Optional[Bbox]:
         """Bbox (cid-local frame) of all geometry reachable from cid —
@@ -867,19 +937,50 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
             if pl.target in visiting:
                 stats.cycles_skipped += oas.repetition_count(rtype, rraw)
                 continue
-            # Array may intersect ROI — now materialize offsets (vectorized)
-            # for per-instance pruning.
-            oa = oas.repetition_offsets_np(rtype, rraw)          # (K,2)
+            # Array intersects the ROI at the whole-array level. For a big
+            # regular grid spanning the chip, only instances NEAR the ROI can
+            # contribute — clamp to that index window analytically instead of
+            # materializing the whole (up to millions of entries) grid (F13).
+            # _candidate_offsets returns a conservative SUPERSET; the exact
+            # mask below still decides. None -> rotated/skewed/irregular case
+            # -> full materialization (unchanged behaviour).
+            _total = oas.repetition_count(rtype, rraw)
+            _cand = _candidate_offsets(rtype, rraw, placed, T, roi)
+            _clamped = _cand is not None
+            oa = _cand if _clamped else oas.repetition_offsets_np(rtype, rraw)
+            if _clamped and DEBUG and _total > 100_000:
+                _dbg(f"  BIG-ARRAY {cid!r}->{pl.target!r}: rep={_total:,} "
+                     f"rtype={rtype} -> {oa.shape[0]:,} candidates")
             K = oa.shape[0]
+            if K == 0:
+                stats.instances_pruned += _total
+                continue
             plb = np.empty((K, 4), dtype=np.float64)
             plb[:, 0] = placed[0] + oa[:, 0]; plb[:, 1] = placed[1] + oa[:, 1]
             plb[:, 2] = placed[2] + oa[:, 0]; plb[:, 3] = placed[3] + oa[:, 1]
             rootb = T.apply_to_rects(plb)                        # -> root coords
             mask = _roi_overlap_mask(rootb, roi)
             sel = np.flatnonzero(mask)
-            stats.instances_pruned += K - len(sel)
+            stats.instances_pruned += _total - len(sel)
             if len(sel) == 0:
                 continue
+            # DEBUG safety net (§7): verify the clamp didn't drop a true
+            # instance by re-running the FULL materialization and comparing the
+            # selected count. Capped so it stays cheap; logs loudly on mismatch.
+            if (_clamped and DEBUG and _total > 100_000
+                    and _feat["clamp_checks"] < 8):
+                _feat["clamp_checks"] += 1
+                _full = oas.repetition_offsets_np(rtype, rraw)
+                _fb = np.empty((_full.shape[0], 4), dtype=np.float64)
+                _fb[:, 0] = placed[0] + _full[:, 0]
+                _fb[:, 1] = placed[1] + _full[:, 1]
+                _fb[:, 2] = placed[2] + _full[:, 0]
+                _fb[:, 3] = placed[3] + _full[:, 1]
+                _fsel = int(_roi_overlap_mask(
+                    T.apply_to_rects(_fb), roi).sum())
+                if _fsel != len(sel):
+                    _dbg(f"  CLAMP-MISMATCH {cid!r}->{pl.target!r}: "
+                         f"clamp={len(sel)} full={_fsel} rtype={rtype}")
             place_ts = base.t + oa                              # (K,2)
             composed_M = T.M @ base.M
             composed_ts = place_ts @ T.M.T + T.t                # (K,2)

@@ -566,3 +566,72 @@ class TestStdBboxPrune:
         rar = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
         assert not rar.has_std_bboxes()
         assert rar.std_bbox(0) is None
+
+
+# ── F13: repetition-array ROI clamp (avoid materializing chip-spanning grids) ─
+
+
+class TestRepetitionClamp:
+
+    def _selected(self, oa, placed, T, roi):
+        """Root-coord bboxes of instances that hit the ROI (mirrors walk)."""
+        K = oa.shape[0]
+        plb = np.empty((K, 4), dtype=np.float64)
+        plb[:, 0] = placed[0] + oa[:, 0]; plb[:, 1] = placed[1] + oa[:, 1]
+        plb[:, 2] = placed[2] + oa[:, 0]; plb[:, 3] = placed[3] + oa[:, 1]
+        rootb = T.apply_to_rects(plb)
+        m = orx._roi_overlap_mask(rootb, roi)
+        return set(map(tuple, np.round(rootb[m], 3).tolist()))
+
+    def test_type1_grid_clamp_matches_full(self):
+        from oasis_walker import Transform
+        rtype, raw = 1, (200, 200, 100, 100)      # 40k instances, pitch 100
+        placed = (0.0, 0.0, 10.0, 10.0)
+        T = Transform.identity()
+        roi = (10005.0, 10005.0, 10008.0, 10008.0)   # hits i=100, j=100
+        cand = orx._candidate_offsets(rtype, raw, placed, T, roi)
+        assert cand is not None
+        assert cand.shape[0] < 100                 # clamped, not 40k
+        full = oas.repetition_offsets_np(rtype, raw)
+        assert (self._selected(cand, placed, T, roi)
+                == self._selected(full, placed, T, roi))
+
+    def test_type2_row_clamp_matches_full(self):
+        from oasis_walker import Transform
+        rtype, raw = 2, (5000, 30)                  # 1D x grid, pitch 30
+        placed = (0.0, 0.0, 5.0, 5.0)
+        T = Transform.identity()
+        roi = (1503.0, 0.0, 1506.0, 5.0)            # hits i≈50
+        cand = orx._candidate_offsets(rtype, raw, placed, T, roi)
+        assert cand is not None and cand.shape[0] < 50
+        full = oas.repetition_offsets_np(rtype, raw)
+        assert (self._selected(cand, placed, T, roi)
+                == self._selected(full, placed, T, roi))
+
+    def test_flipped_scale_matches_full(self):
+        # Negative diagonal (flip) must still produce the same selection.
+        from oasis_walker import Transform
+        rtype, raw = 1, (300, 300, 50, 50)
+        placed = (0.0, 0.0, 8.0, 8.0)
+        T = Transform(M=np.array([[1.0, 0.0], [0.0, -1.0]]),
+                      t=np.array([0.0, 100000.0]))
+        roi = (5005.0, 92505.0, 5040.0, 92540.0)
+        cand = orx._candidate_offsets(rtype, raw, placed, T, roi)
+        assert cand is not None
+        full = oas.repetition_offsets_np(rtype, raw)
+        assert (self._selected(cand, placed, T, roi)
+                == self._selected(full, placed, T, roi))
+
+    def test_rotated_transform_falls_back(self):
+        from oasis_walker import Transform
+        T = Transform(M=np.array([[0.0, -1.0], [1.0, 0.0]]),
+                      t=np.array([0.0, 0.0]))
+        assert orx._candidate_offsets(
+            1, (10, 10, 5, 5), (0., 0., 1., 1.), T, (0., 0., 1., 1.)) is None
+
+    def test_irregular_type_falls_back(self):
+        from oasis_walker import Transform
+        # type 9 (arbitrary vector) is not separable -> None (full path).
+        assert orx._candidate_offsets(
+            9, (100, (3, 7)), (0., 0., 1., 1.), Transform.identity(),
+            (0., 0., 1., 1.)) is None
