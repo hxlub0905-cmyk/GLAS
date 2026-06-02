@@ -316,14 +316,18 @@ class RandomAccessReader:
         """Per-cell bounding box from S_BOUNDING_BOX in the cell-local *grid*
         frame (same frame as ``reachable_bbox``), or None when absent.
 
-        Operand format is **assumed** ``[flag, x, y, w, h]`` (SEMI P39 §31);
-        this is verified per-file by the F13 M1 diagnostic before M2 wires it
-        into the prune. ``flag`` bit 0 marks an empty cell -> no box."""
+        Operand format ``[flag, left, bottom, width, height]`` is confirmed
+        from KLayout's dbOASISWriter (it pushes ``flag, bbox.left, bbox.bottom,
+        bbox.width, bbox.height``) and matched against a real file (F13 M1).
+        KLayout writes a nonzero ``flag`` (0x2) for a degenerate box that is
+        empty or depends on external cells; any nonzero flag is treated as
+        untrustworthy here -> None -> caller falls back to the CE / full-decode
+        prune for that one cell (never drops geometry)."""
         raw = self.std_bbox_raw(cell_id)
         if not raw or len(raw) < 5:
             return None
         flag, x, y, w, h = raw[0], raw[1], raw[2], raw[3], raw[4]
-        if flag & 1:                      # empty-cell flag -> no geometry
+        if flag != 0:                     # degenerate / external-dependent box
             return None
         return (float(x), float(y), float(x + w), float(y + h))
 
@@ -453,6 +457,14 @@ class RandomAccessReader:
     def _reachable_bbox(self, cid, computing, cancel_cb):
         if cid in self._reach_memo:
             return self._reach_memo[cid]
+        # F13 M2: KLayout's per-cell S_BOUNDING_BOX already is the full
+        # reachable bbox (own + all placed children, cell-local grid). When
+        # present, return it directly — no load_cell_bbox, no recursion — so a
+        # file without a CE boundary layer no longer decodes the whole tree.
+        sb = self.std_bbox(cid)
+        if sb is not None:
+            self._reach_memo[cid] = sb
+            return sb
         if cid in computing:
             return None
         if cancel_cb is not None and cancel_cb():
@@ -702,7 +714,7 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
     computing: set = set()
     _feat = {"rtype": set(), "angle": set(), "flip": False,
              "mag": set(), "name_ref": False, "rect_rtype": set(),
-             "poly_rtype": set(), "ce_viol": 0}
+             "poly_rtype": set(), "ce_viol": 0, "sbb_used": 0, "sbb_viol": 0}
 
     def reachable_bbox(cid: object) -> Optional[Bbox]:
         """Bbox (cid-local frame) of all geometry reachable from cid —
@@ -710,6 +722,15 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
         return None."""
         if cid in reach_memo:
             return reach_memo[cid]
+        # F13 M2: prefer KLayout's per-cell S_BOUNDING_BOX (the full reachable
+        # bbox, cell-local grid) — a direct lookup that skips the load + the
+        # whole recursion. This is what turns a no-CE-layer file's first ROI
+        # walk from a full-chip decode into a seconds-long prune.
+        sb = rar.std_bbox(cid)
+        if sb is not None:
+            reach_memo[cid] = sb
+            _feat["sbb_used"] += 1
+            return sb
         if cid in computing:
             return None
         _check_cancel()
@@ -757,6 +778,19 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
                 if _feat["ce_viol"] <= 6:
                     _dbg(f"  CE-VIOLATION cell {cid!r}: own_bbox={ob} "
                          f"ce_bbox={_ceb}")
+            # F13 M2 cross-check: the S_BOUNDING_BOX prune bbox must CONTAIN the
+            # cell's own decoded geometry (it claims to bound own + children).
+            # A violation means the operand format/frame is off and the prune
+            # could drop geometry — surface it loudly in debug runs.
+            _sb = rar.std_bbox(cid)
+            if _sb is not None:
+                ok = (_sb[0] <= ob[0] and _sb[1] <= ob[1]
+                      and _sb[2] >= ob[2] and _sb[3] >= ob[3])
+                if not ok:
+                    _feat["sbb_viol"] += 1
+                    if _feat["sbb_viol"] <= 6:
+                        _dbg(f"  SBBOX-VIOLATION cell {cid!r}: own_bbox={ob} "
+                             f"std_bbox={_sb}")
         for _pl in content.placements:
             _feat["rtype"].add(_pl.repetition_type)
             _feat["angle"].add(_pl.angle)
@@ -856,7 +890,8 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
          f"mags={sorted(_feat['mag'])} name_ref={_feat['name_ref']} "
          f"rect_rtypes={sorted(str(x) for x in _feat['rect_rtype'])} "
          f"poly_rtypes={sorted(str(x) for x in _feat['poly_rtype'])} "
-         f"ce_violations={_feat['ce_viol']}")
+         f"ce_violations={_feat['ce_viol']} "
+         f"sbbox_used={_feat['sbb_used']} sbbox_violations={_feat['sbb_viol']}")
     if rar.errors:
         for cid, off, m in rar.errors[:8]:
             _dbg(f"  ERROR cell {cid!r} @ {off}: {m}")

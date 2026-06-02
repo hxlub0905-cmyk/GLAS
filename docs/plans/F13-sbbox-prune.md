@@ -18,14 +18,17 @@
 - 剪枝瓶頸：`reachable_bbox(cid)`（oasis_random.py）→ `load_cell_bbox(cid)` 無 CE
   層時 fallback `load_cell`（全 decode）→ 遞迴展開整棵樹 ≈ 全 chip 解碼。
 
-## 未定（必須真檔確認，不可猜——§7 漏幾何風險）
+## 格式（已確認，不再是假設）
 
-`S_BOUNDING_BOX` 的 5 個 value 確切語意。**假設**（SEMI P39 §31）：
-`[flag(uint), x(int), y(int), w(uint), h(uint)]` → bbox =
-`(x, y, x+w, y+h)`，cell-local grid units。**待 M1 真檔數值驗證**：
-- value 個數是否真為 5、型別順序是否如上；
-- 座標是否 cell-local grid（與 `reachable_bbox` 同 frame）；
-- `flag` 語意（空 cell？）。
+`S_BOUNDING_BOX` = 5 operand `[flag, left, bottom, width, height]`，cell-local
+grid units → bbox = `(x, y, x+w, y+h)`。雙重確認：
+1. **KLayout 源碼** `dbOASISWriter.cc`：依序 push `flag`(0x0 或 0x2)、`bbox.left`、
+   `bbox.bottom`、`bbox.width`、`bbox.height`。
+2. **真檔**（`R8_OD_to_VC_KKKK.oas`，unit=2000 → 0.5 nm/grid，292,883 cells **全部**
+   有 S_BOUNDING_BOX）：root `iMerge_Top` raw=`[0,0,0,7460112,2204400]` →
+   nm `(0,0,3730056,1102200)` = 3.73mm × 1.10mm，合理 die 尺寸。
+- `flag` 非零（KLayout 用 0x2）= 退化/依賴 external cell 的無效 box →
+  `std_bbox` 回 None → 該 cell fallback CE/full-decode（不漏幾何）。
 
 ## Milestones
 
@@ -36,16 +39,22 @@
     `std_bbox(cell_id)`（用上述**假設**格式 → grid bbox 或 None）。
   - [x] app `_on_open_roi`：開檔印 map 大小；Pick root 後印 root 的 raw values +
     換算 bbox(nm)，供 user 對照 KLayout 該 cell bbox 確認格式。
-  - [ ] **user 驗收**：開檔回報 root 的 `S_BOUNDING_BOX raw=...` 數值。
-- [ ] **M2 接上剪枝（格式確認後）**
-  - `reachable_bbox` / `_reachable_bbox`：cid 命中 `std_bbox` 時**直接回傳**，
-    不 `load_cell_bbox`、不遞迴。未命中 → 既有 CE / full-decode fallback（不退化）。
-  - DEBUG cross-check：對 walk 實際 full-decode 的 cell，驗
-    `std_bbox(cid) ⊇ own-geometry bbox`，違反則警告（抓格式/語意錯）。
-- [ ] **M3 測試**
-  - 合成帶 `S_BOUNDING_BOX`（header + tail offset_flag）OASIS：驗 map 收集、
-    `std_bbox` 換算、`reachable_bbox` 短路命中、未命中 fallback、walk_roi 正確性。
-- [ ] **M4 真檔驗收**：`R8_OD_to_VC_NEW.oas` GUI 開 ROI → walk 秒級 + 幾何正確。
+  - [x] **user 驗收**：root `iMerge_Top` raw=`[0,0,0,7460112,2204400]` 回報，格式確認。
+- [x] **M2 接上剪枝（格式已確認）**
+  - [x] `std_bbox` flag 判斷改 `!= 0`（KLayout 用 0x2 標記退化 box）。
+  - [x] `reachable_bbox`（walk_roi closure）/ `_reachable_bbox`（method）：cid 命中
+    `std_bbox` 時**直接回傳並 memo**，不 `load_cell_bbox`、不遞迴。未命中 → 既有
+    CE / full-decode fallback（不退化）。
+  - [x] DEBUG cross-check：walk 實際 full-decode 的 cell 驗 `std_bbox(cid) ⊇
+    own-geometry bbox`，違反 → `SBBOX-VIOLATION` 警告 + `sbbox_violations` 計數；
+    `sbbox_used` 計命中數。
+- [x] **M3 測試**
+  - [x] `tests/test_oasis_random.py::TestStdBboxPrune`：每 cell 雙 property
+    (S_CELL_OFFSET + S_BOUNDING_BOX) 合成檔，驗 map 收集 + `std_bbox` 換算、
+    `reachable_bbox` 短路（std_bbox 故意放大→回傳原值證明免遞迴）、flag!=0 fallback
+    回幾何值、無 property 時 `has_std_bboxes()` False。（沙箱無 numpy → 待 user 本地跑）
+- [ ] **M4 真檔驗收**：`R8_OD_to_VC_KKKK.oas` GUI 開 ROI → walk 秒級 + 幾何正確
+  （`--debug` 看 `sbbox_used` 大、`sbbox_violations=0`）。
 
 ## 不變式 / 風險
 

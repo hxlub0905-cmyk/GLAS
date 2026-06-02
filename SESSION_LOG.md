@@ -4,6 +4,38 @@
 
 ---
 
+## [2026-06-02] [F13] M2：S_BOUNDING_BOX 接上 reachable_bbox 剪枝（格式已確認）
+
+**變更類型：** 新功能 M2（core 剪枝短路 + 測試）· **狀態：待 user 真檔 GUI 驗收**
+
+**格式確認（雙重）：** (1) KLayout 源碼 `dbOASISWriter.cc` 依序 push
+`flag, bbox.left, bbox.bottom, bbox.width, bbox.height` → operand =
+`[flag, x, y, w, h]`（cell-local grid）。(2) user 真檔 `R8_OD_to_VC_KKKK.oas`
+（unit=2000、292,883 cells **全有** S_BOUNDING_BOX）root `iMerge_Top`
+raw=`[0,0,0,7460112,2204400]` → nm `(0,0,3730056,1102200)`=3.73×1.10mm 合理 die。
+
+**實作：**
+- `oasis_random.std_bbox`：flag 判斷 `& 1` → `!= 0`（KLayout 用 0x2 標退化/依賴
+  external 的無效 box；非零一律回 None → 該 cell fallback，不漏幾何）。docstring
+  改「assumed」為 KLayout 源碼確認。
+- `reachable_bbox`（walk_roi closure）與 `_reachable_bbox`（method）：開頭加
+  `std_bbox(cid)` 短路——命中直接回傳並寫 `_reach_memo`，**不 load_cell_bbox、不
+  遞迴**。未命中走既有 CE/full-decode fallback（§7 不變式：命中才短路→不退化）。
+  全 cell 都有 bbox 時，root 一次查詢即完成整個剪枝，walk 只 full-decode ROI 內少數
+  cell → 無 CE 層大檔首次 walk 從 10min+ 變秒級。
+- walk() DEBUG cross-check：對已 full-decode 的 cell 驗 `std_bbox ⊇ own_bbox`，
+  違反印 `SBBOX-VIOLATION` + `sbbox_violations` 計數，`sbbox_used` 計命中（抓格式錯）。
+
+**測試：** `py_compile` 全過；新增 `tests/test_oasis_random.py::TestStdBboxPrune`
+4 例（雙 property 合成檔：map 收集/換算、短路免遞迴〔std_bbox 故意放大證明〕、
+flag!=0 fallback 回幾何、無 property→has_std_bboxes False）。`std_bbox` 換算另以
+stdlib 獨立驗證。沙箱無 numpy → pytest 待 user 本地跑。
+
+**影響檔案：** `glas/core/oasis_random.py`、`tests/test_oasis_random.py`、
+`docs/plans/F13-sbbox-prune.md`。 **Branch：** `claude/magical-davinci-Ibo8K`
+
+---
+
 ## [2026-06-02] [F13] M1：讀 KLayout per-cell S_BOUNDING_BOX（收集 + accessor + 診斷）
 
 **變更類型：** 新功能 M1（core 收集 + accessor + app 診斷，純加法，未動剪枝）·

@@ -482,3 +482,87 @@ class TestResolveLayerName:
     def test_narrower_record_wins(self):
         ln = [("R", (10, 30), (0, 0)), ("X", (20, 20), (0, 0))]
         assert orx.resolve_layer_name(ln, 20, 0) == "X"
+
+
+# ── F13: KLayout per-cell S_BOUNDING_BOX prune ───────────────────────────────
+
+
+def _build_two_cell_sbbox(bbA, bbB, *, flagA=0, flagB=0):
+    """Two cells A(ref0)+B(ref1); A holds a rect + a placement of B. Each
+    CELLNAME carries an S_CELL_OFFSET *and* an S_BOUNDING_BOX (x,y,w,h)
+    property, mirroring KLayout strict output. Returns (bytes, offA, offB)."""
+    start = (bytes([oas.START]) + _astr("1.0") + bytes([0])
+             + _uint(1000) + _uint(0) + bytes([0] * 12))
+    pn_off = bytes([oas.PROPNAME_IMP]) + _astr("S_CELL_OFFSET")     # refnum 0
+    pn_bb = bytes([oas.PROPNAME_IMP]) + _astr("S_BOUNDING_BOX")     # refnum 1
+    cna = bytes([oas.CELLNAME_IMP]) + _astr("A")
+    cnb = bytes([oas.CELLNAME_IMP]) + _astr("B")
+
+    def prop_off(off):     # PROPERTY S_CELL_OFFSET: C=1 N=1 V=0 U=1, ref 0
+        return (bytes([oas.PROPERTY_NORMAL, 0x16]) + _uint(0)
+                + _uint(8) + _ufix(off, 4))
+
+    def prop_bb(bb, flag):  # PROPERTY S_BOUNDING_BOX: C=1 N=1 V=0 U=5, ref 1
+        x, y, w, h = bb
+        vals = b"".join(_uint(8) + _uint(v) for v in (flag, x, y, w, h))
+        return bytes([oas.PROPERTY_NORMAL, 0x56]) + _uint(1) + vals
+
+    place_b = bytes([oas.PLACEMENT_NOMAG, 0xC0]) + _uint(1)         # B at 0,0
+    cell_a = bytes([oas.CELL_REFNUM]) + _uint(0)
+    cell_b = bytes([oas.CELL_REFNUM]) + _uint(1)
+    end = bytes([oas.END]) + _uint(0)
+
+    def header(off_a, off_b):
+        return (oas.MAGIC + start + pn_off + pn_bb
+                + cna + prop_off(off_a) + prop_bb(bbA, flagA)
+                + cnb + prop_off(off_b) + prop_bb(bbB, flagB))
+
+    off_a = len(header(0, 0))            # _ufix is fixed-width -> length stable
+    body_a = cell_a + _rect(17, 10, 10, 0, 0) + place_b
+    off_b = off_a + len(body_a)
+    data = (header(off_a, off_b) + body_a
+            + cell_b + _rect(17, 20, 20, 100, 100) + end)
+    return data, off_a, off_b
+
+
+class TestStdBboxPrune:
+
+    def test_collected_and_parsed(self, tmp_path):
+        data, _, _ = _build_two_cell_sbbox((0, 0, 300, 200), (100, 100, 50, 50))
+        p = tmp_path / "sb.oas"
+        p.write_bytes(data)
+        rar = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
+        assert rar.has_std_bboxes()
+        assert rar.std_bbox_raw(0) == [0, 0, 0, 300, 200]
+        assert rar.std_bbox(0) == (0.0, 0.0, 300.0, 200.0)
+        assert rar.std_bbox("A") == (0.0, 0.0, 300.0, 200.0)
+        assert rar.std_bbox(1) == (100.0, 100.0, 150.0, 150.0)
+
+    def test_reachable_bbox_short_circuits_to_std_bbox(self, tmp_path):
+        # A's real geometry (own rect + child B) is small; give A a deliberately
+        # LARGER std_bbox. reachable_bbox must return it verbatim — proving it
+        # used the property and never recursed/decoded.
+        data, _, _ = _build_two_cell_sbbox((0, 0, 500, 500), (100, 100, 50, 50))
+        p = tmp_path / "sb.oas"
+        p.write_bytes(data)
+        rar = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
+        assert rar.reachable_bbox(0) == (0.0, 0.0, 500.0, 500.0)
+
+    def test_flag_nonzero_falls_back_to_geometry(self, tmp_path):
+        # A's flag != 0 -> std_bbox None -> reachable_bbox computes from
+        # geometry: own rect (0,0,10,10) U child B's std_bbox placed at origin.
+        data, _, _ = _build_two_cell_sbbox((0, 0, 500, 500), (100, 100, 50, 50),
+                                           flagA=2)
+        p = tmp_path / "sb.oas"
+        p.write_bytes(data)
+        rar = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
+        assert rar.std_bbox(0) is None
+        assert rar.reachable_bbox(0) == (0.0, 0.0, 150.0, 150.0)
+
+    def test_absent_property_no_std_bboxes(self, tmp_path):
+        data, _, _ = _build_two_cell()          # no S_BOUNDING_BOX
+        p = tmp_path / "plain.oas"
+        p.write_bytes(data)
+        rar = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
+        assert not rar.has_std_bboxes()
+        assert rar.std_bbox(0) is None
