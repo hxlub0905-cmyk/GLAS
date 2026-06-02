@@ -4,6 +4,28 @@
 
 ---
 
+## [2026-06-02] 測試修正：m5 export dialog 簽章 + m4b 子像素容差（user 本地 pytest 暴露）
+
+**變更類型：** 測試修正（純 tests，無功能變更）·  **狀態：完成**
+
+**背景：** user 在本地（Python 3.13 / numpy 2.4.6 / cv2 4.13 / PyQt6 6.11）跑 `pytest tests/` →
+553 passed, 4 failed。
+
+**根因 + 修法：**
+- **m5 `TestExportDialog`（2 筆）**：F13 把 `AlignmentExportDialog.selected()` 從 4-tuple 擴成
+  6-tuple（多 `export_mask` / `mask_threshold`），舊測試仍 `fmt, ids = selected()` → unpack 錯。
+  改 `fmt, ids, *_ = d.selected()`。**屬 F13 API 演進未同步測試。**
+- **m4b `TestFineAlignOne`（2 筆）**：`fine_align_one` 子像素拋物線殘差 ~9.5e-6（abs=1e-6 過嚴），
+  隨 BLAS/cv2/numpy build 浮動，**與 F13/F14 無關**（未動該數學）。容差放寬 1e-6→1e-3 nm（仍遠嚴於
+  任何實際對位誤差，sign/整數像素不變式不受影響）。
+
+**測試：** `py_compile` 過；預期 `pytest tests/` 全綠（待 user 重跑確認）。
+
+**影響檔案：** `tests/test_gds_align_m5.py`、`tests/test_gds_align_m4b.py`、`SESSION_LOG.md`。
+**Branch：** `claude/optimistic-pasteur-31ELv`
+
+---
+
 ## [2026-06-02] [F14] batch align + image/mask export 加速（規劃→M1–M4）
 
 **變更類型：** 效能/重構（新 core 模組 + worker 平行化 + UI）+ 測試 + 文件 ·  **狀態：實作完成，待 user 本地驗收**

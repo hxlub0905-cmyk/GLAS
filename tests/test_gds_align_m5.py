@@ -134,14 +134,16 @@ class TestExportDialog:
 
     def test_defaults_all_selected(self):
         d = gat.AlignmentExportDialog(None, [_img("D1", 1, 2), _img("D2")])
-        fmt, ids = d.selected()
+        # selected() grew image/mask export flags in F5 M6 / F13; this test
+        # only cares about the format + id list.
+        fmt, ids, *_ = d.selected()
         assert fmt == "csv" and ids == ["D1", "D2"]
 
     def test_select_none_then_format(self):
         d = gat.AlignmentExportDialog(None, [_img("D1", 1, 2)])
         d._set_all(False)
         d._fmt.setCurrentIndex(1)
-        fmt, ids = d.selected()
+        fmt, ids, *_ = d.selected()
         assert fmt == "json" and ids == []
 
 
