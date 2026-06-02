@@ -4,6 +4,34 @@
 
 ---
 
+## [2026-06-02] 狀態快照：進行中任務的「未做 / 未驗證」盤點
+
+**變更類型：** 文件整理（無碼變更）。前提：本沙箱無 numpy/cv2/shapely/PyQt6 →
+**所有 pytest 皆未實際跑過**（僅 `py_compile` 過），全部待 user 本地 `pytest tests/ -v`。
+
+- **[F9] OASIS 匯出**：已實作 M1–M6（writer + ROI 裁剪 + 匯出對話框 + 開發者模式）。
+  未驗證＝GUI 匯出（全區 + ROI）→ KLayout 開檔幾何/座標/裁切正確、`pytest
+  test_oasis_writer`。未做＝M5 收尾（README/§1/§5 補匯出說明、從 §8 移除）。
+- **[F10] OASIS debug mode**：已實作 M1–M4。未驗證＝`pytest test_oasis_debug
+  test_layout_export`、GUI（匯出勾 Debug 看報告 + sidecar、File→Diagnose OASIS）。
+- **[F11] 整顆 chip 匯出**：**plan 待核准**；部分實作（WholeChipExportWorker，
+  NameError 已修）。未做＝M1 兩模式座標可見 + 裁剪框帶入、OasisExportDialog「匯出
+  範圍」選項。未驗證＝整 chip → KLayout 比對、OOM/效能、`pytest`。
+- **[F13] S_BOUNDING_BOX 剪枝**：M1–M3.5 已實作並 commit（收集 + reachable_bbox
+  短路 + repetition `_candidate_offsets` 裁剪 + DEBUG tracing）。驗證＝剪枝/裁剪
+  正確（`--debug` 看 `sbbox_used` 大、無 `sbbox_violations`/`CLAMP-MISMATCH`）。
+  未達＝M4「首次 walk 秒級」**做不到**——真檔有 mega-cell（refnum 271517，1351 萬
+  placement，decode ~283s），非剪枝可解 → 拆為 [F14] 暫擱。未驗證＝`pytest
+  test_oasis_random`（新增 TestStdBboxPrune / TestRepetitionClamp）。
+- **[F14]（backlog）**：placement-heavy mega-cell 優化（numpy 欄位陣列 decode +
+  walk 向量化 + 快取），**user 選擇暫擱**。
+- **[F12]**：撤案（無索引表 OASIS，2026-05-28）。
+
+**唯一還有「實作未做」的進行中任務＝F11**（且 plan 未核准）；F9/F10/F13 皆只差
+user 本地驗證。**影響檔案：** 無（純文件）。**Branch：** `claude/magical-davinci-Ibo8K`
+
+---
+
 ## [2026-06-02] [F13] 最終根因：單一 mega-cell（1351 萬 placement）decode ~4.7min（暫擱）
 
 **變更類型：** 診斷結論（無碼變更，純記錄）· **狀態：user 決定先停（不投入 mega-cell 優化）**
