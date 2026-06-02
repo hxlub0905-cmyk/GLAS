@@ -114,3 +114,53 @@ def test_manifest_csv_header_has_mask_png(tmp_path):
     assert "mask_png" in header
     # No mask written for the not-aligned image.
     assert not list(Path(tmp_path).glob("*_mask.png"))
+
+
+# ── PR#9 review: mask must keep Boolean interior holes ───────────────────────
+def test_mask_preserves_boolean_holes():
+    pytest.importorskip("shapely")
+    pytest.importorskip("cv2")
+    import gds_boolean as gb
+    from shapely.geometry import Polygon
+
+    # 100×100 box (nm) with a 40×40 interior hole, rasterised at 1 nm/px.
+    outer = [(0, 0), (100, 0), (100, 100), (0, 100)]
+    hole = [(30, 30), (70, 30), (70, 70), (30, 70)]
+    geom = Polygon(outer, [hole])
+    kw = dict(width_px=100, height_px=100, x_min_nm=0.0, y_min_nm=0.0,
+              nm_per_px=1.0)
+
+    # union_geometries (the mask path) keeps the hole: centre reads 0, ring 255.
+    umask = gb.make_mask(gb.union_geometries([geom]), **kw)
+    assert umask[50, 50] == 0
+    assert umask[10, 10] == 255
+
+    # The old path — rebuilding from exterior rings — wrongly fills the hole.
+    flat = gb.polys_to_geometry(gb.geometry_to_polygons(geom))
+    assert gb.make_mask(flat, **kw)[50, 50] == 255
+
+
+# ── PR#9 review: mask pixels must match the fine-align template / overlay ─────
+def test_mask_matches_rasterize_layer_pixels():
+    pytest.importorskip("shapely")
+    pytest.importorskip("cv2")
+    import numpy as np
+
+    import gds_boolean as gb
+    from shapely.geometry import Polygon
+
+    W, H, nm = 64, 48, 2.0
+    cx, cy = 1000.0, 2000.0
+    poly = np.array([[cx - 30, cy - 20], [cx + 40, cy - 20],
+                     [cx + 40, cy + 25], [cx - 30, cy + 25]], dtype=float)
+    # Reference: the template rasteriser the alignment was computed against.
+    bbox = (cx - W / 2 * nm, cy - H / 2 * nm, cx + W / 2 * nm, cy + H / 2 * nm)
+    ref = fine_align.rasterize_layer([poly], bbox, nm)
+    # make_mask with the worker's origin (y_min raised one pixel) must match it
+    # pixel-for-pixel — same (W/2, H/2) anchor convention as overlay/template.
+    got = gb.make_mask(
+        Polygon(poly), width_px=W, height_px=H,
+        x_min_nm=cx - W / 2.0 * nm, y_min_nm=cy - (H / 2.0 - 1.0) * nm,
+        nm_per_px=nm)
+    assert ref.shape == got.shape == (H, W)
+    assert np.array_equal(ref, got)

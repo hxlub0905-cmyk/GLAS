@@ -135,6 +135,7 @@ import fine_align       # noqa: E402
 from fine_align import (  # noqa: E402,F401
     _fine_align_image, _fit_mask, _parabola_subpx, _walk_roi_polys,
     fine_align_one, make_template, poi_polys_for_roi,
+    poi_polys_and_geometry_for_roi,
     rasterize_layer, render_composite_template, render_poi_template,
 )
 
@@ -1428,14 +1429,18 @@ class OverlayExportWorker(QObject):
                         roi = (coarse[0] - c["fov_w"], coarse[1] - c["fov_h"],
                                coarse[0] + c["fov_w"], coarse[1] + c["fov_h"])
                         entries = []
-                        all_polys = []
+                        mask_geoms = []
                         for spec, color in self._poi:
-                            polys = poi_polys_for_roi(
+                            # One ROI walk per POI feeds both outputs: ``polys``
+                            # (exterior rings) stroke the overlay; ``geom`` keeps
+                            # Boolean interior holes for the mask.
+                            polys, geom = poi_polys_and_geometry_for_roi(
                                 self._rar, self._root, roi, spec,
                                 cancel_cb=self._cancel.is_set)
                             if polys:
                                 entries.append((polys, color))
-                                all_polys.extend(polys)
+                            if geom is not None and not geom.is_empty:
+                                mask_geoms.append(geom)
                         anchor = (coarse if refined is None else
                                   (coarse[0] + refined[0], coarse[1] + refined[1]))
                         if self._export_overlay and entries:
@@ -1446,15 +1451,19 @@ class OverlayExportWorker(QObject):
                             cv2.imwrite(str(self._out_dir / name),
                                         rgb[:, :, ::-1])
                             row["overlay_png"] = name
-                        # F13 Q2: only write a mask for score >= threshold images;
-                        # the FOV bottom-left corner mirrors overlay_outlines_on_sem
-                        # so the mask lands on the same SEM pixels.
-                        if (self._export_mask and all_polys
+                        # F13 Q2: only write a mask for score >= threshold images.
+                        # The geometry (holes preserved) is rasterised so it lands
+                        # on the same SEM pixels as overlay_outlines_on_sem /
+                        # rasterize_layer, which map the anchor to (W/2, H/2) via
+                        # row = (y_top - y)/nm. make_mask(invert_y=True) uses
+                        # (height_px-1) - (y-y_min)/nm, so y_min is raised one
+                        # pixel to reconcile the off-by-one.
+                        if (self._export_mask and mask_geoms
                                 and fine_align.mask_should_export(
                                     refined, self._mask_thr)):
-                            geom = gds_boolean.polys_to_geometry(all_polys)
+                            geom = gds_boolean.union_geometries(mask_geoms)
                             x_min_nm = anchor[0] - W / 2.0 * nm_per_px
-                            y_min_nm = anchor[1] - H / 2.0 * nm_per_px
+                            y_min_nm = anchor[1] - (H / 2.0 - 1.0) * nm_per_px
                             mask = gds_boolean.make_mask(
                                 geom, width_px=W, height_px=H,
                                 x_min_nm=x_min_nm, y_min_nm=y_min_nm,

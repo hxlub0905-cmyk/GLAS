@@ -273,16 +273,23 @@ def _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb=None):
     return polys
 
 
-def poi_polys_for_roi(rar, root, roi_bbox, poi_spec, cancel_cb=None):
-    """POI polygons (nm, root coords) for a given ROI, for batch fine align
-    (plan M4b "Run all"). ``poi_spec`` is ``('raw', layer, datatype)`` or
-    ``('expr', expr_text, bindings[, recipes])``; the latter walks each bound
-    layer over the ROI and evaluates the Boolean expression, resolving any
-    nested synthetic references via ``recipes`` (``{name: (expr, bindings)}``)."""
+def poi_polys_and_geometry_for_roi(rar, root, roi_bbox, poi_spec,
+                                   cancel_cb=None):
+    """POI outline polygons *and* the hole-preserving resolved geometry for a
+    ROI, from a single walk (F13). ``poi_spec`` is ``('raw', layer, datatype)``
+    or ``('expr', expr_text, bindings[, recipes])``.
+
+    ``poi_polys_for_roi`` returns only the flattened exterior rings
+    (``geometry_to_polygons`` drops interior holes), which is fine for stroking
+    overlay outlines but would *fill* Boolean interior exclusions (subtraction /
+    complement) once rasterised into a mask. The mask path therefore needs the
+    geometry, not the rings. Returns ``(polys, geom)`` so one ROI walk feeds
+    both the overlay (polys) and the mask (geom)."""
     kind = poi_spec[0]
     if kind == "raw":
         _, layer, datatype = poi_spec
-        return _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb)
+        polys = _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb)
+        return polys, gds_boolean.polys_to_geometry(polys)
     # expression POI
     expr, bindings = poi_spec[1], poi_spec[2]
     recipes = poi_spec[3] if len(poi_spec) > 3 else {}
@@ -297,7 +304,19 @@ def poi_polys_for_roi(rar, root, roi_bbox, poi_spec, cancel_cb=None):
         expr, bindings, raw_provider=raw_provider,
         recipe_provider=lambda n: recipes.get(n),
         fov_bbox=gds_boolean.fov_box(cx, cy, w, h))
-    return gds_boolean.geometry_to_polygons(geom)
+    return gds_boolean.geometry_to_polygons(geom), geom
+
+
+def poi_polys_for_roi(rar, root, roi_bbox, poi_spec, cancel_cb=None):
+    """POI polygons (nm, root coords) for a given ROI, for batch fine align
+    (plan M4b "Run all") and overlay outlines. ``poi_spec`` is
+    ``('raw', layer, datatype)`` or ``('expr', expr_text, bindings[, recipes])``;
+    the latter walks each bound layer over the ROI and evaluates the Boolean
+    expression, resolving any nested synthetic references via ``recipes``
+    (``{name: (expr, bindings)}``). For the hole-preserving geometry (mask
+    export) use :func:`poi_polys_and_geometry_for_roi`."""
+    return poi_polys_and_geometry_for_roi(
+        rar, root, roi_bbox, poi_spec, cancel_cb)[0]
 
 
 def _fine_align_image(job, rar, root, poi_specs, cfg, cancel_is_set):
