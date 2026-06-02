@@ -4,6 +4,28 @@
 
 ---
 
+## [2026-06-02] [F9][F10] 結案；[F11] 進度條確認；[F13/F14] pending
+
+**變更類型：** 任務狀態收尾（文件，無碼變更）。依 user 驗收決定：
+
+- **[F9] OASIS 匯出 — 結案。** user 本地驗收 OK（GUI 匯出 + KLayout 開檔）。從 §8 移除。
+  實作見 git（M1–M6：core writer + ROI 裁剪 + 匯出對話框 + 開發者模式）；CLAUDE.md §1.5
+  已述此能力。plan：`docs/plans/F9-layout-export.md`。
+- **[F10] OASIS debug mode — 結案。** user 本地驗收 OK。從 §8 移除。實作 M1–M4
+  （診斷報告 + `.debug.txt` sidecar + dev-mode gating）。plan：`docs/plans/F10-debug-mode.md`。
+- **[F11] 整 chip 匯出 — 釐清：進度條本來就有。** user 擔心「無 0–100% 進度條、不知多久」。
+  查證：`WholeChipExportWorker` 每 tile emit `progress(done,total)` → `LoadProgressDialog.
+  set_progress` 顯示 determinate fill bar + `done/total · pct% · Elapsed · ETA` + 取消鈕
+  （`gds_align_tool.py` 6685、873、890）。FOV 載入用的是不確定轉圈，故 user 可能誤以為沒有。
+  **caveat**：本真檔含 mega-cell（[F14]，1351 萬 placement），整 chip 會逐 tile 重走該 cell
+  → 極慢；進度條會顯示 ETA 並可取消，但實務上需 F14 才順。§8 條目更新（移除 stale「待核准」）。
+- **[F13] / [F14] — pending（user 暫不做）。** F13 剪枝已實作且正確，僅卡 F14 mega-cell；
+  兩者皆停在 backlog/pending，不續推。
+
+**影響檔案：** `CLAUDE.md`（§8）、`SESSION_LOG.md`。**Branch：** `claude/magical-davinci-Ibo8K`
+
+---
+
 ## [2026-06-02] 狀態快照：進行中任務的「未做 / 未驗證」盤點
 
 **變更類型：** 文件整理（無碼變更）。前提：本沙箱無 numpy/cv2/shapely/PyQt6 →
