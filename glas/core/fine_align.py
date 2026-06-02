@@ -28,6 +28,50 @@ import gds_boolean
 import oasis_random
 
 
+# ── F13: batch re-run + mask-export decision helpers ─────────────────────────
+# Qt-free pure logic, shared by the app's OverlayExportWorker / re-run wiring and
+# unit-tested directly (the app module needs PyQt6, this one does not).
+
+# Manifest column order for OverlayExportWorker (F5 M6 + F13 ``mask_png``).
+# ``mask_png`` is appended last so any index-based reader of the older columns is
+# unaffected; it carries the per-image GDS mask filename (blank when no mask was
+# written for that image).
+OVERLAY_MANIFEST_COLS = [
+    "image_id", "raw_png", "overlay_png",
+    "fine_dx_nm", "fine_dy_nm", "score", "status", "mask_png",
+]
+
+
+def rerun_should_overwrite(old_refined, new_score: float, status: str) -> bool:
+    """F13 Q1=C: a batch re-run only replaces an image's stored alignment when
+    the new run is *strictly better*, so re-running can never make results worse.
+
+    ``old_refined`` is the existing ``(dx, dy, score)`` tuple (or ``None`` when
+    the image had no prior result); ``status`` is the worker's objective status.
+    A non-"ok" re-run never clobbers a prior result.
+    """
+    if status != "ok":
+        return False
+    if old_refined is None:
+        return True
+    return new_score > old_refined[2]
+
+
+def mask_should_export(refined, threshold: float) -> bool:
+    """F13 Q2: a per-image GDS mask is written only for images that were
+    fine-aligned (``refined`` is not ``None``) *and* whose score meets the
+    threshold, so every exported mask is trustworthy (MMH needs no fallback).
+    ``refined`` is ``(dx, dy, score)`` or ``None``."""
+    return refined is not None and refined[2] >= threshold
+
+
+def rerun_image_subset(images, image_ids):
+    """Pick the image objects whose ``image_id`` is in ``image_ids`` (F13 batch
+    re-run of a selected / low-score subset), preserving dataset order."""
+    idset = {str(i) for i in image_ids}
+    return [im for im in images if str(getattr(im, "image_id", im)) in idset]
+
+
 # ── Rasterization helper (used by Boolean masks / template) ──────────────────
 
 

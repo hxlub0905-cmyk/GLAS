@@ -1,6 +1,6 @@
 # [F13] Per-image GDS mask 批次輸出 + low-score re-run
 
-> **狀態：** planned
+> **狀態：** in progress (2026-06-02)
 > **§8 ID：** [F13]
 > **建立：** 2026-06-02
 > **負責 branch：** claude/optimistic-pasteur-31ELv
@@ -62,54 +62,54 @@
 
 > 每個 milestone 以「一個 session 可完成」為粒度切。
 
-### M1: BatchResultsPanel Re-run 介面  [status: planned]
+### M1: BatchResultsPanel Re-run 介面  [status: done (code; pytest 待 user)]
 
-- [ ] `BatchResultsPanel` results table 下方新增 Re-run 參數區塊（沿用 FineAlignPanel 既有參數名）：
-  - [ ] Search radius (nm) — `search_radius_nm`（預設帶入現有值，可覆蓋）
-  - [ ] Background GL — `bg_glv`
-  - [ ] Blur σ (px) — `blur_sigma_px`
-  - [ ] Per-POI FG GL — `fg_glv`（繼承現有設定，可覆蓋）
-- [ ] 新增「Re-run low-score」按鈕：重跑所有 `status == "low-score"` 的圖
-- [ ] 新增「Re-run selected」按鈕：重跑 table 勾選的圖（table 改支援多選 / checkable）
-- [ ] Re-run 透過既有 `FineAlignAllWorker`（ProcessPoolExecutor）跑**子集** jobs
-- [ ] 覆蓋規則（Q1=C）：新 score > 舊 score 才更新 `MainWindow._refined[image_id]`
+- [x] `BatchResultsPanel` results table 下方新增 Re-run 參數區塊（沿用 FineAlignPanel 既有參數名）：
+  - [x] Search radius (nm) — `search_radius_nm`（預設帶入現有值，可覆蓋）
+  - [x] Background GL — `bg_glv`
+  - [x] Blur σ (px) — `blur_sigma_px`
+  - [x] Per-POI FG GL — `fg_glv`（繼承現有設定，可覆蓋）
+- [x] 新增「Re-run low-score」按鈕：重跑所有 `status == "low-score"` 的圖
+- [x] 新增「Re-run selected」按鈕：重跑 table 勾選的圖（table 改支援多選 / checkable）
+- [x] Re-run 透過既有 `FineAlignAllWorker`（ProcessPoolExecutor）跑**子集** jobs
+- [x] 覆蓋規則（Q1=C）：新 score > 舊 score 才更新 `MainWindow._refined[image_id]`
       與對應 `BatchResultsPanel._rows` 列（兩處同步）
-- [ ] Re-run 完成後 table / histogram / scatter 自動刷新
+- [x] Re-run 完成後 table / histogram / scatter 自動刷新
 - [ ] 驗證：手動對 low-score 圖重跑，table 只更新有變好的列；histogram/scatter 跟著更新
 
-### M2: OverlayExportWorker 補 mask 輸出  [status: planned]
+### M2: OverlayExportWorker 補 mask 輸出  [status: done (code; pytest 待 user)]
 
-- [ ] `__init__` 新增 `export_mask: bool` 與 `mask_score_threshold: float` 參數
-- [ ] `run()` 重構：ROI walk（`poi_polys_for_roi`）改為「`export_overlay` 或 `export_mask` 任一為真」就執行一次，
+- [x] `__init__` 新增 `export_mask: bool` 與 `mask_score_threshold: float` 參數
+- [x] `run()` 重構：ROI walk（`poi_polys_for_roi`）改為「`export_overlay` 或 `export_mask` 任一為真」就執行一次，
       overlay 與 mask **共用同一次 walk 的 `entries`**（不重複呼叫 `poi_polys_for_roi`）
-- [ ] mask 輸出分支：
-  - [ ] `refined is None` → 跳過（不輸出 mask）
-  - [ ] `refined[2] < mask_score_threshold` → 跳過
-  - [ ] 以上都過 → 把 entries 的 polys `unary_union` 成 geom，由 anchor + `nm_per_px` + W/H 換算
+- [x] mask 輸出分支：
+  - [x] `refined is None` → 跳過（不輸出 mask）
+  - [x] `refined[2] < mask_score_threshold` → 跳過
+  - [x] 以上都過 → 把 entries 的 polys `unary_union` 成 geom，由 anchor + `nm_per_px` + W/H 換算
         FOV 左下角 `x_min_nm/y_min_nm`（與 `overlay_outlines_on_sem` 的座標映射一致），
         呼叫 `make_mask(geom, width_px=W, height_px=H, x_min_nm=..., y_min_nm=..., nm_per_px=...)`
         → `cv2.imwrite(out_dir / f"{base}_mask.png", mask)`
-  - [ ] manifest row 新增 `mask_png` 欄（跳過的留空字串）
-- [ ] `_COLS` 增 `"mask_png"`
+  - [x] manifest row 新增 `mask_png` 欄（跳過的留空字串）
+- [x] `_COLS` 增 `"mask_png"`
 - [ ] 驗證：見 M4 單元測試
 
-### M3: Export Dialog 更新  [status: planned]
+### M3: Export Dialog 更新  [status: done (code; pytest 待 user)]
 
-- [ ] `AlignmentExportDialog` 新增：
-  - [ ] `Export GDS mask (.png)` QCheckBox
-  - [ ] `Score threshold` QDoubleSpinBox（預設 0.8、range 0.0–1.0、step 0.05）
-  - [ ] 預計輸出張數 QLabel（即時計算 jobs 中 score ≥ threshold 的數量；隨 threshold 變動更新）
-- [ ] `selected()` 回傳擴充：帶出 `export_mask` 與 `mask_score_threshold`
-- [ ] 呼叫端建構 `OverlayExportWorker` 時帶入新參數
+- [x] `AlignmentExportDialog` 新增：
+  - [x] `Export GDS mask (.png)` QCheckBox
+  - [x] `Score threshold` QDoubleSpinBox（預設 0.8、range 0.0–1.0、step 0.05）
+  - [x] 預計輸出張數 QLabel（即時計算 jobs 中 score ≥ threshold 的數量；隨 threshold 變動更新）
+- [x] `selected()` 回傳擴充：帶出 `export_mask` 與 `mask_score_threshold`
+- [x] 呼叫端建構 `OverlayExportWorker` 時帶入新參數
 - [ ] 驗證：勾/不勾 mask、調 threshold，預計張數 label 即時正確
 
-### M4: 測試  [status: planned]
+### M4: 測試  [status: done (code; pytest 待 user)]
 
-- [ ] `test_rerun_only_improves`：re-run 後 score 更低**不**覆蓋、更高**才**覆蓋
-- [ ] `test_rerun_selected`：只有選取的 image_id 被重跑
-- [ ] `test_mask_export_threshold`：score < threshold 不輸出 `mask_png`，≥ threshold 輸出
-- [ ] `test_mask_export_no_refined`：`refined is None` 的圖不輸出 mask
-- [ ] `test_manifest_mask_png_col`：manifest CSV 有 `mask_png` 欄位
+- [x] `test_rerun_only_improves`：re-run 後 score 更低**不**覆蓋、更高**才**覆蓋
+- [x] `test_rerun_selected`：只有選取的 image_id 被重跑
+- [x] `test_mask_export_threshold`：score < threshold 不輸出 `mask_png`，≥ threshold 輸出
+- [x] `test_mask_export_no_refined`：`refined is None` 的圖不輸出 mask
+- [x] `test_manifest_mask_png_col`：manifest CSV 有 `mask_png` 欄位
 - [ ] 驗證：`pytest tests/test_gds_align_f13.py -v` 全綠
 
 ---
@@ -142,12 +142,12 @@
 
 整個 feature 結束時的 end-to-end 驗證：
 
-- [ ] 所有 milestone checkbox 已勾
-- [ ] `pytest tests/test_gds_align_f13.py -v` 通過
+- [x] 所有 milestone 程式碼 subtask 已完成（`py_compile` 通過）
+- [ ] `pytest tests/test_gds_align_f13.py -v` 通過（**待 user 本地**——沙箱無 numpy/PyQt6）
 - [ ] 手動：batch `Run all` → 對 low-score 圖調參 `Re-run low-score` / `Re-run selected`
       → 確認只變好不變壞、table/圖刷新 → Export 勾 `Export GDS mask` 設 threshold
       → 檢查資料夾每張 `{image_id}_mask.png` + manifest `mask_png` 欄、只有 score ≥ threshold 才有 mask
-- [ ] `SESSION_LOG.md` 有對應紀錄
+- [x] `SESSION_LOG.md` 有對應紀錄
 
 ---
 
