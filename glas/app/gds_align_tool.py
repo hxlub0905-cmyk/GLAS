@@ -135,6 +135,7 @@ import fine_align       # noqa: E402
 from fine_align import (  # noqa: E402,F401
     _fine_align_image, _fit_mask, _parabola_subpx, _walk_roi_polys,
     fine_align_one, make_template, poi_polys_for_roi,
+    poi_polys_and_geometry_for_roi,
     rasterize_layer, render_composite_template, render_poi_template,
 )
 
@@ -1362,11 +1363,12 @@ class OverlayExportWorker(QObject):
     failed = pyqtSignal(str)
     cancelled = pyqtSignal()
 
-    _COLS = ["image_id", "raw_png", "overlay_png", "fine_dx_nm", "fine_dy_nm",
-             "score", "status"]
+    _COLS = fine_align.OVERLAY_MANIFEST_COLS
 
     def __init__(self, rar, root, poi_specs_colored, jobs, cfg, out_dir,
-                 export_raw: bool, export_overlay: bool) -> None:
+                 export_raw: bool, export_overlay: bool,
+                 export_mask: bool = False,
+                 mask_score_threshold: float = 0.0) -> None:
         super().__init__()
         self._rar = rar
         self._root = root
@@ -1376,6 +1378,9 @@ class OverlayExportWorker(QObject):
         self._out_dir = Path(out_dir)
         self._export_raw = export_raw
         self._export_overlay = export_overlay
+        # F13: per-image GDS mask (uint8 PNG) export, gated by score threshold.
+        self._export_mask = export_mask
+        self._mask_thr = mask_score_threshold
         self._cancel = threading.Event()
 
     def cancel(self) -> None:
@@ -1395,6 +1400,7 @@ class OverlayExportWorker(QObject):
                 self.progress.emit(done, n, str(image_id))
                 row = {
                     "image_id": str(image_id), "raw_png": "", "overlay_png": "",
+                    "mask_png": "",
                     "fine_dx_nm": "" if refined is None else round(refined[0], 3),
                     "fine_dy_nm": "" if refined is None else round(refined[1], 3),
                     "score": "" if refined is None else round(refined[2], 6),
@@ -1411,7 +1417,11 @@ class OverlayExportWorker(QObject):
                     name = f"{base}_raw.png"
                     cv2.imwrite(str(self._out_dir / name), sem)
                     row["raw_png"] = name
-                if self._export_overlay and coarse is not None and self._poi:
+                # F13: overlay and mask both consume one ROI walk per image. The
+                # walk runs when either output is requested; ``poi_polys_for_roi``
+                # is called once per POI and its result is reused for both.
+                if ((self._export_overlay or self._export_mask)
+                        and coarse is not None and self._poi):
                     H, W = sem.shape[:2]
                     nm_per_px = (c["nm_manual"] if (not c["nm_auto"] and
                                  c["nm_manual"] > 0) else c["fov_w"] / max(1, W))
@@ -1419,20 +1429,48 @@ class OverlayExportWorker(QObject):
                         roi = (coarse[0] - c["fov_w"], coarse[1] - c["fov_h"],
                                coarse[0] + c["fov_w"], coarse[1] + c["fov_h"])
                         entries = []
+                        mask_geoms = []
                         for spec, color in self._poi:
-                            polys = poi_polys_for_roi(
+                            # One ROI walk per POI feeds both outputs: ``polys``
+                            # (exterior rings) stroke the overlay; ``geom`` keeps
+                            # Boolean interior holes for the mask.
+                            polys, geom = poi_polys_and_geometry_for_roi(
                                 self._rar, self._root, roi, spec,
                                 cancel_cb=self._cancel.is_set)
                             if polys:
                                 entries.append((polys, color))
+                            if geom is not None and not geom.is_empty:
+                                mask_geoms.append(geom)
                         anchor = (coarse if refined is None else
                                   (coarse[0] + refined[0], coarse[1] + refined[1]))
-                        rgb = overlay_outlines_on_sem(sem, entries, anchor,
-                                                      nm_per_px)
-                        name = f"{base}_overlay.png"
-                        # overlay returns RGB; cv2 writes BGR → flip channels.
-                        cv2.imwrite(str(self._out_dir / name), rgb[:, :, ::-1])
-                        row["overlay_png"] = name
+                        if self._export_overlay and entries:
+                            rgb = overlay_outlines_on_sem(sem, entries, anchor,
+                                                          nm_per_px)
+                            name = f"{base}_overlay.png"
+                            # overlay returns RGB; cv2 writes BGR → flip channels.
+                            cv2.imwrite(str(self._out_dir / name),
+                                        rgb[:, :, ::-1])
+                            row["overlay_png"] = name
+                        # F13 Q2: only write a mask for score >= threshold images.
+                        # The geometry (holes preserved) is rasterised so it lands
+                        # on the same SEM pixels as overlay_outlines_on_sem /
+                        # rasterize_layer, which map the anchor to (W/2, H/2) via
+                        # row = (y_top - y)/nm. make_mask(invert_y=True) uses
+                        # (height_px-1) - (y-y_min)/nm, so y_min is raised one
+                        # pixel to reconcile the off-by-one.
+                        if (self._export_mask and mask_geoms
+                                and fine_align.mask_should_export(
+                                    refined, self._mask_thr)):
+                            geom = gds_boolean.union_geometries(mask_geoms)
+                            x_min_nm = anchor[0] - W / 2.0 * nm_per_px
+                            y_min_nm = anchor[1] - (H / 2.0 - 1.0) * nm_per_px
+                            mask = gds_boolean.make_mask(
+                                geom, width_px=W, height_px=H,
+                                x_min_nm=x_min_nm, y_min_nm=y_min_nm,
+                                nm_per_px=nm_per_px)
+                            name = f"{base}_mask.png"
+                            cv2.imwrite(str(self._out_dir / name), mask)
+                            row["mask_png"] = name
                 manifest.append(row)
             mpath = self._write_manifest(manifest)
         except oasis_random.WalkCancelled:
@@ -3868,6 +3906,8 @@ class BatchResultsPanel(QWidget):
     apply_median_requested = pyqtSignal(float, float)
     cancel_requested = pyqtSignal()
     back_requested = pyqtSignal()
+    # F13: (image_ids, overrides) — re-run a subset with overridden params.
+    rerun_requested = pyqtSignal(list, dict)
 
     _OK_BG = QColor("#dff3e6")
     _LOW_BG = QColor("#fdf2cf")
@@ -3945,6 +3985,9 @@ class BatchResultsPanel(QWidget):
         self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows)
+        # F13: multi-row select so 'Re-run selected' can act on several images.
+        self._table.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection)
         self._table.verticalHeader().setVisible(False)
         self._table.cellDoubleClicked.connect(self._on_cell_activated)
         v.addWidget(self._table, 1)
@@ -3965,6 +4008,55 @@ class BatchResultsPanel(QWidget):
         btn_row.addWidget(self._apply_btn)
         btn_row.addStretch(1)
         v.addLayout(btn_row)
+
+        # F13: re-run a subset (low-score or selected rows) with overridden
+        # params, instead of re-running the whole dataset. Per-POI FG GL is
+        # inherited live from the Fine Align panel (adjust it there to override).
+        rr_box = QGroupBox("Re-run low-score / selected", self)
+        rr = QGridLayout(rr_box)
+        rr.setContentsMargins(8, 6, 8, 6)
+        rr.setHorizontalSpacing(6)
+        rr.setVerticalSpacing(4)
+        self._rr_radius = QSpinBox(rr_box)
+        self._rr_radius.setRange(0, 100_000)
+        self._rr_radius.setSingleStep(50)
+        self._rr_radius.setValue(200)
+        self._rr_radius.setToolTip("Search radius (nm) for the re-run.")
+        self._rr_bg = QSpinBox(rr_box)
+        self._rr_bg.setRange(0, 255)
+        self._rr_bg.setValue(80)
+        self._rr_bg.setToolTip("Background grey level for the re-run template.")
+        self._rr_blur = QDoubleSpinBox(rr_box)
+        self._rr_blur.setRange(0.0, 20.0)
+        self._rr_blur.setSingleStep(0.5)
+        self._rr_blur.setDecimals(2)
+        self._rr_blur.setValue(1.0)
+        self._rr_blur.setToolTip("Gaussian blur σ (px) for the re-run template.")
+        for col, (lbl, w) in enumerate((
+                ("Search radius (nm)", self._rr_radius),
+                ("Background GL", self._rr_bg),
+                ("Blur σ (px)", self._rr_blur))):
+            cap = QLabel(lbl, rr_box)
+            cap.setStyleSheet(_hint_qss(_FS_CAPTION))
+            rr.addWidget(cap, 0, col)
+            rr.addWidget(w, 1, col)
+        rr_hint = QLabel("Per-POI FG GL inherited from the Fine Align panel.",
+                         rr_box)
+        rr_hint.setStyleSheet(_hint_qss(_FS_CAPTION))
+        rr.addWidget(rr_hint, 2, 0, 1, 3)
+        self._rr_low_btn = QPushButton("Re-run low-score", rr_box)
+        self._rr_low_btn.setToolTip(
+            "Re-run every image with status 'low-score' using the params above; "
+            "results are kept only where the new score is higher.")
+        self._rr_low_btn.clicked.connect(self._on_rerun_low)
+        self._rr_sel_btn = QPushButton("Re-run selected", rr_box)
+        self._rr_sel_btn.setToolTip(
+            "Re-run the rows selected in the table above (Ctrl/Shift-click for "
+            "several); results are kept only where the new score is higher.")
+        self._rr_sel_btn.clicked.connect(self._on_rerun_selected)
+        rr.addWidget(self._rr_low_btn, 3, 0, 1, 2)
+        rr.addWidget(self._rr_sel_btn, 3, 2)
+        v.addWidget(rr_box)
 
     # ── data ────────────────────────────────────────────────────────────────
     def set_rows(self, rows, threshold: float,
@@ -4056,6 +4148,46 @@ class BatchResultsPanel(QWidget):
         if med is not None:
             self.apply_median_requested.emit(med[0], med[1])
 
+    # ── F13: subset re-run ────────────────────────────────────────────────────
+    def set_rerun_defaults(self, values: dict) -> None:
+        """Seed the re-run override spins from the Fine Align panel's current
+        values, so a re-run starts from the same params unless the user tweaks
+        them here."""
+        self._rr_radius.setValue(int(values.get("search_radius_nm", 200)))
+        self._rr_bg.setValue(int(values.get("bg_glv", 80)))
+        self._rr_blur.setValue(float(values.get("blur_sigma_px", 1.0)))
+
+    def _rerun_overrides(self) -> dict:
+        return {
+            "search_radius_nm": float(self._rr_radius.value()),
+            "bg_glv": int(self._rr_bg.value()),
+            "blur_sigma_px": float(self._rr_blur.value()),
+        }
+
+    def _selected_image_ids(self) -> list:
+        ids = []
+        for idx in self._table.selectionModel().selectedRows():
+            item = self._table.item(idx.row(), 0)
+            if item is not None:
+                iid = item.data(Qt.ItemDataRole.UserRole)
+                if iid is not None:
+                    ids.append(iid)
+        return ids
+
+    def _on_rerun_low(self) -> None:
+        ids = [r["image_id"] for r in self._rows if r["status"] == "low-score"]
+        if ids:
+            self.rerun_requested.emit(ids, self._rerun_overrides())
+
+    def _on_rerun_selected(self) -> None:
+        ids = self._selected_image_ids()
+        if ids:
+            self.rerun_requested.emit(ids, self._rerun_overrides())
+
+    def _set_rerun_enabled(self, on: bool) -> None:
+        self._rr_low_btn.setEnabled(on)
+        self._rr_sel_btn.setEnabled(on)
+
     # ── inline progress ───────────────────────────────────────────────────────
     def start_progress(self) -> None:
         self._cancelled = False
@@ -4067,6 +4199,7 @@ class BatchResultsPanel(QWidget):
         self._elapsed.start()
         self._tick.start()
         self._prog_box.show()
+        self._set_rerun_enabled(False)
 
     def set_progress(self, done: int, total: int, image_id: str = "") -> None:
         self._progress = (done, total)
@@ -4077,6 +4210,7 @@ class BatchResultsPanel(QWidget):
     def end_progress(self, text: str = "") -> None:
         self._tick.stop()
         self._prog_box.hide()
+        self._set_rerun_enabled(True)
 
     def _on_cancel_clicked(self) -> None:
         if self._cancelled:
@@ -4569,10 +4703,13 @@ class AlignmentExportDialog(QDialog):
     """Pick the format (CSV / JSON) and which images to export (plan M5).
     Defaults to every image checked."""
 
-    def __init__(self, parent, images) -> None:
+    def __init__(self, parent, images, refined=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Export alignment")
         self.setMinimumWidth(_capped_min_width(360))
+        # F13: per-image scores so the GDS-mask export can show how many images
+        # clear the threshold. ``refined`` is ``{image_id: (dx, dy, score)}``.
+        self._refined = dict(refined or {})
         v = QVBoxLayout(self)
 
         v.addWidget(QLabel("Format"))
@@ -4589,6 +4726,7 @@ class AlignmentExportDialog(QDialog):
             item.setCheckState(Qt.CheckState.Checked)
             item.setData(Qt.ItemDataRole.UserRole, img.image_id)
             self._list.addItem(item)
+        self._list.itemChanged.connect(lambda _it: self._update_mask_count())
         v.addWidget(self._list, 1)
 
         row = QHBoxLayout()
@@ -4611,6 +4749,34 @@ class AlignmentExportDialog(QDialog):
             "Aligned GDS-overlay PNG (POI outlines on SEM)", img_box)
         ibl.addWidget(self._exp_raw)
         ibl.addWidget(self._exp_overlay)
+
+        # F13: per-image GDS mask (uint8 PNG) export, gated by score threshold so
+        # MMH can trust every emitted mask without fallback logic.
+        self._exp_mask = QCheckBox("Export GDS mask (.png)", img_box)
+        self._exp_mask.setToolTip(
+            "Write a per-image uint8 mask (POI Boolean geometry rasterised at "
+            "the aligned anchor). Only images with a fine-align score at or "
+            "above the threshold below are written.")
+        ibl.addWidget(self._exp_mask)
+        thr_row = QHBoxLayout()
+        thr_row.addWidget(QLabel("Score threshold", img_box))
+        self._mask_thr = QDoubleSpinBox(img_box)
+        self._mask_thr.setRange(0.0, 1.0)
+        self._mask_thr.setSingleStep(0.05)
+        self._mask_thr.setDecimals(2)
+        self._mask_thr.setValue(0.8)
+        self._mask_thr.valueChanged.connect(lambda _v: self._update_mask_count())
+        thr_row.addWidget(self._mask_thr)
+        thr_row.addStretch(1)
+        ibl.addLayout(thr_row)
+        self._mask_count = QLabel("", img_box)
+        self._mask_count.setStyleSheet(_hint_qss(_FS_CAPTION))
+        ibl.addWidget(self._mask_count)
+        # Threshold + count only matter when mask export is on.
+        self._exp_mask.toggled.connect(self._mask_thr.setEnabled)
+        self._exp_mask.toggled.connect(lambda _on: self._update_mask_count())
+        self._mask_thr.setEnabled(False)
+        self._update_mask_count()
         v.addWidget(img_box)
 
         bb = QDialogButtonBox(
@@ -4625,14 +4791,29 @@ class AlignmentExportDialog(QDialog):
         for i in range(self._list.count()):
             self._list.item(i).setCheckState(st)
 
+    def _checked_ids(self) -> list:
+        return [self._list.item(i).data(Qt.ItemDataRole.UserRole)
+                for i in range(self._list.count())
+                if self._list.item(i).checkState() == Qt.CheckState.Checked]
+
+    def _update_mask_count(self) -> None:
+        """Show how many of the checked images would get a mask at the current
+        threshold (F13: score >= threshold among the selected images)."""
+        if not self._exp_mask.isChecked():
+            self._mask_count.setText("")
+            return
+        thr = float(self._mask_thr.value())
+        n = sum(1 for iid in self._checked_ids()
+                if fine_align.mask_should_export(self._refined.get(iid), thr))
+        self._mask_count.setText(f"{n} image(s) ≥ threshold will get a mask")
+
     def selected(self) -> tuple:
-        """``(fmt, [image_id, ...], export_raw, export_overlay)`` where ``fmt``
-        is 'csv' or 'json'."""
+        """``(fmt, [image_id, ...], export_raw, export_overlay, export_mask,
+        mask_score_threshold)`` where ``fmt`` is 'csv' or 'json'."""
         fmt = "csv" if self._fmt.currentIndex() == 0 else "json"
-        ids = [self._list.item(i).data(Qt.ItemDataRole.UserRole)
-               for i in range(self._list.count())
-               if self._list.item(i).checkState() == Qt.CheckState.Checked]
-        return fmt, ids, self._exp_raw.isChecked(), self._exp_overlay.isChecked()
+        return (fmt, self._checked_ids(), self._exp_raw.isChecked(),
+                self._exp_overlay.isChecked(), self._exp_mask.isChecked(),
+                float(self._mask_thr.value()))
 
 
 # ── Main window ──────────────────────────────────────────────────────────────
@@ -4708,6 +4889,7 @@ class MainWindow(QMainWindow):
             self._on_apply_median_residual)
         self.batch_panel.back_requested.connect(self._exit_batch_workspace)
         self.batch_panel.cancel_requested.connect(self._on_fa_cancel_clicked)
+        self.batch_panel.rerun_requested.connect(self._on_rerun_requested)
         # M7-ov #9: corner minimap floated over the SEM view (hidden unless in
         # 'minimap' mode).
         self.minimap = MiniMap(self.sem_viewer)
@@ -4821,6 +5003,9 @@ class MainWindow(QMainWindow):
         # M4b fine align: chosen POI layer + per-image refined offset.
         self._poi_entries: list[LayerEntry] = []
         self._refined: dict = {}     # image_id -> (dx_nm, dy_nm, score)
+        # F13: True while a batch *re-run* is in flight, so results only
+        # overwrite when strictly better (rerun_should_overwrite).
+        self._fa_rerun_mode = False
         # F5: per-image (used_radius_px, status) parallel to _refined, for the
         # results table (C3/C4). status: ok / no-coords / missing-file /
         # no-scale / flat.
@@ -5657,9 +5842,53 @@ class MainWindow(QMainWindow):
         }
         # F7: run inside the batch workspace with inline progress, instead of a
         # modal dialog. Show the (initial) results table and the progress strip.
+        self._fa_rerun_mode = False
         self._batch_refresh_timer.stop()     # clear any pending refresh (F8)
         self._enter_batch_workspace()
+        self.batch_panel.set_rerun_defaults(self.sem_panel.fine_align.values())
         self._refresh_batch_panel()
+        self._launch_fa(specs, jobs, cfg)
+
+    def _on_rerun_requested(self, image_ids: list, overrides: dict) -> None:
+        """F13: re-run a subset (low-score / selected) with overridden params.
+        Same guards as 'Run all'; results only overwrite when strictly better
+        (handled in ``_on_fa_result`` via ``_fa_rerun_mode``)."""
+        if cv2 is None:
+            QMessageBox.warning(self, "Fine align",
+                                "opencv (cv2) is required for fine alignment.")
+            return
+        if self._fa_thread is not None:
+            return  # already running
+        specs = self._poi_specs()
+        if not specs:
+            self._status_doc.setText("re-run: select a POI layer first")
+            return
+        if self._rar is None or self._roi_root is None:
+            self._status_doc.setText("re-run: open an OASIS (ROI) first")
+            return
+        if self._fov_w <= 0 or self._fov_h <= 0:
+            self._status_doc.setText("re-run: set FOV width/height first")
+            return
+        subset = fine_align.rerun_image_subset(self._sem_images, image_ids)
+        jobs = [(im.image_id, self._coarse_gds(im),
+                 str(im.file_path) if im.file_path else "", bool(im.exists))
+                for im in subset]
+        if not jobs:
+            self._status_doc.setText("re-run: no matching images")
+            return
+        cfg = {
+            "fov_w": self._fov_w, "fov_h": self._fov_h,
+            "nm_auto": self._nm_auto, "nm_manual": self._nm_per_px_manual,
+            **self.sem_panel.fine_align.values(), **overrides,
+        }
+        self._fa_rerun_mode = True
+        self._batch_refresh_timer.stop()
+        self._status_doc.setText(f"re-run: {len(jobs)} image(s)…")
+        self._launch_fa(specs, jobs, cfg)
+
+    def _launch_fa(self, specs, jobs, cfg) -> None:
+        """Start the batch fine-align worker thread (shared by Run all and the
+        F13 subset re-run)."""
         self.batch_panel.start_progress()
         self._fa_thread = QThread(self)
         self._fa_worker = FineAlignAllWorker(
@@ -5701,15 +5930,25 @@ class MainWindow(QMainWindow):
     def _on_fa_result(self, image_id: str, dx: float, dy: float,
                       score: float, used_r: int, status: str) -> None:
         thr = self.sem_panel.fine_align.values()["score_threshold"]
-        self._fa_meta[image_id] = (int(used_r), status)
-        if status == "ok":
+        if self._fa_rerun_mode:
+            # F13 Q1=C: a re-run only replaces a result when strictly better, so
+            # a worse (or now-failing) re-run never clobbers a prior good one.
+            if not fine_align.rerun_should_overwrite(
+                    self._refined.get(image_id), score, status):
+                return
             self._refined[image_id] = (dx, dy, score)
+            self._fa_meta[image_id] = (int(used_r), status)
             self.sem_panel.set_score(image_id, score, thr)
         else:
-            # Drop any stale offset/badge so a now-failing image isn't still
-            # rendered/exported with outdated alignment (PR#4 review).
-            self._refined.pop(image_id, None)
-            self.sem_panel.clear_score(image_id)
+            self._fa_meta[image_id] = (int(used_r), status)
+            if status == "ok":
+                self._refined[image_id] = (dx, dy, score)
+                self.sem_panel.set_score(image_id, score, thr)
+            else:
+                # Drop any stale offset/badge so a now-failing image isn't still
+                # rendered/exported with outdated alignment (PR#4 review).
+                self._refined.pop(image_id, None)
+                self.sem_panel.clear_score(image_id)
         # Stream the new row into the batch panel as it arrives (F7), but
         # coalesce the rebuilds (F8): kick the single-shot timer so a burst of
         # results refreshes the table at most ~3x/sec, not once per image.
@@ -5748,6 +5987,7 @@ class MainWindow(QMainWindow):
             self._status_doc.setText("results: load SEM images first")
             return
         self._enter_batch_workspace()
+        self.batch_panel.set_rerun_defaults(self.sem_panel.fine_align.values())
         self._refresh_batch_panel()
 
     def _on_results_image_activated(self, image_id: str) -> None:
@@ -5796,10 +6036,10 @@ class MainWindow(QMainWindow):
         if not self._sem_images:
             self._status_doc.setText("export: load SEM images first")
             return
-        dlg = AlignmentExportDialog(self, self._sem_images)
+        dlg = AlignmentExportDialog(self, self._sem_images, self._refined)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        fmt, ids, exp_raw, exp_overlay = dlg.selected()
+        fmt, ids, exp_raw, exp_overlay, exp_mask, mask_thr = dlg.selected()
         if not ids:
             self._status_doc.setText("export: no images selected")
             return
@@ -5828,8 +6068,9 @@ class MainWindow(QMainWindow):
             return
         self._status_doc.setText(
             f"exported {len(rows)} image(s) → {Path(path).name}")
-        if exp_raw or exp_overlay:
-            self._export_overlay_images(images, exp_raw, exp_overlay)
+        if exp_raw or exp_overlay or exp_mask:
+            self._export_overlay_images(images, exp_raw, exp_overlay,
+                                        exp_mask, mask_thr)
 
     # ── F5 M6: SEM + aligned-overlay PNG export ──────────────────────────────
     def _poi_specs_colored(self) -> list:
@@ -5844,7 +6085,8 @@ class MainWindow(QMainWindow):
         return out
 
     def _export_overlay_images(self, images, exp_raw: bool,
-                               exp_overlay: bool) -> None:
+                               exp_overlay: bool, exp_mask: bool = False,
+                               mask_thr: float = 0.0) -> None:
         if cv2 is None:
             QMessageBox.warning(self, "Image export",
                                 "opencv (cv2) is required for image export.")
@@ -5852,13 +6094,15 @@ class MainWindow(QMainWindow):
         if self._ov_thread is not None:
             return
         specs = self._poi_specs_colored()
-        if exp_overlay and (not specs or self._rar is None
-                            or self._roi_root is None):
+        # Both overlay and mask need an OASIS ROI + a POI layer to walk geometry.
+        if (exp_overlay or exp_mask) and (not specs or self._rar is None
+                                          or self._roi_root is None):
             QMessageBox.information(
                 self, "Overlay export",
-                "Overlay PNGs need an OASIS (ROI) open and ≥1 POI layer; "
+                "Overlay / mask PNGs need an OASIS (ROI) open and ≥1 POI layer; "
                 "exporting raw images / manifest only.")
             exp_overlay = False
+            exp_mask = False
         out_dir = QFileDialog.getExistingDirectory(self, "Export images to…")
         if not out_dir:
             return
@@ -5873,7 +6117,7 @@ class MainWindow(QMainWindow):
         self._ov_thread = QThread(self)
         self._ov_worker = OverlayExportWorker(
             self._rar, self._roi_root, specs, jobs, cfg, out_dir,
-            exp_raw, exp_overlay)
+            exp_raw, exp_overlay, exp_mask, mask_thr)
         self._ov_worker.moveToThread(self._ov_thread)
         self._ov_thread.started.connect(self._ov_worker.run)
         self._ov_worker.progress.connect(self._on_ov_progress)

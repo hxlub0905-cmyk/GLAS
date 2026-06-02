@@ -28,6 +28,50 @@ import gds_boolean
 import oasis_random
 
 
+# ── F13: batch re-run + mask-export decision helpers ─────────────────────────
+# Qt-free pure logic, shared by the app's OverlayExportWorker / re-run wiring and
+# unit-tested directly (the app module needs PyQt6, this one does not).
+
+# Manifest column order for OverlayExportWorker (F5 M6 + F13 ``mask_png``).
+# ``mask_png`` is appended last so any index-based reader of the older columns is
+# unaffected; it carries the per-image GDS mask filename (blank when no mask was
+# written for that image).
+OVERLAY_MANIFEST_COLS = [
+    "image_id", "raw_png", "overlay_png",
+    "fine_dx_nm", "fine_dy_nm", "score", "status", "mask_png",
+]
+
+
+def rerun_should_overwrite(old_refined, new_score: float, status: str) -> bool:
+    """F13 Q1=C: a batch re-run only replaces an image's stored alignment when
+    the new run is *strictly better*, so re-running can never make results worse.
+
+    ``old_refined`` is the existing ``(dx, dy, score)`` tuple (or ``None`` when
+    the image had no prior result); ``status`` is the worker's objective status.
+    A non-"ok" re-run never clobbers a prior result.
+    """
+    if status != "ok":
+        return False
+    if old_refined is None:
+        return True
+    return new_score > old_refined[2]
+
+
+def mask_should_export(refined, threshold: float) -> bool:
+    """F13 Q2: a per-image GDS mask is written only for images that were
+    fine-aligned (``refined`` is not ``None``) *and* whose score meets the
+    threshold, so every exported mask is trustworthy (MMH needs no fallback).
+    ``refined`` is ``(dx, dy, score)`` or ``None``."""
+    return refined is not None and refined[2] >= threshold
+
+
+def rerun_image_subset(images, image_ids):
+    """Pick the image objects whose ``image_id`` is in ``image_ids`` (F13 batch
+    re-run of a selected / low-score subset), preserving dataset order."""
+    idset = {str(i) for i in image_ids}
+    return [im for im in images if str(getattr(im, "image_id", im)) in idset]
+
+
 # ── Rasterization helper (used by Boolean masks / template) ──────────────────
 
 
@@ -229,16 +273,23 @@ def _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb=None):
     return polys
 
 
-def poi_polys_for_roi(rar, root, roi_bbox, poi_spec, cancel_cb=None):
-    """POI polygons (nm, root coords) for a given ROI, for batch fine align
-    (plan M4b "Run all"). ``poi_spec`` is ``('raw', layer, datatype)`` or
-    ``('expr', expr_text, bindings[, recipes])``; the latter walks each bound
-    layer over the ROI and evaluates the Boolean expression, resolving any
-    nested synthetic references via ``recipes`` (``{name: (expr, bindings)}``)."""
+def poi_polys_and_geometry_for_roi(rar, root, roi_bbox, poi_spec,
+                                   cancel_cb=None):
+    """POI outline polygons *and* the hole-preserving resolved geometry for a
+    ROI, from a single walk (F13). ``poi_spec`` is ``('raw', layer, datatype)``
+    or ``('expr', expr_text, bindings[, recipes])``.
+
+    ``poi_polys_for_roi`` returns only the flattened exterior rings
+    (``geometry_to_polygons`` drops interior holes), which is fine for stroking
+    overlay outlines but would *fill* Boolean interior exclusions (subtraction /
+    complement) once rasterised into a mask. The mask path therefore needs the
+    geometry, not the rings. Returns ``(polys, geom)`` so one ROI walk feeds
+    both the overlay (polys) and the mask (geom)."""
     kind = poi_spec[0]
     if kind == "raw":
         _, layer, datatype = poi_spec
-        return _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb)
+        polys = _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb)
+        return polys, gds_boolean.polys_to_geometry(polys)
     # expression POI
     expr, bindings = poi_spec[1], poi_spec[2]
     recipes = poi_spec[3] if len(poi_spec) > 3 else {}
@@ -253,7 +304,19 @@ def poi_polys_for_roi(rar, root, roi_bbox, poi_spec, cancel_cb=None):
         expr, bindings, raw_provider=raw_provider,
         recipe_provider=lambda n: recipes.get(n),
         fov_bbox=gds_boolean.fov_box(cx, cy, w, h))
-    return gds_boolean.geometry_to_polygons(geom)
+    return gds_boolean.geometry_to_polygons(geom), geom
+
+
+def poi_polys_for_roi(rar, root, roi_bbox, poi_spec, cancel_cb=None):
+    """POI polygons (nm, root coords) for a given ROI, for batch fine align
+    (plan M4b "Run all") and overlay outlines. ``poi_spec`` is
+    ``('raw', layer, datatype)`` or ``('expr', expr_text, bindings[, recipes])``;
+    the latter walks each bound layer over the ROI and evaluates the Boolean
+    expression, resolving any nested synthetic references via ``recipes``
+    (``{name: (expr, bindings)}``). For the hole-preserving geometry (mask
+    export) use :func:`poi_polys_and_geometry_for_roi`."""
+    return poi_polys_and_geometry_for_roi(
+        rar, root, roi_bbox, poi_spec, cancel_cb)[0]
 
 
 def _fine_align_image(job, rar, root, poi_specs, cfg, cancel_is_set):

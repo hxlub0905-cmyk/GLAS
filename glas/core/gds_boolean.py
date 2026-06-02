@@ -422,6 +422,16 @@ def polys_to_geometry(polys: list[np.ndarray]) -> "BaseGeometry":
     return unary_union(shapes)
 
 
+def union_geometries(geoms) -> "BaseGeometry":
+    """Union an iterable of geometries into one, **preserving interior holes**
+    (unlike re-unioning exterior-ring polygons). Empty / all-empty -> empty."""
+    _require_shapely()
+    parts = [g for g in geoms if g is not None and not g.is_empty]
+    if not parts:
+        return Polygon()
+    return unary_union(parts)
+
+
 def layer_geometry(bboxes: Optional[np.ndarray] = None,
                    polys: Optional[list[np.ndarray]] = None) -> "BaseGeometry":
     """Combine a layer's rectangles and polygons into one geometry.
