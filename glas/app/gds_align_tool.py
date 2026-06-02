@@ -6242,6 +6242,19 @@ class MainWindow(QMainWindow):
         QApplication.restoreOverrideCursor()
         print(f"[open-roi] reader built in {_t.perf_counter() - _t0:.2f}s "
               f"({len(rar._by_refnum):,} cell offsets)", flush=True)
+        # Diagnostic: list the file's PROPNAME table. If it contains
+        # S_BOUNDING_BOX, KLayout wrote per-cell bounding boxes — we can read
+        # those to prune walk_roi instantly (no CE boundary layer needed) and
+        # kill the multi-minute first ROI load on this kind of file.
+        try:
+            import oasis_streamer as _oas
+            _props = _oas.scan_cell_offsets(
+                path, use_mmap=True).get("propnames", [])
+            print(f"[open-roi] property names in file: {_props}  "
+                  f"(S_BOUNDING_BOX present: "
+                  f"{'S_BOUNDING_BOX' in _props})", flush=True)
+        except Exception as _exc:                       # noqa: BLE001
+            print(f"[open-roi] propname scan failed: {_exc}", flush=True)
         if not rar.has_offsets():
             QMessageBox.warning(
                 self, "ROI mode unavailable",

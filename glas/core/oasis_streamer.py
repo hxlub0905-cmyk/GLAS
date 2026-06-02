@@ -2434,6 +2434,7 @@ def _scan_tail_tables(reader: "OasisReader", start: dict) -> dict:
     by_refnum: dict[int, int] = {}
     by_name: dict[str, int] = {}
     layernames: list[tuple[str, tuple, tuple]] = []
+    propname_by_refnum: dict[int, str] = {}
     cellnames = 0
     try:
         offs = _read_end_table_offsets(reader)
@@ -2442,7 +2443,6 @@ def _scan_tail_tables(reader: "OasisReader", start: dict) -> dict:
 
             # 1) PROPNAME table → refnum/index → name, so a PROPERTY that
             #    references its propname by refnum resolves to S_CELL_OFFSET.
-            propname_by_refnum: dict[int, str] = {}
             pn_implicit = 0
             if propname_t[1]:
                 for rid, p in _iter_table_at(reader, propname_t[1],
@@ -2507,6 +2507,7 @@ def _scan_tail_tables(reader: "OasisReader", start: dict) -> dict:
         "cellnames": cellnames,
         "unit": start.get("unit"),
         "layernames": layernames,
+        "propnames": sorted(set(propname_by_refnum.values())),
     }
 
 
@@ -2605,6 +2606,7 @@ def scan_cell_offsets(path: str | Path, *, use_mmap: bool = False,
         "cellnames": cellnames,
         "unit": unit,
         "layernames": layernames,
+        "propnames": sorted(set(propname_by_refnum.values())),
     }
 
 

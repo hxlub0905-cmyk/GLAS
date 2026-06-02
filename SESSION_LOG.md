@@ -4,22 +4,32 @@
 
 ---
 
-## [2026-05-29] [B] ROI 開檔 freeze 診斷計時 + 釐清「無 LAYERNAME 表」
+## [2026-05-29] [B] ROI 開檔 freeze 診斷 + walk_roi 慢根因（無 CE 層）+ S_BOUNDING_BOX 探查
 
-**變更類型：** 診斷（app，純加 log）·  **狀態：待 user 跑一次回報定位**
+**變更類型：** 診斷（core + app，純加 log/accessor）·  **狀態：待 user 回報 propnames**
 
 **背景：** offset_flag=1 修正後測試 141 全過，但 user 開實際 KLayout strict 檔
-（`R8_OD_to_VC_NEW.oas`，1.84 GB，27425 cells）時：(1) Scan layers 仍列不出 layer——
-經確認該檔**根本沒有 LAYERNAME 表**（KLayout 也只顯示數字如 17/101、6/0，無 name），
-非 bug；可在「Pick ROI layers」對話框直接手動輸入數字載入。(2) 手動輸入後「開檔/Pick
-root cell 當下」UI freeze（未必恢復、每次不一）。
+（`R8_OD_to_VC_NEW.oas`，1.84 GB，27425 cells）時三個現象：
 
-**診斷手段：** 在 `_on_open_roi` 三個主執行緒重活點之間加 `[open-roi]` 計時 print
-（stdout, flush）：建 `RandomAccessReader`（讀 27425 cell offset）→ `QInputDialog.getItem`
-塞 27425 names 的下拉（Qt 萬級項目經典卡點）→ `_fit_view_to_defects`/首次重繪。看 console
-最後停在哪行即定位 freeze 來源，再對症修（背景化 reader / 輕量 root-cell picker / etc.）。
+1. **Scan layers 列不出 layer** — 該檔**根本沒有 LAYERNAME 表**（KLayout 也只顯示數字
+   如 17/101、6/0，無 name），非 bug；「Pick ROI layers」對話框可直接手動輸入數字載入。
+2. **開檔/Pick root cell freeze** — 加 `[open-roi]` 計時 print 後，user 回報已不卡；
+   只剩按 Pick root cell 時 `QInputDialog` 塞 27425 names 的下拉短暫凍結（次要，待輕量化）。
+3. **walk_roi 載入 10min+ 還沒好（UI 不卡，背景在跑）** — 根因確認＝**此檔無 CE 邊界層
+   (108/250)**。`_decode_bbox_at` 找不到 bbox_layer 矩形 → 每 cell 解到結尾算 own bbox，
+   `reachable_bbox` 遞迴把整棵 27425-cell 樹全解 ≈ 全 chip 解碼。即 [F12] 撤案記錄的根本問題。
 
-**影響檔案：** `glas/app/gds_align_tool.py`。 **Branch：** `claude/magical-davinci-Ibo8K`
+**救星方向：** KLayout strict 可為每 cell 寫 `S_BOUNDING_BOX` property（per-cell bbox）。
+若此檔有，可直接讀它剪枝、免 CE 層、walk_roi 秒級。為確認存在性：`scan_cell_offsets`
+回傳新增 `propnames`（檔尾/檔頭 PROPNAME 表所有名稱，offset_flag 0/1 皆收），`_on_open_roi`
+開檔時 print 出來（並標 `S_BOUNDING_BOX present: T/F`）。待 user 回報後決定正式方案
+（有 → 實作 S_BOUNDING_BOX 剪枝；無 → 建議 KLayout 重存勾 write cell bounding boxes，
+或一次性 bbox sidecar）。**屬新功能，將走 §2.3 規劃流程。**
+
+**測試：** py_compile 全過；合成檔驗證 `propnames` 回傳（含 S_CELL_OFFSET）。
+
+**影響檔案：** `glas/core/oasis_streamer.py`、`glas/app/gds_align_tool.py`。
+**Branch：** `claude/magical-davinci-Ibo8K`
 
 ---
 
