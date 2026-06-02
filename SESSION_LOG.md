@@ -4,6 +4,31 @@
 
 ---
 
+## [2026-06-02] [F13] 規劃：per-image GDS mask 批次輸出 + low-score re-run
+
+**變更類型：** 規劃（plan 檔 + §8 註冊，未動程式）·  **狀態：plan 待 user 核准**
+
+**動機：** 下游 MMH 需要 per-image GDS mask 限縮 blob 偵測範圍（解 gray-level 定位失效）；
+GLAS 是唯一能產 mask 的工具（Boolean + fine-align），但缺 (1) 批次 mask 輸出、(2) batch
+fine-align 後針對 low-score 圖調參重跑（現只能重跑全部上萬張）。
+
+**規劃內容：** 切 4 個 milestone——M1 `BatchResultsPanel` Re-run 介面（low-score / selected
+子集重跑、覆蓋規則 Q1=C「新 score > 舊才覆蓋」）、M2 `OverlayExportWorker` 補 mask 輸出
+（與 overlay 共用同一次 ROI walk、score ≥ threshold 才輸出、manifest 加 `mask_png` 欄）、
+M3 `AlignmentExportDialog` 加 `Export GDS mask` checkbox + threshold spinbox + 預計張數 label、
+M4 測試。Q&A：mask 不輸出 fallback（GLAS 把關品質）、共用既有 `make_mask()`。
+
+**探索修正：** 草稿誤寫對話框為 `OverlayExportDialog`，實為 `AlignmentExportDialog`
+（`gds_align_tool.py:4568`）；`make_mask()` 實際吃**單一 geom**（keyword-only），非
+`(polys, anchor, W, H, nm_per_px)`，故 M2 需先 `unary_union` 並由 anchor 換算 `x_min_nm/y_min_nm`。
+
+**測試：** 本次純文件，無程式變更（M1–M4 待核准後實作）。
+
+**影響檔案：** `docs/plans/F13-mask-export-rerun.md`（新增）、`CLAUDE.md`（§8 加 [F13]）、
+`SESSION_LOG.md`。 **Branch：** `claude/optimistic-pasteur-31ELv`
+
+---
+
 ## [2026-05-28] [F12] 探索後撤案：無索引表 OASIS 支援（改用 KLayout 轉檔）
 
 **變更類型：** 決策 / 還原（本 session 的 F12 程式碼變更已全數 revert，淨碼變更為 0）
