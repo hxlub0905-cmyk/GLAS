@@ -33,6 +33,13 @@ instance materialize（`(K,4)` 陣列幾 GB），即使 ROI 只命中 1~2 個。
 **影響檔案：** `glas/core/oasis_random.py`、`tests/test_oasis_random.py`。
 **Branch：** `claude/magical-davinci-Ibo8K`
 
+**追加（同日）：** user 回報加裁剪後仍卡在 `SLOW load_cell 'iMerge_Top'` 之後、**無
+`BIG-ARRAY`/`CLAMP-MISMATCH`** → 卡點在未記 log 的 fallback 路。補兩條 tracing（皆在
+昂貴運算**之前**印，卡死也看得到）：`FULL-ARRAY`（裁剪不支援的 type 8/9/10/11 或旋轉
+transform → 全展開；印 rtype/count/diagT/raw）、`REACH-FALLBACK`（cell 的 S_BOUNDING_BOX
+flag!=0 → std_bbox None → reachable_bbox 退回全樹遞迴；印 raw operands）。done 摘要加
+`reach_fallback` 計數。待 user 回報哪條觸發以決定下一步（擴充裁剪 type8/9 或處理 flag!=0）。
+
 ---
 
 ## [2026-06-02] [F13] walk_roi 卡死診斷：DEBUG cross-check 全 decode + 加 tracing
