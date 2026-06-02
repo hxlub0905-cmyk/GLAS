@@ -4,6 +4,37 @@
 
 ---
 
+## [2026-06-02] [F13] walk_roi 卡死診斷：DEBUG cross-check 全 decode + 加 tracing
+
+**變更類型：** 效能修正 + 診斷（core）· **狀態：待 user pull 後回報 tracing**
+
+**現象：** user 真檔（`R8_OD_to_VC_KKKK.oas`，有 CE 層 108/250）`--debug` 開 ROI
+→ progress 卡在 `5 / 292883 cells scanned` 不動、等 ~10min；terminal 停在
+`walk_roi root='iMerge_Top' layer=6/0` 之後無 `done`。
+
+**根因（DEBUG 專屬）：** walk() 的 DEBUG cross-check 對**每個 visited cell** 呼叫
+`load_cell_bbox(cid)`（CE-violation 檢查，M3.5e.3 舊診斷）。撞到「沒有 CE 矩形」的
+大 cell 時，`_decode_bbox_at` 一路 decode 到 cell 結尾 = 全 body（可達百萬 records）
+→ 卡死在單顆。`_n_loaded` 因此卡在個位數不動。與 F13 短路無關，是 `--debug` 才觸發
+的二次全 decode。
+
+**修復：**
+- walk() DEBUG cross-check 改：有 `std_bbox` 的 cell 走**免費**檢查（已載入的
+  `content.bbox` ⊇ `std_bbox` lookup，O(1)）；只有**無 std_bbox** 的 cell 才做
+  `load_cell_bbox` 的 CE 檢查，且抽樣上限 200 次（診斷非正確性需求）。
+- 加 tracing：walk 起始印 `prune source: std_bboxes=.. root_std_bbox=.. bbox_layer=..`
+  （可確認 M2 短路是否生效）；`load_cell` 單顆 >1s 印 `SLOW load_cell` + spec/placement
+  數（定位卡點是哪顆大 cell）。
+
+**待釐清：** 若非 --debug 仍慢，瓶頸可能是 `walk()` 對 ROI 命中的**巨大 flat cell**
+做 `load_cell` 全 decode（cell 內 geometry 無空間索引，F13 樹剪枝幫不上）——
+等 user 回報 `SLOW load_cell` / `prune source` 行確認。也需確認 user 已 pull M2 短路。
+
+**測試：** `py_compile` 過。**影響檔案：** `glas/core/oasis_random.py`。
+**Branch：** `claude/magical-davinci-Ibo8K`
+
+---
+
 ## [2026-06-02] [F13] M2：S_BOUNDING_BOX 接上 reachable_bbox 剪枝（格式已確認）
 
 **變更類型：** 新功能 M2（core 剪枝短路 + 測試）· **狀態：待 user 真檔 GUI 驗收**
