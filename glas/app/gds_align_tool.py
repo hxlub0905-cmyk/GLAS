@@ -55,7 +55,7 @@ import re
 import sys
 import threading
 import traceback
-from concurrent.futures import CancelledError, ProcessPoolExecutor, as_completed
+from concurrent.futures import CancelledError, ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -1313,10 +1313,12 @@ class FineAlignAllWorker(QObject):
 
     def _run_process_pool(self, workers: int) -> None:
         """Parallel path: fan the per-image jobs out to a spawn-based process
-        pool. Each worker rebuilds its reader once via the initializer. On
-        cancel, futures that haven't started are dropped; in-flight images run
-        to completion and their results are still kept (deterministic partial
-        results, like the old thread-pool drain)."""
+        pool. Each worker rebuilds its reader once via the initializer. All jobs
+        are submitted up front (so every worker stays busy), but results are
+        consumed in *submission order* (F14: image order) so the table / overview
+        fill top-to-bottom instead of jumping around in completion order. On
+        cancel, futures that haven't started are dropped; in-flight images run to
+        completion and their results are still kept."""
         n = len(self._jobs)
         rar = self._rar
         # Reader params (not the live reader, which owns an unpicklable mmap):
@@ -1332,7 +1334,7 @@ class FineAlignAllWorker(QObject):
         try:
             futures = [ex.submit(fine_align._pool_task, job)
                        for job in self._jobs]
-            for fut in as_completed(futures):
+            for fut in futures:
                 if self._cancel.is_set() and not dropped:
                     for f in futures:
                         f.cancel()          # drop not-yet-started tasks
@@ -1440,9 +1442,11 @@ class OverlayExportWorker(QObject):
     def _run_process_pool(self, workers: int):
         """Parallel path: fan the per-image export out to a spawn-based process
         pool. Each worker rebuilds its reader once via the initializer and writes
-        its own PNGs. Rows are reordered to job order so the manifest is stable
-        and matches the sequential output. Returns rows, or ``None`` if
-        cancelled (partial PNGs already on disk are kept, like the old path)."""
+        its own PNGs. All jobs are submitted up front (workers stay busy), but
+        results are consumed in *submission order* (F14: image order) so progress
+        ticks top-to-bottom and the manifest is stable / matches the sequential
+        output. Returns rows, or ``None`` if cancelled (partial PNGs on disk are
+        kept, like the old path)."""
         n = len(self._jobs)
         rar = self._rar
         initargs = (str(rar._path), rar._init_wanted, rar._dtype,
@@ -1455,11 +1459,11 @@ class OverlayExportWorker(QObject):
                                  initargs=initargs)
         done = 0
         dropped = False
-        results: dict = {}
+        rows = []
         try:
-            futures = {ex.submit(overlay_export._export_pool_task, job): i
-                       for i, job in enumerate(self._jobs)}
-            for fut in as_completed(futures):
+            futures = [ex.submit(overlay_export._export_pool_task, job)
+                       for job in self._jobs]
+            for fut in futures:
                 if self._cancel.is_set() and not dropped:
                     for f in futures:
                         f.cancel()          # drop not-yet-started tasks
@@ -1468,14 +1472,14 @@ class OverlayExportWorker(QObject):
                     row = fut.result()
                 except CancelledError:
                     continue                # a pending task we just dropped
-                results[futures[fut]] = row
+                rows.append(row)
                 done += 1
                 self.progress.emit(done, n, str(row["image_id"]))
         finally:
             ex.shutdown(wait=True)
         if self._cancel.is_set():
             return None
-        return [results[i] for i in range(n) if i in results]
+        return rows
 
     def _write_manifest(self, rows) -> str:
         csv_path = self._out_dir / "overlay_manifest.csv"
@@ -4069,14 +4073,14 @@ class BatchResultsPanel(QWidget):
         self._table.resizeColumnsToContents()
 
     def _rebuild_charts(self) -> None:
+        # F14: the score histogram was dropped (low value + its teardown/rebuild
+        # was the costly part of each streaming refresh); keep only the residual
+        # scatter, which actually guides alignment (median residual → origin δ).
         while self._charts_l.count():
             it = self._charts_l.takeAt(0)
             w = it.widget()
             if w is not None:
                 w.deleteLater()
-        scores = [r["score"] for r in self._rows if r["score"] is not None]
-        self._charts_l.addWidget(
-            _ScoreHistogram(score_histogram(scores), self._threshold), 1)
         pts = [(r["dx_nm"], r["dy_nm"]) for r in self._rows
                if r["dx_nm"] is not None and r["status"] in ("ok", "low-score")]
         self._charts_l.addWidget(

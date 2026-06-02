@@ -4,6 +4,33 @@
 
 ---
 
+## [2026-06-02] Batch UX：移除 score 直方圖 + 平行結果改回影像順序（user 回饋）
+
+**變更類型：** UX/效能（app）·  **狀態：完成（待 user 實機確認）**
+
+**背景：** user 回饋 (1) batch 結果頁的 score 直方圖沒什麼用、想再快一點；(2) batch align 進度「跳著
+跑」（不是 1,2,3…），顯示怪。
+
+**修法：**
+- **直方圖**：`BatchResultsPanel._rebuild_charts` 移除 `_ScoreHistogram`，只留殘差散點圖（散點圖對
+  「median residual → origin δ」有實際用途）。順帶減少每次串流刷新的圖表 teardown/rebuild 開銷。
+  `score_histogram` / `_ScoreHistogram` 保留（仍有單元測試）。
+- **跳著跑**：`FineAlignAllWorker._run_process_pool` 與 `OverlayExportWorker._run_process_pool` 改成
+  **全部 job 先提交（worker 仍滿載平行），但結果依提交（影像）順序消費**（`for fut in futures` 取代
+  `as_completed`），讓表格/overview 由上而下填、manifest 順序穩定。吞吐幾乎不變（僅進度回報序列化）。
+  移除未用的 `as_completed` import。
+
+**未解（待 user 提供診斷）：** 匯出的 overlay/mask「沒對齊」——靜態比對證明 Run-all（無手動拖曳）下
+畫面 `paintEvent`/`_world_to_view` 與匯出 `overlay_outlines_on_sem` 的 anchor(=coarse+refined)、
+nm_per_px、座標框（皆 root nm，源自同一 `walk_roi`）**逐項相同**，找不到程式碼層級偏移。需 user 提供
+單張 manifest `fine_dx/dy_nm` + 畫面vs匯出截圖以定位（是否 refined 被丟、或匯出後座標設定被改動）。
+
+**測試：** `py_compile` 過；in-thread fallback 路徑不變。**待 user `pytest` + 實機。**
+
+**影響檔案：** `glas/app/gds_align_tool.py`、`SESSION_LOG.md`。 **Branch：** `claude/optimistic-pasteur-31ELv`
+
+---
+
 ## [2026-06-02] 測試修正：m5 export dialog 簽章 + m4b 子像素容差（user 本地 pytest 暴露）
 
 **變更類型：** 測試修正（純 tests，無功能變更）·  **狀態：完成**
