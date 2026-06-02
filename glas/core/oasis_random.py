@@ -700,6 +700,10 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
            float(roi_bbox[2]) / scale, float(roi_bbox[3]) / scale)
     _dbg(f"walk_roi root={root_id!r} layer={layer}/{datatype} "
          f"roi_nm={tuple(roi_bbox)} scale={scale} roi_grid={roi}")
+    # F13: confirm the per-cell S_BOUNDING_BOX prune is the active path. When
+    # root resolves via std_bbox, reachable_bbox never recurses the tree.
+    _dbg(f"  prune source: std_bboxes={rar.has_std_bboxes()} "
+         f"root_std_bbox={rar.std_bbox(root_id)} bbox_layer={rar._bbox_layer}")
     _t0 = time.perf_counter()
     cells_at_start = rar._n_loaded
     stats = RoiWalkStats()
@@ -714,7 +718,8 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
     computing: set = set()
     _feat = {"rtype": set(), "angle": set(), "flip": False,
              "mag": set(), "name_ref": False, "rect_rtype": set(),
-             "poly_rtype": set(), "ce_viol": 0, "sbb_used": 0, "sbb_viol": 0}
+             "poly_rtype": set(), "ce_viol": 0, "ce_checks": 0,
+             "sbb_used": 0, "sbb_viol": 0}
 
     def reachable_bbox(cid: object) -> Optional[Bbox]:
         """Bbox (cid-local frame) of all geometry reachable from cid —
@@ -762,26 +767,22 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
 
     def walk(cid: object, T: Transform, visiting: set, depth: int) -> None:
         _check_cancel()
+        _lt = time.perf_counter()
         content = rar.load_cell(cid)
+        _dt = time.perf_counter() - _lt
+        if DEBUG and _dt > 1.0:
+            _nrec = (sum(len(v) for v in content.rect_specs.values())
+                     + sum(len(v) for v in content.poly_specs.values()))
+            _dbg(f"  SLOW load_cell {cid!r}: {_dt:.1f}s "
+                 f"(~{_nrec:,} geom specs, {len(content.placements):,} places)")
         stats.cell_visits += 1
-        # Debug: does the CE early-stop bbox actually bound the cell's real
-        # geometry? (M3.5e.3 assumes CE rect == cell full bbox.) Compare the
-        # full-decode own bbox against the CE-only bbox for descended cells.
+        # F13 cross-check (free): the S_BOUNDING_BOX prune bbox must CONTAIN the
+        # cell's own decoded geometry (it claims to bound own + children). A
+        # violation means the operand format/frame is off and the prune could
+        # drop geometry — surface it loudly. Uses already-loaded content.bbox +
+        # an O(1) std_bbox lookup, so it costs nothing.
         if DEBUG and content.bbox is not None:
-            _ce = rar.load_cell_bbox(cid)
-            _ceb = _ce.bbox if _ce is not None else None
             ob = content.bbox
-            inside = (_ceb is not None and _ceb[0] <= ob[0] and _ceb[1] <= ob[1]
-                      and _ceb[2] >= ob[2] and _ceb[3] >= ob[3])
-            if not inside:
-                _feat["ce_viol"] += 1
-                if _feat["ce_viol"] <= 6:
-                    _dbg(f"  CE-VIOLATION cell {cid!r}: own_bbox={ob} "
-                         f"ce_bbox={_ceb}")
-            # F13 M2 cross-check: the S_BOUNDING_BOX prune bbox must CONTAIN the
-            # cell's own decoded geometry (it claims to bound own + children).
-            # A violation means the operand format/frame is off and the prune
-            # could drop geometry — surface it loudly in debug runs.
             _sb = rar.std_bbox(cid)
             if _sb is not None:
                 ok = (_sb[0] <= ob[0] and _sb[1] <= ob[1]
@@ -791,6 +792,22 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
                     if _feat["sbb_viol"] <= 6:
                         _dbg(f"  SBBOX-VIOLATION cell {cid!r}: own_bbox={ob} "
                              f"std_bbox={_sb}")
+            elif rar._bbox_layer is not None and _feat["ce_checks"] < 200:
+                # Only when the cell has NO std_bbox: sanity-check the CE
+                # early-stop bbox. load_cell_bbox can fully decode a cell that
+                # lacks its CE rect, so cap the number of these checks (it is a
+                # diagnostic, not a correctness requirement).
+                _feat["ce_checks"] += 1
+                _ce = rar.load_cell_bbox(cid)
+                _ceb = _ce.bbox if _ce is not None else None
+                inside = (_ceb is not None and _ceb[0] <= ob[0]
+                          and _ceb[1] <= ob[1] and _ceb[2] >= ob[2]
+                          and _ceb[3] >= ob[3])
+                if not inside:
+                    _feat["ce_viol"] += 1
+                    if _feat["ce_viol"] <= 6:
+                        _dbg(f"  CE-VIOLATION cell {cid!r}: own_bbox={ob} "
+                             f"ce_bbox={_ceb}")
         for _pl in content.placements:
             _feat["rtype"].add(_pl.repetition_type)
             _feat["angle"].add(_pl.angle)
