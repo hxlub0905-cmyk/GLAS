@@ -4,6 +4,37 @@
 
 ---
 
+## [2026-06-02] [F13] walk_roi 真正瓶頸：chip 級 repetition 陣列全展開 → 解析裁剪
+
+**變更類型：** 效能修正（core）· **狀態：待 user 真檔 GUI 驗收（秒級 + 幾何正確）**
+
+**定位：** user 加 tracing 後回報 `prune source: std_bboxes=True root_std_bbox=(0,0,
+7460112,2204400)`（M2 短路有效）、`SLOW load_cell 'iMerge_Top': 5.2s (~0 specs,
+5 places)`（root 是薄 top cell，非扁平大 cell；5.2s 是 1.84GB 首次 mmap 暖機）。
+Ctrl+C 落在主執行緒 `_on_tick`（walk 在 worker thread，抓不到堆疊）。綜合：卡點在
+walk 展開**某個橫跨整顆 chip 的 regular grid placement** —— 陣列整體 bbox 蓋到 2µm
+ROI → 通過 array-level 剪枝 → 舊碼 `repetition_offsets_np` 把**全部 K 個**（可達數百萬）
+instance materialize（`(K,4)` 陣列幾 GB），即使 ROI 只命中 1~2 個。此期間無 load_cell
+→ `cells scanned` 卡個位數不動，完全吻合現象。
+
+**修復（解析裁剪，保證不漏幾何）：**
+- 新增 `_candidate_offsets` / `_axis_index_range`（oasis_random）：對**可分離且軸對齊**
+  的 regular grid（repetition type 1/2/3）、在**無旋轉** transform（`M` 對角）下，解析
+  算出 ROI 附近的 index 視窗（外round + 各邊 widen 2 step），只 materialize 該子網格。
+  回傳**保守超集**，下游既有精確 ROI mask 仍逐一判定 → 不漏。旋轉/斜交/不規則
+  (type 8/9/10/11) 回 None → 走原本全展開（行為不變）。
+- DEBUG 安全網：前 8 個大陣列同時跑完整 materialize 比對選中數，不符印 `CLAMP-MISMATCH`；
+  `BIG-ARRAY` 行印 rep 數 → candidate 數。
+
+**測試：** `py_compile` 過；新增 `TestRepetitionClamp`（type1/type2 grid + flip 的裁剪
+選集 == 完整選集；旋轉 / type9 fallback）。裁剪邏輯另以 20 萬筆隨機暴力比對驗證為
+保守超集（含負 step/負 scale/退化軸，0 violation）。沙箱無 numpy → pytest 待 user 本地跑。
+
+**影響檔案：** `glas/core/oasis_random.py`、`tests/test_oasis_random.py`。
+**Branch：** `claude/magical-davinci-Ibo8K`
+
+---
+
 ## [2026-06-02] [F13] walk_roi 卡死診斷：DEBUG cross-check 全 decode + 加 tracing
 
 **變更類型：** 效能修正 + 診斷（core）· **狀態：待 user pull 後回報 tracing**

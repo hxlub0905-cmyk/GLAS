@@ -53,8 +53,14 @@ grid units → bbox = `(x, y, x+w, y+h)`。雙重確認：
     (S_CELL_OFFSET + S_BOUNDING_BOX) 合成檔，驗 map 收集 + `std_bbox` 換算、
     `reachable_bbox` 短路（std_bbox 故意放大→回傳原值證明免遞迴）、flag!=0 fallback
     回幾何值、無 property 時 `has_std_bboxes()` False。（沙箱無 numpy → 待 user 本地跑）
+- [x] **M3.5 真檔瓶頸：chip 級 repetition 陣列全展開**（M2 短路雖生效，但 walk 展開
+  橫跨整顆 chip 的 type1/2/3 grid 時 materialize 全部 K 個 instance → 卡死）
+  - [x] `_candidate_offsets`/`_axis_index_range`：可分離軸對齊 grid + 無旋轉 transform
+    下解析裁剪到 ROI 附近子網格（保守超集，下游精確 mask 把關）；其他情況 fallback 全展開。
+  - [x] DEBUG 安全網 `CLAMP-MISMATCH` 比對 + `BIG-ARRAY` 計數；20 萬筆隨機暴力驗證超集。
+  - [x] `TestRepetitionClamp`（grid 裁剪==完整選集、旋轉/type9 fallback）。
 - [ ] **M4 真檔驗收**：`R8_OD_to_VC_KKKK.oas` GUI 開 ROI → walk 秒級 + 幾何正確
-  （`--debug` 看 `sbbox_used` 大、`sbbox_violations=0`）。
+  （`--debug` 看 `sbbox_used` 大、`sbbox_violations=0`、`CLAMP-MISMATCH` 不出現）。
 
 ## 不變式 / 風險
 
