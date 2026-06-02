@@ -4,26 +4,37 @@
 
 ---
 
-## [2026-06-02] [F14] 規劃：batch align + image/mask export 加速
+## [2026-06-02] [F14] batch align + image/mask export 加速（規劃→M1–M4）
 
-**變更類型：** 規劃（plan 檔 + §8 註冊，未動程式）·  **狀態：plan 待 user 核准**
+**變更類型：** 效能/重構（新 core 模組 + worker 平行化 + UI）+ 測試 + 文件 ·  **狀態：實作完成，待 user 本地驗收**
 
 **動機：** user 回報 batch align 與 image/mask 匯出在上萬張規模仍太慢。探索定位兩瓶頸：
 (1) **export（`OverlayExportWorker`）完全循序**——單 reader、單 thread，每張逐張 ROI walk + 畫
 overlay/mask，**完全沒平行化**（而 align 早在 F8 就多進程平行）；(2) **align worker 上限寫死 8**
-（`_auto_batch_workers`，cap 8 是怕 cv2 多 thread × 多進程 oversubscription），多核機核心閒置。
+（cv2 多 thread × 多進程 oversubscription 顧慮），多核機核心閒置。Q&A：兩條都要加速、核心數不確定→
+自動偵測+保守 cap+UI 可調、可接受多 reader 記憶體、快取 align 幾何重用列後續選項。
 
-**規劃內容（4 milestone）：** M1 抽 Qt-free `glas/core/overlay_export.py`（搬 `overlay_outlines_on_sem`
-+ 新增 `export_one_image`）；M2 export 走 F8 同款 `ProcessPoolExecutor`（per-process reader、
-as_completed 收 row、cancel drop futures、manifest 穩定排序）；M3 `_auto_batch_workers` cap 8→16 +
-worker 內 `cv2.setNumThreads(1)` 解 oversubscription + UI 可調 worker 數（0=auto，QSettings）；
-M4 測試 + 文件。Q&A：兩條都要、核心數不確定→自動偵測+保守 cap+UI 可調、可接受多 reader 記憶體、
-快取 align 幾何給 export 重用列後續選項不在本期。
+**實作：**
+- **M1** 新增 Qt-free `glas/core/overlay_export.py`：把 `overlay_outlines_on_sem` / `_draw_polyline_np`
+  / `_safe_name` 從 app 原樣搬入；新增 `export_one_image(...)`（單張 imread + raw/overlay/mask 寫出 +
+  回 manifest row，內用 `poi_polys_and_geometry_for_roi` 單 walk 共用），與舊 worker 單張邏輯逐行等價。
+  app 改 re-import 這些 helper（preview 仍可用）。
+- **M2** `OverlayExportWorker` 改 orchestrator：`_run_in_thread`（小批/raw-only/無 reader fallback）
+  + `_run_process_pool`（spawn `ProcessPoolExecutor`、`_export_pool_init/_task`、as_completed 收 row、
+  cancel drop futures、依 job 序回 row 讓 manifest 穩定）。
+- **M3** `fine_align.batch_worker_count(override, cap=16)`（cap 8→16；UI override 優先）；
+  `fine_align._pool_init` 與 `overlay_export._export_pool_init` 內 `cv2.setNumThreads(1)`；
+  FineAlignPanel 加「Parallel workers (0=auto)」spinbox（QSettings 持久化），align/export cfg 透傳
+  `max_workers`。
+- **M4** `tests/test_export_perf.py`（worker 數解析 / export_one_image raw-only+純函式determinism /
+  missing-file / 無 POI 不寫 mask / 模組 Qt-free）+ README + CLAUDE §5.2 並行模型。
 
-**測試：** 本次純文件，無程式變更（待核准後實作）。
+**測試：** `py_compile` 全過；既有 F5 `OverlayExportWorker._write_manifest` 測試相容（建構子向後相容）。
+沙箱無 numpy/PyQt6，**pytest 綠 + 多核實測加速待 user 本地**。
 
-**影響檔案：** `docs/plans/F14-batch-export-perf.md`（新增）、`CLAUDE.md`（§8 加 [F14]）、
-`SESSION_LOG.md`。 **Branch：** `claude/optimistic-pasteur-31ELv`
+**影響檔案：** `glas/core/overlay_export.py`（新增）、`glas/core/fine_align.py`、
+`glas/app/gds_align_tool.py`、`tests/test_export_perf.py`（新增）、`README.md`、`CLAUDE.md`、
+`docs/plans/F14-batch-export-perf.md`、`SESSION_LOG.md`。 **Branch：** `claude/optimistic-pasteur-31ELv`
 
 ---
 

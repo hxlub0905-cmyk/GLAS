@@ -1,6 +1,6 @@
 # [F14] Batch fine-align + image/mask export 加速
 
-> **狀態：** planned
+> **狀態：** in progress (2026-06-02)
 > **§8 ID：** [F14]
 > **建立：** 2026-06-02
 > **負責 branch：** claude/optimistic-pasteur-31ELv
@@ -61,48 +61,51 @@ process-pool + cv2-thread 策略。
 
 ## Milestones
 
-### M1: 抽出 Qt-free export render 模組  [status: planned]
+### M1: 抽出 Qt-free export render 模組  [status: done (code; pytest+實測待 user)]
 
-- [ ] 新增 `glas/core/overlay_export.py`（Qt-free，只依賴 numpy/cv2/shapely via gds_boolean）：
-  - [ ] 把 `overlay_outlines_on_sem` + `_draw_polyline_np` 從 app **原樣搬入**（兩者已是 Qt-free）
-  - [ ] 新增 `export_one_image(job, rar, root, poi_specs_colored, cfg, out_dir, export_raw,
+- [x] 新增 `glas/core/overlay_export.py`（Qt-free，只依賴 numpy/cv2/shapely via gds_boolean）：
+  - [x] 把 `overlay_outlines_on_sem` + `_draw_polyline_np` 從 app **原樣搬入**（兩者已是 Qt-free）
+  - [x] 新增 `export_one_image(job, rar, root, poi_specs_colored, cfg, out_dir, export_raw,
         export_overlay, export_mask, mask_thr)`：做單張的 imread + raw/overlay/mask 寫出，回傳
         manifest row dict（沿用現有欄位 + `mask_png`）。內部用
         `fine_align.poi_polys_and_geometry_for_roi`（單 walk 共用）+ `gds_boolean.make_mask/
         union_geometries`，與目前 `OverlayExportWorker.run()` 的單張邏輯**逐行等價**
-- [ ] app 改從 `overlay_export` import `overlay_outlines_on_sem`（preview `_on_preview_template`
+- [x] app 改從 `overlay_export` import `overlay_outlines_on_sem`（preview `_on_preview_template`
       仍可用），移除 app 內重複定義
 - [ ] 驗證：`py_compile`；既有 overlay/preview 測試仍綠
 
-### M2: Export 多進程平行化  [status: planned]
+### M2: Export 多進程平行化  [status: done (code; pytest+實測待 user)]
 
-- [ ] `overlay_export.py` 加 `_export_pool_init` / `_export_pool_task` + 模組全域 `_GE`
+- [x] `overlay_export.py` 加 `_export_pool_init` / `_export_pool_task` + 模組全域 `_GE`
       （鏡像 `fine_align._pool_init/_pool_task`：worker 內重建 reader、cache batch context）
-- [ ] 重寫 `OverlayExportWorker.run()`：
-  - [ ] 小批（≤2 或 workers≤1）→ in-thread 跑 `export_one_image`（循序 fallback）
-  - [ ] 大批 → `ProcessPoolExecutor`（spawn），`as_completed` 收 row、emit progress
-  - [ ] cancel：drop 未啟動 futures（同 `FineAlignAllWorker._run_process_pool`）
-  - [ ] 全部完成後在 orchestrator（app）寫 manifest（順序依 image_id 穩定排序，確保與循序版一致）
+- [x] 重寫 `OverlayExportWorker.run()`：
+  - [x] 小批（≤2 或 workers≤1）→ in-thread 跑 `export_one_image`（循序 fallback）
+  - [x] 大批 → `ProcessPoolExecutor`（spawn），`as_completed` 收 row、emit progress
+  - [x] cancel：drop 未啟動 futures（同 `FineAlignAllWorker._run_process_pool`）
+  - [x] 全部完成後在 orchestrator（app）寫 manifest（順序依 image_id 穩定排序，確保與循序版一致）
 - [ ] 驗證：M4 整合測試（檔案 + manifest）；循序 vs 平行輸出一致
 
-### M3: worker 數自動放大 + cv2 oversubscription + UI 可調  [status: planned]
+### M3: worker 數自動放大 + cv2 oversubscription + UI 可調  [status: done (code; pytest+實測待 user)]
 
-- [ ] `_auto_batch_workers`：改 `min(cpu_count, 16)`（cap 8→16）；接受 override 參數
-- [ ] `fine_align._pool_init` 與 `overlay_export._export_pool_init` 內 `cv2.setNumThreads(1)`
+- [x] `_auto_batch_workers`：改 `min(cpu_count, 16)`（cap 8→16）；接受 override 參數
+- [x] `fine_align._pool_init` 與 `overlay_export._export_pool_init` 內 `cv2.setNumThreads(1)`
       （worker process 限定，主行程不變）
-- [ ] UI：新增「Parallel workers (0 = auto)」spinbox（FineAlignPanel 或設定區），QSettings 持久化；
+- [x] UI：新增「Parallel workers (0 = auto)」spinbox（FineAlignPanel 或設定區），QSettings 持久化；
       align 與 export 兩條路徑都讀此值（0→auto）
 - [ ] 驗證：worker 數解析 helper 單測；多核機手動實測加速
 
-### M4: 測試 + 文件  [status: planned]
+### M4: 測試 + 文件  [status: done (code; pytest+實測待 user)]
 
-- [ ] `tests/test_export_perf.py`：
-  - [ ] `test_worker_count_resolver`：override / auto / cap 邊界
-  - [ ] `test_export_one_image_raw_only`：coarse=None / raw-only 不需 reader，row 正確
-  - [ ] `test_export_one_image_mask_threshold`：score < thr 不寫 mask（沿用 `mask_should_export`）
-  - [ ] （Qt+cv2 gated）`test_parallel_matches_sequential`：同輸入下平行與循序產生相同檔案集 + manifest
-- [ ] README / CLAUDE §5.2 補一句並行模型；`pytest` 全綠
-- [ ] 驗證：`pytest tests/ -v` 通過
+- [x] `tests/test_export_perf.py`：
+  - [x] `test_worker_count_resolver`：override / auto / cap 邊界
+  - [x] `test_export_one_image_raw_only`：coarse=None / raw-only 不需 reader，row 正確 + 純函式
+        二次呼叫同結果（平行==循序 by construction）
+  - [x] `test_export_one_image_missing_file`：exists=False → missing-file、不寫檔
+  - [x] `test_export_one_image_no_poi_no_mask`：要 mask 但無 POI → 不 walk、不寫 mask
+  - [x] `test_overlay_export_module_is_qt_free`：模組無 PyQt6 依賴（spawn worker 可 re-import）
+  - 說明：score-gate 由 F13 `test_mask_should_export` 覆蓋；真正的 pool 平行↔循序等價走手動驗證
+- [x] README / CLAUDE §5.2 補一句並行模型
+- [ ] 驗證：`pytest tests/ -v` 通過（**待 user 本地**）
 
 ---
 
@@ -133,11 +136,11 @@ process-pool + cv2-thread 策略。
 
 ## 驗證方式
 
-- [ ] 所有 milestone checkbox 已勾
-- [ ] `pytest tests/ -v` 通過（含新 `test_export_perf.py`）
+- [x] 所有 milestone 程式碼 subtask 完成（`py_compile` 通過）
+- [ ] `pytest tests/ -v` 通過（含新 `test_export_perf.py`）（**待 user 本地**——沙箱無 numpy/PyQt6）
 - [ ] 手動：多核機跑 Run all + Export，確認 CPU 多核吃滿、時間明顯下降；調整 UI worker 數生效
 - [ ] 輸出檔案 + manifest 與循序版一致（抽樣比對）
-- [ ] `SESSION_LOG.md` 有對應紀錄
+- [x] `SESSION_LOG.md` 有對應紀錄
 
 ---
 

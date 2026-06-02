@@ -138,6 +138,13 @@ from fine_align import (  # noqa: E402,F401
     poi_polys_and_geometry_for_roi,
     rasterize_layer, render_composite_template, render_poi_template,
 )
+# F14: the Qt-free per-image image/mask export compute (and the moved
+# overlay_outlines_on_sem / _safe_name helpers) live in glas/core so the export
+# batch can run across a spawn-based ProcessPool, mirroring fine_align (F8).
+import overlay_export     # noqa: E402
+from overlay_export import (  # noqa: E402,F401
+    overlay_outlines_on_sem, _safe_name, _draw_polyline_np,
+)
 
 # Design-system styling / widgets / icons (glas/app). Soft-imported so the tool
 # still launches if the GUI helpers are unavailable.
@@ -1217,10 +1224,12 @@ class WholeChipExportWorker(QObject):
             w.add_polygons(out_l, out_d, rings)
 
 
-def _auto_batch_workers() -> int:
-    """Thread-pool size for batch fine-align (F6 M3): one per core, capped at
-    8 so a many-core box doesn't oversubscribe cv2's own internal threads."""
-    return max(1, min(os.cpu_count() or 1, 8))
+def _auto_batch_workers(override: int = 0) -> int:
+    """Process-pool size for batch fine-align / image export. Delegates to
+    ``fine_align.batch_worker_count`` (F14: explicit UI override wins, else one
+    per core capped at 16; cv2 is single-threaded in workers so the higher cap
+    no longer oversubscribes)."""
+    return fine_align.batch_worker_count(override)
 
 
 class FineAlignAllWorker(QObject):
@@ -1269,7 +1278,7 @@ class FineAlignAllWorker(QObject):
             if n == 0:
                 self.finished.emit(0)
                 return
-            workers = min(_auto_batch_workers(), n)
+            workers = min(_auto_batch_workers(self._cfg.get("max_workers", 0)), n)
             # Small batches: process spawn + per-process reader build costs more
             # than it saves, so run them in-thread on a single cloned reader.
             if n <= 2 or workers <= 1:
@@ -1344,12 +1353,6 @@ class FineAlignAllWorker(QObject):
             self.finished.emit(done)
 
 
-def _safe_name(s: str) -> str:
-    """Filesystem-safe basename from an image id (F5 M6)."""
-    out = "".join(ch if (ch.isalnum() or ch in "-_.") else "_" for ch in str(s))
-    return out or "image"
-
-
 class OverlayExportWorker(QObject):
     """Batch export of SEM frames + aligned GDS-outline overlays + a manifest
     (F5 M6). For every selected image it optionally writes ``<id>_raw.png`` and
@@ -1389,96 +1392,90 @@ class OverlayExportWorker(QObject):
     def run(self) -> None:
         try:
             n = len(self._jobs)
-            done = 0
-            c = self._cfg
-            manifest = []
-            for image_id, coarse, refined, path, exists in self._jobs:
-                if self._cancel.is_set():
-                    self.cancelled.emit()
-                    return
-                done += 1
-                self.progress.emit(done, n, str(image_id))
-                row = {
-                    "image_id": str(image_id), "raw_png": "", "overlay_png": "",
-                    "mask_png": "",
-                    "fine_dx_nm": "" if refined is None else round(refined[0], 3),
-                    "fine_dy_nm": "" if refined is None else round(refined[1], 3),
-                    "score": "" if refined is None else round(refined[2], 6),
-                    "status": "ok" if refined is not None else "not-run",
-                }
-                sem = (cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
-                       if (cv2 and exists) else None)
-                if sem is None:
-                    row["status"] = "missing-file"
-                    manifest.append(row)
-                    continue
-                base = _safe_name(image_id)
-                if self._export_raw:
-                    name = f"{base}_raw.png"
-                    cv2.imwrite(str(self._out_dir / name), sem)
-                    row["raw_png"] = name
-                # F13: overlay and mask both consume one ROI walk per image. The
-                # walk runs when either output is requested; ``poi_polys_for_roi``
-                # is called once per POI and its result is reused for both.
-                if ((self._export_overlay or self._export_mask)
-                        and coarse is not None and self._poi):
-                    H, W = sem.shape[:2]
-                    nm_per_px = (c["nm_manual"] if (not c["nm_auto"] and
-                                 c["nm_manual"] > 0) else c["fov_w"] / max(1, W))
-                    if nm_per_px > 0:
-                        roi = (coarse[0] - c["fov_w"], coarse[1] - c["fov_h"],
-                               coarse[0] + c["fov_w"], coarse[1] + c["fov_h"])
-                        entries = []
-                        mask_geoms = []
-                        for spec, color in self._poi:
-                            # One ROI walk per POI feeds both outputs: ``polys``
-                            # (exterior rings) stroke the overlay; ``geom`` keeps
-                            # Boolean interior holes for the mask.
-                            polys, geom = poi_polys_and_geometry_for_roi(
-                                self._rar, self._root, roi, spec,
-                                cancel_cb=self._cancel.is_set)
-                            if polys:
-                                entries.append((polys, color))
-                            if geom is not None and not geom.is_empty:
-                                mask_geoms.append(geom)
-                        anchor = (coarse if refined is None else
-                                  (coarse[0] + refined[0], coarse[1] + refined[1]))
-                        if self._export_overlay and entries:
-                            rgb = overlay_outlines_on_sem(sem, entries, anchor,
-                                                          nm_per_px)
-                            name = f"{base}_overlay.png"
-                            # overlay returns RGB; cv2 writes BGR → flip channels.
-                            cv2.imwrite(str(self._out_dir / name),
-                                        rgb[:, :, ::-1])
-                            row["overlay_png"] = name
-                        # F13 Q2: only write a mask for score >= threshold images.
-                        # The geometry (holes preserved) is rasterised so it lands
-                        # on the same SEM pixels as overlay_outlines_on_sem /
-                        # rasterize_layer, which map the anchor to (W/2, H/2) via
-                        # row = (y_top - y)/nm. make_mask(invert_y=True) uses
-                        # (height_px-1) - (y-y_min)/nm, so y_min is raised one
-                        # pixel to reconcile the off-by-one.
-                        if (self._export_mask and mask_geoms
-                                and fine_align.mask_should_export(
-                                    refined, self._mask_thr)):
-                            geom = gds_boolean.union_geometries(mask_geoms)
-                            x_min_nm = anchor[0] - W / 2.0 * nm_per_px
-                            y_min_nm = anchor[1] - (H / 2.0 - 1.0) * nm_per_px
-                            mask = gds_boolean.make_mask(
-                                geom, width_px=W, height_px=H,
-                                x_min_nm=x_min_nm, y_min_nm=y_min_nm,
-                                nm_per_px=nm_per_px)
-                            name = f"{base}_mask.png"
-                            cv2.imwrite(str(self._out_dir / name), mask)
-                            row["mask_png"] = name
-                manifest.append(row)
-            mpath = self._write_manifest(manifest)
+            if n == 0:
+                self.finished.emit(0, self._write_manifest([]))
+                return
+            workers = min(
+                fine_align.batch_worker_count(self._cfg.get("max_workers", 0)), n)
+            # F14: parallelise the export across a process pool (mirrors
+            # FineAlignAllWorker). The ROI walk dominates and is GIL-bound, so
+            # processes are what actually speed it up. Tiny batches, a single
+            # worker, or a raw-only run (no reader to rebuild) stay in-thread.
+            if (n <= 2 or workers <= 1 or self._rar is None
+                    or not (self._export_overlay or self._export_mask)):
+                rows = self._run_in_thread()
+            else:
+                rows = self._run_process_pool(workers)
         except oasis_random.WalkCancelled:
             self.cancelled.emit()
         except Exception as exc:                       # noqa: BLE001
             self.failed.emit(str(exc))
         else:
-            self.finished.emit(done, mpath)
+            if rows is None:
+                self.cancelled.emit()
+            else:
+                self.finished.emit(len(rows), self._write_manifest(rows))
+
+    def _run_in_thread(self):
+        """Sequential fallback (tiny / raw-only batches): export each image on
+        this worker thread. Returns the manifest rows in job order, or ``None``
+        if cancelled mid-batch."""
+        n = len(self._jobs)
+        rows = []
+        for job in self._jobs:
+            if self._cancel.is_set():
+                return None
+            try:
+                row = overlay_export.export_one_image(
+                    job, self._rar, self._root, self._poi, self._cfg,
+                    self._out_dir, self._export_raw, self._export_overlay,
+                    self._export_mask, self._mask_thr,
+                    cancel_cb=self._cancel.is_set)
+            except oasis_random.WalkCancelled:
+                return None
+            rows.append(row)
+            self.progress.emit(len(rows), n, str(row["image_id"]))
+        return rows
+
+    def _run_process_pool(self, workers: int):
+        """Parallel path: fan the per-image export out to a spawn-based process
+        pool. Each worker rebuilds its reader once via the initializer and writes
+        its own PNGs. Rows are reordered to job order so the manifest is stable
+        and matches the sequential output. Returns rows, or ``None`` if
+        cancelled (partial PNGs already on disk are kept, like the old path)."""
+        n = len(self._jobs)
+        rar = self._rar
+        initargs = (str(rar._path), rar._init_wanted, rar._dtype,
+                    rar._bbox_layer, self._root, self._poi, self._cfg,
+                    str(self._out_dir), self._export_raw, self._export_overlay,
+                    self._export_mask, self._mask_thr)
+        ctx = mp.get_context("spawn")
+        ex = ProcessPoolExecutor(max_workers=workers, mp_context=ctx,
+                                 initializer=overlay_export._export_pool_init,
+                                 initargs=initargs)
+        done = 0
+        dropped = False
+        results: dict = {}
+        try:
+            futures = {ex.submit(overlay_export._export_pool_task, job): i
+                       for i, job in enumerate(self._jobs)}
+            for fut in as_completed(futures):
+                if self._cancel.is_set() and not dropped:
+                    for f in futures:
+                        f.cancel()          # drop not-yet-started tasks
+                    dropped = True
+                try:
+                    row = fut.result()
+                except CancelledError:
+                    continue                # a pending task we just dropped
+                results[futures[fut]] = row
+                done += 1
+                self.progress.emit(done, n, str(row["image_id"]))
+        finally:
+            ex.shutdown(wait=True)
+        if self._cancel.is_set():
+            return None
+        return [results[i] for i in range(n) if i in results]
 
     def _write_manifest(self, rows) -> str:
         csv_path = self._out_dir / "overlay_manifest.csv"
@@ -1492,61 +1489,6 @@ class OverlayExportWorker(QObject):
             json.dump({"schema": "mmh-gds-overlay-v1", "columns": self._COLS,
                        "images": rows}, f, indent=2)
         return str(csv_path)
-
-
-# ── GUI overlay-outline helper (raster stroking; rasterize_layer + template /
-#    fine-align compute moved to glas/core/fine_align.py in F8) ───────────────
-
-
-def _draw_polyline_np(rgb: np.ndarray, pts: np.ndarray, color: tuple) -> None:
-    """Stroke a closed polyline into an RGB array (numpy fallback for the
-    overlay helper when cv2 is unavailable)."""
-    H, W = rgb.shape[:2]
-    n = len(pts)
-    for i in range(n):
-        x0, y0 = pts[i]
-        x1, y1 = pts[(i + 1) % n]
-        steps = int(max(abs(x1 - x0), abs(y1 - y0))) + 1
-        xs = np.linspace(x0, x1, steps).round().astype(int)
-        ys = np.linspace(y0, y1, steps).round().astype(int)
-        m = (xs >= 0) & (xs < W) & (ys >= 0) & (ys < H)
-        rgb[ys[m], xs[m]] = color
-
-
-def overlay_outlines_on_sem(sem_gray: np.ndarray, entries: list, anchor: tuple,
-                            nm_per_px: float, thickness: int = 1) -> np.ndarray:
-    """Draw layer outlines over a SEM frame, returning an (H, W, 3) uint8 RGB.
-
-    The SEM grayscale is widened to grey RGB, then each entry's polygon
-    *outlines* are stroked in its colour. ``entries`` is ``[(polygons, (r,g,b)),
-    ...]`` with polygons as (N, 2) nm arrays. The FOV is centred on ``anchor``
-    at ``nm_per_px``, mirroring :func:`rasterize_layer`'s mapping (X right, Y
-    flipped to screen convention) so the outlines land on the SEM structure for
-    a given coarse/refined anchor. Self-contained raster — it does not touch the
-    SemViewer screen drawing (F5 M1). Used by both the before/after preview and
-    the overlay PNG export (M6)."""
-    H, W = sem_gray.shape[:2]
-    rgb = np.repeat(sem_gray.astype(np.uint8)[:, :, None], 3, axis=2).copy()
-    gx, gy = anchor
-    x0 = gx - W / 2.0 * nm_per_px
-    y1 = gy + H / 2.0 * nm_per_px
-    for polygons, color in entries:
-        col = (int(color[0]), int(color[1]), int(color[2]))
-        for poly in polygons:
-            arr = np.asarray(poly, dtype=np.float64)
-            if arr.shape[0] < 2:
-                continue
-            px = (arr[:, 0] - x0) / nm_per_px
-            py = (y1 - arr[:, 1]) / nm_per_px
-            pts = np.stack([px, py], axis=1)
-            if cv2 is not None:
-                ip = pts.round().astype(np.int32)
-                cv2.polylines(rgb, [ip], isClosed=True, color=col,
-                              thickness=max(1, thickness),
-                              lineType=cv2.LINE_AA)
-            else:
-                _draw_polyline_np(rgb, pts, col)
-    return rgb
 
 
 # ── M5: per-image alignment export ───────────────────────────────────────────
@@ -3566,6 +3508,17 @@ class FineAlignPanel(QGroupBox):
         self._thresh = _spin(0.0, 1.0, 0.5, 0.05, 2)
         self._thresh.setToolTip(
             "Score threshold: matches at or above are 'good' (green).")
+        # F14: parallel worker (process) count for Run all + image/mask export.
+        # 0 = auto (one per CPU, capped). Persisted so it survives a restart.
+        saved_workers = QSettings("GLAS", "GLAS").value(
+            "batch_workers", 0, type=int)
+        self._workers = _spin(0, 64, int(saved_workers))
+        self._workers.setToolTip(
+            "Parallel worker processes for 'Run all' and image/mask export.\n"
+            "0 = auto (one per CPU core, capped). Raise on a many-core box; "
+            "lower to limit CPU / memory.")
+        self._workers.valueChanged.connect(
+            lambda v: QSettings("GLAS", "GLAS").setValue("batch_workers", int(v)))
 
         # Secondary (not primaryBtn): a disabled primary renders as washed-out
         # pale-orange with faint text; secondary greys cleanly (M7 R6).
@@ -3604,6 +3557,7 @@ class FineAlignPanel(QGroupBox):
             ("Background GL", self._bg), ("Blur σ (px)", self._blur),
             ("Search radius (nm)", self._radius),
             ("Score threshold", self._thresh),
+            ("Parallel workers (0 = auto)", self._workers),
             ("span", self._run_btn), ("span", self._run_all_btn),
             ("span", self._preview_btn), ("span", self._results_btn),
             ("span", self._result_lbl),
@@ -3689,6 +3643,7 @@ class FineAlignPanel(QGroupBox):
             "blur_sigma_px": float(self._blur.value()),
             "search_radius_nm": float(self._radius.value()),
             "score_threshold": float(self._thresh.value()),
+            "max_workers": int(self._workers.value()),
         }
 
     def set_result(self, score: float, dx_nm: float, dy_nm: float) -> None:
@@ -6111,7 +6066,9 @@ class MainWindow(QMainWindow):
                  str(im.file_path) if im.file_path else "", bool(im.exists))
                 for im in images]
         cfg = {"fov_w": self._fov_w, "fov_h": self._fov_h,
-               "nm_auto": self._nm_auto, "nm_manual": self._nm_per_px_manual}
+               "nm_auto": self._nm_auto, "nm_manual": self._nm_per_px_manual,
+               # F14: parallel export worker count (0 = auto).
+               "max_workers": self.sem_panel.fine_align.values()["max_workers"]}
         self._ov_progress = LoadProgressDialog(self)
         self._ov_progress.set_text("Exporting images…")
         self._ov_thread = QThread(self)

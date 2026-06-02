@@ -17,6 +17,8 @@ alignment offset 供下游量測工具使用。
   輸出 shapely polygon + uint8 mask。
 - **SEM↔GDS overlay 對位**：手動拖動（Set Offset δ）+ `cv2.matchTemplate` 自動 fine-align。
 - **匯出**：per-image alignment offset（CSV / JSON，schema `mmh-gds-alignment-v1`，`image_id` join key）。
+- **批次加速**：Run all 與 image/mask 匯出皆多進程平行（spawn process pool）。Fine Align 面板
+  「Parallel workers」可調並行度（0 = auto，每核一個、cap 16）；大量影像時明顯縮短時間。
 - **OASIS 匯出**（開發者模式）：把選定的 raw layer + Boolean 合成 layer 反向寫出成 `.oas`（自寫
   writer、不依賴 klayout / gdstk，KLayout 可開）。匯出範圍可選 **目前 FOV**（可再以 GDS 座標框裁剪
   特定 ROI）或 **整顆 chip**（分 tile 串流走訪 + 全 chip 重算 Boolean，記憶體受單一 tile 控制）。入口在

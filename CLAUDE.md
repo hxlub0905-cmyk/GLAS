@@ -135,6 +135,13 @@ sem_loader 載 KLARF（die-corner XREL/YREL）→ gds_fov.klarf_to_gds 換算 �
 → 匯出 per-image offset CSV/JSON（schema mmh-gds-alignment-v1，image_id join key）
 ```
 
+**並行模型（F8/F14）：** batch fine-align（`FineAlignAllWorker`）與 image/mask 匯出
+（`OverlayExportWorker`）的 per-image 工作都是獨立的，跑在 spawn-based `ProcessPoolExecutor`
+（compute 抽到 Qt-free 的 `fine_align` / `overlay_export`，worker 各自重建 reader）。worker 數
+由 `fine_align.batch_worker_count`（UI「Parallel workers」override；0=auto=每核一個 cap 16）決定，
+worker 內 `cv2.setNumThreads(1)` 避免「多進程 × cv2 多執行緒」oversubscription。小批 / raw-only
+走 in-thread fallback。
+
 ### 5.3 Boolean 引擎（gds_boolean）
 
 HMI 風格表達式 → 遞迴下降 parser → AST → shapely 運算。運算子優先序（高到低）：
@@ -192,7 +199,9 @@ HMI 風格表達式 → 遞迴下降 parser → AST → shapely 運算。運算�
   **待 user 本地驗收**（`pytest` + GUI）。見 `docs/plans/F13-mask-export-rerun.md`
 - [F14] Batch fine-align + image/mask export 加速（export 多進程平行化 + worker 數自動放大 +
   cv2 單執行緒解 oversubscription + UI 可調）
-  → plan 已產出**待核准**，見 `docs/plans/F14-batch-export-perf.md`
+  → 已實作 M1–M4（Qt-free `overlay_export` 模組 + `OverlayExportWorker` process-pool 化 +
+  `batch_worker_count` cap 8→16 + `cv2.setNumThreads(1)` + FineAlignPanel worker spinbox + 測試），
+  **待 user 本地驗收**（`pytest` + 多核實測）。見 `docs/plans/F14-batch-export-perf.md`
 
 ### 待辦 (Backlog)
 

@@ -72,6 +72,20 @@ def rerun_image_subset(images, image_ids):
     return [im for im in images if str(getattr(im, "image_id", im)) in idset]
 
 
+def batch_worker_count(override: int = 0, cap: int = 16) -> int:
+    """Worker (process) count for batch fine-align / image export (F14).
+
+    An explicit ``override`` (> 0, from the UI) wins; otherwise one worker per
+    CPU, capped at ``cap``. The old cap of 8 guarded against cv2's internal
+    threads multiplying across the process pool — F14 sets ``cv2.setNumThreads(1)``
+    inside each worker (see the pool initializers), so a higher cap no longer
+    oversubscribes and many-core boxes are no longer left idle."""
+    if override and override > 0:
+        return max(1, int(override))
+    import os
+    return max(1, min(os.cpu_count() or 1, cap))
+
+
 # ── Rasterization helper (used by Boolean masks / template) ──────────────────
 
 
@@ -379,6 +393,13 @@ _G: dict = {}
 def _pool_init(path, wanted_layers, dtype, bbox_layer, root, poi_specs, cfg):
     """ProcessPoolExecutor initializer: build the per-process reader + cache the
     immutable batch context. Runs once in each worker process."""
+    # F14: pin cv2 to one thread per worker so matchTemplate's internal threads
+    # don't multiply across the process pool (the reason the old cap was 8).
+    if cv2 is not None:
+        try:
+            cv2.setNumThreads(1)
+        except Exception:  # pragma: no cover - older cv2
+            pass
     _G["rar"] = oasis_random.RandomAccessReader(
         path, wanted_layers=wanted_layers, dtype=dtype, bbox_layer=bbox_layer)
     _G["root"] = root
