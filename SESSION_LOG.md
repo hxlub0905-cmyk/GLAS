@@ -4,6 +4,29 @@
 
 ---
 
+## [2026-06-02] [F14] 規劃：batch align + image/mask export 加速
+
+**變更類型：** 規劃（plan 檔 + §8 註冊，未動程式）·  **狀態：plan 待 user 核准**
+
+**動機：** user 回報 batch align 與 image/mask 匯出在上萬張規模仍太慢。探索定位兩瓶頸：
+(1) **export（`OverlayExportWorker`）完全循序**——單 reader、單 thread，每張逐張 ROI walk + 畫
+overlay/mask，**完全沒平行化**（而 align 早在 F8 就多進程平行）；(2) **align worker 上限寫死 8**
+（`_auto_batch_workers`，cap 8 是怕 cv2 多 thread × 多進程 oversubscription），多核機核心閒置。
+
+**規劃內容（4 milestone）：** M1 抽 Qt-free `glas/core/overlay_export.py`（搬 `overlay_outlines_on_sem`
++ 新增 `export_one_image`）；M2 export 走 F8 同款 `ProcessPoolExecutor`（per-process reader、
+as_completed 收 row、cancel drop futures、manifest 穩定排序）；M3 `_auto_batch_workers` cap 8→16 +
+worker 內 `cv2.setNumThreads(1)` 解 oversubscription + UI 可調 worker 數（0=auto，QSettings）；
+M4 測試 + 文件。Q&A：兩條都要、核心數不確定→自動偵測+保守 cap+UI 可調、可接受多 reader 記憶體、
+快取 align 幾何給 export 重用列後續選項不在本期。
+
+**測試：** 本次純文件，無程式變更（待核准後實作）。
+
+**影響檔案：** `docs/plans/F14-batch-export-perf.md`（新增）、`CLAUDE.md`（§8 加 [F14]）、
+`SESSION_LOG.md`。 **Branch：** `claude/optimistic-pasteur-31ELv`
+
+---
+
 ## [2026-06-02] [F13] per-image GDS mask 批次輸出 + low-score re-run（規劃→M1–M4）
 
 **變更類型：** 功能（app + core helper + 測試）+ 文件 ·  **狀態：實作完成，待 user 本地驗收**
