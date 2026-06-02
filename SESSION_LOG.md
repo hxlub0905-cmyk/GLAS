@@ -4,6 +4,33 @@
 
 ---
 
+## [2026-06-02] [F13] 最終根因：單一 mega-cell（1351 萬 placement）decode ~4.7min（暫擱）
+
+**變更類型：** 診斷結論（無碼變更，純記錄）· **狀態：user 決定先停（不投入 mega-cell 優化）**
+
+**根因（決定性）：** tracing 顯示 `SLOW load_cell 271517: 283.5s (~0 geom specs,
+13,518,432 places)`。即 ROI 落點下方有**一顆 cell 含 1351 萬筆獨立 PLACEMENT 記錄**
+（非 AREF 陣列壓縮，攤平成個別 placement）。OASIS 在 cell *內部*無空間索引 → 要找出
+ROI 內的少數 placement，必須把 1351 萬筆**全部 decode 過一遍**（Python 逐筆 varint，
+物理下限 ~1–2min；283s 大半耗在建 1351 萬個 `Placement` dataclass + walk 的 1351 萬次
+Python 迴圈）。
+
+**重要結論：** S_BOUNDING_BOX 剪枝（M1–M2）+ repetition 裁剪（M3.5）**正確且有效** ——
+正是它們讓 walk 從 root 秒級剪枝、跳過其餘 29 萬 cell、精準定位到這顆 mega-cell。瓶頸
+已從「全樹遍歷」縮到「單一病態 cell」，與原問題本質不同。
+
+**未做的優化（user 選擇先停，列入 backlog [F14]）：** placement-heavy cell 改 numpy
+欄位陣列 decode（免建千萬物件）+ walk 向量化 ROI 篩選 + 快取/磁碟 sidecar。預估可把
+首碰 ~283s 降到 ~30–60s、之後即時；但冷啟動無法達「秒級」（無 cell 內索引）。
+
+**本 session 保留的程式（皆已 commit、對正常檔有益、DEBUG-gated tracing）：**
+S_BOUNDING_BOX 收集/短路、repetition `_candidate_offsets` 裁剪、`SLOW load_cell` /
+`FULL-ARRAY` / `REACH-FALLBACK` / `BIG-ARRAY` / `prune source` 診斷行。
+
+**影響檔案：** 無（純文件）。**Branch：** `claude/magical-davinci-Ibo8K`
+
+---
+
 ## [2026-06-02] [F13] walk_roi 真正瓶頸：chip 級 repetition 陣列全展開 → 解析裁剪
 
 **變更類型：** 效能修正（core）· **狀態：待 user 真檔 GUI 驗收（秒級 + 幾何正確）**

@@ -61,6 +61,16 @@ grid units → bbox = `(x, y, x+w, y+h)`。雙重確認：
   - [x] `TestRepetitionClamp`（grid 裁剪==完整選集、旋轉/type9 fallback）。
 - [ ] **M4 真檔驗收**：`R8_OD_to_VC_KKKK.oas` GUI 開 ROI → walk 秒級 + 幾何正確
   （`--debug` 看 `sbbox_used` 大、`sbbox_violations=0`、`CLAMP-MISMATCH` 不出現）。
+  → **部分達成**：剪枝/裁剪正確（`sbbox_used` 大、無 violation/mismatch），但首次
+  walk 仍久——根因是**單一 mega-cell（refnum 271517，1351 萬 placement）decode ~283s**
+  （`SLOW load_cell 271517: 283.5s, 13,518,432 places`）。已縮到單一病態 cell，非剪枝問題。
+
+## 後續（[F14] backlog，user 暫擱）
+
+placement-heavy cell 優化：`_decode_at` 改 numpy 欄位陣列存 placement（免建千萬
+dataclass）+ walk 向量化 ROI 篩選（免 1351 萬次 Python 迴圈）+ 解碼結果快取（記憶體/
+磁碟 sidecar，跨 session）。預估首碰 283s → ~30–60s、之後即時。冷啟動無法達秒級
+（OASIS cell 內部無空間索引，必須掃過全部 placement 記錄）。
 
 ## 不變式 / 風險
 
