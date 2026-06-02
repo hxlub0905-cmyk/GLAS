@@ -789,7 +789,8 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
     _feat = {"rtype": set(), "angle": set(), "flip": False,
              "mag": set(), "name_ref": False, "rect_rtype": set(),
              "poly_rtype": set(), "ce_viol": 0, "ce_checks": 0,
-             "sbb_used": 0, "sbb_viol": 0, "clamp_checks": 0}
+             "sbb_used": 0, "sbb_viol": 0, "clamp_checks": 0,
+             "reach_fallback": 0}
 
     def reachable_bbox(cid: object) -> Optional[Bbox]:
         """Bbox (cid-local frame) of all geometry reachable from cid —
@@ -806,6 +807,13 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
             reach_memo[cid] = sb
             _feat["sbb_used"] += 1
             return sb
+        # No std_bbox (flag!=0 or property absent) -> recursive fallback, which
+        # can walk a whole subtree. Surface it: if this fires a lot it explains
+        # a stall even though most cells have a std_bbox.
+        _feat["reach_fallback"] += 1
+        if DEBUG and _feat["reach_fallback"] <= 12:
+            _dbg(f"  REACH-FALLBACK cell {cid!r} (no std_bbox -> recursing "
+                 f"subtree; raw={rar.std_bbox_raw(cid)})")
         if cid in computing:
             return None
         _check_cancel()
@@ -947,6 +955,11 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
             _total = oas.repetition_count(rtype, rraw)
             _cand = _candidate_offsets(rtype, rraw, placed, T, roi)
             _clamped = _cand is not None
+            if DEBUG and _total > 100_000 and not _clamped:
+                _diag = abs(T.M[0, 1]) < 1e-9 and abs(T.M[1, 0]) < 1e-9
+                _dbg(f"  FULL-ARRAY {cid!r}->{pl.target!r}: rep={_total:,} "
+                     f"rtype={rtype} diagT={_diag} -> materializing ALL (slow); "
+                     f"raw={rraw!r}")
             oa = _cand if _clamped else oas.repetition_offsets_np(rtype, rraw)
             if _clamped and DEBUG and _total > 100_000:
                 _dbg(f"  BIG-ARRAY {cid!r}->{pl.target!r}: rep={_total:,} "
@@ -1009,7 +1022,8 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
          f"rect_rtypes={sorted(str(x) for x in _feat['rect_rtype'])} "
          f"poly_rtypes={sorted(str(x) for x in _feat['poly_rtype'])} "
          f"ce_violations={_feat['ce_viol']} "
-         f"sbbox_used={_feat['sbb_used']} sbbox_violations={_feat['sbb_viol']}")
+         f"sbbox_used={_feat['sbb_used']} sbbox_violations={_feat['sbb_viol']} "
+         f"reach_fallback={_feat['reach_fallback']}")
     if rar.errors:
         for cid, off, m in rar.errors[:8]:
             _dbg(f"  ERROR cell {cid!r} @ {off}: {m}")
