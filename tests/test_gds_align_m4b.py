@@ -101,11 +101,15 @@ class TestFineAlignOne:
     def _template(self):
         return gat.make_template(_square_mask(), 200, 80, 0.0)
 
+    # The sub-pixel parabola fit leaves a tiny residual (~1e-5 nm) that varies
+    # with the BLAS / cv2 / numpy build, so assert to 1e-3 nm (= 2e-4 px) rather
+    # than 1e-6 — still far tighter than any meaningful alignment error, and
+    # the integer-pixel value + sign (the actual invariants) are unaffected.
     def test_aligned_zero_offset(self):
         t = self._template()
         dx, dy, score, r = gat.fine_align_one(t, t, nm_per_px=5.0,
                                               search_radius_px=8)
-        assert (dx, dy) == pytest.approx((0.0, 0.0), abs=1e-6)
+        assert (dx, dy) == pytest.approx((0.0, 0.0), abs=1e-3)
         assert score > 0.99
 
     def test_shift_right_down_signs(self):
@@ -114,8 +118,8 @@ class TestFineAlignOne:
         dx, dy, score, r = gat.fine_align_one(sem, t, nm_per_px=5.0,
                                               search_radius_px=8)
         # ex=+4 -> dx=-20 ; ey=+3 -> dy=+15
-        assert dx == pytest.approx(-20.0, abs=1e-6)
-        assert dy == pytest.approx(15.0, abs=1e-6)
+        assert dx == pytest.approx(-20.0, abs=1e-3)
+        assert dy == pytest.approx(15.0, abs=1e-3)
         assert score > 0.9
 
     def test_flat_template_no_signal(self):

@@ -4,6 +4,196 @@
 
 ---
 
+## [2026-06-03] 完成 [F15] 模擬 GLV 灰階 + label ROI 匯出（取代 F13 binary mask）
+
+**變更類型：** 功能（core 2 函式 + export pipeline + app dialog/worker）+ 測試 + 文件 ·
+**狀態：實作完成、sandbox pytest 全綠，待 user 本地驗收**
+
+**動機：** user 釐清下游 MMH 真正要的不是 F13 的 binary mask，而是 (1) 一張「已對齊」的
+**模擬 GLV 灰階圖**（像 fine-align template）當量測底圖、(2) **ROI 資訊**。問「ROI 怎麼讀
+最快」→ 決定用 **整數 label 圖**（單次 imread + `gray[label==id]` boolean index，零
+rasterize/JSON/閾值）。user 進一步決定 **gray+label 直接取代 mask（拿掉 mask 選項）**。
+
+**實作：**
+- **M1 core**：`fine_align.render_label_image`（per-layer geom→`make_mask`→paint 整數 id、
+  bg=0、無 blur、後層覆前層）+ `render_grayscale_from_geoms`（同組 geom→paint fg_glv + 一次
+  blur，hole-preserving 版的 `render_composite_template`）；共用 `_fov_min_corner`（沿用 F13
+  mask 的 y_min 1-px raise，§7）→ gray/label 像素網格一致。`OVERLAY_MANIFEST_COLS` 的
+  `mask_png` 換成 `gray_png`/`label_png`。
+- **M2 `overlay_export`**：`export_one_image` 以 `export_gray`/`export_label`/`score_thr`
+  取代 `export_mask`/`mask_thr`；poi 入參擴成 `[(spec, color, fg_glv)]`，label id = POI 位置；
+  那次 ROI walk 的 per-layer `geom` 同時餵 gray/label；cfg 取 `bg_glv`/`blur_sigma_px`。
+  pool init/task 同步。移除已不用的 `gds_boolean` import。
+- **M3 app**：`AlignmentExportDialog` 移除「Export GDS mask」改兩 checkbox（grayscale /
+  label map），共用 score-threshold 區塊；`selected()` 回 7-tuple。`OverlayExportWorker`
+  建構子改 `export_gray`/`export_label`/`score_threshold`/`label_map`；manifest schema
+  bump `mmh-gds-overlay-v1`→`v2` 並加 `label_map`（id→層名+fg_glv）。`_export_overlay_images`
+  /`_poi_specs_colored`(+fg)/`_export_label_map` 串接。
+- **M4 文件**：README 匯出章節、CLAUDE §5.2 + §8、plan 檔、本 log。
+
+**測試：** sandbox 裝 numpy/cv2/shapely/PyQt6 後 `pytest tests/` **560 passed**（含新
+`render_label_image`/`render_grayscale_from_geoms` 決定論 + holes + gray↔label 邊界一致；
+F13 mask 測試改寫成 gray/label；F5 schema v2；m5 dialog 7-tuple）。`py_compile` 全過。
+**手動 GUI 端到端待 user 本地。**
+
+**影響檔案：** `glas/core/fine_align.py`、`glas/core/overlay_export.py`、
+`glas/app/gds_align_tool.py`、`tests/test_export_perf.py`、`tests/test_gds_align_f13.py`、
+`tests/test_gds_align_f5.py`、`README.md`、`CLAUDE.md`、
+`docs/plans/F15-glv-grayscale-roi-export.md`、`SESSION_LOG.md`。
+**Branch：** `claude/optimistic-pasteur-31ELv`
+
+---
+
+## [2026-06-03] 結案 F9 / F10 / F13 / F14；撤案 F11（user 驗收 + 決策）
+
+**變更類型：** 任務管理（文件）·  **狀態：完成**
+
+**背景：** user 本地驗收後確認 F9（layout 匯出）、F10（OASIS debug mode）、F13（per-image mask 批次
+輸出 + low-score re-run）、F14（batch fine-align / export 加速）皆 OK → 結案；F11（整顆 chip OASIS
+匯出）決定不做 → 撤案。
+
+**修法：**
+- CLAUDE.md §8「進行中」清空（F9/F10/F13/F14 依規則完成即從清單刪除，紀錄留在 git history + 本 log）。
+- F11 移到「待辦 (Backlog)」並標 ~~刪除線~~ + 撤案註記（比照 F12 慣例）；plan 檔
+  `docs/plans/F11-whole-chip-export.md` 保留供日後參考。
+
+**測試：** 純文件變更，無程式碼異動。
+
+**影響檔案：** `CLAUDE.md`、`SESSION_LOG.md`。 **Branch：** `claude/optimistic-pasteur-31ELv`
+
+## [2026-06-02] Batch UX：移除 score 直方圖 + 平行結果改回影像順序（user 回饋）
+
+**變更類型：** UX/效能（app）·  **狀態：完成（待 user 實機確認）**
+
+**背景：** user 回饋 (1) batch 結果頁的 score 直方圖沒什麼用、想再快一點；(2) batch align 進度「跳著
+跑」（不是 1,2,3…），顯示怪。
+
+**修法：**
+- **直方圖**：`BatchResultsPanel._rebuild_charts` 移除 `_ScoreHistogram`，只留殘差散點圖（散點圖對
+  「median residual → origin δ」有實際用途）。順帶減少每次串流刷新的圖表 teardown/rebuild 開銷。
+  `score_histogram` / `_ScoreHistogram` 保留（仍有單元測試）。
+- **跳著跑**：`FineAlignAllWorker._run_process_pool` 與 `OverlayExportWorker._run_process_pool` 改成
+  **全部 job 先提交（worker 仍滿載平行），但結果依提交（影像）順序消費**（`for fut in futures` 取代
+  `as_completed`），讓表格/overview 由上而下填、manifest 順序穩定。吞吐幾乎不變（僅進度回報序列化）。
+  移除未用的 `as_completed` import。
+
+**已釐清（非 bug）：** 先前回報匯出 overlay/mask「沒對齊」——經查為**操作面**：`AlignmentExportDialog`
+預設「全部影像勾選」，batch 中途 abort（或部分影像 flat/失敗）後若直接匯出，**未算到 fine-align 的影像
+沒有 `_refined` → 退回 coarse-only**，看起來才像沒對齊。只勾「已算完（有 score）」的影像匯出即正確，
+與靜態比對結論一致（畫面 `paintEvent`/`_world_to_view` == 匯出 `overlay_outlines_on_sem`，anchor=
+coarse+refined、nm_per_px、座標框逐項相同）。mask 因有 score 門檻把關不受影響；overlay PNG 無門檻才會
+混入 coarse-only。可選後續防呆：對話框加「Only images with a fine-align result」過濾（暫未做）。
+
+**測試：** `py_compile` 過；in-thread fallback 路徑不變。**待 user `pytest` + 實機。**
+
+**影響檔案：** `glas/app/gds_align_tool.py`、`SESSION_LOG.md`。 **Branch：** `claude/optimistic-pasteur-31ELv`
+
+---
+
+## [2026-06-02] 測試修正：m5 export dialog 簽章 + m4b 子像素容差（user 本地 pytest 暴露）
+
+**變更類型：** 測試修正（純 tests，無功能變更）·  **狀態：完成**
+
+**背景：** user 在本地（Python 3.13 / numpy 2.4.6 / cv2 4.13 / PyQt6 6.11）跑 `pytest tests/` →
+553 passed, 4 failed。
+
+**根因 + 修法：**
+- **m5 `TestExportDialog`（2 筆）**：F13 把 `AlignmentExportDialog.selected()` 從 4-tuple 擴成
+  6-tuple（多 `export_mask` / `mask_threshold`），舊測試仍 `fmt, ids = selected()` → unpack 錯。
+  改 `fmt, ids, *_ = d.selected()`。**屬 F13 API 演進未同步測試。**
+- **m4b `TestFineAlignOne`（2 筆）**：`fine_align_one` 子像素拋物線殘差 ~9.5e-6（abs=1e-6 過嚴），
+  隨 BLAS/cv2/numpy build 浮動，**與 F13/F14 無關**（未動該數學）。容差放寬 1e-6→1e-3 nm（仍遠嚴於
+  任何實際對位誤差，sign/整數像素不變式不受影響）。
+
+**測試：** `py_compile` 過；預期 `pytest tests/` 全綠（待 user 重跑確認）。
+
+**影響檔案：** `tests/test_gds_align_m5.py`、`tests/test_gds_align_m4b.py`、`SESSION_LOG.md`。
+**Branch：** `claude/optimistic-pasteur-31ELv`
+
+---
+
+## [2026-06-02] [F14] batch align + image/mask export 加速（規劃→M1–M4）
+
+**變更類型：** 效能/重構（新 core 模組 + worker 平行化 + UI）+ 測試 + 文件 ·  **狀態：實作完成，待 user 本地驗收**
+
+**動機：** user 回報 batch align 與 image/mask 匯出在上萬張規模仍太慢。探索定位兩瓶頸：
+(1) **export（`OverlayExportWorker`）完全循序**——單 reader、單 thread，每張逐張 ROI walk + 畫
+overlay/mask，**完全沒平行化**（而 align 早在 F8 就多進程平行）；(2) **align worker 上限寫死 8**
+（cv2 多 thread × 多進程 oversubscription 顧慮），多核機核心閒置。Q&A：兩條都要加速、核心數不確定→
+自動偵測+保守 cap+UI 可調、可接受多 reader 記憶體、快取 align 幾何重用列後續選項。
+
+**實作：**
+- **M1** 新增 Qt-free `glas/core/overlay_export.py`：把 `overlay_outlines_on_sem` / `_draw_polyline_np`
+  / `_safe_name` 從 app 原樣搬入；新增 `export_one_image(...)`（單張 imread + raw/overlay/mask 寫出 +
+  回 manifest row，內用 `poi_polys_and_geometry_for_roi` 單 walk 共用），與舊 worker 單張邏輯逐行等價。
+  app 改 re-import 這些 helper（preview 仍可用）。
+- **M2** `OverlayExportWorker` 改 orchestrator：`_run_in_thread`（小批/raw-only/無 reader fallback）
+  + `_run_process_pool`（spawn `ProcessPoolExecutor`、`_export_pool_init/_task`、as_completed 收 row、
+  cancel drop futures、依 job 序回 row 讓 manifest 穩定）。
+- **M3** `fine_align.batch_worker_count(override, cap=16)`（cap 8→16；UI override 優先）；
+  `fine_align._pool_init` 與 `overlay_export._export_pool_init` 內 `cv2.setNumThreads(1)`；
+  FineAlignPanel 加「Parallel workers (0=auto)」spinbox（QSettings 持久化），align/export cfg 透傳
+  `max_workers`。
+- **M4** `tests/test_export_perf.py`（worker 數解析 / export_one_image raw-only+純函式determinism /
+  missing-file / 無 POI 不寫 mask / 模組 Qt-free）+ README + CLAUDE §5.2 並行模型。
+
+**測試：** `py_compile` 全過；既有 F5 `OverlayExportWorker._write_manifest` 測試相容（建構子向後相容）。
+沙箱無 numpy/PyQt6，**pytest 綠 + 多核實測加速待 user 本地**。
+
+**影響檔案：** `glas/core/overlay_export.py`（新增）、`glas/core/fine_align.py`、
+`glas/app/gds_align_tool.py`、`tests/test_export_perf.py`（新增）、`README.md`、`CLAUDE.md`、
+`docs/plans/F14-batch-export-perf.md`、`SESSION_LOG.md`。 **Branch：** `claude/optimistic-pasteur-31ELv`
+
+---
+
+## [2026-06-02] [F13] per-image GDS mask 批次輸出 + low-score re-run（規劃→M1–M4）
+
+**變更類型：** 功能（app + core helper + 測試）+ 文件 ·  **狀態：實作完成，待 user 本地驗收**
+
+**動機：** 下游 MMH 需要 per-image GDS mask 限縮 blob 偵測範圍（解 gray-level 定位失效）；
+GLAS 是唯一能產 mask 的工具（Boolean + fine-align），但缺 (1) 批次 mask 輸出、(2) batch
+fine-align 後針對 low-score 圖調參重跑（現只能重跑全部上萬張）。Q&A：覆蓋規則 Q1=C（新 score >
+舊才覆蓋）、mask 不輸出 fallback（GLAS 把關品質，Q2）、UI 併入 export dialog（Q3）、用既有
+`make_mask()`（Q4）、re-run UI 放 BatchResultsPanel（Q5）。
+
+**實作：**
+- **M1 `BatchResultsPanel` 子集 re-run**：table 下方新增 Re-run 區塊（Search radius / Background
+  GL / Blur σ 覆蓋 spin，per-POI FG GL 沿用 Fine Align 面板）+「Re-run low-score」/「Re-run
+  selected」鈕（table 改 ExtendedSelection 多選），emit `rerun_requested(ids, overrides)`。
+  MainWindow `_on_rerun_requested` 重用 `FineAlignAllWorker` 跑子集（抽 `_launch_fa`），
+  `_fa_rerun_mode` 旗標令 `_on_fa_result` 走 `fine_align.rerun_should_overwrite`（Q1=C：只變好）。
+- **M2 `OverlayExportWorker`**：`__init__` 加 `export_mask` / `mask_score_threshold`；`run()` 把
+  ROI walk 改成 overlay/mask 任一需要就走一次、共用 `entries`；mask 分支用
+  `polys_to_geometry`→`make_mask`（FOV 左下角座標與 `overlay_outlines_on_sem` 對齊）→寫
+  `{base}_mask.png`，僅 `mask_should_export(refined, thr)` 為真才寫。
+- **M3 `AlignmentExportDialog`**：加 `Export GDS mask (.png)` checkbox + Score threshold spin
+  （0.8 / 0–1 / 0.05）+ 即時「N image(s) ≥ threshold」label；`selected()` 多回 2 值，呼叫鏈
+  （`_on_export_alignment`→`_export_overlay_images`）透傳。
+- **core helper（Qt-free，便於單測）**：`fine_align.py` 新增 `OVERLAY_MANIFEST_COLS`（加
+  `mask_png`）、`rerun_should_overwrite` / `mask_should_export` / `rerun_image_subset`。
+
+**探索修正：** 草稿誤寫對話框為 `OverlayExportDialog`，實為 `AlignmentExportDialog`；
+`make_mask()` 吃**單一 geom**（keyword-only），故 M2 用 `polys_to_geometry` union 後傳入。
+
+**PR#9 review 修正（Codex，2 × P2）：** (1) **Boolean 洞保留**——原 mask 用 `poi_polys_for_roi`
+回傳的 exterior-only rings（`geometry_to_polygons` 會丟內洞）重建幾何，subtraction/complement 表
+達式的洞會被填實。改新增 `fine_align.poi_polys_and_geometry_for_roi`（單次 walk 同時回 polys[給
+overlay] + hole-preserving geom[給 mask]）+ `gds_boolean.union_geometries`，mask 走 geom。
+(2) **1px Y 偏移**——`make_mask(invert_y=True)` 用 `(H-1)-(y-y_min)/nm`，但 overlay 與 fine-align
+template（`rasterize_layer`）用 `(y_top-y)/nm`（anchor→H/2）；mask 比兩者高一格。改 `y_min` 抬高一
+像素（`anchor_y-(H/2-1)*nm`），使 mask 像素與 `rasterize_layer` 完全一致（新測試 array_equal 證明）。
+
+**測試：** `tests/test_gds_align_f13.py`——5 個純邏輯測試（rerun 覆蓋規則 / 子集選取 / mask
+threshold / 無 refined / manifest 欄）+ Qt+cv2 gated 整合測試（worker manifest header）+ review 修正
+測試（洞保留、mask↔rasterize_layer 像素相等）。`py_compile` 全過；沙箱無 numpy/PyQt6，
+**pytest 綠 + GUI 端到端待 user 本地**。
+
+**影響檔案：** `glas/app/gds_align_tool.py`、`glas/core/fine_align.py`、
+`tests/test_gds_align_f13.py`（新增）、`docs/plans/F13-mask-export-rerun.md`、`CLAUDE.md`、
+`SESSION_LOG.md`。 **Branch：** `claude/optimistic-pasteur-31ELv`
+
+---
+
 ## [2026-05-28] [F12] 探索後撤案：無索引表 OASIS 支援（改用 KLayout 轉檔）
 
 **變更類型：** 決策 / 還原（本 session 的 F12 程式碼變更已全數 revert，淨碼變更為 0）

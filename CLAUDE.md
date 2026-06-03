@@ -133,7 +133,17 @@ sem_loader 載 KLARF（die-corner XREL/YREL）→ gds_fov.klarf_to_gds 換算 �
 → oasis_random ROI walk 載入該處 geometry → SemViewer 半透明 overlay
 → 手動拖動（Set Offset δ）或 FineAlignPanel cv2.matchTemplate 自動 refine
 → 匯出 per-image offset CSV/JSON（schema mmh-gds-alignment-v1，image_id join key）
+  + 影像匯出：模擬 GLV 灰階圖 `<id>_gray.png` + ROI label map `<id>_label.png`（F15，
+  同一組 per-layer 幾何 rasterize、gray 套 blur / label 不 blur、像素網格一致，下游
+  `gray[label==id]` 取 ROI；取代 F13 binary mask；manifest schema mmh-gds-overlay-v2 帶 label_map）
 ```
+
+**並行模型（F8/F14）：** batch fine-align（`FineAlignAllWorker`）與 image 匯出
+（`OverlayExportWorker`，含 raw/overlay/gray/label）的 per-image 工作都是獨立的，跑在 spawn-based `ProcessPoolExecutor`
+（compute 抽到 Qt-free 的 `fine_align` / `overlay_export`，worker 各自重建 reader）。worker 數
+由 `fine_align.batch_worker_count`（UI「Parallel workers」override；0=auto=每核一個 cap 16）決定，
+worker 內 `cv2.setNumThreads(1)` 避免「多進程 × cv2 多執行緒」oversubscription。小批 / raw-only
+走 in-thread fallback。
 
 ### 5.3 Boolean 引擎（gds_boolean）
 
@@ -179,16 +189,12 @@ HMI 風格表達式 → 遞迴下降 parser → AST → shapely 運算。運算�
 
 ### 進行中 (In Progress)
 
-- [F9] Layout 匯出：raw layer + Boolean 合成 layer 寫出成 OASIS（.oas，含 ROI 座標裁剪 + 開發者模式）
-  → 已實作 M1–M6（core writer + ROI 裁剪 + app 匯出對話框 + 開發者模式 gating），**待 user 本地驗收**
-  （GUI 匯出 + KLayout 開檔 + `pytest`）。見 `docs/plans/F9-layout-export.md`
-- [F10] OASIS debug mode：載入/匯出雙向診斷（可複製報告 + `.debug.txt` sidecar、dev-mode gated）
-  → 已實作 M1–M4，**待 user 本地驗收**（`pytest` + GUI）。見 `docs/plans/F10-debug-mode.md`
-- [F11] 整顆 chip OASIS 匯出（原始 + Boolean 全 chip 重算）+ GDS 座標可見性
-  → plan 已產出**待核准**，見 `docs/plans/F11-whole-chip-export.md`
+- （目前無）
 
 ### 待辦 (Backlog)
 
+- [F11] ~~整顆 chip OASIS 匯出（原始 + Boolean 全 chip 重算）+ GDS 座標可見性~~ — **撤案**（2026-06-03，
+  user 決定不做）。plan 仍保留於 `docs/plans/F11-whole-chip-export.md` 供日後參考。
 - [F12] ~~無索引表 OASIS（無 LAYERNAME / 無 S_CELL_OFFSET）原生支援~~ — **撤案**（2026-05-28）。
   根本卡在無 per-cell bbox → ROI 首次載入需全 chip 解碼。替代：用 KLayout 開→另存 `.oas` 補索引表後再開。
   詳見 SESSION_LOG 2026-05-28 條目。

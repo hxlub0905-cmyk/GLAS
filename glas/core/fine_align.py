@@ -28,6 +28,65 @@ import gds_boolean
 import oasis_random
 
 
+# ── F13: batch re-run + mask-export decision helpers ─────────────────────────
+# Qt-free pure logic, shared by the app's OverlayExportWorker / re-run wiring and
+# unit-tested directly (the app module needs PyQt6, this one does not).
+
+# Manifest column order for OverlayExportWorker (F5 M6 + F15).
+# ``gray_png`` / ``label_png`` are appended last (replacing F13's ``mask_png``):
+# the per-image simulated-GLV grayscale and integer ROI label map filenames
+# (blank when not written for that image). Older raw/overlay readers that index
+# the leading columns are unaffected.
+OVERLAY_MANIFEST_COLS = [
+    "image_id", "raw_png", "overlay_png",
+    "fine_dx_nm", "fine_dy_nm", "score", "status", "gray_png", "label_png",
+]
+
+
+def rerun_should_overwrite(old_refined, new_score: float, status: str) -> bool:
+    """F13 Q1=C: a batch re-run only replaces an image's stored alignment when
+    the new run is *strictly better*, so re-running can never make results worse.
+
+    ``old_refined`` is the existing ``(dx, dy, score)`` tuple (or ``None`` when
+    the image had no prior result); ``status`` is the worker's objective status.
+    A non-"ok" re-run never clobbers a prior result.
+    """
+    if status != "ok":
+        return False
+    if old_refined is None:
+        return True
+    return new_score > old_refined[2]
+
+
+def mask_should_export(refined, threshold: float) -> bool:
+    """F13 Q2: a per-image GDS mask is written only for images that were
+    fine-aligned (``refined`` is not ``None``) *and* whose score meets the
+    threshold, so every exported mask is trustworthy (MMH needs no fallback).
+    ``refined`` is ``(dx, dy, score)`` or ``None``."""
+    return refined is not None and refined[2] >= threshold
+
+
+def rerun_image_subset(images, image_ids):
+    """Pick the image objects whose ``image_id`` is in ``image_ids`` (F13 batch
+    re-run of a selected / low-score subset), preserving dataset order."""
+    idset = {str(i) for i in image_ids}
+    return [im for im in images if str(getattr(im, "image_id", im)) in idset]
+
+
+def batch_worker_count(override: int = 0, cap: int = 16) -> int:
+    """Worker (process) count for batch fine-align / image export (F14).
+
+    An explicit ``override`` (> 0, from the UI) wins; otherwise one worker per
+    CPU, capped at ``cap``. The old cap of 8 guarded against cv2's internal
+    threads multiplying across the process pool — F14 sets ``cv2.setNumThreads(1)``
+    inside each worker (see the pool initializers), so a higher cap no longer
+    oversubscribes and many-core boxes are no longer left idle."""
+    if override and override > 0:
+        return max(1, int(override))
+    import os
+    return max(1, min(os.cpu_count() or 1, cap))
+
+
 # ── Rasterization helper (used by Boolean masks / template) ──────────────────
 
 
@@ -164,6 +223,75 @@ def render_poi_template(polygons: list, anchor: tuple, width_px: int,
         bg_glv, blur_sigma_px)
 
 
+# ── F15: export-time simulated-GLV grayscale + integer ROI label map ─────────
+#
+# The downstream tool (MMH) wants ONE aligned image to measure on plus ROI info
+# it can read fast. We give it a simulated-GLV grayscale (the working image) and
+# an integer label map (label == id → that POI layer's exact ROI, a single numpy
+# boolean index). Both are painted from the *same* per-layer hole-preserving
+# geometry via ``gds_boolean.make_mask`` — so the grayscale and the label map
+# agree pixel-for-pixel on region boundaries — using the same FOV corner as the
+# F13 mask path (§7: ``y_min`` raised one pixel so ``invert_y`` lands on the same
+# SEM pixels as ``overlay_outlines_on_sem`` / ``rasterize_layer``).
+
+
+def _fov_min_corner(anchor: tuple, width_px: int, height_px: int,
+                    nm_per_px: float) -> tuple:
+    """Bottom-left GDS ``(x_min_nm, y_min_nm)`` of the FOV centred on ``anchor``
+    for :func:`gds_boolean.make_mask`, matching the F13 mask-export convention
+    (y raised one pixel; §7)."""
+    x_min = anchor[0] - width_px / 2.0 * nm_per_px
+    y_min = anchor[1] - (height_px / 2.0 - 1.0) * nm_per_px
+    return x_min, y_min
+
+
+def render_label_image(poi_geoms_ids: list, anchor: tuple, width_px: int,
+                       height_px: int, nm_per_px: float) -> np.ndarray:
+    """Integer ROI label map (F15). ``poi_geoms_ids`` is ``[(geom, label_id),
+    ...]``; each layer's hole-preserving geometry is rasterised (via
+    :func:`gds_boolean.make_mask`) onto a 0 background and painted with its
+    integer ``label_id`` — **no blur**, so ``label == id`` is the exact ROI for
+    that POI layer (a single numpy boolean index downstream). Later layers
+    overwrite earlier ones where they overlap. uint8 → up to 255 layers."""
+    lbl = np.zeros((height_px, width_px), dtype=np.uint8)
+    x_min, y_min = _fov_min_corner(anchor, width_px, height_px, nm_per_px)
+    for geom, label_id in poi_geoms_ids:
+        if geom is None or getattr(geom, "is_empty", False):
+            continue
+        m = gds_boolean.make_mask(geom, width_px=width_px, height_px=height_px,
+                                  x_min_nm=x_min, y_min_nm=y_min,
+                                  nm_per_px=nm_per_px)
+        lbl[m > 0] = np.uint8(label_id)
+    return lbl
+
+
+def render_grayscale_from_geoms(poi_geoms_fgs: list, anchor: tuple,
+                                width_px: int, height_px: int, nm_per_px: float,
+                                bg_glv: int = 80,
+                                blur_sigma_px: float = 1.0) -> np.ndarray:
+    """SEM-like simulated-GLV grayscale (F15) — the hole-preserving sibling of
+    :func:`render_composite_template`. ``poi_geoms_fgs`` is ``[(geom, fg_glv),
+    ...]``; each layer's hole-preserving geometry is rasterised (via
+    :func:`gds_boolean.make_mask`) onto a ``bg_glv`` background, painted at its
+    ``fg_glv``, then softened with one Gaussian blur so it resembles a
+    band-limited SEM frame. Shares the make_mask raster + FOV corner with
+    :func:`render_label_image`, so the grayscale and the label map line up
+    pixel-for-pixel on region boundaries."""
+    img = np.full((height_px, width_px), np.uint8(bg_glv), dtype=np.uint8)
+    x_min, y_min = _fov_min_corner(anchor, width_px, height_px, nm_per_px)
+    for geom, fg_glv in poi_geoms_fgs:
+        if geom is None or getattr(geom, "is_empty", False):
+            continue
+        m = gds_boolean.make_mask(geom, width_px=width_px, height_px=height_px,
+                                  x_min_nm=x_min, y_min_nm=y_min,
+                                  nm_per_px=nm_per_px)
+        img[m > 0] = np.uint8(fg_glv)
+    if blur_sigma_px and blur_sigma_px > 0 and cv2 is not None:
+        k = int(max(1, round(blur_sigma_px * 3))) * 2 + 1
+        img = cv2.GaussianBlur(img, (k, k), float(blur_sigma_px))
+    return img
+
+
 def _parabola_subpx(res: np.ndarray, bx: int, by: int, axis: int) -> float:
     """Sub-pixel peak offset (∈ [-1, 1]) from a 3-point parabola fit around
     the score-map peak along ``axis`` (0 = x, 1 = y)."""
@@ -229,16 +357,23 @@ def _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb=None):
     return polys
 
 
-def poi_polys_for_roi(rar, root, roi_bbox, poi_spec, cancel_cb=None):
-    """POI polygons (nm, root coords) for a given ROI, for batch fine align
-    (plan M4b "Run all"). ``poi_spec`` is ``('raw', layer, datatype)`` or
-    ``('expr', expr_text, bindings[, recipes])``; the latter walks each bound
-    layer over the ROI and evaluates the Boolean expression, resolving any
-    nested synthetic references via ``recipes`` (``{name: (expr, bindings)}``)."""
+def poi_polys_and_geometry_for_roi(rar, root, roi_bbox, poi_spec,
+                                   cancel_cb=None):
+    """POI outline polygons *and* the hole-preserving resolved geometry for a
+    ROI, from a single walk (F13). ``poi_spec`` is ``('raw', layer, datatype)``
+    or ``('expr', expr_text, bindings[, recipes])``.
+
+    ``poi_polys_for_roi`` returns only the flattened exterior rings
+    (``geometry_to_polygons`` drops interior holes), which is fine for stroking
+    overlay outlines but would *fill* Boolean interior exclusions (subtraction /
+    complement) once rasterised into a mask. The mask path therefore needs the
+    geometry, not the rings. Returns ``(polys, geom)`` so one ROI walk feeds
+    both the overlay (polys) and the mask (geom)."""
     kind = poi_spec[0]
     if kind == "raw":
         _, layer, datatype = poi_spec
-        return _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb)
+        polys = _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb)
+        return polys, gds_boolean.polys_to_geometry(polys)
     # expression POI
     expr, bindings = poi_spec[1], poi_spec[2]
     recipes = poi_spec[3] if len(poi_spec) > 3 else {}
@@ -253,7 +388,19 @@ def poi_polys_for_roi(rar, root, roi_bbox, poi_spec, cancel_cb=None):
         expr, bindings, raw_provider=raw_provider,
         recipe_provider=lambda n: recipes.get(n),
         fov_bbox=gds_boolean.fov_box(cx, cy, w, h))
-    return gds_boolean.geometry_to_polygons(geom)
+    return gds_boolean.geometry_to_polygons(geom), geom
+
+
+def poi_polys_for_roi(rar, root, roi_bbox, poi_spec, cancel_cb=None):
+    """POI polygons (nm, root coords) for a given ROI, for batch fine align
+    (plan M4b "Run all") and overlay outlines. ``poi_spec`` is
+    ``('raw', layer, datatype)`` or ``('expr', expr_text, bindings[, recipes])``;
+    the latter walks each bound layer over the ROI and evaluates the Boolean
+    expression, resolving any nested synthetic references via ``recipes``
+    (``{name: (expr, bindings)}``). For the hole-preserving geometry (mask
+    export) use :func:`poi_polys_and_geometry_for_roi`."""
+    return poi_polys_and_geometry_for_roi(
+        rar, root, roi_bbox, poi_spec, cancel_cb)[0]
 
 
 def _fine_align_image(job, rar, root, poi_specs, cfg, cancel_is_set):
@@ -316,6 +463,13 @@ _G: dict = {}
 def _pool_init(path, wanted_layers, dtype, bbox_layer, root, poi_specs, cfg):
     """ProcessPoolExecutor initializer: build the per-process reader + cache the
     immutable batch context. Runs once in each worker process."""
+    # F14: pin cv2 to one thread per worker so matchTemplate's internal threads
+    # don't multiply across the process pool (the reason the old cap was 8).
+    if cv2 is not None:
+        try:
+            cv2.setNumThreads(1)
+        except Exception:  # pragma: no cover - older cv2
+            pass
     _G["rar"] = oasis_random.RandomAccessReader(
         path, wanted_layers=wanted_layers, dtype=dtype, bbox_layer=bbox_layer)
     _G["root"] = root
