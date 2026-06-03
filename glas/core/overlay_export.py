@@ -6,8 +6,9 @@ compute moved to :mod:`fine_align` in F8. ``OverlayExportWorker`` was a single
 sequential reader; this module lets each worker process rebuild its own reader
 and write its own PNGs in parallel.
 
-Depends only on numpy / cv2 / shapely (via ``gds_boolean``) and the sibling
-``fine_align`` / ``oasis_random`` engines — no PyQt6 — so a spawn worker can
+Depends only on numpy / cv2 and the sibling ``fine_align`` (which owns the
+shapely / ``gds_boolean`` raster) / ``oasis_random`` engines — no PyQt6 — so a
+spawn worker can
 re-import it cheaply. ``overlay_outlines_on_sem`` lived in the app module before
 F14; it moved here (it only ever needed numpy/cv2) and the app re-imports it for
 the template preview.
@@ -24,7 +25,6 @@ except Exception:  # pragma: no cover
     cv2 = None
 
 import fine_align
-import gds_boolean
 import oasis_random
 
 
@@ -87,21 +87,23 @@ def overlay_outlines_on_sem(sem_gray: np.ndarray, entries: list, anchor: tuple,
 
 def export_one_image(job, rar, root, poi, cfg, out_dir,
                      export_raw: bool, export_overlay: bool,
-                     export_mask: bool = False, mask_thr: float = 0.0,
-                     cancel_cb=None):
+                     export_gray: bool = False, export_label: bool = False,
+                     score_thr: float = 0.0, cancel_cb=None):
     """Write the requested PNGs for ONE image and return its manifest row.
 
     ``job`` is ``(image_id, coarse|None, refined|None, path, exists)``; ``poi``
-    is ``[(spec, (r,g,b)), ...]``. One ROI walk per POI feeds both the overlay
-    (exterior rings) and the mask (hole-preserving geometry). Pure per-image work
-    with no shared state — identical whether run in-thread or across the process
-    pool — so the parallel output matches the old sequential output (§7)."""
+    is ``[(spec, (r,g,b), fg_glv), ...]`` (the colour strokes the overlay, the
+    ``fg_glv`` paints the grayscale; the POI's 1-based position is its label id).
+    One ROI walk per POI feeds the overlay (exterior rings) and the
+    grayscale/label (hole-preserving geometry, F15). Pure per-image work with no
+    shared state — identical whether run in-thread or across the process pool —
+    so the parallel output matches the sequential output (§7)."""
     image_id, coarse, refined, path, exists = job
     out_dir = Path(out_dir)
     c = cfg
     row = {
         "image_id": str(image_id), "raw_png": "", "overlay_png": "",
-        "mask_png": "",
+        "gray_png": "", "label_png": "",
         "fine_dx_nm": "" if refined is None else round(refined[0], 3),
         "fine_dy_nm": "" if refined is None else round(refined[1], 3),
         "score": "" if refined is None else round(refined[2], 6),
@@ -117,8 +119,9 @@ def export_one_image(job, rar, root, poi, cfg, out_dir,
         name = f"{base}_raw.png"
         cv2.imwrite(str(out_dir / name), sem)
         row["raw_png"] = name
-    # overlay and mask both consume one ROI walk per image.
-    if (export_overlay or export_mask) and coarse is not None and poi:
+    # overlay, grayscale and label all consume one ROI walk per image.
+    if (export_overlay or export_gray or export_label) and coarse is not None \
+            and poi:
         H, W = sem.shape[:2]
         nm_per_px = (c["nm_manual"] if (not c["nm_auto"] and
                      c["nm_manual"] > 0) else c["fov_w"] / max(1, W))
@@ -126,16 +129,20 @@ def export_one_image(job, rar, root, poi, cfg, out_dir,
             roi = (coarse[0] - c["fov_w"], coarse[1] - c["fov_h"],
                    coarse[0] + c["fov_w"], coarse[1] + c["fov_h"])
             entries = []
-            mask_geoms = []
-            for spec, color in poi:
+            geoms_fgs = []          # [(geom, fg_glv)]  → grayscale
+            geoms_ids = []          # [(geom, label_id)] → label map
+            for idx, (spec, color, fg_glv) in enumerate(poi):
                 # ``polys`` (exterior rings) stroke the overlay; ``geom`` keeps
-                # Boolean interior holes for the mask (F13).
+                # Boolean interior holes for the grayscale/label fill (F15).
                 polys, geom = fine_align.poi_polys_and_geometry_for_roi(
                     rar, root, roi, spec, cancel_cb=cancel_cb)
                 if polys:
                     entries.append((polys, color))
                 if geom is not None and not geom.is_empty:
-                    mask_geoms.append(geom)
+                    geoms_fgs.append((geom, fg_glv))
+                    # label id = POI's 1-based position, so it matches the
+                    # manifest ``label_map`` regardless of which layers are empty.
+                    geoms_ids.append((geom, idx + 1))
             anchor = (coarse if refined is None else
                       (coarse[0] + refined[0], coarse[1] + refined[1]))
             if export_overlay and entries:
@@ -144,20 +151,25 @@ def export_one_image(job, rar, root, poi, cfg, out_dir,
                 # overlay returns RGB; cv2 writes BGR → flip channels.
                 cv2.imwrite(str(out_dir / name), rgb[:, :, ::-1])
                 row["overlay_png"] = name
-            # F13 Q2: only write a mask for score >= threshold images. y_min is
-            # raised one pixel so make_mask(invert_y=True) lands on the same SEM
-            # pixels as overlay_outlines_on_sem / rasterize_layer.
-            if (export_mask and mask_geoms
-                    and fine_align.mask_should_export(refined, mask_thr)):
-                geom = gds_boolean.union_geometries(mask_geoms)
-                x_min_nm = anchor[0] - W / 2.0 * nm_per_px
-                y_min_nm = anchor[1] - (H / 2.0 - 1.0) * nm_per_px
-                mask = gds_boolean.make_mask(
-                    geom, width_px=W, height_px=H,
-                    x_min_nm=x_min_nm, y_min_nm=y_min_nm, nm_per_px=nm_per_px)
-                name = f"{base}_mask.png"
-                cv2.imwrite(str(out_dir / name), mask)
-                row["mask_png"] = name
+            # F15 (s: F13 Q2): only emit the grayscale / label for images whose
+            # fine-align score meets the threshold, so every exported artifact is
+            # trustworthy (MMH needs no fallback). Both are rasterised from the
+            # same per-layer geometry (fine_align shares the make_mask raster +
+            # FOV corner) so they line up pixel-for-pixel.
+            gate = fine_align.mask_should_export(refined, score_thr)
+            if export_gray and geoms_fgs and gate:
+                img = fine_align.render_grayscale_from_geoms(
+                    geoms_fgs, anchor, W, H, nm_per_px,
+                    c.get("bg_glv", 80), c.get("blur_sigma_px", 1.0))
+                name = f"{base}_gray.png"
+                cv2.imwrite(str(out_dir / name), img)
+                row["gray_png"] = name
+            if export_label and geoms_ids and gate:
+                lbl = fine_align.render_label_image(
+                    geoms_ids, anchor, W, H, nm_per_px)
+                name = f"{base}_label.png"
+                cv2.imwrite(str(out_dir / name), lbl)
+                row["label_png"] = name
     return row
 
 
@@ -172,8 +184,8 @@ _GE: dict = {}
 
 
 def _export_pool_init(path, wanted_layers, dtype, bbox_layer, root, poi, cfg,
-                      out_dir, export_raw, export_overlay, export_mask,
-                      mask_thr):
+                      out_dir, export_raw, export_overlay, export_gray,
+                      export_label, score_thr):
     """ProcessPoolExecutor initializer: build the per-process reader + cache the
     immutable export context. Runs once in each worker process."""
     if cv2 is not None:
@@ -189,8 +201,9 @@ def _export_pool_init(path, wanted_layers, dtype, bbox_layer, root, poi, cfg,
     _GE["out_dir"] = out_dir
     _GE["raw"] = export_raw
     _GE["overlay"] = export_overlay
-    _GE["mask"] = export_mask
-    _GE["thr"] = mask_thr
+    _GE["gray"] = export_gray
+    _GE["label"] = export_label
+    _GE["thr"] = score_thr
 
 
 def _export_pool_task(job):
@@ -199,4 +212,4 @@ def _export_pool_task(job):
     futures, so the task itself never checks a flag."""
     return export_one_image(
         job, _GE["rar"], _GE["root"], _GE["poi"], _GE["cfg"], _GE["out_dir"],
-        _GE["raw"], _GE["overlay"], _GE["mask"], _GE["thr"])
+        _GE["raw"], _GE["overlay"], _GE["gray"], _GE["label"], _GE["thr"])

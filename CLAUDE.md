@@ -133,10 +133,13 @@ sem_loader 載 KLARF（die-corner XREL/YREL）→ gds_fov.klarf_to_gds 換算 �
 → oasis_random ROI walk 載入該處 geometry → SemViewer 半透明 overlay
 → 手動拖動（Set Offset δ）或 FineAlignPanel cv2.matchTemplate 自動 refine
 → 匯出 per-image offset CSV/JSON（schema mmh-gds-alignment-v1，image_id join key）
+  + 影像匯出：模擬 GLV 灰階圖 `<id>_gray.png` + ROI label map `<id>_label.png`（F15，
+  同一組 per-layer 幾何 rasterize、gray 套 blur / label 不 blur、像素網格一致，下游
+  `gray[label==id]` 取 ROI；取代 F13 binary mask；manifest schema mmh-gds-overlay-v2 帶 label_map）
 ```
 
-**並行模型（F8/F14）：** batch fine-align（`FineAlignAllWorker`）與 image/mask 匯出
-（`OverlayExportWorker`）的 per-image 工作都是獨立的，跑在 spawn-based `ProcessPoolExecutor`
+**並行模型（F8/F14）：** batch fine-align（`FineAlignAllWorker`）與 image 匯出
+（`OverlayExportWorker`，含 raw/overlay/gray/label）的 per-image 工作都是獨立的，跑在 spawn-based `ProcessPoolExecutor`
 （compute 抽到 Qt-free 的 `fine_align` / `overlay_export`，worker 各自重建 reader）。worker 數
 由 `fine_align.batch_worker_count`（UI「Parallel workers」override；0=auto=每核一個 cap 16）決定，
 worker 內 `cv2.setNumThreads(1)` 避免「多進程 × cv2 多執行緒」oversubscription。小批 / raw-only
@@ -186,8 +189,7 @@ HMI 風格表達式 → 遞迴下降 parser → AST → shapely 運算。運算�
 
 ### 進行中 (In Progress)
 
-- [F15] 模擬 GLV 灰階圖 + label ROI 匯出（**取代** F13 binary mask）— plan 待核准，
-  詳見 `docs/plans/F15-glv-grayscale-roi-export.md`。
+- （目前無）
 
 ### 待辦 (Backlog)
 

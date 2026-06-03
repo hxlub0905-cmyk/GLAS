@@ -17,7 +17,14 @@ alignment offset 供下游量測工具使用。
   輸出 shapely polygon + uint8 mask。
 - **SEM↔GDS overlay 對位**：手動拖動（Set Offset δ）+ `cv2.matchTemplate` 自動 fine-align。
 - **匯出**：per-image alignment offset（CSV / JSON，schema `mmh-gds-alignment-v1`，`image_id` join key）。
-- **批次加速**：Run all 與 image/mask 匯出皆多進程平行（spawn process pool）。Fine Align 面板
+  影像匯出（給下游 MMH 區域量測）可勾 **模擬 GLV 灰階圖**（`<id>_gray.png`，各 POI 層以
+  其 FG 灰階畫在背景灰階、含 blur 的 SEM-like 工作底圖）與 **ROI label map**（`<id>_label.png`，
+  uint8：0=背景、1..N=第 N 個 POI 層、無 blur 邊界精確）；兩張由同一組 per-layer 幾何
+  rasterize、像素網格一致，MMH 端 `gray[label == id]` 單次 boolean index 即取得該層 ROI。
+  manifest（`overlay_manifest.json`，schema `mmh-gds-overlay-v2`）含 `gray_png`/`label_png`
+  欄與 `label_map`（id → 層名 + fg_glv）。兩者皆以 fine-align score 門檻把關，只輸出對齊達標
+  的影像（下游免 fallback）。
+- **批次加速**：Run all 與 image 匯出皆多進程平行（spawn process pool）。Fine Align 面板
   「Parallel workers」可調並行度（0 = auto，每核一個、cap 16）；大量影像時明顯縮短時間。
 - **OASIS 匯出**（開發者模式）：把選定的 raw layer + Boolean 合成 layer 反向寫出成 `.oas`（自寫
   writer、不依賴 klayout / gdstk，KLayout 可開）。匯出範圍可選 **目前 FOV**（可再以 GDS 座標框裁剪

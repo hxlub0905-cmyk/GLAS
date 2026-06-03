@@ -1,6 +1,6 @@
 # [F15] 模擬 GLV 灰階圖 + label ROI 匯出（下游 MMH 區域量測底圖）
 
-> **狀態：** planned
+> **狀態：** done (2026-06-03)
 > **§8 ID：** [F15]
 > **建立：** 2026-06-03
 > **負責 branch：** claude/optimistic-pasteur-31ELv
@@ -72,47 +72,47 @@ blur 保證 `label==id` 是精確 ROI。（與 matchTemplate 當下用 exterior-
 
 ## Milestones
 
-### M1: core — render_label_image + per-layer 共用 raster  [status: planned]
+### M1: core — render_label_image + per-layer 共用 raster  [status: done]
 
-- [ ] `fine_align.render_label_image(poi_layers_ids, anchor, W, H, nm_per_px)`：
+- [x] `fine_align.render_label_image(poi_layers_ids, anchor, W, H, nm_per_px)`：
       `poi_layers_ids` = `[(geom_or_polys, label_id), ...]`，bg=0、無 blur，後層覆前層，
       回 uint8 ndarray。複用 `rasterize_layer` + `_fit_mask`（或 `make_mask` per layer）。
-- [ ] 抽出/確認 gray 與 label 共用「per-layer geom→mask」的 raster 路徑，確保兩張同網格。
-- [ ] 驗證：`tests/test_export_perf.py` 加 label 決定論 / id 指派 / 後層覆蓋 / 無 blur
+- [x] 抽出/確認 gray 與 label 共用「per-layer geom→mask」的 raster 路徑，確保兩張同網格。
+- [x] 驗證：`tests/test_export_perf.py` 加 label 決定論 / id 指派 / 後層覆蓋 / 無 blur
       （邊界只有 0 與 id、無中間值）/ hole 保留 測試；模組仍 Qt-free。
 
-### M2: overlay_export — export_one_image 加 gray / label 輸出  [status: planned]
+### M2: overlay_export — export_one_image 加 gray / label 輸出  [status: done]
 
-- [ ] poi 入參擴成帶 fg_glv（`[(spec, color, fg_glv), ...]`；label id = enumerate+1）；
+- [x] poi 入參擴成帶 fg_glv（`[(spec, color, fg_glv), ...]`；label id = enumerate+1）；
       cfg 加 `bg_glv` / `blur_sigma_px`。
-- [ ] `export_one_image(...)` 新增 `export_gray` / `export_label` 旗標：用既有那次 ROI
+- [x] `export_one_image(...)` 新增 `export_gray` / `export_label` 旗標：用既有那次 ROI
       walk 拿到的 per-layer `geom`，產 `<id>_gray.png`（fg_glv+blur）與 `<id>_label.png`
       （id、no blur），anchor/nm_per_px 對齊既有 mask 路徑（含 y_min 1-px 慣例）。
-- [ ] gating 沿用 `fine_align.mask_should_export(refined, thr)`。
-- [ ] manifest row 加 `gray_png` / `label_png`；`OVERLAY_MANIFEST_COLS` 同步擴欄。
-- [ ] `_export_pool_init` / `_export_pool_task` initargs 帶上新旗標。
-- [ ] 驗證：export_one_image 在 raw-only / 有 POI / 未達門檻 各情境的寫檔正確；純函式決定論。
+- [x] gating 沿用 `fine_align.mask_should_export(refined, thr)`。
+- [x] manifest row 加 `gray_png` / `label_png`；`OVERLAY_MANIFEST_COLS` 同步擴欄。
+- [x] `_export_pool_init` / `_export_pool_task` initargs 帶上新旗標。
+- [x] 驗證：export_one_image 在 raw-only / 有 POI / 未達門檻 各情境的寫檔正確；純函式決定論。
 
-### M3: app UI + manifest label_map + worker 串接  [status: planned]
+### M3: app UI + manifest label_map + worker 串接  [status: done]
 
-- [ ] `AlignmentExportDialog`：**移除**「Export GDS mask」checkbox，改為
+- [x] `AlignmentExportDialog`：**移除**「Export GDS mask」checkbox，改為
       「Export simulated GLV grayscale (.png)」與「Export ROI label map (.png)」兩
       checkbox，沿用同一 score-threshold 區塊（threshold/count 標籤改綁 gray/label）；
       `selected()` 回 `(fmt, ids, export_raw, export_overlay, export_gray, export_label,
       score_threshold)`（mask 欄移除）。
-- [ ] `OverlayExportWorker` 建構子以 `export_gray` / `export_label` 取代 `export_mask`；
+- [x] `OverlayExportWorker` 建構子以 `export_gray` / `export_label` 取代 `export_mask`；
       `_write_manifest` 在 JSON 加 `label_map = [{id, layer, fg_glv}, ...]`（schema bump）。
-- [ ] `_export_overlay_images`：建 `[(spec, color, fg_glv)]` poi 清單、cfg 補 `bg_glv`/
+- [x] `_export_overlay_images`：建 `[(spec, color, fg_glv)]` poi 清單、cfg 補 `bg_glv`/
       `blur_sigma_px`、組 `label_map`（由 `_poi_entries` 層名 + `poi_fgs()`），透傳 worker。
-- [ ] 更新呼叫 `selected()` 的 m5 測試（已用 `*_` 解包，確認相容）。
-- [ ] 驗證：`pytest tests/test_export_perf.py tests/test_gds_align_m5.py -v`；
+- [x] 更新呼叫 `selected()` 的 m5 測試（已用 `*_` 解包，確認相容）。
+- [x] 驗證：`pytest tests/test_export_perf.py tests/test_gds_align_m5.py -v`；
       `py_compile`；（user 端實機：勾兩框匯出 → 檢查 gray/label/ manifest）。
 
-### M4: 文件  [status: planned]
+### M4: 文件  [status: done]
 
-- [ ] README 匯出章節補 gray + label 輸出與 MMH 讀法（`gray[label==id]`）。
-- [ ] CLAUDE.md §5.2 對位流程末段補一句新輸出；§8 完成後移除 [F15]。
-- [ ] 本 plan 各 checkbox 勾完、SESSION_LOG 補條目。
+- [x] README 匯出章節補 gray + label 輸出與 MMH 讀法（`gray[label==id]`）。
+- [x] CLAUDE.md §5.2 對位流程末段補一句新輸出；§8 完成後移除 [F15]。
+- [x] 本 plan 各 checkbox 勾完、SESSION_LOG 補條目。
 
 ---
 
@@ -140,13 +140,13 @@ blur 保證 `label==id` 是精確 ROI。（與 matchTemplate 當下用 exterior-
 
 ## 驗證方式
 
-- [ ] 所有 milestone checkbox 已勾
-- [ ] `pytest tests/test_export_perf.py tests/test_gds_align_m5.py -v` 通過
-- [ ] `python3 -m py_compile` 三個改動的 core/app 檔
-- [ ] 手動：開 OASIS(ROI)+選 POI+batch fine-align → export dialog 勾 gray+label →
-      檢查每張達標影像有 `<id>_gray.png`/`<id>_label.png`、manifest 有欄與 label_map、
-      `gray[label==1]` 圈到該層
-- [ ] `SESSION_LOG.md` 有對應紀錄
+- [x] 所有 milestone checkbox 已勾
+- [x] `pytest tests/test_export_perf.py tests/test_gds_align_m5.py -v` 通過
+- [x] `python3 -m py_compile` 三個改動的 core/app 檔
+- [ ] 手動（待 user 實機）：開 OASIS(ROI)+選 POI+batch fine-align → export dialog
+      勾 gray+label → 檢查每張達標影像有 `<id>_gray.png`/`<id>_label.png`、manifest 有欄
+      與 label_map、`gray[label==1]` 圈到該層
+- [x] `SESSION_LOG.md` 有對應紀錄
 
 ---
 

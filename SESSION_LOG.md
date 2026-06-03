@@ -4,24 +4,43 @@
 
 ---
 
-## [2026-06-03] [F15] 模擬 GLV 灰階 + label ROI 匯出（規劃中）
+## [2026-06-03] 完成 [F15] 模擬 GLV 灰階 + label ROI 匯出（取代 F13 binary mask）
 
-**變更類型：** 規劃（plan 檔 + 任務註冊，尚未動程式碼）·  **狀態：plan 待 user 核准開工**
+**變更類型：** 功能（core 2 函式 + export pipeline + app dialog/worker）+ 測試 + 文件 ·
+**狀態：實作完成、sandbox pytest 全綠，待 user 本地驗收**
 
 **動機：** user 釐清下游 MMH 真正要的不是 F13 的 binary mask，而是 (1) 一張「已對齊」的
 **模擬 GLV 灰階圖**（像 fine-align template）當量測底圖、(2) **ROI 資訊**。問「ROI 怎麼讀
 最快」→ 決定用 **整數 label 圖**（單次 imread + `gray[label==id]` boolean index，零
 rasterize/JSON/閾值）。user 進一步決定 **gray+label 直接取代 mask（拿掉 mask 選項）**。
 
-**規劃內容：** 探索確認 GLV 灰階模擬已存在（`fine_align.render_composite_template`）、
-`make_mask`、`export_one_image`（F14 process pool）可大量複用。產 plan
-`docs/plans/F15-glv-grayscale-roi-export.md`（M1 core `render_label_image` / M2
-`export_one_image` 加 gray+label / M3 dialog+worker 移除 mask 改 gray+label + manifest
-`label_map` / M4 文件）。gray 與 label 共用同組 per-layer hole-preserving geom（gray 套
-blur、label 不 blur），沿用 F13 score-threshold 把關。
+**實作：**
+- **M1 core**：`fine_align.render_label_image`（per-layer geom→`make_mask`→paint 整數 id、
+  bg=0、無 blur、後層覆前層）+ `render_grayscale_from_geoms`（同組 geom→paint fg_glv + 一次
+  blur，hole-preserving 版的 `render_composite_template`）；共用 `_fov_min_corner`（沿用 F13
+  mask 的 y_min 1-px raise，§7）→ gray/label 像素網格一致。`OVERLAY_MANIFEST_COLS` 的
+  `mask_png` 換成 `gray_png`/`label_png`。
+- **M2 `overlay_export`**：`export_one_image` 以 `export_gray`/`export_label`/`score_thr`
+  取代 `export_mask`/`mask_thr`；poi 入參擴成 `[(spec, color, fg_glv)]`，label id = POI 位置；
+  那次 ROI walk 的 per-layer `geom` 同時餵 gray/label；cfg 取 `bg_glv`/`blur_sigma_px`。
+  pool init/task 同步。移除已不用的 `gds_boolean` import。
+- **M3 app**：`AlignmentExportDialog` 移除「Export GDS mask」改兩 checkbox（grayscale /
+  label map），共用 score-threshold 區塊；`selected()` 回 7-tuple。`OverlayExportWorker`
+  建構子改 `export_gray`/`export_label`/`score_threshold`/`label_map`；manifest schema
+  bump `mmh-gds-overlay-v1`→`v2` 並加 `label_map`（id→層名+fg_glv）。`_export_overlay_images`
+  /`_poi_specs_colored`(+fg)/`_export_label_map` 串接。
+- **M4 文件**：README 匯出章節、CLAUDE §5.2 + §8、plan 檔、本 log。
 
-**測試：** 尚未動程式碼。**影響檔案（本次）：** `docs/plans/F15-glv-grayscale-roi-export.md`
-（新增）、`CLAUDE.md` §8、`SESSION_LOG.md`。 **Branch：** `claude/optimistic-pasteur-31ELv`
+**測試：** sandbox 裝 numpy/cv2/shapely/PyQt6 後 `pytest tests/` **560 passed**（含新
+`render_label_image`/`render_grayscale_from_geoms` 決定論 + holes + gray↔label 邊界一致；
+F13 mask 測試改寫成 gray/label；F5 schema v2；m5 dialog 7-tuple）。`py_compile` 全過。
+**手動 GUI 端到端待 user 本地。**
+
+**影響檔案：** `glas/core/fine_align.py`、`glas/core/overlay_export.py`、
+`glas/app/gds_align_tool.py`、`tests/test_export_perf.py`、`tests/test_gds_align_f13.py`、
+`tests/test_gds_align_f5.py`、`README.md`、`CLAUDE.md`、
+`docs/plans/F15-glv-grayscale-roi-export.md`、`SESSION_LOG.md`。
+**Branch：** `claude/optimistic-pasteur-31ELv`
 
 ---
 

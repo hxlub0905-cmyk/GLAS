@@ -1372,20 +1372,24 @@ class OverlayExportWorker(QObject):
 
     def __init__(self, rar, root, poi_specs_colored, jobs, cfg, out_dir,
                  export_raw: bool, export_overlay: bool,
-                 export_mask: bool = False,
-                 mask_score_threshold: float = 0.0) -> None:
+                 export_gray: bool = False, export_label: bool = False,
+                 score_threshold: float = 0.0, label_map=None) -> None:
         super().__init__()
         self._rar = rar
         self._root = root
-        self._poi = list(poi_specs_colored)   # [(spec, (r,g,b)), ...]
+        self._poi = list(poi_specs_colored)   # [(spec, (r,g,b), fg_glv), ...]
         self._jobs = jobs    # [(image_id, coarse|None, refined|None, path, exists)]
         self._cfg = cfg
         self._out_dir = Path(out_dir)
         self._export_raw = export_raw
         self._export_overlay = export_overlay
-        # F13: per-image GDS mask (uint8 PNG) export, gated by score threshold.
-        self._export_mask = export_mask
-        self._mask_thr = mask_score_threshold
+        # F15 (replaces F13's mask): per-image simulated-GLV grayscale + integer
+        # ROI label map, gated by score threshold; ``label_map`` describes the
+        # label ids for the manifest.
+        self._export_gray = export_gray
+        self._export_label = export_label
+        self._score_thr = score_threshold
+        self._label_map = list(label_map or [])
         self._cancel = threading.Event()
 
     def cancel(self) -> None:
@@ -1404,7 +1408,8 @@ class OverlayExportWorker(QObject):
             # processes are what actually speed it up. Tiny batches, a single
             # worker, or a raw-only run (no reader to rebuild) stay in-thread.
             if (n <= 2 or workers <= 1 or self._rar is None
-                    or not (self._export_overlay or self._export_mask)):
+                    or not (self._export_overlay or self._export_gray
+                            or self._export_label)):
                 rows = self._run_in_thread()
             else:
                 rows = self._run_process_pool(workers)
@@ -1431,7 +1436,7 @@ class OverlayExportWorker(QObject):
                 row = overlay_export.export_one_image(
                     job, self._rar, self._root, self._poi, self._cfg,
                     self._out_dir, self._export_raw, self._export_overlay,
-                    self._export_mask, self._mask_thr,
+                    self._export_gray, self._export_label, self._score_thr,
                     cancel_cb=self._cancel.is_set)
             except oasis_random.WalkCancelled:
                 return None
@@ -1452,7 +1457,7 @@ class OverlayExportWorker(QObject):
         initargs = (str(rar._path), rar._init_wanted, rar._dtype,
                     rar._bbox_layer, self._root, self._poi, self._cfg,
                     str(self._out_dir), self._export_raw, self._export_overlay,
-                    self._export_mask, self._mask_thr)
+                    self._export_gray, self._export_label, self._score_thr)
         ctx = mp.get_context("spawn")
         ex = ProcessPoolExecutor(max_workers=workers, mp_context=ctx,
                                  initializer=overlay_export._export_pool_init,
@@ -1489,9 +1494,14 @@ class OverlayExportWorker(QObject):
             for r in rows:
                 w.writerow({k: r.get(k, "") for k in self._COLS})
         json_path = self._out_dir / "overlay_manifest.json"
+        manifest = {"schema": "mmh-gds-overlay-v2", "columns": self._COLS,
+                    "images": rows}
+        # F15: id → POI layer map so downstream can turn label_png pixels back
+        # into named layers (read a region with gray[label == id]).
+        if self._label_map:
+            manifest["label_map"] = self._label_map
         with open(json_path, "w") as f:
-            json.dump({"schema": "mmh-gds-overlay-v1", "columns": self._COLS,
-                       "images": rows}, f, indent=2)
+            json.dump(manifest, f, indent=2)
         return str(csv_path)
 
 
@@ -4685,7 +4695,7 @@ class AlignmentExportDialog(QDialog):
             item.setCheckState(Qt.CheckState.Checked)
             item.setData(Qt.ItemDataRole.UserRole, img.image_id)
             self._list.addItem(item)
-        self._list.itemChanged.connect(lambda _it: self._update_mask_count())
+        self._list.itemChanged.connect(lambda _it: self._update_thr_count())
         v.addWidget(self._list, 1)
 
         row = QHBoxLayout()
@@ -4709,33 +4719,46 @@ class AlignmentExportDialog(QDialog):
         ibl.addWidget(self._exp_raw)
         ibl.addWidget(self._exp_overlay)
 
-        # F13: per-image GDS mask (uint8 PNG) export, gated by score threshold so
-        # MMH can trust every emitted mask without fallback logic.
-        self._exp_mask = QCheckBox("Export GDS mask (.png)", img_box)
-        self._exp_mask.setToolTip(
-            "Write a per-image uint8 mask (POI Boolean geometry rasterised at "
-            "the aligned anchor). Only images with a fine-align score at or "
-            "above the threshold below are written.")
-        ibl.addWidget(self._exp_mask)
+        # F15 (replaces F13's binary mask): a simulated-GLV grayscale working
+        # image + an integer ROI label map, both gated by the score threshold so
+        # MMH can trust every emitted artifact without fallback logic.
+        self._exp_gray = QCheckBox(
+            "Export simulated GLV grayscale (.png)", img_box)
+        self._exp_gray.setToolTip(
+            "Write a per-image SEM-like grayscale: each POI layer painted at its "
+            "FG grey on the background grey at the aligned anchor (the downstream "
+            "measurement image). Only images with a fine-align score at or above "
+            "the threshold below are written.")
+        self._exp_label = QCheckBox("Export ROI label map (.png)", img_box)
+        self._exp_label.setToolTip(
+            "Write a per-image uint8 label map: 0 = background, 1..N = the Nth "
+            "POI layer (no blur, crisp ROI). Downstream reads a region with a "
+            "single `gray[label == id]` boolean index. Same score gate as above.")
+        ibl.addWidget(self._exp_gray)
+        ibl.addWidget(self._exp_label)
         thr_row = QHBoxLayout()
         thr_row.addWidget(QLabel("Score threshold", img_box))
-        self._mask_thr = QDoubleSpinBox(img_box)
-        self._mask_thr.setRange(0.0, 1.0)
-        self._mask_thr.setSingleStep(0.05)
-        self._mask_thr.setDecimals(2)
-        self._mask_thr.setValue(0.8)
-        self._mask_thr.valueChanged.connect(lambda _v: self._update_mask_count())
-        thr_row.addWidget(self._mask_thr)
+        self._score_thr = QDoubleSpinBox(img_box)
+        self._score_thr.setRange(0.0, 1.0)
+        self._score_thr.setSingleStep(0.05)
+        self._score_thr.setDecimals(2)
+        self._score_thr.setValue(0.8)
+        self._score_thr.valueChanged.connect(lambda _v: self._update_thr_count())
+        thr_row.addWidget(self._score_thr)
         thr_row.addStretch(1)
         ibl.addLayout(thr_row)
-        self._mask_count = QLabel("", img_box)
-        self._mask_count.setStyleSheet(_hint_qss(_FS_CAPTION))
-        ibl.addWidget(self._mask_count)
-        # Threshold + count only matter when mask export is on.
-        self._exp_mask.toggled.connect(self._mask_thr.setEnabled)
-        self._exp_mask.toggled.connect(lambda _on: self._update_mask_count())
-        self._mask_thr.setEnabled(False)
-        self._update_mask_count()
+        self._thr_count = QLabel("", img_box)
+        self._thr_count.setStyleSheet(_hint_qss(_FS_CAPTION))
+        ibl.addWidget(self._thr_count)
+        # Threshold + count only matter when grayscale/label export is on.
+        def _thr_enabled(_on=None):
+            on = self._exp_gray.isChecked() or self._exp_label.isChecked()
+            self._score_thr.setEnabled(on)
+            self._update_thr_count()
+        self._exp_gray.toggled.connect(_thr_enabled)
+        self._exp_label.toggled.connect(_thr_enabled)
+        self._score_thr.setEnabled(False)
+        self._update_thr_count()
         v.addWidget(img_box)
 
         bb = QDialogButtonBox(
@@ -4755,24 +4778,24 @@ class AlignmentExportDialog(QDialog):
                 for i in range(self._list.count())
                 if self._list.item(i).checkState() == Qt.CheckState.Checked]
 
-    def _update_mask_count(self) -> None:
-        """Show how many of the checked images would get a mask at the current
-        threshold (F13: score >= threshold among the selected images)."""
-        if not self._exp_mask.isChecked():
-            self._mask_count.setText("")
+    def _update_thr_count(self) -> None:
+        """Show how many of the checked images would get a grayscale/label at the
+        current threshold (F15: score >= threshold among the selected images)."""
+        if not (self._exp_gray.isChecked() or self._exp_label.isChecked()):
+            self._thr_count.setText("")
             return
-        thr = float(self._mask_thr.value())
+        thr = float(self._score_thr.value())
         n = sum(1 for iid in self._checked_ids()
                 if fine_align.mask_should_export(self._refined.get(iid), thr))
-        self._mask_count.setText(f"{n} image(s) ≥ threshold will get a mask")
+        self._thr_count.setText(f"{n} image(s) ≥ threshold will be written")
 
     def selected(self) -> tuple:
-        """``(fmt, [image_id, ...], export_raw, export_overlay, export_mask,
-        mask_score_threshold)`` where ``fmt`` is 'csv' or 'json'."""
+        """``(fmt, [image_id, ...], export_raw, export_overlay, export_gray,
+        export_label, score_threshold)`` where ``fmt`` is 'csv' or 'json'."""
         fmt = "csv" if self._fmt.currentIndex() == 0 else "json"
         return (fmt, self._checked_ids(), self._exp_raw.isChecked(),
-                self._exp_overlay.isChecked(), self._exp_mask.isChecked(),
-                float(self._mask_thr.value()))
+                self._exp_overlay.isChecked(), self._exp_gray.isChecked(),
+                self._exp_label.isChecked(), float(self._score_thr.value()))
 
 
 # ── Main window ──────────────────────────────────────────────────────────────
@@ -5998,7 +6021,8 @@ class MainWindow(QMainWindow):
         dlg = AlignmentExportDialog(self, self._sem_images, self._refined)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        fmt, ids, exp_raw, exp_overlay, exp_mask, mask_thr = dlg.selected()
+        fmt, ids, exp_raw, exp_overlay, exp_gray, exp_label, score_thr = \
+            dlg.selected()
         if not ids:
             self._status_doc.setText("export: no images selected")
             return
@@ -6027,25 +6051,45 @@ class MainWindow(QMainWindow):
             return
         self._status_doc.setText(
             f"exported {len(rows)} image(s) → {Path(path).name}")
-        if exp_raw or exp_overlay or exp_mask:
+        if exp_raw or exp_overlay or exp_gray or exp_label:
             self._export_overlay_images(images, exp_raw, exp_overlay,
-                                        exp_mask, mask_thr)
+                                        exp_gray, exp_label, score_thr)
 
     # ── F5 M6: SEM + aligned-overlay PNG export ──────────────────────────────
     def _poi_specs_colored(self) -> list:
-        """``[(spec, (r, g, b)), ...]`` for the active POI layers, for overlay
-        export — the spec walks the ROI, the colour strokes the outline."""
+        """``[(spec, (r, g, b), fg_glv), ...]`` for the active POI layers, for
+        image export — the spec walks the ROI, the colour strokes the overlay
+        outline, the ``fg_glv`` paints the simulated-GLV grayscale (F15). The
+        POI's position here is its label id (1-based) in the ROI label map."""
+        fgs = self.sem_panel.fine_align.poi_fgs()
         out = []
         for e in self._poi_entries:
             spec = self._entry_spec(e)
             if spec is not None:
-                out.append((spec, (e.color.red(), e.color.green(),
-                                   e.color.blue())))
+                out.append((spec,
+                            (e.color.red(), e.color.green(), e.color.blue()),
+                            fgs.get(e.key.key(), 200)))
+        return out
+
+    def _export_label_map(self) -> list:
+        """``[{"id", "layer", "fg_glv"}, ...]`` describing each POI layer's label
+        id (F15) for the export manifest, in the same order / filter as
+        :meth:`_poi_specs_colored` so ``label == id`` round-trips to a layer."""
+        fgs = self.sem_panel.fine_align.poi_fgs()
+        out = []
+        idx = 0
+        for e in self._poi_entries:
+            if self._entry_spec(e) is None:
+                continue
+            idx += 1
+            out.append({"id": idx, "layer": _entry_label(e),
+                        "fg_glv": int(fgs.get(e.key.key(), 200))})
         return out
 
     def _export_overlay_images(self, images, exp_raw: bool,
-                               exp_overlay: bool, exp_mask: bool = False,
-                               mask_thr: float = 0.0) -> None:
+                               exp_overlay: bool, exp_gray: bool = False,
+                               exp_label: bool = False,
+                               score_thr: float = 0.0) -> None:
         if cv2 is None:
             QMessageBox.warning(self, "Image export",
                                 "opencv (cv2) is required for image export.")
@@ -6053,15 +6097,16 @@ class MainWindow(QMainWindow):
         if self._ov_thread is not None:
             return
         specs = self._poi_specs_colored()
-        # Both overlay and mask need an OASIS ROI + a POI layer to walk geometry.
-        if (exp_overlay or exp_mask) and (not specs or self._rar is None
-                                          or self._roi_root is None):
+        # Overlay / grayscale / label all need an OASIS ROI + a POI layer.
+        if (exp_overlay or exp_gray or exp_label) and (
+                not specs or self._rar is None or self._roi_root is None):
             QMessageBox.information(
                 self, "Overlay export",
-                "Overlay / mask PNGs need an OASIS (ROI) open and ≥1 POI layer; "
-                "exporting raw images / manifest only.")
+                "Overlay / grayscale / label PNGs need an OASIS (ROI) open and "
+                "≥1 POI layer; exporting raw images / manifest only.")
             exp_overlay = False
-            exp_mask = False
+            exp_gray = False
+            exp_label = False
         out_dir = QFileDialog.getExistingDirectory(self, "Export images to…")
         if not out_dir:
             return
@@ -6069,16 +6114,20 @@ class MainWindow(QMainWindow):
                  self._refined.get(im.image_id),
                  str(im.file_path) if im.file_path else "", bool(im.exists))
                 for im in images]
+        fa = self.sem_panel.fine_align.values()
         cfg = {"fov_w": self._fov_w, "fov_h": self._fov_h,
                "nm_auto": self._nm_auto, "nm_manual": self._nm_per_px_manual,
+               # F15: grayscale rendering greys / blur (same as the template).
+               "bg_glv": fa["bg_glv"], "blur_sigma_px": fa["blur_sigma_px"],
                # F14: parallel export worker count (0 = auto).
-               "max_workers": self.sem_panel.fine_align.values()["max_workers"]}
+               "max_workers": fa["max_workers"]}
+        label_map = self._export_label_map() if exp_label else []
         self._ov_progress = LoadProgressDialog(self)
         self._ov_progress.set_text("Exporting images…")
         self._ov_thread = QThread(self)
         self._ov_worker = OverlayExportWorker(
             self._rar, self._roi_root, specs, jobs, cfg, out_dir,
-            exp_raw, exp_overlay, exp_mask, mask_thr)
+            exp_raw, exp_overlay, exp_gray, exp_label, score_thr, label_map)
         self._ov_worker.moveToThread(self._ov_thread)
         self._ov_thread.started.connect(self._ov_worker.run)
         self._ov_worker.progress.connect(self._on_ov_progress)

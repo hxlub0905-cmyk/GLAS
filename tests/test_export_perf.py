@@ -57,14 +57,15 @@ def test_export_one_image_raw_only(tmp_path):
     job = ("img1", None, None, str(src), True)
     row = overlay_export.export_one_image(
         job, None, None, [], _CFG, str(tmp_path),
-        export_raw=True, export_overlay=False, export_mask=False)
+        export_raw=True, export_overlay=False)
     assert row["raw_png"] == "img1_raw.png"
     assert (tmp_path / "img1_raw.png").exists()
-    assert row["overlay_png"] == "" and row["mask_png"] == ""
+    assert row["overlay_png"] == "" and row["gray_png"] == ""
+    assert row["label_png"] == ""
     # Pure function → identical row on a second call (parallel == sequential).
     row2 = overlay_export.export_one_image(
         job, None, None, [], _CFG, str(tmp_path),
-        export_raw=True, export_overlay=False, export_mask=False)
+        export_raw=True, export_overlay=False)
     assert row2 == row
 
 
@@ -73,13 +74,13 @@ def test_export_one_image_missing_file(tmp_path):
     job = ("ghost", (0.0, 0.0), None, str(tmp_path / "nope.png"), False)
     row = overlay_export.export_one_image(
         job, None, None, [], _CFG, str(tmp_path),
-        export_raw=True, export_overlay=False, export_mask=False)
+        export_raw=True, export_overlay=False)
     assert row["status"] == "missing-file"
     assert not list(tmp_path.glob("*.png"))
 
 
-def test_export_one_image_no_poi_no_mask(tmp_path):
-    # export_mask requested but no POI specs → no walk, no mask, no crash.
+def test_export_one_image_no_poi_no_gray_label(tmp_path):
+    # gray/label requested but no POI specs → no walk, nothing written, no crash.
     cv2 = pytest.importorskip("cv2")
     import numpy as np
     src = tmp_path / "img2.png"
@@ -87,10 +88,74 @@ def test_export_one_image_no_poi_no_mask(tmp_path):
     job = ("img2", (1000.0, 2000.0), (0.0, 0.0, 0.9), str(src), True)
     row = overlay_export.export_one_image(
         job, None, None, [], _CFG, str(tmp_path),
-        export_raw=False, export_overlay=True, export_mask=True,
-        mask_thr=0.8)
-    assert row["mask_png"] == "" and row["overlay_png"] == ""
-    assert not list(tmp_path.glob("*_mask.png"))
+        export_raw=False, export_overlay=True, export_gray=True,
+        export_label=True, score_thr=0.8)
+    assert row["gray_png"] == "" and row["label_png"] == ""
+    assert row["overlay_png"] == ""
+    assert not list(tmp_path.glob("*_gray.png"))
+    assert not list(tmp_path.glob("*_label.png"))
+
+
+# ── F15: simulated-GLV grayscale + integer ROI label map renderers ───────────
+def _square(cx, cy, half):
+    from shapely.geometry import Polygon
+    return Polygon([(cx - half, cy - half), (cx + half, cy - half),
+                    (cx + half, cy + half), (cx - half, cy + half)])
+
+
+def test_render_label_image_ids_and_background():
+    pytest.importorskip("shapely")
+    pytest.importorskip("cv2")
+    import numpy as np
+    W = H = 64
+    nm = 2.0
+    anchor = (1000.0, 2000.0)
+    geom = _square(*anchor, 30.0)            # ~30 px half-width square at centre
+    lbl = fine_align.render_label_image([(geom, 5)], anchor, W, H, nm)
+    assert lbl.dtype == np.uint8 and lbl.shape == (H, W)
+    # No blur → only background (0) and the layer id appear (crisp ROI).
+    assert set(np.unique(lbl).tolist()) <= {0, 5}
+    assert lbl[H // 2, W // 2] == 5          # FOV centre is the layer
+    assert lbl[0, 0] == 0                    # corner is background
+    # Deterministic.
+    assert np.array_equal(
+        lbl, fine_align.render_label_image([(geom, 5)], anchor, W, H, nm))
+
+
+def test_render_label_image_later_layer_wins_and_keeps_holes():
+    pytest.importorskip("shapely")
+    pytest.importorskip("cv2")
+    import numpy as np
+    from shapely.geometry import Polygon
+    W = H = 80
+    nm = 1.0
+    anchor = (0.0, 0.0)
+    big = _square(0.0, 0.0, 30.0)
+    ring = Polygon([(-30, -30), (30, -30), (30, 30), (-30, 30)],
+                   [[(-12, -12), (12, -12), (12, 12), (-12, 12)]])
+    lbl = fine_align.render_label_image([(big, 1), (ring, 2)], anchor, W, H, nm)
+    # Later layer (id 2) overwrites the earlier one where they overlap…
+    assert lbl[H // 2 - 20, W // 2] == 2
+    # …but the ring's interior hole keeps the earlier layer (id 1) showing
+    # through, never id 2 (holes preserved per layer).
+    assert lbl[H // 2, W // 2] == 1
+    assert set(np.unique(lbl).tolist()) <= {0, 1, 2}
+
+
+def test_grayscale_and_label_share_boundaries():
+    pytest.importorskip("shapely")
+    pytest.importorskip("cv2")
+    import numpy as np
+    W = H = 64
+    nm = 2.0
+    anchor = (1000.0, 2000.0)
+    geom = _square(*anchor, 30.0)
+    # blur off so the grayscale is crisp and comparable to the label.
+    gray = fine_align.render_grayscale_from_geoms(
+        [(geom, 200)], anchor, W, H, nm, bg_glv=80, blur_sigma_px=0.0)
+    lbl = fine_align.render_label_image([(geom, 1)], anchor, W, H, nm)
+    assert np.array_equal(gray == 200, lbl == 1)      # same region pixels
+    assert np.array_equal(gray == 80, lbl == 0)       # same background pixels
 
 
 def test_overlay_export_module_is_qt_free():

@@ -59,7 +59,7 @@ def test_rerun_selected():
     assert fine_align.rerun_image_subset(imgs, []) == []
 
 
-# ── M4: mask export score gate (Q2) ──────────────────────────────────────────
+# ── M4: gray/label export score gate (Q2; F15 reuses this helper) ────────────
 def test_mask_export_threshold():
     assert fine_align.mask_should_export((0.0, 0.0, 0.9), 0.8) is True
     assert fine_align.mask_should_export((0.0, 0.0, 0.8), 0.8) is True   # >=
@@ -71,19 +71,20 @@ def test_mask_export_no_refined():
     assert fine_align.mask_should_export(None, 0.0) is False
 
 
-# ── M4: manifest carries the mask_png column ─────────────────────────────────
-def test_manifest_mask_png_col():
+# ── F15: manifest carries the gray_png / label_png columns (replaced mask) ───
+def test_manifest_gray_label_png_cols():
     cols = fine_align.OVERLAY_MANIFEST_COLS
-    assert "mask_png" in cols
+    assert "gray_png" in cols and "label_png" in cols
+    assert "mask_png" not in cols
     # The original overlay columns are preserved (backward compatibility).
     for c in ("image_id", "raw_png", "overlay_png", "fine_dx_nm",
               "fine_dy_nm", "score", "status"):
         assert c in cols
 
 
-# ── M4: integration — worker writes a manifest with the mask_png header and
-#    skips the mask for a not-fine-aligned image (Qt + cv2 required) ──────────
-def test_manifest_csv_header_has_mask_png(tmp_path):
+# ── F15: integration — worker writes a manifest with the gray/label headers and
+#    skips both for a not-fine-aligned image (Qt + cv2 required) ──────────────
+def test_manifest_csv_header_has_gray_label(tmp_path):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     pytest.importorskip("PyQt6.QtWidgets")
     cv2 = pytest.importorskip("cv2")
@@ -96,14 +97,14 @@ def test_manifest_csv_header_has_mask_png(tmp_path):
 
     src = tmp_path / "img1.png"
     cv2.imwrite(str(src), np.zeros((8, 8), dtype=np.uint8))
-    # coarse=None → the ROI walk / mask branch is skipped (no reader needed);
-    # refined=None → no mask even though export_mask is on.
+    # coarse=None → the ROI walk / gray+label branch is skipped (no reader
+    # needed); refined=None → nothing written even though gray/label are on.
     jobs = [("img1", None, None, str(src), True)]
     cfg = {"fov_w": 1000.0, "fov_h": 1000.0, "nm_auto": True, "nm_manual": 0.0}
     w = gat.OverlayExportWorker(
         None, None, [], jobs, cfg, str(tmp_path),
         export_raw=True, export_overlay=False,
-        export_mask=True, mask_score_threshold=0.8)
+        export_gray=True, export_label=True, score_threshold=0.8)
     captured = {}
     w.finished.connect(lambda n, m: captured.update(count=n, manifest=m))
     w.run()
@@ -111,9 +112,10 @@ def test_manifest_csv_header_has_mask_png(tmp_path):
     assert "manifest" in captured, "worker should finish and emit a manifest"
     with open(captured["manifest"], newline="") as f:
         header = next(csv.reader(f))
-    assert "mask_png" in header
-    # No mask written for the not-aligned image.
-    assert not list(Path(tmp_path).glob("*_mask.png"))
+    assert "gray_png" in header and "label_png" in header
+    # Nothing written for the not-aligned image.
+    assert not list(Path(tmp_path).glob("*_gray.png"))
+    assert not list(Path(tmp_path).glob("*_label.png"))
 
 
 # ── PR#9 review: mask must keep Boolean interior holes ───────────────────────

@@ -32,13 +32,14 @@ import oasis_random
 # Qt-free pure logic, shared by the app's OverlayExportWorker / re-run wiring and
 # unit-tested directly (the app module needs PyQt6, this one does not).
 
-# Manifest column order for OverlayExportWorker (F5 M6 + F13 ``mask_png``).
-# ``mask_png`` is appended last so any index-based reader of the older columns is
-# unaffected; it carries the per-image GDS mask filename (blank when no mask was
-# written for that image).
+# Manifest column order for OverlayExportWorker (F5 M6 + F15).
+# ``gray_png`` / ``label_png`` are appended last (replacing F13's ``mask_png``):
+# the per-image simulated-GLV grayscale and integer ROI label map filenames
+# (blank when not written for that image). Older raw/overlay readers that index
+# the leading columns are unaffected.
 OVERLAY_MANIFEST_COLS = [
     "image_id", "raw_png", "overlay_png",
-    "fine_dx_nm", "fine_dy_nm", "score", "status", "mask_png",
+    "fine_dx_nm", "fine_dy_nm", "score", "status", "gray_png", "label_png",
 ]
 
 
@@ -220,6 +221,75 @@ def render_poi_template(polygons: list, anchor: tuple, width_px: int,
     return render_composite_template(
         [(polygons, fg_glv)], anchor, width_px, height_px, nm_per_px,
         bg_glv, blur_sigma_px)
+
+
+# ── F15: export-time simulated-GLV grayscale + integer ROI label map ─────────
+#
+# The downstream tool (MMH) wants ONE aligned image to measure on plus ROI info
+# it can read fast. We give it a simulated-GLV grayscale (the working image) and
+# an integer label map (label == id → that POI layer's exact ROI, a single numpy
+# boolean index). Both are painted from the *same* per-layer hole-preserving
+# geometry via ``gds_boolean.make_mask`` — so the grayscale and the label map
+# agree pixel-for-pixel on region boundaries — using the same FOV corner as the
+# F13 mask path (§7: ``y_min`` raised one pixel so ``invert_y`` lands on the same
+# SEM pixels as ``overlay_outlines_on_sem`` / ``rasterize_layer``).
+
+
+def _fov_min_corner(anchor: tuple, width_px: int, height_px: int,
+                    nm_per_px: float) -> tuple:
+    """Bottom-left GDS ``(x_min_nm, y_min_nm)`` of the FOV centred on ``anchor``
+    for :func:`gds_boolean.make_mask`, matching the F13 mask-export convention
+    (y raised one pixel; §7)."""
+    x_min = anchor[0] - width_px / 2.0 * nm_per_px
+    y_min = anchor[1] - (height_px / 2.0 - 1.0) * nm_per_px
+    return x_min, y_min
+
+
+def render_label_image(poi_geoms_ids: list, anchor: tuple, width_px: int,
+                       height_px: int, nm_per_px: float) -> np.ndarray:
+    """Integer ROI label map (F15). ``poi_geoms_ids`` is ``[(geom, label_id),
+    ...]``; each layer's hole-preserving geometry is rasterised (via
+    :func:`gds_boolean.make_mask`) onto a 0 background and painted with its
+    integer ``label_id`` — **no blur**, so ``label == id`` is the exact ROI for
+    that POI layer (a single numpy boolean index downstream). Later layers
+    overwrite earlier ones where they overlap. uint8 → up to 255 layers."""
+    lbl = np.zeros((height_px, width_px), dtype=np.uint8)
+    x_min, y_min = _fov_min_corner(anchor, width_px, height_px, nm_per_px)
+    for geom, label_id in poi_geoms_ids:
+        if geom is None or getattr(geom, "is_empty", False):
+            continue
+        m = gds_boolean.make_mask(geom, width_px=width_px, height_px=height_px,
+                                  x_min_nm=x_min, y_min_nm=y_min,
+                                  nm_per_px=nm_per_px)
+        lbl[m > 0] = np.uint8(label_id)
+    return lbl
+
+
+def render_grayscale_from_geoms(poi_geoms_fgs: list, anchor: tuple,
+                                width_px: int, height_px: int, nm_per_px: float,
+                                bg_glv: int = 80,
+                                blur_sigma_px: float = 1.0) -> np.ndarray:
+    """SEM-like simulated-GLV grayscale (F15) — the hole-preserving sibling of
+    :func:`render_composite_template`. ``poi_geoms_fgs`` is ``[(geom, fg_glv),
+    ...]``; each layer's hole-preserving geometry is rasterised (via
+    :func:`gds_boolean.make_mask`) onto a ``bg_glv`` background, painted at its
+    ``fg_glv``, then softened with one Gaussian blur so it resembles a
+    band-limited SEM frame. Shares the make_mask raster + FOV corner with
+    :func:`render_label_image`, so the grayscale and the label map line up
+    pixel-for-pixel on region boundaries."""
+    img = np.full((height_px, width_px), np.uint8(bg_glv), dtype=np.uint8)
+    x_min, y_min = _fov_min_corner(anchor, width_px, height_px, nm_per_px)
+    for geom, fg_glv in poi_geoms_fgs:
+        if geom is None or getattr(geom, "is_empty", False):
+            continue
+        m = gds_boolean.make_mask(geom, width_px=width_px, height_px=height_px,
+                                  x_min_nm=x_min, y_min_nm=y_min,
+                                  nm_per_px=nm_per_px)
+        img[m > 0] = np.uint8(fg_glv)
+    if blur_sigma_px and blur_sigma_px > 0 and cv2 is not None:
+        k = int(max(1, round(blur_sigma_px * 3))) * 2 + 1
+        img = cv2.GaussianBlur(img, (k, k), float(blur_sigma_px))
+    return img
 
 
 def _parabola_subpx(res: np.ndarray, bx: int, by: int, axis: int) -> float:
