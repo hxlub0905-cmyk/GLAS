@@ -186,7 +186,8 @@ HMI 風格表達式 → 遞迴下降 parser → AST → shapely 運算。運算�
 
 ### 進行中 (In Progress)
 
-- （目前無）
+- [F15] 模擬 GLV 灰階圖 + label ROI 匯出（**取代** F13 binary mask）— plan 待核准，
+  詳見 `docs/plans/F15-glv-grayscale-roi-export.md`。
 
 ### 待辦 (Backlog)
 

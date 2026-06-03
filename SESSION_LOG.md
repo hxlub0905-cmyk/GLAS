@@ -4,6 +4,27 @@
 
 ---
 
+## [2026-06-03] [F15] 模擬 GLV 灰階 + label ROI 匯出（規劃中）
+
+**變更類型：** 規劃（plan 檔 + 任務註冊，尚未動程式碼）·  **狀態：plan 待 user 核准開工**
+
+**動機：** user 釐清下游 MMH 真正要的不是 F13 的 binary mask，而是 (1) 一張「已對齊」的
+**模擬 GLV 灰階圖**（像 fine-align template）當量測底圖、(2) **ROI 資訊**。問「ROI 怎麼讀
+最快」→ 決定用 **整數 label 圖**（單次 imread + `gray[label==id]` boolean index，零
+rasterize/JSON/閾值）。user 進一步決定 **gray+label 直接取代 mask（拿掉 mask 選項）**。
+
+**規劃內容：** 探索確認 GLV 灰階模擬已存在（`fine_align.render_composite_template`）、
+`make_mask`、`export_one_image`（F14 process pool）可大量複用。產 plan
+`docs/plans/F15-glv-grayscale-roi-export.md`（M1 core `render_label_image` / M2
+`export_one_image` 加 gray+label / M3 dialog+worker 移除 mask 改 gray+label + manifest
+`label_map` / M4 文件）。gray 與 label 共用同組 per-layer hole-preserving geom（gray 套
+blur、label 不 blur），沿用 F13 score-threshold 把關。
+
+**測試：** 尚未動程式碼。**影響檔案（本次）：** `docs/plans/F15-glv-grayscale-roi-export.md`
+（新增）、`CLAUDE.md` §8、`SESSION_LOG.md`。 **Branch：** `claude/optimistic-pasteur-31ELv`
+
+---
+
 ## [2026-06-03] 結案 F9 / F10 / F13 / F14；撤案 F11（user 驗收 + 決策）
 
 **變更類型：** 任務管理（文件）·  **狀態：完成**
