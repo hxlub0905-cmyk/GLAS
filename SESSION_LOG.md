@@ -20,10 +20,12 @@
   `as_completed`），讓表格/overview 由上而下填、manifest 順序穩定。吞吐幾乎不變（僅進度回報序列化）。
   移除未用的 `as_completed` import。
 
-**未解（待 user 提供診斷）：** 匯出的 overlay/mask「沒對齊」——靜態比對證明 Run-all（無手動拖曳）下
-畫面 `paintEvent`/`_world_to_view` 與匯出 `overlay_outlines_on_sem` 的 anchor(=coarse+refined)、
-nm_per_px、座標框（皆 root nm，源自同一 `walk_roi`）**逐項相同**，找不到程式碼層級偏移。需 user 提供
-單張 manifest `fine_dx/dy_nm` + 畫面vs匯出截圖以定位（是否 refined 被丟、或匯出後座標設定被改動）。
+**已釐清（非 bug）：** 先前回報匯出 overlay/mask「沒對齊」——經查為**操作面**：`AlignmentExportDialog`
+預設「全部影像勾選」，batch 中途 abort（或部分影像 flat/失敗）後若直接匯出，**未算到 fine-align 的影像
+沒有 `_refined` → 退回 coarse-only**，看起來才像沒對齊。只勾「已算完（有 score）」的影像匯出即正確，
+與靜態比對結論一致（畫面 `paintEvent`/`_world_to_view` == 匯出 `overlay_outlines_on_sem`，anchor=
+coarse+refined、nm_per_px、座標框逐項相同）。mask 因有 score 門檻把關不受影響；overlay PNG 無門檻才會
+混入 coarse-only。可選後續防呆：對話框加「Only images with a fine-align result」過濾（暫未做）。
 
 **測試：** `py_compile` 過；in-thread fallback 路徑不變。**待 user `pytest` + 實機。**
 
