@@ -186,25 +186,12 @@ HMI 風格表達式 → 遞迴下降 parser → AST → shapely 運算。運算�
 
 ### 進行中 (In Progress)
 
-- [F9] Layout 匯出：raw layer + Boolean 合成 layer 寫出成 OASIS（.oas，含 ROI 座標裁剪 + 開發者模式）
-  → 已實作 M1–M6（core writer + ROI 裁剪 + app 匯出對話框 + 開發者模式 gating），**待 user 本地驗收**
-  （GUI 匯出 + KLayout 開檔 + `pytest`）。見 `docs/plans/F9-layout-export.md`
-- [F10] OASIS debug mode：載入/匯出雙向診斷（可複製報告 + `.debug.txt` sidecar、dev-mode gated）
-  → 已實作 M1–M4，**待 user 本地驗收**（`pytest` + GUI）。見 `docs/plans/F10-debug-mode.md`
-- [F11] 整顆 chip OASIS 匯出（原始 + Boolean 全 chip 重算）+ GDS 座標可見性
-  → plan 已產出**待核准**，見 `docs/plans/F11-whole-chip-export.md`
-- [F13] Per-image GDS mask 批次輸出 + low-score re-run
-  → 已實作 M1–M4（BatchResultsPanel 子集 re-run + OverlayExportWorker mask 輸出 +
-  AlignmentExportDialog mask 選項 + 測試）+ PR#9 review 修正（Boolean 洞保留 + mask 1px Y 對齊），
-  **待 user 本地驗收**（`pytest` + GUI）。見 `docs/plans/F13-mask-export-rerun.md`
-- [F14] Batch fine-align + image/mask export 加速（export 多進程平行化 + worker 數自動放大 +
-  cv2 單執行緒解 oversubscription + UI 可調）
-  → 已實作 M1–M4（Qt-free `overlay_export` 模組 + `OverlayExportWorker` process-pool 化 +
-  `batch_worker_count` cap 8→16 + `cv2.setNumThreads(1)` + FineAlignPanel worker spinbox + 測試），
-  **待 user 本地驗收**（`pytest` + 多核實測）。見 `docs/plans/F14-batch-export-perf.md`
+- （目前無）
 
 ### 待辦 (Backlog)
 
+- [F11] ~~整顆 chip OASIS 匯出（原始 + Boolean 全 chip 重算）+ GDS 座標可見性~~ — **撤案**（2026-06-03，
+  user 決定不做）。plan 仍保留於 `docs/plans/F11-whole-chip-export.md` 供日後參考。
 - [F12] ~~無索引表 OASIS（無 LAYERNAME / 無 S_CELL_OFFSET）原生支援~~ — **撤案**（2026-05-28）。
   根本卡在無 per-cell bbox → ROI 首次載入需全 chip 解碼。替代：用 KLayout 開→另存 `.oas` 補索引表後再開。
   詳見 SESSION_LOG 2026-05-28 條目。

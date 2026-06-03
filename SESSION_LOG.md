@@ -4,6 +4,23 @@
 
 ---
 
+## [2026-06-03] 結案 F9 / F10 / F13 / F14；撤案 F11（user 驗收 + 決策）
+
+**變更類型：** 任務管理（文件）·  **狀態：完成**
+
+**背景：** user 本地驗收後確認 F9（layout 匯出）、F10（OASIS debug mode）、F13（per-image mask 批次
+輸出 + low-score re-run）、F14（batch fine-align / export 加速）皆 OK → 結案；F11（整顆 chip OASIS
+匯出）決定不做 → 撤案。
+
+**修法：**
+- CLAUDE.md §8「進行中」清空（F9/F10/F13/F14 依規則完成即從清單刪除，紀錄留在 git history + 本 log）。
+- F11 移到「待辦 (Backlog)」並標 ~~刪除線~~ + 撤案註記（比照 F12 慣例）；plan 檔
+  `docs/plans/F11-whole-chip-export.md` 保留供日後參考。
+
+**測試：** 純文件變更，無程式碼異動。
+
+**影響檔案：** `CLAUDE.md`、`SESSION_LOG.md`。 **Branch：** `claude/optimistic-pasteur-31ELv`
+
 ## [2026-06-02] Batch UX：移除 score 直方圖 + 平行結果改回影像順序（user 回饋）
 
 **變更類型：** UX/效能（app）·  **狀態：完成（待 user 實機確認）**
