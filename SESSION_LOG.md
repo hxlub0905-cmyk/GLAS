@@ -4,6 +4,30 @@
 
 ---
 
+## [2026-06-04] F15 驗收（測試通過）+ [F12] 重啟規劃（範圍重界定 → plan 檔）
+
+**變更類型：** 驗收 + 規劃（新增 plan 檔，無程式碼異動）·  **狀態：F15 測試綠；F12 plan 待 user 核准**
+
+**F15 確認：** 沙箱裝 numpy 2.4.6 / cv2 4.13 / shapely 2.1.2 / PyQt6（+ libEGL1）後
+`QT_QPA_PLATFORM=offscreen pytest tests/` **560 passed**，與 2026-06-03 條目宣稱一致；F15 核心測試
+（`render_label_image` id/背景、後層覆前層保 holes、gray↔label 邊界一致、無 POI 略過路徑）全綠。
+程式 + 測試層面驗收通過，僅手動 GUI 端到端待 user 實機。
+
+**F12 重啟（依 §2.3 探索 + Q&A → plan）：** 用 Explore agent 摸清隨機存取/bbox/scan 路徑後與 user
+Q&A，**範圍大幅收斂**——user 接受 KLayout 轉檔補 `S_CELL_OFFSET`（隨機存取 + bbox 由 KLayout 解決，
+GLAS 端不自建 bbox 索引，避開 2026-05-28 撤案的根本效能卡點）。真正痛點只剩「這類檔無 `LAYERNAME`
+表 → Scan layers 列空、強制手 key 數字 layer」。Plan 核心：`oasis_streamer.enumerate_layers` 在無
+LAYERNAME 表時 fallback 掃幾何記錄列舉 distinct (layer/datatype)，餵既有 `LayerPickDialog`（已支援
+無名稱條目，只顯示數字）。不碰 §7 任何不變式。Plan 存 `docs/plans/F12-no-layername-scan.md`，**待
+user 核准才開工**。
+
+**測試：** 純文件 + 驗收，無程式碼異動。
+
+**影響檔案：** `docs/plans/F12-no-layername-scan.md`（新）、`SESSION_LOG.md`。
+**Branch：** `claude/friendly-franklin-9uZqU`
+
+---
+
 ## [2026-06-03] 完成 [F15] 模擬 GLV 灰階 + label ROI 匯出（取代 F13 binary mask）
 
 **變更類型：** 功能（core 2 函式 + export pipeline + app dialog/worker）+ 測試 + 文件 ·
