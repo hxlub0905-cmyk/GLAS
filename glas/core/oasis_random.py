@@ -638,6 +638,14 @@ class RoiWalkStats:
     cells_decoded: int = 0
     elapsed_s: float = 0.0
     sbbox_prune: bool = False
+    # F16 perf-triage: arrays that survived the cheap whole-array prune and had
+    # to materialize per-instance offsets, the total instances so materialized,
+    # and the largest single array. instances_materialized ≫ instances_visited
+    # means a giant regular grid is being expanded just to keep a handful (fix:
+    # analytic sub-grid clip); instances_visited huge means recursion blow-up.
+    arrays_materialized: int = 0
+    instances_materialized: int = 0
+    max_array_k: int = 0
 
 
 def _xform_bbox(T: Transform, bbox: Bbox) -> np.ndarray:
@@ -664,6 +672,64 @@ def _roi_overlap_mask(boxes: np.ndarray, roi: Bbox) -> np.ndarray:
     bx2 = np.maximum(boxes[:, 0], boxes[:, 2])
     by2 = np.maximum(boxes[:, 1], boxes[:, 3])
     return (bx1 <= roi[2]) & (bx2 >= roi[0]) & (by1 <= roi[3]) & (by2 >= roi[1])
+
+
+def _roi_to_local(T: "Transform", roi: Bbox) -> Bbox:
+    """Map ``roi`` (root coords) into ``T``'s local frame as an axis-aligned
+    bbox. For D4 transforms (M entries in {-1,0,1}·mag) this is exact."""
+    Minv = np.linalg.inv(T.M)
+    cs = np.array([[roi[0], roi[1]], [roi[2], roi[1]],
+                   [roi[2], roi[3]], [roi[0], roi[3]]], dtype=np.float64)
+    loc = (cs - T.t) @ Minv.T
+    return (float(loc[:, 0].min()), float(loc[:, 1].min()),
+            float(loc[:, 0].max()), float(loc[:, 1].max()))
+
+
+def _axis_index_range(n: int, step: float, lo_val: float, hi_val: float):
+    """Inclusive ``(i0, i1)`` grid indices in ``[0, n)`` whose instance
+    ``i*step`` can satisfy ``lo_val <= i*step <= hi_val``, padded by one
+    index each side for rounding safety. ``i0 > i1`` means empty."""
+    if n <= 1 or step == 0:
+        return (0, n - 1) if (lo_val <= 0.0 <= hi_val) else (1, 0)
+    a, b = lo_val / step, hi_val / step
+    if step < 0:
+        a, b = b, a
+    i0 = max(0, int(np.floor(a)) - 1)
+    i1 = min(n - 1, int(np.ceil(b)) + 1)
+    return (i0, i1)
+
+
+def _clip_grid_offsets(rtype, raw, placed: np.ndarray, T: "Transform",
+                       roi: Bbox) -> np.ndarray:
+    """Materialize *only* the repetition offsets whose placed instance can
+    overlap ``roi`` — for the regular-grid types (1/2/3) this turns a
+    chip-spanning million-instance array straddling a tiny FOV into a handful
+    of candidates without building the full grid. The caller still applies the
+    exact root-space ROI mask, so the survivor set is identical to materializing
+    the whole array; the analytic clip (padded by one index) only ever returns a
+    *superset* of the true survivors. Non-grid / arbitrary-list types fall back
+    to the full materialization."""
+    if rtype == 1:
+        nx, ny, xs, ys = raw
+    elif rtype == 2:
+        nx, xs = raw
+        ny, ys = 1, 0
+    elif rtype == 3:
+        ny, ys = raw
+        nx, xs = 1, 0
+    else:
+        return oas.repetition_offsets_np(rtype, raw)
+    rl = _roi_to_local(T, roi)
+    px0, px1 = min(placed[0], placed[2]), max(placed[0], placed[2])
+    py0, py1 = min(placed[1], placed[3]), max(placed[1], placed[3])
+    ix0, ix1 = _axis_index_range(nx, xs, rl[0] - px1, rl[2] - px0)
+    iy0, iy1 = _axis_index_range(ny, ys, rl[1] - py1, rl[3] - py0)
+    if ix0 > ix1 or iy0 > iy1:
+        return np.empty((0, 2), dtype=np.float64)
+    iv = np.arange(ix0, ix1 + 1, dtype=np.float64) * xs
+    jv = np.arange(iy0, iy1 + 1, dtype=np.float64) * ys
+    gx, gy = np.meshgrid(iv, jv)
+    return np.column_stack((gx.ravel(), gy.ravel()))
 
 
 def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
@@ -838,17 +904,27 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
             if pl.target in visiting:
                 stats.cycles_skipped += oas.repetition_count(rtype, rraw)
                 continue
-            # Array may intersect ROI — now materialize offsets (vectorized)
-            # for per-instance pruning.
-            oa = oas.repetition_offsets_np(rtype, rraw)          # (K,2)
+            # Array may intersect ROI — materialize only the sub-grid whose
+            # instances can reach the ROI (analytic clip for regular grids;
+            # full array for arbitrary-list types), then exact-mask in root
+            # coords. full_k is the true instance count for honest pruned stats.
+            full_k = oas.repetition_count(rtype, rraw)
+            oa = _clip_grid_offsets(rtype, rraw, placed, T, roi)  # (K,2)
             K = oa.shape[0]
+            stats.arrays_materialized += 1
+            stats.instances_materialized += K
+            if K > stats.max_array_k:
+                stats.max_array_k = K
+            if K == 0:
+                stats.instances_pruned += full_k
+                continue
             plb = np.empty((K, 4), dtype=np.float64)
             plb[:, 0] = placed[0] + oa[:, 0]; plb[:, 1] = placed[1] + oa[:, 1]
             plb[:, 2] = placed[2] + oa[:, 0]; plb[:, 3] = placed[3] + oa[:, 1]
             rootb = T.apply_to_rects(plb)                        # -> root coords
             mask = _roi_overlap_mask(rootb, roi)
             sel = np.flatnonzero(mask)
-            stats.instances_pruned += K - len(sel)
+            stats.instances_pruned += full_k - len(sel)
             if len(sel) == 0:
                 continue
             place_ts = base.t + oa                              # (K,2)
@@ -876,6 +952,10 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
          f"rects={stats.rects_emitted} polys={stats.polys_emitted} "
          f"newly_decoded_cells={rar._n_loaded - cells_at_start} "
          f"pruned={stats.instances_pruned} reader_errors={len(rar.errors)}")
+    _dbg(f"  perf: visited={stats.instances_visited} "
+         f"arrays_materialized={stats.arrays_materialized} "
+         f"instances_materialized={stats.instances_materialized} "
+         f"max_array_k={stats.max_array_k}")
     _dbg(f"  features: place_rtypes={sorted(str(x) for x in _feat['rtype'])} "
          f"angles={sorted(_feat['angle'])} flip={_feat['flip']} "
          f"mags={sorted(_feat['mag'])} name_ref={_feat['name_ref']} "

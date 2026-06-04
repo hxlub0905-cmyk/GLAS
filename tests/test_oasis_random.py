@@ -313,6 +313,10 @@ class TestBigGridRepetition:
         res = orx.walk_roi(rar, 0, (4990, 4990, 5010, 5010), 17, 0)
         assert res["rects"].tolist() == [[5000, 5000, 5010, 5010]]
         assert res["stats"].instances_pruned == 1_000_000 - 1
+        # F16 perf: the analytic sub-grid clip must keep one instance WITHOUT
+        # materializing the whole 1M grid — only a small padded neighbourhood.
+        assert res["stats"].max_array_k <= 25
+        assert res["stats"].instances_materialized <= 25
 
     def test_roi_outside_pruned_instantly(self, tmp_path):
         p = tmp_path / "big.oas"
@@ -586,3 +590,51 @@ class TestResolveLayerName:
     def test_narrower_record_wins(self):
         ln = [("R", (10, 30), (0, 0)), ("X", (20, 20), (0, 0))]
         assert orx.resolve_layer_name(ln, 20, 0) == "X"
+
+
+class TestGridClip:
+    """F16 perf: _clip_grid_offsets must be a *superset* of the true ROI
+    survivors under every D4 transform (so the downstream exact mask yields
+    identical geometry) while actually shrinking the materialized set."""
+
+    def test_clip_is_superset_under_d4(self):
+        from oasis_walker import Transform
+        rng = np.random.default_rng(0)
+        nx, ny, xs, ys = 200, 150, 37, 41
+        placed = np.array([0.0, 0.0, 12.0, 9.0])          # child bbox, local
+        full = oas.repetition_offsets_np(1, (nx, ny, xs, ys))
+        plb = np.empty((full.shape[0], 4))
+        plb[:, 0] = placed[0] + full[:, 0]; plb[:, 1] = placed[1] + full[:, 1]
+        plb[:, 2] = placed[2] + full[:, 0]; plb[:, 3] = placed[3] + full[:, 1]
+        for angle in (0, 90, 180, 270):
+            for flip in (False, True):
+                T = Transform.from_placement(123, -456, angle, flip, 1.0)
+                rootb = T.apply_to_rects(plb)
+                for _ in range(15):
+                    i = int(rng.integers(0, nx)); j = int(rng.integers(0, ny))
+                    lx, ly = i * xs, j * ys
+                    rb = T.apply_to_rects(np.array(
+                        [[placed[0] + lx, placed[1] + ly,
+                          placed[2] + lx, placed[3] + ly]]))[0]
+                    roi = (rb[0] - 3, rb[1] - 3, rb[2] + 3, rb[3] + 3)
+                    truth = set(map(tuple,
+                                    full[orx._roi_overlap_mask(rootb, roi)].tolist()))
+                    clipped = orx._clip_grid_offsets(
+                        1, (nx, ny, xs, ys), placed, T, roi)
+                    cl = set(map(tuple, clipped.tolist()))
+                    assert truth, "fixture should have at least one survivor"
+                    assert truth <= cl                      # never drops a hit
+                    assert len(cl) < full.shape[0]          # and actually clips
+
+    def test_clip_1d_arrays(self):
+        from oasis_walker import Transform
+        T = Transform.identity()
+        placed = np.array([0.0, 0.0, 10.0, 10.0])
+        # type 2: 1000 along x at pitch 50; ROI around index 400 (x=20000)
+        off2 = orx._clip_grid_offsets(2, (1000, 50), placed, T,
+                                      (19995, -5, 20015, 15))
+        assert off2.shape[0] < 1000 and (off2[:, 1] == 0).all()
+        # type 3: 1000 along y at pitch 50; ROI around index 400 (y=20000)
+        off3 = orx._clip_grid_offsets(3, (1000, 50), placed, T,
+                                      (-5, 19995, 15, 20015))
+        assert off3.shape[0] < 1000 and (off3[:, 0] == 0).all()

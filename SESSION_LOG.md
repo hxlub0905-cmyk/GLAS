@@ -4,6 +4,29 @@
 
 ---
 
+## [2026-06-04] [F16 後續] walk_roi 大型 repetition 阵列「解析子網格裁剪」（修真正的慢點）
+
+**變更類型：** 效能修復 + 測試 ·  **狀態：完成**
+
+**動機現象：** LTV 一次 ROI（4×4µm）三層共等 ~17 分鐘（每層 528–593s），但 `newly_decoded_cells=271`、
+`pruned=16,263,752`、`sbbox_prune=ON`。即 **F16 sbbox 有生效、幾乎沒在解幾何**，時間全花在「把一個橫跨全 chip、
+~1600 萬 instance 的 repetition 阵列整個 materialize 出來，只為了留下小 FOV 內的幾顆」。`place_rtypes=['2','3','10','11']`
+（1D 阵列巢狀成 sea）。既有的「整阵列 extent 剪枝」對「阵列 extent 蓋住 ROI」的情形無效 → 退化成全展開。
+
+**修復實作：** 新增 `_clip_grid_offsets`（+ `_roi_to_local` / `_axis_index_range`）：對規則格點型（type 1/2/3）先把
+ROI 用 `T⁻¹` 映回阵列 local 座標，解析算出可能命中的 index 子範圍（每邊 pad 1 格做 rounding 安全餘裕），**只 materialize
+該子網格**；其餘 arbitrary-list 型（10/11，本就有界）維持全展開。下游仍跑原本的精確 root-space mask 決定 survivor，
+故結果與全展開**完全相同**（clip 只回傳真 survivor 的 superset）。`instances_pruned` 改用 `repetition_count` 全數計，統計不失真。
+新增遙測 `arrays_materialized / instances_materialized / max_array_k`（`[roi]   perf: ...` 行）。
+
+**測試：** `TestBigGridRepetition.test_roi_inside_picks_one` 加驗 1M 阵列 ROI-inside 時 `max_array_k<=25`（不再全展開）；
+新 `TestGridClip`：(1) 四種 D4 旋轉 ×flip 下 clip 結果 ⊇ 真 survivor 且確實縮小；(2) type 2/3 1D 阵列裁剪。
+`pytest tests/ -k "oasis or random or walk or layout or boolean"` → 367 passed。
+
+**影響檔案：** `glas/core/oasis_random.py`、`tests/test_oasis_random.py`、`SESSION_LOG.md`。
+
+---
+
 ## [2026-06-04] [F16 後續] ROI load 永遠顯示效能遙測（診斷「為何還是慢」）
 
 **變更類型：** 診斷遙測 + 測試 ·  **狀態：完成**
