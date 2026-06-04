@@ -4,6 +4,32 @@
 
 ---
 
+## [2026-06-04] [F16 後續] walk_roi 自身幾何（RECTANGLE/POLYGON）阵列也裁剪 + type-8 grid 支援
+
+**變更類型：** 效能修復 + 測試 ·  **狀態：完成**
+
+**動機現象：** 加了 placement 子網格裁剪後再測 LTV，placement 端已修好（`max_array_k=304`、
+`instances_materialized=111,355`、`visited=2802`、`decoded=713` 都很小），但仍 ~527s/層。關鍵線索：walk 2/3
+`newly_decoded_cells=0`（無解碼）卻 612s/174s，時間與**輸出矩形數**成正比（4664 rect→612s、1493→174s）。
+定位到 `walk()` 的「自身幾何發射」：`content.rects(key)` 把**每個 RECTANGLE/POLYGON 的 repetition 阵列全展開**
+（type 1/8 CMG 阵列可達數百萬），再 `apply_to_rects` 全 transform、最後只留 ROI 內幾千個——且**完全沒有剪枝**
+（連 miss ROI 的阵列也全展開）。
+
+**修復實作：**
+1. `walk()` 自身幾何改為逐 spec 處理：先做便宜的 whole-array extent 剪枝（miss ROI 直接 O(1) skip，
+   這是 `content.rects()` 路徑本來缺的），再用 `_clip_grid_offsets` 只 materialize ROI 附近子網格，才 transform+mask。
+   結果與全展開完全相同（clip 回傳真 survivor 的 superset，下游精確 mask 決定）。
+2. `_clip_grid_offsets` 重構為 `_grid_axes` 軸分解，**新增 type 8（2D lattice）支援**：向量軸對齊（一橫一縱）時可裁剪，
+   斜向 lattice 退回全展開。placement 與幾何兩路共用，故 type-8 placement 阵列現也裁。
+3. 幾何阵列 materialize 也計入 `arrays_materialized/instances_materialized/max_array_k`（perf 行含幾何）。
+
+**測試：** 新增 `test_walk_clips_huge_rect_array_to_roi`（1M rect 阵列 walk 只 emit ROI 內 1 顆、`max_array_k<=25`）、
+`TestGridClip.test_clip_type8_axis_aligned`（type-8 軸對齊裁剪為 superset、斜向退回全展開）。`pytest tests/` → 591 passed。
+
+**影響檔案：** `glas/core/oasis_random.py`、`tests/test_oasis_random.py`、`SESSION_LOG.md`。
+
+---
+
 ## [2026-06-04] [F16 後續] walk_roi 大型 repetition 阵列「解析子網格裁剪」（修真正的慢點）
 
 **變更類型：** 效能修復 + 測試 ·  **狀態：完成**

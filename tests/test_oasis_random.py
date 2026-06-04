@@ -314,9 +314,10 @@ class TestBigGridRepetition:
         assert res["rects"].tolist() == [[5000, 5000, 5010, 5010]]
         assert res["stats"].instances_pruned == 1_000_000 - 1
         # F16 perf: the analytic sub-grid clip must keep one instance WITHOUT
-        # materializing the whole 1M grid — only a small padded neighbourhood.
+        # materializing the whole 1M grid — only a small padded neighbourhood
+        # (25 placement candidates + the one surviving cell's single rect).
         assert res["stats"].max_array_k <= 25
-        assert res["stats"].instances_materialized <= 25
+        assert res["stats"].instances_materialized <= 30
 
     def test_roi_outside_pruned_instantly(self, tmp_path):
         p = tmp_path / "big.oas"
@@ -409,6 +410,34 @@ class TestRectRepetition:
         assert len(cc.rect_specs[(17, 0)]) == 1          # one spec, not 1M rects
         assert cc.bbox == (0, 0, 999010, 999010)         # analytic extent
         assert cc.rects((17, 0)).shape == (1_000_000, 4)  # lazy materialization
+
+    def test_walk_clips_huge_rect_array_to_roi(self, tmp_path):
+        # The walk's own-geometry emission must clip a 1M-rect repetition to the
+        # ROI, NOT materialize+transform the whole array (the slow path).
+        start = (bytes([oas.START]) + _astr("1.0") + bytes([0])
+                 + _uint(1000) + _uint(0) + bytes([0] * 12))
+        pn = bytes([oas.PROPNAME_IMP]) + _astr("S_CELL_OFFSET")
+        cn = bytes([oas.CELLNAME_IMP]) + _astr("A")
+
+        def prop(off):
+            return (bytes([oas.PROPERTY_NORMAL, 0x16]) + _uint(0)
+                    + _uint(8) + _ufix(off, 4))
+
+        rep1 = bytes([1]) + _uint(998) + _uint(998) + _uint(1000) + _uint(1000)
+        rect = (bytes([oas.RECTANGLE, 0x7f]) + _uint(17) + _uint(0)
+                + _uint(10) + _uint(10) + _sint(0) + _sint(0) + rep1)
+        cell = bytes([oas.CELL_REFNUM]) + _uint(0)
+        end = bytes([oas.END]) + _uint(0)
+        hdr = oas.MAGIC + start + pn + cn + prop(0)
+        off = len(hdr)
+        p = tmp_path / "huge.oas"
+        p.write_bytes(oas.MAGIC + start + pn + cn + prop(off) + cell + rect + end)
+        rar = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
+        # ROI around the instance at (500_000, 500_000) (grid index 500,500).
+        res = orx.walk_roi(rar, 0, (499_995, 499_995, 500_015, 500_015), 17, 0)
+        assert res["rects"].tolist() == [[500_000, 500_000, 500_010, 500_010]]
+        assert res["stats"].max_array_k <= 25            # clipped, not 1M
+        assert res["stats"].instances_materialized <= 25
 
 
 def _rectdt(layer: int, dt: int, w: int, h: int, x: int, y: int) -> bytes:
@@ -638,3 +667,24 @@ class TestGridClip:
         off3 = orx._clip_grid_offsets(3, (1000, 50), placed, T,
                                       (-5, 19995, 15, 20015))
         assert off3.shape[0] < 1000 and (off3[:, 0] == 0).all()
+
+    def test_clip_type8_axis_aligned(self):
+        from oasis_walker import Transform
+        T = Transform.identity()
+        placed = np.array([0.0, 0.0, 10.0, 10.0])
+        # type 8: 500 along (40,0) x 500 along (0,40) = 250k grid; ROI near
+        # index (100, 200) -> (4000, 8000). Must clip to a tiny neighbourhood.
+        raw = (500, 500, (40, 0), (0, 40))
+        full = oas.repetition_offsets_np(8, raw)
+        roi = (3995, 7995, 4015, 8015)
+        clipped = orx._clip_grid_offsets(8, raw, placed, T, roi)
+        assert clipped.shape[0] <= 25 and full.shape[0] == 250_000
+        # superset check: every true survivor of the full array is kept
+        plb = np.column_stack((placed[0] + full[:, 0], placed[1] + full[:, 1],
+                               placed[2] + full[:, 0], placed[3] + full[:, 1]))
+        truth = set(map(tuple, full[orx._roi_overlap_mask(plb, roi)].tolist()))
+        assert truth and truth <= set(map(tuple, clipped.tolist()))
+        # a skew type-8 lattice is not clippable -> full fallback
+        skew = orx._clip_grid_offsets(8, (10, 10, (40, 5), (0, 40)), placed,
+                                      T, roi)
+        assert skew.shape[0] == 100

@@ -699,37 +699,66 @@ def _axis_index_range(n: int, step: float, lo_val: float, hi_val: float):
     return (i0, i1)
 
 
-def _clip_grid_offsets(rtype, raw, placed: np.ndarray, T: "Transform",
-                       roi: Bbox) -> np.ndarray:
-    """Materialize *only* the repetition offsets whose placed instance can
-    overlap ``roi`` — for the regular-grid types (1/2/3) this turns a
-    chip-spanning million-instance array straddling a tiny FOV into a handful
-    of candidates without building the full grid. The caller still applies the
-    exact root-space ROI mask, so the survivor set is identical to materializing
-    the whole array; the analytic clip (padded by one index) only ever returns a
-    *superset* of the true survivors. Non-grid / arbitrary-list types fall back
-    to the full materialization."""
+def _grid_axes(rtype, raw):
+    """Decompose an analytically-clippable repetition into orthogonal axes
+    ``[(count, vx, vy), ...]`` (each axis purely horizontal or vertical), or
+    ``None`` for types that must be materialized in full (arbitrary lists 10/11,
+    skew/oblique lattices). Covers the regular grids 1/2/3 and the common
+    Manhattan case of type 8 (2-D lattice with axis-aligned vectors)."""
     if rtype == 1:
         nx, ny, xs, ys = raw
-    elif rtype == 2:
+        return [(nx, xs, 0), (ny, 0, ys)]
+    if rtype == 2:
         nx, xs = raw
-        ny, ys = 1, 0
-    elif rtype == 3:
+        return [(nx, xs, 0)]
+    if rtype == 3:
         ny, ys = raw
-        nx, xs = 1, 0
-    else:
+        return [(ny, 0, ys)]
+    if rtype == 8:
+        nn, mm, n_vec, m_vec = raw
+        a, b = (nn, n_vec[0], n_vec[1]), (mm, m_vec[0], m_vec[1])
+        horiz = [ax for ax in (a, b) if ax[1] != 0 and ax[2] == 0]
+        vert = [ax for ax in (a, b) if ax[2] != 0 and ax[1] == 0]
+        # Only a clean orthogonal grid (one horizontal axis, one vertical) lets
+        # the two indices be clipped independently; anything else -> full.
+        if len(horiz) == 1 and len(vert) == 1:
+            return [horiz[0], vert[0]]
+        return None
+    return None
+
+
+def _clip_grid_offsets(rtype, raw, placed: np.ndarray, T: "Transform",
+                       roi: Bbox) -> np.ndarray:
+    """Materialize *only* the repetition offsets whose placed instance (a box
+    ``placed`` in the array's local frame) can overlap ``roi`` — turning a
+    chip-spanning million-instance array straddling a tiny FOV into a handful of
+    candidates without building the full grid. The caller still applies the
+    exact root-space ROI mask, so the survivor set is identical to materializing
+    the whole array; the analytic clip (padded one index per side) only ever
+    returns a *superset* of the true survivors. Non-grid / arbitrary-list types
+    fall back to the full materialization."""
+    axes = _grid_axes(rtype, raw)
+    if axes is None:
         return oas.repetition_offsets_np(rtype, raw)
     rl = _roi_to_local(T, roi)
     px0, px1 = min(placed[0], placed[2]), max(placed[0], placed[2])
     py0, py1 = min(placed[1], placed[3]), max(placed[1], placed[3])
-    ix0, ix1 = _axis_index_range(nx, xs, rl[0] - px1, rl[2] - px0)
-    iy0, iy1 = _axis_index_range(ny, ys, rl[1] - py1, rl[3] - py0)
-    if ix0 > ix1 or iy0 > iy1:
-        return np.empty((0, 2), dtype=np.float64)
-    iv = np.arange(ix0, ix1 + 1, dtype=np.float64) * xs
-    jv = np.arange(iy0, iy1 + 1, dtype=np.float64) * ys
-    gx, gy = np.meshgrid(iv, jv)
-    return np.column_stack((gx.ravel(), gy.ravel()))
+    grids = []
+    for (n, vx, vy) in axes:
+        if vx != 0:        # horizontal axis -> constrain by the ROI x-span
+            i0, i1 = _axis_index_range(n, vx, rl[0] - px1, rl[2] - px0)
+        elif vy != 0:      # vertical axis -> constrain by the ROI y-span
+            i0, i1 = _axis_index_range(n, vy, rl[1] - py1, rl[3] - py0)
+        else:              # zero vector: n coincident copies
+            i0, i1 = 0, n - 1
+        if i0 > i1:
+            return np.empty((0, 2), dtype=np.float64)
+        idx = np.arange(i0, i1 + 1, dtype=np.float64)
+        grids.append(np.column_stack((idx * vx, idx * vy)))      # (k, 2)
+    out = grids[0]
+    for g in grids[1:]:                                          # cartesian sum
+        out = (out[:, None, :] + g[None, :, :]).reshape(-1, 2)
+    return out
 
 
 def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
@@ -863,21 +892,59 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
             for _s in _specs:
                 _feat["poly_rtype"].add(_s[1])
         # Emit this cell's own geometry (transformed) that hits the ROI.
-        # Materialize lazily here — only for cells the walk actually visits.
-        own = content.rects(key)
-        if own.size:
-            r = T.apply_to_rects(own.astype(np.float64))
+        # Each RECTANGLE/POLYGON may carry its own repetition (CMG arrays that
+        # explode to millions), so clip every spec's array to the ROI before
+        # materializing — the same analytic sub-grid clip as the placement loop.
+        # A cheap whole-array extent prune skips arrays that miss the ROI in O(1)
+        # (the old content.rects()/polys() expanded *every* spec in full).
+        for x1, y1, x2, y2, rt, rr in content.rect_specs.get(key, ()):
+            bb_local = np.array([min(x1, x2), min(y1, y2),
+                                 max(x1, x2), max(y1, y2)], dtype=np.float64)
+            ex0, ey0, ex1, ey1 = oas.repetition_extent(rt, rr)
+            arr_local = np.array([[bb_local[0] + ex0, bb_local[1] + ey0,
+                                   bb_local[2] + ex1, bb_local[3] + ey1]])
+            if not _roi_overlap_mask(T.apply_to_rects(arr_local), roi)[0]:
+                continue
+            oa = _clip_grid_offsets(rt, rr, bb_local, T, roi)
+            if oa.shape[0] == 0:
+                continue
+            stats.arrays_materialized += 1
+            stats.instances_materialized += oa.shape[0]
+            if oa.shape[0] > stats.max_array_k:
+                stats.max_array_k = oa.shape[0]
+            arr = np.empty((oa.shape[0], 4), dtype=np.float64)
+            arr[:, 0] = x1 + oa[:, 0]; arr[:, 1] = y1 + oa[:, 1]
+            arr[:, 2] = x2 + oa[:, 0]; arr[:, 3] = y2 + oa[:, 1]
+            r = T.apply_to_rects(arr)
             m = _roi_overlap_mask(r, roi)
             if m.any():
                 rect_out.append(r[m])
                 stats.rects_emitted += int(m.sum())
-        for pts in content.polys(key):
-            tp = T.apply_to_points(pts.astype(np.float64))
-            bb = np.array([[tp[:, 0].min(), tp[:, 1].min(),
-                            tp[:, 0].max(), tp[:, 1].max()]])
-            if _roi_overlap_mask(bb, roi)[0]:
-                poly_out.append(tp)
-                stats.polys_emitted += 1
+        for base, rt, rr in content.poly_specs.get(key, ()):
+            bb_local = np.array([base[:, 0].min(), base[:, 1].min(),
+                                 base[:, 0].max(), base[:, 1].max()],
+                                dtype=np.float64)
+            ex0, ey0, ex1, ey1 = oas.repetition_extent(rt, rr)
+            arr_local = np.array([[bb_local[0] + ex0, bb_local[1] + ey0,
+                                   bb_local[2] + ex1, bb_local[3] + ey1]])
+            if not _roi_overlap_mask(T.apply_to_rects(arr_local), roi)[0]:
+                continue
+            oa = _clip_grid_offsets(rt, rr, bb_local, T, roi)
+            if oa.shape[0]:
+                stats.arrays_materialized += 1
+                stats.instances_materialized += oa.shape[0]
+                if oa.shape[0] > stats.max_array_k:
+                    stats.max_array_k = oa.shape[0]
+            basef = base.astype(np.float64)
+            for dx, dy in oa:
+                s = basef.copy()
+                s[:, 0] += dx; s[:, 1] += dy
+                tp = T.apply_to_points(s)
+                bb = np.array([[tp[:, 0].min(), tp[:, 1].min(),
+                                tp[:, 0].max(), tp[:, 1].max()]])
+                if _roi_overlap_mask(bb, roi)[0]:
+                    poly_out.append(tp)
+                    stats.polys_emitted += 1
         if depth >= max_depth:
             return
         for pl in content.placements:
