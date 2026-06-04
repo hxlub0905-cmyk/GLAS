@@ -223,10 +223,15 @@ class TestSBoundingBoxPrune:
             child_sbbox=[0, 0, 0, 20, 20]))
         rar = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
         res = orx.walk_roi(rar, 0, (0, 0, 5, 5), 17, 0)
+        st = res["stats"]
         assert res["rects"].tolist() == [[0, 0, 10, 10]]
-        assert res["stats"].instances_pruned == 1
+        assert st.instances_pruned == 1
         # decode-free prune: load_cell_bbox (the CE/decode path) never ran.
         assert rar._bbox_memo == {}
+        # telemetry: prune flagged on, and only the ROI-hit child was decoded
+        # (root + child A), not the pruned far instance's subtree.
+        assert st.sbbox_prune is True
+        assert st.cells_decoded == 2
 
 
 def _build_hierarchy(places: list[tuple[int, int]]) -> bytes:

@@ -630,6 +630,14 @@ class RoiWalkStats:
     unknown_target_skipped: int = 0
     rects_emitted: int = 0
     polys_emitted: int = 0
+    # Diagnostics surfaced to the UI (F16): wall-clock of the walk, how many
+    # cells were *fully decoded* (the real cost — should be small for a tight
+    # FOV once pruning works), and whether the decode-free S_BOUNDING_BOX prune
+    # was in effect. cells_decoded staying high on a tiny FOV => the prune isn't
+    # biting (no S_BOUNDING_BOX and no per-cell CE boundary => bbox-by-decode).
+    cells_decoded: int = 0
+    elapsed_s: float = 0.0
+    sbbox_prune: bool = False
 
 
 def _xform_bbox(T: Transform, bbox: Bbox) -> np.ndarray:
@@ -861,6 +869,9 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
         poly_out = [p * scale for p in poly_out]
     rects = np.rint(rects).astype(np.int64)
     poly_out = [np.rint(p).astype(np.int64) for p in poly_out]
+    stats.cells_decoded = rar._n_loaded - cells_at_start
+    stats.elapsed_s = time.perf_counter() - _t0
+    stats.sbbox_prune = bool(rar._sbbox_by_refnum or rar._sbbox_by_name)
     _dbg(f"walk_roi done in {time.perf_counter() - _t0:.1f}s: "
          f"rects={stats.rects_emitted} polys={stats.polys_emitted} "
          f"newly_decoded_cells={rar._n_loaded - cells_at_start} "

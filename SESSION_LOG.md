@@ -4,6 +4,28 @@
 
 ---
 
+## [2026-06-04] [F16 後續] ROI load 永遠顯示效能遙測（診斷「為何還是慢」）
+
+**變更類型：** 診斷遙測 + 測試 ·  **狀態：完成**
+
+**動機：** user 回報 LTV/R8 兩個大檔 Load GDS ROI 仍很慢，並發現 LTV「有 CE 層但 Scan layers 沒讀到」。釐清：
+(1) `bbox_layer` 是寫死的 `DEFAULT_BBOX_LAYER=(108,250)`，與 Scan layers 有無列出無關；(2) 三檔 L108/D250 都只有
+~4–6 個矩形（非 per-cell 邊界，cell 數卻上萬）→ CE early-stop 對這些檔幾乎不觸發，本來就慢；F16 的 S_BOUNDING_BOX
+才是正解。為了能不開 DEBUG 就看出「prune 到底有沒有生效、時間花在哪」，把 walk 的關鍵數字做成永遠顯示。
+
+**實作：** `RoiWalkStats` 新增 `cells_decoded`（本次真正全解的 cell 數）、`elapsed_s`、`sbbox_prune`（reader 是否有
+S_BOUNDING_BOX map → 走免解幾何路徑）。`walk_roi` 收尾填入。app `_on_roi_loaded` 永遠 print：
+`[roi] loaded in X.Xs · cells decoded=N · M instances pruned · S_BOUNDING_BOX prune=ON/off`。
+**判讀：** 小 FOV 卻 `cells decoded` 上千 → prune 沒咬住（多半 F16 未生效或幾何是 flat 大 cell）。
+
+**測試：** `TestSBoundingBoxPrune::test_walk_prunes_far_instance` 加驗 `sbbox_prune is True` 且 `cells_decoded==2`
+（只解 root+命中 child，遠端 instance 子樹未解）。`pytest tests/test_oasis_random.py` 30 passed。
+
+**影響檔案：** `glas/core/oasis_random.py`、`glas/app/gds_align_tool.py`、`tests/test_oasis_random.py`、`SESSION_LOG.md`。
+**Branch：** `claude/friendly-franklin-9uZqU`
+
+---
+
 ## [2026-06-04] [F16] 用 name-table S_BOUNDING_BOX 免解幾何加速 Load GDS ROI
 
 **變更類型：** 功能（ROI 剪枝 fast path）+ 診斷 + 測試 ·  **狀態：完成** ·  **plan：** `docs/plans/F16-sbbox-roi-prune.md`

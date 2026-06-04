@@ -6349,6 +6349,16 @@ class MainWindow(QMainWindow):
         errs = len(self._rar.errors)
         msg = (f"ROI {len(self._roi_layers)} layer(s): {total_rects} rects, "
                f"{total_polys} polys ({pruned:,} instances pruned)")
+        # Always-on perf telemetry (F16): the time + how many cells were fully
+        # decoded tells us instantly whether the prune is biting. A tight FOV
+        # that still decodes thousands of cells => no decode-free bbox (no
+        # S_BOUNDING_BOX, no per-cell CE boundary) — the slow first-load case.
+        elapsed = sum(s.elapsed_s for _, s in per_layer)
+        decoded = sum(s.cells_decoded for _, s in per_layer)
+        sbbox_on = any(s.sbbox_prune for _, s in per_layer)
+        print(f"[roi] loaded in {elapsed:.1f}s · cells decoded={decoded:,} · "
+              f"{pruned:,} instances pruned · S_BOUNDING_BOX prune="
+              f"{'ON' if sbbox_on else 'off'}", flush=True)
         if errs:
             msg += f" · ⚠ {errs} cell decode error(s) — run with --debug"
         if expr_errs:
