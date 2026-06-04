@@ -2312,6 +2312,70 @@ def _name_str(v) -> str:
     return v if isinstance(v, str) else str(v)
 
 
+# SEMI P39 §14: the END record is padded to a fixed 256-byte length at the very
+# end of the file. When offset_flag == 1 the 6 name-table offset pairs live in
+# that END record, so we can read them by seeking to size-256 (used to locate
+# end-of-file name tables — F12 strict-mode fix).
+_END_RECORD_LEN = 256
+
+# table_offsets index order (SEMI P39 §13.11): one (strict, byte-offset) pair
+# per name table.
+_TBL_CELLNAME = 0
+_TBL_PROPNAME = 2
+_TBL_LAYERNAME = 4
+
+
+def _read_end_table_offsets(reader: "OasisReader") -> Optional[list]:
+    """offset_flag == 1: the name-table offset pairs are in the fixed-size END
+    record at the tail of the file. Seek there and parse the 6 pairs. Returns
+    the list ``[(strict, offset), …]`` or ``None`` if it can't be read."""
+    f = reader._f
+    try:
+        size = len(f._buf)
+    except Exception:
+        return None
+    pos = size - _END_RECORD_LEN
+    if pos < 0:
+        return None
+    try:
+        f.clear_substreams()
+        f.seek(pos)
+        head = f.read(1)
+        if not head or head[0] != END:
+            return None
+        offsets = []
+        for _ in range(6):
+            strict = decode_unsigned_int(f)
+            off = decode_unsigned_int(f)
+            offsets.append((strict, off))
+        return offsets
+    except OasisFormatError:
+        return None
+
+
+def _read_table_region(reader: "OasisReader", offset: int, keep_ids: tuple,
+                       consume, *, max_records: int = 50_000_000) -> int:
+    """Seek to a strict-mode name table at ``offset`` and feed each of its
+    records to ``consume`` until a record outside ``keep_ids`` (i.e. the table
+    boundary / next table / CELL / END) is reached. Returns the count fed.
+
+    The table is a contiguous run at a known offset, so this is bounded by the
+    table size (proportional to the cell / layer count), never the whole file.
+    """
+    f = reader._f
+    f.clear_substreams()
+    f.seek(int(offset))
+    n = 0
+    for rid, payload in reader.iter_records():
+        if rid not in keep_ids:
+            break                      # left this table region
+        consume(rid, payload)
+        n += 1
+        if n >= max_records:
+            break
+    return n
+
+
 def scan_cell_offsets(path: str | Path, *, use_mmap: bool = False,
                       shared_buf: object = None) -> dict:
     """Read the name-table section and return the per-cell byte-offset
@@ -2332,71 +2396,126 @@ def scan_cell_offsets(path: str | Path, *, use_mmap: bool = False,
     reader = OasisReader(path, capture_prop_values=True, use_mmap=use_mmap,
                          shared_buf=shared_buf)
     propname_by_refnum: dict[int, str] = {}
-    pn_implicit = 0
-    cn_implicit = 0
-    last_propname: Optional[str] = None
-    last_cell_ref: Optional[int] = None
-    last_cell_name: Optional[str] = None
     by_refnum: dict[int, int] = {}
     by_name: dict[str, int] = {}
-    cellnames = 0
     # LAYERNAME records (11/12) map a name to a (layer, datatype) interval; they
-    # live in the name-table section before any CELL, so this same pass picks
-    # them up for free (F3 M2 — layer labels in the UI).
+    # live in the name-table section, so this same pass picks them up for free
+    # (F3 M2 — layer labels in the UI).
     layernames: list[tuple[str, tuple, tuple]] = []
+    # Mutable per-record state, shared between the inline pass and any
+    # strict-mode table-follow pass below.
+    st = {"pn_implicit": 0, "cn_implicit": 0, "last_propname": None,
+          "last_cell_ref": None, "last_cell_name": None, "cellnames": 0}
 
-    unit = None
-    for rid, payload in reader.iter_records():
-        if rid == START:
-            unit = payload.get("unit")
+    def _consume(rid, payload) -> None:
+        """Handle one name-table record (LAYERNAME / PROPNAME / CELLNAME /
+        PROPERTY), updating the shared dicts. Used by both the inline scan and
+        the strict-mode table-follow scan."""
         if rid in (LAYERNAME_GEOM, LAYERNAME_TEXT):
             layernames.append((
                 _name_str(payload.get("name", "")),
                 tuple(payload.get("layer_interval") or (0, -1)),
                 tuple(payload.get("datatype_interval") or (0, -1)),
             ))
-        if rid in (PROPNAME_IMP, PROPNAME_EXP):
+        elif rid in (PROPNAME_IMP, PROPNAME_EXP):
             nm = _name_str(payload.get("name", ""))
             if rid == PROPNAME_EXP and payload.get("refnum") is not None:
                 propname_by_refnum[int(payload["refnum"])] = nm
             else:
-                propname_by_refnum[pn_implicit] = nm
-                pn_implicit += 1
+                propname_by_refnum[st["pn_implicit"]] = nm
+                st["pn_implicit"] += 1
         elif rid in (CELLNAME_IMP, CELLNAME_EXP):
-            cellnames += 1
-            last_cell_name = _name_str(payload.get("name", ""))
+            st["cellnames"] += 1
+            st["last_cell_name"] = _name_str(payload.get("name", ""))
             if rid == CELLNAME_EXP and payload.get("refnum") is not None:
-                last_cell_ref = int(payload["refnum"])
+                st["last_cell_ref"] = int(payload["refnum"])
             else:
-                last_cell_ref = cn_implicit
-                cn_implicit += 1
+                st["last_cell_ref"] = st["cn_implicit"]
+                st["cn_implicit"] += 1
         elif rid in (PROPERTY_NORMAL, PROPERTY_LAST):
             pn = payload.get("propname")
             if pn is None:
-                name = last_propname            # modal: reuse previous
+                name = st["last_propname"]      # modal: reuse previous
             elif isinstance(pn, int):
                 name = propname_by_refnum.get(pn)
             else:
                 name = _name_str(pn)
-            last_propname = name
-            if name == _CELL_OFFSET_PROP and last_cell_ref is not None:
+            st["last_propname"] = name
+            if name == _CELL_OFFSET_PROP and st["last_cell_ref"] is not None:
                 vals = payload.get("values") or []
                 if vals:
                     off = int(vals[0])
-                    by_refnum[last_cell_ref] = off
-                    if last_cell_name is not None:
-                        by_name[last_cell_name] = off
-        elif rid in (CELL_REFNUM, CELL_NAME):
-            break    # body reached; name table fully behind us
+                    by_refnum[st["last_cell_ref"]] = off
+                    if st["last_cell_name"] is not None:
+                        by_name[st["last_cell_name"]] = off
+
+    unit = None
+    offset_flag = None
+    table_offsets = None
+    for rid, payload in reader.iter_records():
+        if rid == START:
+            unit = payload.get("unit")
+            offset_flag = payload.get("offset_flag")
+            # Present in START only when offset_flag == 0; for ==1 it's in END.
+            table_offsets = payload.get("table_offsets")
+            continue
+        if rid in (CELL_REFNUM, CELL_NAME):
+            break    # body reached; inline name table (if any) fully behind us
+        _consume(rid, payload)
+
+    offsets_via = "inline" if by_refnum else None
+
+    # Strict-mode files (e.g. KLayout "Save As ▸ OASIS, strict") put the name
+    # tables AFTER the cells and record their byte offsets in START (flag 0) or
+    # the END record (flag 1). The inline pass above breaks at the first CELL
+    # and so misses them — which made such files look index-less (no
+    # S_CELL_OFFSET / no LAYERNAME) even though both are present (F12 fix).
+    # Follow the offsets: PROPNAME first (so PROPERTY refnums resolve), then
+    # CELLNAME (carries S_CELL_OFFSET), then LAYERNAME. Each is a bounded seek
+    # to a known table region, never a whole-file scan.
+    if not by_refnum or not layernames:
+        if table_offsets is None and offset_flag == 1:
+            table_offsets = _read_end_table_offsets(reader)
+
+        def _tbl_off(i: int) -> int:
+            try:
+                strict, off = table_offsets[i]
+                return int(off)
+            except (TypeError, IndexError, ValueError):
+                return 0
+
+        if table_offsets:
+            if not by_refnum:
+                pn_off = _tbl_off(_TBL_PROPNAME)
+                cn_off = _tbl_off(_TBL_CELLNAME)
+                if pn_off:
+                    _read_table_region(reader, pn_off,
+                                       (PROPNAME_IMP, PROPNAME_EXP), _consume)
+                if cn_off:
+                    _read_table_region(
+                        reader, cn_off,
+                        (CELLNAME_IMP, CELLNAME_EXP,
+                         PROPERTY_NORMAL, PROPERTY_LAST), _consume)
+                if by_refnum:
+                    offsets_via = "tables"
+            if not layernames:
+                ln_off = _tbl_off(_TBL_LAYERNAME)
+                if ln_off:
+                    _read_table_region(reader, ln_off,
+                                       (LAYERNAME_GEOM, LAYERNAME_TEXT),
+                                       _consume)
 
     reader.close()   # release the mmap / slurp buffer (F6 M1)
     return {
         "by_refnum": by_refnum,
         "by_name": by_name,
         "found": len(by_refnum),
-        "cellnames": cellnames,
+        "cellnames": st["cellnames"],
         "unit": unit,
         "layernames": layernames,
+        "offset_flag": offset_flag,
+        "table_offsets": table_offsets,
+        "offsets_via": offsets_via,
     }
 
 

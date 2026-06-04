@@ -78,6 +78,34 @@ def report_file(path, *, sent_layers: Optional[Iterable] = None,
                  + (", ".join(cellnames[:20]) + (" …" if len(cellnames) > 20 else "")
                     if cellnames else "(none)"))
 
+    # Index-table diagnostics (F12): the random-access ROI load and "Scan
+    # layers" both depend on the S_CELL_OFFSET + LAYERNAME tables. Strict-mode
+    # writers (e.g. KLayout) put them after the cells, located via START/END
+    # offsets; report how (and whether) they were found so an index-less
+    # diagnosis is actionable.
+    lines.append("")
+    lines.append("index tables (S_CELL_OFFSET / LAYERNAME):")
+    try:
+        idx = oas.scan_cell_offsets(p)
+        n_off = len(idx.get("by_refnum") or {})
+        n_ln = len(idx.get("layernames") or [])
+        lines.append(f"  offset_flag : {idx.get('offset_flag')}  "
+                     "(0=offsets in START, 1=in END, None=non-strict/absent)")
+        lines.append(f"  located via : {idx.get('offsets_via')}  "
+                     "(inline | tables | None)")
+        lines.append(f"  table_offsets: {idx.get('table_offsets')}")
+        lines.append(f"  S_CELL_OFFSET entries: {n_off}")
+        lines.append(f"  LAYERNAME rows       : {n_ln}")
+        if n_off == 0:
+            lines.append("  -> NO cell-offset index: random-access ROI load "
+                         "and layer scan are unavailable. Re-save from KLayout "
+                         "with OASIS 'strict mode' to write the offset table.")
+        elif n_ln == 0:
+            lines.append("  -> offsets present but no LAYERNAME table: 'Scan "
+                         "layers' will enumerate numeric layers by sampling.")
+    except Exception as exc:  # noqa: BLE001 — diagnostics must never throw
+        lines.append(f"  (scan_cell_offsets failed: {type(exc).__name__}: {exc})")
+
     lines.append("")
     lines.append("record histogram:")
     for rid in sorted(hist):

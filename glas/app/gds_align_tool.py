@@ -1043,9 +1043,30 @@ def _scan_oas_with_streamer(path: "Path", q: "mp.Queue") -> None:
     res = _orx.enumerate_layers(p, progress_cb=_progress)
 
     elapsed = _t.monotonic() - t0
+    diag = res.get("diag") or {}
+    layers = res.get("layers") or []
+    # Rich terminal diagnostics: how the index tables were located (the common
+    # "UI says no index" cause is a strict-mode file whose tables sit after the
+    # cells), plus what was enumerated.
     _sys.stderr.write(
-        f"[gds-scan] {elapsed:.2f}s  source={res.get('source')}  "
-        f"enumerated {len(res.get('layers') or [])} layers\n")
+        f"[gds-scan] {p.name}  {size_mb:,.0f} MB  {elapsed:.2f}s\n"
+        f"[gds-scan]   source        = {res.get('source')}\n"
+        f"[gds-scan]   offset_flag   = {diag.get('offset_flag')}  "
+        f"(0=offsets in START, 1=in END, None=non-strict/absent)\n"
+        f"[gds-scan]   offsets_via   = {diag.get('offsets_via')}  "
+        f"(inline | tables | None=none found)\n"
+        f"[gds-scan]   table_offsets = {diag.get('table_offsets')}\n"
+        f"[gds-scan]   cell offsets  = {diag.get('n_cell_offsets')}  "
+        f"(S_CELL_OFFSET entries)\n"
+        f"[gds-scan]   LAYERNAME rows= {diag.get('n_layernames')}\n"
+        f"[gds-scan]   layers found  = {len(layers)}  "
+        + ", ".join(f"{d['layer']}/{d['datatype']}" for d in layers[:20])
+        + (" …" if len(layers) > 20 else "") + "\n")
+    if res.get("source") == "no-index":
+        _sys.stderr.write(
+            "[gds-scan]   NOTE: no LAYERNAME table and no S_CELL_OFFSET index "
+            "were found. If you saved this from KLayout, enable 'strict mode' "
+            "in the OASIS writer options so the cell-offset table is written.\n")
     _sys.stderr.flush()
     q.put(("done", res))
 

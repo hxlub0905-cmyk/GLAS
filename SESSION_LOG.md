@@ -4,6 +4,47 @@
 
 ---
 
+## [2026-06-04] [F12 bugfix] strict-mode（表在檔尾）OASIS 的 S_CELL_OFFSET/LAYERNAME 找不到 + scan 診斷強化
+
+**變更類型：** bug fix（core `scan_cell_offsets` 補 strict-mode table-offset 跟隨）+ 終端機/Diagnose 診斷強化
++ 測試 ·  **狀態：實作完成、全套件 577 passed，待 user 實機驗收**
+
+**現象（user 回報）：** user 用 KLayout 特別「另存」成有 S_CELL_OFFSET 的 `.oas`，但 GLAS「Scan layers」
+仍顯示無索引（no-index）。
+
+**根因：** `scan_cell_offsets` 只做 inline 掃描、**遇到第一個 CELL record 就 break**。但 **strict-mode
+writer（KLayout）把 name table（CELLNAME+S_CELL_OFFSET / PROPNAME / LAYERNAME）寫在所有 cell 之後**，
+其 byte offset 記在 START（offset_flag=0）或固定 256B 的 END（offset_flag=1）。inline 掃描在第一個 CELL
+就停 → 永遠掃不到檔尾的表 → 回 `by_refnum={}` / `layernames=[]` → enumerate_layers 判 no-index。已用合成
+strict 檔重現（scan 前回空、修後正確）。
+
+**修法（`glas/core/oasis_streamer.py`）：** 把 per-record 處理抽成 `_consume` 閉包供 inline 與
+table-follow 共用；inline 掃描時補抓 START 的 `offset_flag` + `table_offsets`。**當 inline 找不到 offsets
+或 layernames 時，依 table_offsets 跟隨檔尾表**：先 PROPNAME（讓 PROPERTY refnum 可解）→ CELLNAME
+（帶 S_CELL_OFFSET）→ LAYERNAME，各為**有界 seek 到已知 table 區段**（讀到非該表 record 即停，非全檔掃）。
+offset_flag=1 時用 `_read_end_table_offsets` 從檔尾 256B END 讀 6 組 offset pair（`_END_RECORD_LEN`，
+SEMI P39 §14）。回傳 dict 加 `offset_flag`/`table_offsets`/`offsets_via`（inline|tables|None）供診斷。
+**Calibre inline 檔兩表都 inline → 不進 table-follow，零額外成本**；只缺表的檔才觸發（最多檔尾 256B + 表區段）。
+
+**診斷強化（issue「終端機 debug 需更多資訊」）：**
+- `oasis_random`：RandomAccessReader 存 `_offset_flag/_offsets_via/_table_offsets`；`enumerate_layers`
+  回傳加 `diag` 區塊並 `_dbg` 輸出。
+- app `_scan_oas_with_streamer`：scan 後在終端機印多行 `[gds-scan]` 區塊（source / offset_flag /
+  offsets_via / table_offsets / cell-offset 數 / LAYERNAME 數 / 找到的 layer），no-index 時附「KLayout
+  請開 strict mode」提示。
+- `oasis_debug.report_file`（Diagnose OASIS file… 選單）新增「index tables」段：offset_flag、located via、
+  table_offsets、S_CELL_OFFSET 筆數、LAYERNAME 筆數 + 對應建議。
+
+**測試：** `tests/test_oasis_layer_scan.py` 新增 `TestStrictEndTables`（offsets-in-START 帶/不帶 LAYERNAME、
+offsets-in-END）共 3 筆 + strict 檔 builder。`QT_QPA_PLATFORM=offscreen pytest tests/` **577 passed**
+（含 oasis_random/oasis_streamer 無回歸）。py_compile 全過。**手動：待 user 拿真實 KLayout strict 檔實測。**
+
+**影響檔案：** `glas/core/oasis_streamer.py`、`glas/core/oasis_random.py`、`glas/core/oasis_debug.py`、
+`glas/app/gds_align_tool.py`、`tests/test_oasis_layer_scan.py`、`SESSION_LOG.md`。
+**Branch：** `claude/friendly-franklin-9uZqU`
+
+---
+
 ## [2026-06-04] [F12] 無 LAYERNAME 檔的 layer 列舉（bounded 抽樣 + sidecar 快取）M1–M4
 
 **變更類型：** 功能（core 2 新函式 + 新 cache 模組 + app scan 接線）+ 測試 + 文件 ·

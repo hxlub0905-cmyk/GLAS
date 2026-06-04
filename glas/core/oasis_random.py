@@ -237,6 +237,12 @@ class RandomAccessReader:
         # the FOV box / KLARF / RFL all use). unit==1000 -> 1.0 (no-op).
         self._unit = idx.get("unit")
         self._layernames = idx.get("layernames") or []
+        # Index provenance, kept for diagnostics (F12): how / whether the
+        # S_CELL_OFFSET + LAYERNAME tables were located (inline vs strict-mode
+        # end tables) — surfaced by enumerate_layers and the Diagnose report.
+        self._offset_flag = idx.get("offset_flag")
+        self._offsets_via = idx.get("offsets_via")
+        self._table_offsets = idx.get("table_offsets")
         self._nm_per_grid = (1000.0 / self._unit) if self._unit else 1.0
         _dbg(f"OASIS unit (grid steps per micron) = {self._unit!r} "
              f"-> 1 grid = {self._nm_per_grid} nm "
@@ -1014,9 +1020,19 @@ def enumerate_layers(path: str | Path, *, progress_cb=None, use_cache: bool = Tr
                 time_budget_s=time_budget_s, stop_after_no_new=stop_after_no_new,
                 include_text=include_text, progress_cb=progress_cb)
             result = {"layers": layers, "source": "sampled"}
+        result["diag"] = {
+            "offset_flag": rar._offset_flag,
+            "offsets_via": rar._offsets_via,
+            "table_offsets": rar._table_offsets,
+            "n_cell_offsets": len(rar._by_refnum),
+            "n_layernames": len(rar._layernames),
+            "n_layers": len(result["layers"]),
+            "source": result["source"],
+        }
     finally:
         rar.close()
 
+    _dbg(f"enumerate_layers {Path(path).name}: {result['diag']}")
     if use_cache:
         layerscan_cache.save(path, result, cache_params)
     return result
