@@ -154,6 +154,7 @@ ROI 進度畫面精確化 + Qt/jump 雜訊收掉。`pytest tests/` 602 全綠。
 
 **M5（ROI 過濾解碼）撤案：** 對「看多 defect」工作流更差（每換區域要重 parse）+ 與 cell 快取相斥。
 
-**後續（已登 §8）：**
-- **[F18]** lazy placement：`load_cell` 從 cache 載回仍重建 ~150 萬 Placement（~10s）。改 lazy（SoA + property）可砍掉、再壓 batch 暖機。
-- **[F19]** sidecar 無自動清理 → 加 LRU / 容量上限。
+**後續（皆已完成 2026-06-04）：**
+- **[F18]** ✅ lazy placement：`placements` 改 lazy property（decoded=list、cache=SoA、用到才建），cache 格式 v2
+  （int target/kind + 稀疏 name），prep 命中時完全不建 150 萬 Placement → cache 載入 placement 段 ~10s→~0.3s。
+- **[F19]** ✅ sidecar LRU 自動清理（`_evict` + `clear()` + `GLAS_CELLCACHE_MAX_MB`）。

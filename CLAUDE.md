@@ -202,11 +202,6 @@ HMI 風格表達式 → 遞迴下降 parser → AST → shapely 運算。運算�
 - [F17] （原 `[F16-B]`，改號避免與「大 cell 解碼快取」F16-B 撞名）S_BOUNDING_BOX 的後續：給「大檔 + 無
   S_BOUNDING_BOX + 無 CE 層」型做一次性 bbox sweep + sidecar 快取。**目前已知三個測試檔都用不到**（會慢的大檔
   都帶 S_BOUNDING_BOX）→ 低優先。F16 方案 A 已完成（`docs/plans/F16-sbbox-roi-prune.md`）。
-- [F18] 大 cell 解碼快取的後續：`load_cell` 從 sidecar 載回時仍會**重建 ~150 萬個 Placement 物件**（~10s）。
-  把 `placements` 改 lazy（cache 存 SoA、用到 survivor 才建），可砍掉這段、進一步壓低 batch 暖機 + 每 session 第一個 ROI。
-  風險中等（需 `placements` property 重構）。詳見 `docs/plans/F16-B-cell-decode-cache.md` 收尾備註。
-- [F19] cell/prep sidecar 快取**無自動清理**（`%LOCALAPPDATA%\glas\celldecode\`，每大檔 ~300MB cell + ~180MB prep），
-  看越多檔越占磁碟 → 加「總量超過上限刪最舊（LRU）」或手動清理入口。
 - [F11] ~~整顆 chip OASIS 匯出（原始 + Boolean 全 chip 重算）+ GDS 座標可見性~~ — **撤案**（2026-06-03，
   user 決定不做）。plan 仍保留於 `docs/plans/F11-whole-chip-export.md` 供日後參考。
 - [F12] 無索引表 OASIS：**部分完成（2026-06-04）**。原「全原生支援」（含無 per-cell bbox 的隨機存取）
