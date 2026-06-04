@@ -4,6 +4,25 @@
 
 ---
 
+## [2026-06-04] [F16 後續] walk_roi 幾何 extent 快取（per-cell）+ 分段計時
+
+**變更類型：** 效能修復 + 診斷 ·  **狀態：完成**
+
+**動機現象：** 向量化後 LTV 從 1313s→443s，但 walk 6/0 仍 366s（`poly_specs=477,590`），而 walk 17/101 掃 870 萬 rect 只 57s。
+poly 每 spec ~727µs，異常高。研判：幾何剪枝的「base bbox min/max + `repetition_extent`（type 10/11 會 `expand_repetition`）」
+在**每次 visit、每層**重算一遍（同一顆 cell 被造訪多次 → 同樣的 extent 重算多次）。
+
+**修復實作：** 在 `CellContent` 加 `_ext_cache`，新增 `rect_arrays(key)` / `poly_arrays(key)` 回傳 `(base_bbox, extent_bbox)`
+兩個 `(M,4)` ndarray，**首次計算後快取**（CellContent 在 reader 上 memoized，跨同一次 walk 的多次 visit 重用）。walk 的幾何
+剪枝改成讀快取陣列 → 一次 `apply_to_rects` 篩選、只展開 survivor。另加分段計時 `t_place/t_rect/t_poly`（`[roi] section time` 行）
+與 `placements/rect_specs/poly_specs` scan 計數，定位剩餘熱點。
+
+**測試：** `pytest tests/` → 592 passed（行為不變，僅把重算改為快取）。
+
+**影響檔案：** `glas/core/oasis_random.py`、`SESSION_LOG.md`。
+
+---
+
 ## [2026-06-04] [F16 後續] walk_roi 剪枝向量化（消除 per-record numpy 開銷）— 真正的慢點
 
 **變更類型：** 效能修復 + 測試 ·  **狀態：完成**

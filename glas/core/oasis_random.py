@@ -97,6 +97,55 @@ class CellContent:
     poly_specs: dict[LayerKey, list] = field(default_factory=dict)
     placements: list = field(default_factory=list)
     bbox: Optional[Bbox] = None
+    # Cache of per-key (base_bbox, array_extent_bbox) ndarrays, built once and
+    # reused across every ROI walk visit of this (memoized) cell — the extent
+    # build (incl. expand_repetition for arbitrary-list types) is otherwise
+    # repeated per visit per layer, which dominated big-chip ROI loads (F16).
+    _ext_cache: dict = field(default_factory=dict, repr=False, compare=False)
+
+    def rect_arrays(self, key: LayerKey):
+        """``(base (M,4), extent (M,4))`` local-frame bbox arrays for the
+        rectangles on ``key`` — ``base`` is each rect's own bbox, ``extent`` is
+        that bbox grown by the repetition extent. Built once and cached."""
+        ck = ("r", key)
+        got = self._ext_cache.get(ck)
+        if got is None:
+            specs = self.rect_specs.get(key) or ()
+            M = len(specs)
+            base = np.empty((M, 4), dtype=np.float64)
+            ext = np.empty((M, 4), dtype=np.float64)
+            for i, (x1, y1, x2, y2, rt, rr) in enumerate(specs):
+                xa, xb = (x1, x2) if x1 <= x2 else (x2, x1)
+                ya, yb = (y1, y2) if y1 <= y2 else (y2, y1)
+                base[i, 0] = xa; base[i, 1] = ya; base[i, 2] = xb; base[i, 3] = yb
+                e0, e1, e2, e3 = oas.repetition_extent(rt, rr)
+                ext[i, 0] = xa + e0; ext[i, 1] = ya + e1
+                ext[i, 2] = xb + e2; ext[i, 3] = yb + e3
+            got = (base, ext)
+            self._ext_cache[ck] = got
+        return got
+
+    def poly_arrays(self, key: LayerKey):
+        """``(base (P,4), extent (P,4))`` local-frame bbox arrays for the
+        polygons on ``key``. Built once and cached (the per-polygon min/max and
+        any arbitrary-list extent expansion run a single time)."""
+        ck = ("p", key)
+        got = self._ext_cache.get(ck)
+        if got is None:
+            specs = self.poly_specs.get(key) or ()
+            P = len(specs)
+            base = np.empty((P, 4), dtype=np.float64)
+            ext = np.empty((P, 4), dtype=np.float64)
+            for i, (b, rt, rr) in enumerate(specs):
+                bx0 = float(b[:, 0].min()); by0 = float(b[:, 1].min())
+                bx1 = float(b[:, 0].max()); by1 = float(b[:, 1].max())
+                base[i, 0] = bx0; base[i, 1] = by0; base[i, 2] = bx1; base[i, 3] = by1
+                e0, e1, e2, e3 = oas.repetition_extent(rt, rr)
+                ext[i, 0] = bx0 + e0; ext[i, 1] = by0 + e1
+                ext[i, 2] = bx1 + e2; ext[i, 3] = by1 + e3
+            got = (base, ext)
+            self._ext_cache[ck] = got
+        return got
 
     def is_empty(self) -> bool:
         return (not self.rect_specs and not self.poly_specs
@@ -652,6 +701,11 @@ class RoiWalkStats:
     placements_scanned: int = 0
     rect_specs_scanned: int = 0
     poly_specs_scanned: int = 0
+    # Wall-clock spent in each section of the walk (sums across all visits) —
+    # tells us which loop dominates a slow ROI load.
+    t_place: float = 0.0
+    t_rect: float = 0.0
+    t_poly: float = 0.0
 
 
 def _xform_bbox(T: Transform, bbox: Bbox) -> np.ndarray:
@@ -916,29 +970,19 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
         # materializing — the same analytic sub-grid clip as the placement loop.
         # A cheap whole-array extent prune skips arrays that miss the ROI in O(1)
         # (the old content.rects()/polys() expanded *every* spec in full).
-        rspecs = content.rect_specs.get(key, ())
+        rspecs = content.rect_specs.get(key)
         if rspecs:
-            # Batched whole-array extent prune: build every spec's array-extent
-            # bbox (parent-local) and test them with ONE apply_to_rects + mask.
-            # Then expand+clip only the survivors and emit with ONE more
-            # transform (avoids a per-spec numpy call on cells with millions of
-            # individual rectangles — the real cost the profiling exposed).
-            M = len(rspecs)
-            stats.rect_specs_scanned += M
-            bb = np.empty((M, 4), dtype=np.float64)
-            arr_local = np.empty((M, 4), dtype=np.float64)
-            for i, (x1, y1, x2, y2, rt, rr) in enumerate(rspecs):
-                xa, xb = (x1, x2) if x1 <= x2 else (x2, x1)
-                ya, yb = (y1, y2) if y1 <= y2 else (y2, y1)
-                bb[i, 0] = xa; bb[i, 1] = ya; bb[i, 2] = xb; bb[i, 3] = yb
-                e0, e1, e2, e3 = oas.repetition_extent(rt, rr)
-                arr_local[i, 0] = xa + e0; arr_local[i, 1] = ya + e1
-                arr_local[i, 2] = xb + e2; arr_local[i, 3] = yb + e3
-            keep = _roi_overlap_mask(T.apply_to_rects(arr_local), roi)
+            # Whole-array extent prune over all rect specs at once (cached local
+            # extent bboxes -> one apply_to_rects + mask); expand+clip only the
+            # survivors and emit with one more transform.
+            _ts = time.perf_counter()
+            base_bb, ext_bb = content.rect_arrays(key)
+            stats.rect_specs_scanned += base_bb.shape[0]
+            keep = _roi_overlap_mask(T.apply_to_rects(ext_bb), roi)
             parts = []
             for i in np.flatnonzero(keep):
                 x1, y1, x2, y2, rt, rr = rspecs[i]
-                oa = _clip_grid_offsets(rt, rr, bb[i], T, roi)
+                oa = _clip_grid_offsets(rt, rr, base_bb[i], T, roi)
                 if oa.shape[0] == 0:
                     continue
                 stats.arrays_materialized += 1
@@ -956,23 +1000,16 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
                 if m.any():
                     rect_out.append(r[m])
                     stats.rects_emitted += int(m.sum())
-        pspecs = content.poly_specs.get(key, ())
+            stats.t_rect += time.perf_counter() - _ts
+        pspecs = content.poly_specs.get(key)
         if pspecs:
-            P = len(pspecs)
-            stats.poly_specs_scanned += P
-            arr_local = np.empty((P, 4), dtype=np.float64)
-            bbs = np.empty((P, 4), dtype=np.float64)
-            for i, (base, rt, rr) in enumerate(pspecs):
-                bx0 = float(base[:, 0].min()); by0 = float(base[:, 1].min())
-                bx1 = float(base[:, 0].max()); by1 = float(base[:, 1].max())
-                bbs[i, 0] = bx0; bbs[i, 1] = by0; bbs[i, 2] = bx1; bbs[i, 3] = by1
-                e0, e1, e2, e3 = oas.repetition_extent(rt, rr)
-                arr_local[i, 0] = bx0 + e0; arr_local[i, 1] = by0 + e1
-                arr_local[i, 2] = bx1 + e2; arr_local[i, 3] = by1 + e3
-            keep = _roi_overlap_mask(T.apply_to_rects(arr_local), roi)
+            _ts = time.perf_counter()
+            base_bb, ext_bb = content.poly_arrays(key)
+            stats.poly_specs_scanned += base_bb.shape[0]
+            keep = _roi_overlap_mask(T.apply_to_rects(ext_bb), roi)
             for i in np.flatnonzero(keep):
                 base, rt, rr = pspecs[i]
-                oa = _clip_grid_offsets(rt, rr, bbs[i], T, roi)
+                oa = _clip_grid_offsets(rt, rr, base_bb[i], T, roi)
                 if oa.shape[0]:
                     stats.arrays_materialized += 1
                     stats.instances_materialized += oa.shape[0]
@@ -988,6 +1025,7 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
                     if _roi_overlap_mask(bb, roi)[0]:
                         poly_out.append(tp)
                         stats.polys_emitted += 1
+            stats.t_poly += time.perf_counter() - _ts
         if depth >= max_depth:
             return
         if depth == 0:
@@ -997,6 +1035,7 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
         placements = content.placements
         if not placements:
             return
+        _ts_pl = time.perf_counter()
         # Vectorized whole-array prune over ALL placements of this cell at once:
         # build each placement's array-extent bbox (parent-local) and test them
         # with a SINGLE apply_to_rects + ROI mask. A per-placement numpy call
@@ -1053,6 +1092,7 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
         arr_local = placed_all + ext
         keep = valid & _roi_overlap_mask(T.apply_to_rects(arr_local), roi)
         stats.instances_pruned += int(rcount[valid & ~keep].sum())
+        stats.t_place += time.perf_counter() - _ts_pl   # gather+prune only
         for i in np.flatnonzero(keep):
             pl = placements[i]
             rtype, rraw = pl.repetition_type, pl.repetition_raw
@@ -1115,6 +1155,8 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
     _dbg(f"  scanned: placements={stats.placements_scanned} "
          f"rect_specs={stats.rect_specs_scanned} "
          f"poly_specs={stats.poly_specs_scanned}")
+    _dbg(f"  section time: placements={stats.t_place:.1f}s "
+         f"rects={stats.t_rect:.1f}s polys={stats.t_poly:.1f}s")
     _dbg(f"  features: place_rtypes={sorted(str(x) for x in _feat['rtype'])} "
          f"angles={sorted(_feat['angle'])} flip={_feat['flip']} "
          f"mags={sorted(_feat['mag'])} name_ref={_feat['name_ref']} "
