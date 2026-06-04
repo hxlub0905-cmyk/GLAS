@@ -2409,6 +2409,11 @@ def scan_cell_offsets(path: str | Path, *, use_mmap: bool = False,
     # (F3 M2 — layer labels in the UI).
     layernames: list[tuple[str, tuple, tuple]] = []
     bbox_sample: list = []   # S_BOUNDING_BOX raw samples (diagnostic, F12/ROI)
+    # F16: full per-cell complete bbox from S_BOUNDING_BOX (flag==0 only), keyed
+    # like the offset maps so the ROI walk can prune without decoding geometry.
+    # Stored as (x0, y0, x1, y1) in grid/DBU units (cell-local frame).
+    bbox_by_refnum: dict[int, tuple] = {}
+    bbox_by_name: dict[str, tuple] = {}
     # Mutable per-record state, shared between the inline pass and any
     # strict-mode table-follow pass below.
     st = {"pn_implicit": 0, "cn_implicit": 0, "last_propname": None,
@@ -2457,13 +2462,23 @@ def scan_cell_offsets(path: str | Path, *, use_mmap: bool = False,
                     if st["last_cell_name"] is not None:
                         by_name[st["last_cell_name"]] = off
             elif name == _BBOX_PROP:
-                # Diagnostic: count cells carrying S_BOUNDING_BOX and keep a
-                # small raw-value sample so the exact encoding can be confirmed
-                # on a real file before wiring it into ROI pruning.
+                # Count S_BOUNDING_BOX cells + keep a small raw-value sample
+                # (diagnostic). Values are [flag, x_ll, y_ll, width, height] in
+                # grid/DBU units (SEMI P39 std property); x/y signed, w/h
+                # unsigned. flag==0 means the box is the *complete* bbox
+                # (includes placed children) — exactly the reachable_bbox the
+                # ROI walk needs, so only those are wired into pruning (F16).
                 st["bbox_count"] += 1
+                vals = payload.get("values") or []
                 if len(bbox_sample) < 5:
-                    bbox_sample.append(
-                        (st["last_cell_name"], list(payload.get("values") or [])))
+                    bbox_sample.append((st["last_cell_name"], list(vals)))
+                if len(vals) >= 5 and int(vals[0]) == 0:
+                    x0, y0 = int(vals[1]), int(vals[2])
+                    box = (x0, y0, x0 + int(vals[3]), y0 + int(vals[4]))
+                    if st["last_cell_ref"] is not None:
+                        bbox_by_refnum[st["last_cell_ref"]] = box
+                    if st["last_cell_name"] is not None:
+                        bbox_by_name[st["last_cell_name"]] = box
 
     unit = None
     offset_flag = None
@@ -2534,6 +2549,8 @@ def scan_cell_offsets(path: str | Path, *, use_mmap: bool = False,
         "offsets_via": offsets_via,
         "n_bbox_props": st["bbox_count"],
         "bbox_sample": bbox_sample,
+        "bbox_by_refnum": bbox_by_refnum,
+        "bbox_by_name": bbox_by_name,
     }
 
 

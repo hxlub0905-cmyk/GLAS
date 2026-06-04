@@ -243,11 +243,15 @@ class RandomAccessReader:
         self._offset_flag = idx.get("offset_flag")
         self._offsets_via = idx.get("offsets_via")
         self._table_offsets = idx.get("table_offsets")
-        # S_BOUNDING_BOX presence (diagnostic): a per-cell bbox in the name
-        # table would let ROI prune without decoding geometry (fast path for
-        # files lacking the CE 108/250 layer). See docs / Load-GDS-ROI perf.
+        # S_BOUNDING_BOX (F16): a per-cell *complete* bbox read straight from
+        # the name table lets the ROI prune skip decoding geometry — the fast
+        # path for big files lacking the CE 108/250 boundary layer. The maps
+        # (cid-local grid bbox, keyed like the offset maps) feed reachable_bbox;
+        # _n_bbox_props / _bbox_sample stay for the Diagnose report.
         self._n_bbox_props = idx.get("n_bbox_props") or 0
         self._bbox_sample = idx.get("bbox_sample") or []
+        self._sbbox_by_refnum: dict[int, Bbox] = idx.get("bbox_by_refnum") or {}
+        self._sbbox_by_name: dict[str, Bbox] = idx.get("bbox_by_name") or {}
         self._nm_per_grid = (1000.0 / self._unit) if self._unit else 1.0
         _dbg(f"OASIS unit (grid steps per micron) = {self._unit!r} "
              f"-> 1 grid = {self._nm_per_grid} nm "
@@ -314,6 +318,20 @@ class RandomAccessReader:
             cell_id = cell_id.decode("ascii", "replace")
         if isinstance(cell_id, str):
             return self._by_name.get(cell_id)
+        return None
+
+    def sbbox_for(self, cell_id: object) -> Optional[Bbox]:
+        """S_BOUNDING_BOX *complete* bbox (cid-local grid frame) for
+        ``cell_id``, or None if the file didn't carry one for this cell (F16).
+        Resolves refnum / name like :meth:`offset_for`. When present this is
+        the cell's full reachable extent (own + placements), so the ROI walk
+        uses it directly and skips decoding the subtree."""
+        if isinstance(cell_id, int):
+            return self._sbbox_by_refnum.get(cell_id)
+        if isinstance(cell_id, bytes):
+            cell_id = cell_id.decode("ascii", "replace")
+        if isinstance(cell_id, str):
+            return self._sbbox_by_name.get(cell_id)
         return None
 
     def load_cell(self, cell_id: object) -> CellContent:
@@ -426,6 +444,10 @@ class RandomAccessReader:
     def _reachable_bbox(self, cid, computing, cancel_cb):
         if cid in self._reach_memo:
             return self._reach_memo[cid]
+        sb = self.sbbox_for(cid)            # F16: name-table complete bbox
+        if sb is not None:
+            self._reach_memo[cid] = sb
+            return sb
         if cid in computing:
             return None
         if cancel_cb is not None and cancel_cb():
@@ -675,7 +697,7 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
     computing: set = set()
     _feat = {"rtype": set(), "angle": set(), "flip": False,
              "mag": set(), "name_ref": False, "rect_rtype": set(),
-             "poly_rtype": set(), "ce_viol": 0}
+             "poly_rtype": set(), "ce_viol": 0, "sbbox_viol": 0}
 
     def reachable_bbox(cid: object) -> Optional[Bbox]:
         """Bbox (cid-local frame) of all geometry reachable from cid —
@@ -683,6 +705,14 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
         return None."""
         if cid in reach_memo:
             return reach_memo[cid]
+        # F16 fast path: a name-table S_BOUNDING_BOX is already the complete
+        # (placement-inclusive) bbox, so use it directly — no geometry decode,
+        # no child recursion. This is what makes the first ROI load fast on big
+        # files without the CE 108/250 boundary layer.
+        sb = rar.sbbox_for(cid)
+        if sb is not None:
+            reach_memo[cid] = sb
+            return sb
         if cid in computing:
             return None
         _check_cancel()
@@ -730,6 +760,17 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
                 if _feat["ce_viol"] <= 6:
                     _dbg(f"  CE-VIOLATION cell {cid!r}: own_bbox={ob} "
                          f"ce_bbox={_ceb}")
+            # F16: validate the name-table S_BOUNDING_BOX actually contains the
+            # cell's own geometry (it must, being the complete bbox). A miss
+            # would mean the flag semantics differ and the prune is unsafe.
+            _sb = rar.sbbox_for(cid)
+            if _sb is not None and not (
+                    _sb[0] <= ob[0] and _sb[1] <= ob[1]
+                    and _sb[2] >= ob[2] and _sb[3] >= ob[3]):
+                _feat["sbbox_viol"] += 1
+                if _feat["sbbox_viol"] <= 6:
+                    _dbg(f"  SBBOX-VIOLATION cell {cid!r}: own_bbox={ob} "
+                         f"sbbox={_sb}")
         for _pl in content.placements:
             _feat["rtype"].add(_pl.repetition_type)
             _feat["angle"].add(_pl.angle)

@@ -4,29 +4,36 @@
 
 ---
 
-## [2026-06-04] [ROI perf 診斷] 偵測 S_BOUNDING_BOX（Load GDS ROI 變慢的解法探查第一步）
+## [2026-06-04] [F16] 用 name-table S_BOUNDING_BOX 免解幾何加速 Load GDS ROI
 
-**變更類型：** 診斷強化（core `scan_cell_offsets` 偵測 + Diagnose/終端機顯示）+ 測試 ·  **狀態：完成**
+**變更類型：** 功能（ROI 剪枝 fast path）+ 診斷 + 測試 ·  **狀態：完成** ·  **plan：** `docs/plans/F16-sbbox-roi-prune.md`
 
-**背景：** user 回報「Load GDS ROI 常常開很久」。查清現有邏輯：`walk_roi` 靠 `reachable_bbox`→`load_cell_bbox`
-取每顆 cell bbox 做 ROI 剪枝；有 CE 邊界層 (108/250) 時每顆只讀 ~1 矩形即停（快），**KLayout 轉檔無此層 →
+**背景／現象：** user 回報「Load GDS ROI 常常開很久」。追查：`walk_roi` 靠 `reachable_bbox`→`load_cell_bbox`
+取每顆 cell bbox 做 ROI 剪枝；有 CE 邊界層 (L108/D250) 時每顆只讀 ~1 矩形即停（快），**KLayout 轉檔無此層 →
 `_decode_bbox_at` 退化成每顆 cell 全解，第一次 ROI load 的 reachable_bbox 全階層 sweep ≈ 全 chip 解碼 → 慢**
-（即 F12 撤案的根本卡點）。Q&A 後 user 選「先診斷檔案有沒有 `S_BOUNDING_BOX`」——若 KLayout 有在 CELLNAME
-表寫每顆 cell 的 bbox 標準屬性，就能像 S_CELL_OFFSET 一樣**從 name table 直接讀 per-cell bbox、免解幾何**
-（方案 A，最快免費）；沒有則需做一次性 bbox 索引 + sidecar（方案 B）。
+（F12 撤案的根本卡點）。
 
-**本次（診斷步驟）：** `scan_cell_offsets` 在掃 name table（含 strict 檔尾表）時順帶偵測 `S_BOUNDING_BOX`
-（`_BBOX_PROP`）：回傳 `n_bbox_props` 計數 + `bbox_sample`（前 5 筆 cell 的原始 values，供確認實際編碼格式）。
-`oasis_debug.report_file`（Diagnose OASIS file… 選單）新增「S_BOUNDING_BOX props」行 + 取樣 + 對 ROI 速度的
-解讀；scan 終端機 `[gds-scan]` 區塊同步加一行。**不改任何 ROI/解碼行為**，純診斷。
+**診斷（M1）：** `scan_cell_offsets` 在掃 name table（含 strict 檔尾表）順帶偵測 `S_BOUNDING_BOX`（`_BBOX_PROP`）：
+`n_bbox_props` 計數 + `bbox_sample` 原始值取樣，顯示在 Diagnose 報告與 `[gds-scan]` 終端機。user 跑三個真實檔回報：
+**1.8 GB 的兩個慢檔每顆 cell 都帶 S_BOUNDING_BOX（其中 R8_OD 還剛好無 CE 層 = 最慢型）；唯一沒有的 E3B（345 MB）
+本就有 CE 層＋檔小**。→ 確定走方案 A（讀 name-table bbox），方案 B（自建 sidecar）三檔用不到、留 backlog。
 
-**測試：** `TestBoundingBoxProp`（有 → 計數+取樣、無 → 0）。`pytest tests/` **583 passed**。
+**解碼確認：** S_BOUNDING_BOX 五值 = `[flag, x左下, y左下, 寬, 高]`，cell-local grid/DBU；x/y 有號、寬高無號；
+bbox=`(x,y,x+寬,y+高)`。`flag==0` = 完整 bbox（含 placement，由檔1 top cell bbox≈整顆 chip 反證）。
 
-**下一步：** 待 user 拿真實慢檔跑 Diagnose / scan，回報 `S_BOUNDING_BOX props` 數與取樣 → 有則實作方案 A
-（從 name table 餵 per-cell bbox 給 reader，繞過幾何解碼）、無則方案 B（一次性 bbox 索引 + sidecar）。
+**實作（M2，方案 A）：**
+- `scan_cell_offsets` 建完整 `bbox_by_refnum`/`bbox_by_name`（**僅 flag==0**，存 `(x0,y0,x1,y1)` grid），隨 idx 回傳。
+- `RandomAccessReader` stash `_sbbox_by_refnum/_by_name` + 新 `sbbox_for(cell_id)`（解析 refnum/name，仿 `offset_for`）。
+- `reachable_bbox`（walk_roi closure + 獨立 `_reachable_bbox`）加 fast path：有 sbbox → **直接回傳、跳過
+  `load_cell_bbox` 與子遞迴**，memoize 進 `_reach_memo`。無 sbbox 完全走原 CE/解碼路（E3B 行為不變）。
+- DEBUG 守門：walk 內仿 CE-VIOLATION 加 `SBBOX-VIOLATION`——查表 bbox 必須包住每顆走訪 cell 的實際 bbox。
+
+**測試：** `TestSBoundingBoxPrune`（value 故意大於真實幾何以證明值來自 name table；flag!=0 → fallback 解碼；
+遠端 instance 免解幾何剪枝且 `_bbox_memo=={}`）+ `TestBoundingBoxProp`（偵測有/無）。`pytest tests/` **587 passed**。
 
 **影響檔案：** `glas/core/oasis_streamer.py`、`glas/core/oasis_random.py`、`glas/core/oasis_debug.py`、
-`glas/app/gds_align_tool.py`、`tests/test_oasis_layer_scan.py`、`SESSION_LOG.md`。
+`glas/app/gds_align_tool.py`、`tests/test_oasis_random.py`、`tests/test_oasis_layer_scan.py`、
+`docs/plans/F16-sbbox-roi-prune.md`、`SESSION_LOG.md`。
 **Branch：** `claude/friendly-franklin-9uZqU`
 
 ---

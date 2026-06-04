@@ -130,6 +130,105 @@ class TestRandomAccessReader:
         assert empty.bbox is None
 
 
+def _build_hierarchy_sbbox(places, root_sbbox, child_sbbox) -> bytes:
+    """root R=ref0 places child A=ref1 (a 10x10 rect at local origin) at each
+    (x, y) in ``places``. Both cells carry S_CELL_OFFSET *and* an
+    S_BOUNDING_BOX standard property (F16). ``root_sbbox`` / ``child_sbbox`` are
+    [flag, x, y, w, h] value lists written verbatim, so a test can set them
+    *different* from the true decoded extent to prove the prune reads the name
+    table rather than decoding geometry."""
+    start = (bytes([oas.START]) + _astr("1.0") + bytes([0])
+             + _uint(1000) + _uint(0) + bytes([0] * 12))
+    pn0 = bytes([oas.PROPNAME_IMP]) + _astr("S_CELL_OFFSET")    # refnum 0
+    pn1 = bytes([oas.PROPNAME_IMP]) + _astr("S_BOUNDING_BOX")   # refnum 1
+    cnr = bytes([oas.CELLNAME_IMP]) + _astr("R")
+    cna = bytes([oas.CELLNAME_IMP]) + _astr("A")
+
+    def prop_off(off):
+        return (bytes([oas.PROPERTY_NORMAL, 0x16]) + _uint(0)
+                + _uint(8) + _ufix(off, 4))
+
+    def prop_bbox(vals):
+        # info 0x56: U=5 values, C=1 (propname follows), N=1 (refnum 1).
+        body = bytes([oas.PROPERTY_NORMAL, 0x56]) + _uint(1)
+        for v in vals:
+            body += _uint(8) + _uint(v)
+        return body
+
+    xyabs = bytes([15])
+    def place(x, y):
+        return bytes([oas.PLACEMENT_NOMAG, 0xF0]) + _uint(1) + _sint(x) + _sint(y)
+
+    cell_r = bytes([oas.CELL_REFNUM]) + _uint(0)
+    cell_a = bytes([oas.CELL_REFNUM]) + _uint(1)
+    end = bytes([oas.END]) + _uint(0)
+
+    # prop_off uses a fixed-width offset, so the header length is invariant —
+    # measure it with placeholder offsets, then re-emit with the real ones.
+    def header(off_r, off_a):
+        return (oas.MAGIC + start + pn0 + pn1
+                + cnr + prop_off(off_r) + prop_bbox(root_sbbox)
+                + cna + prop_off(off_a) + prop_bbox(child_sbbox))
+
+    off_r = len(header(0, 0))
+    body_r = cell_r + xyabs + b"".join(place(x, y) for x, y in places)
+    off_a = off_r + len(body_r)
+    return (header(off_r, off_a) + body_r
+            + cell_a + _rect(17, 10, 10, 0, 0) + end)
+
+
+class TestSBoundingBoxPrune:
+    """F16: when the name table carries S_BOUNDING_BOX, reachable_bbox returns
+    it directly (the complete, placement-inclusive bbox) — pruning the ROI
+    walk without decoding geometry. The fixtures set the property *larger than*
+    the real geometry so the value can only come from the name table."""
+
+    def test_map_populated(self, tmp_path):
+        p = tmp_path / "sb.oas"
+        p.write_bytes(_build_hierarchy_sbbox(
+            [(0, 0)], root_sbbox=[0, 0, 0, 99999, 99999],
+            child_sbbox=[0, 0, 0, 20, 20]))
+        rar = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
+        assert rar._n_bbox_props == 2
+        # keyed by refnum and by name, stored as (x0, y0, x1, y1)
+        assert rar.sbbox_for(1) == (0, 0, 20, 20)
+        assert rar.sbbox_for("R") == (0, 0, 99999, 99999)
+
+    def test_reachable_bbox_reads_name_table(self, tmp_path):
+        # child's real geometry is 10x10; S_BOUNDING_BOX says 20x20.
+        p = tmp_path / "sb.oas"
+        p.write_bytes(_build_hierarchy_sbbox(
+            [(0, 0)], root_sbbox=[0, 0, 0, 99999, 99999],
+            child_sbbox=[0, 0, 0, 20, 20]))
+        rar = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
+        assert tuple(rar.reachable_bbox(1)) == (0, 0, 20, 20)   # not decoded 10x10
+        assert tuple(rar.reachable_bbox(0)) == (0, 0, 99999, 99999)
+
+    def test_flag_nonzero_ignored(self, tmp_path):
+        # flag != 0 means "own geometry only" (not the complete bbox) — must be
+        # skipped, so reachable_bbox falls back to the decoded union (10x10).
+        p = tmp_path / "sb.oas"
+        p.write_bytes(_build_hierarchy_sbbox(
+            [(0, 0)], root_sbbox=[1, 0, 0, 99999, 99999],
+            child_sbbox=[1, 0, 0, 20, 20]))
+        rar = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
+        assert rar.sbbox_for(1) is None
+        assert tuple(rar.reachable_bbox(1)) == (0, 0, 10, 10)   # decoded
+
+    def test_walk_prunes_far_instance(self, tmp_path):
+        p = tmp_path / "sb.oas"
+        p.write_bytes(_build_hierarchy_sbbox(
+            [(0, 0), (100_000, 100_000)],
+            root_sbbox=[0, 0, 0, 100_020, 100_020],
+            child_sbbox=[0, 0, 0, 20, 20]))
+        rar = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
+        res = orx.walk_roi(rar, 0, (0, 0, 5, 5), 17, 0)
+        assert res["rects"].tolist() == [[0, 0, 10, 10]]
+        assert res["stats"].instances_pruned == 1
+        # decode-free prune: load_cell_bbox (the CE/decode path) never ran.
+        assert rar._bbox_memo == {}
+
+
 def _build_hierarchy(places: list[tuple[int, int]]) -> bytes:
     """root R=ref0 places child A=ref1 (a 10x10 rect at local origin) at
     each (x, y) in ``places``. Both cells carry S_CELL_OFFSET."""

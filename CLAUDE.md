@@ -91,6 +91,7 @@ GLAS/
 │   │   ├── oasis_walker.py      # cell-graph walker + transform 展開 → root 座標
 │   │   ├── oasis_random.py      # S_CELL_OFFSET 隨機存取 + ROI walk + CE 邊界 early-stop
 │   │   │                        #   + F12 enumerate_layers/sample_layers（無 LAYERNAME 時 bounded 抽樣列 layer）
+│   │   │                        #   + F16 sbbox_for：有 S_BOUNDING_BOX 時 reachable_bbox 免解幾何直接剪枝
 │   │   ├── layerscan_cache.py   # F12 layer 列舉結果 sidecar 快取（keyed by mtime+size+params）
 │   │   ├── gds_fov.py           # KLARF↔GDS 座標換算 + FOV 空間查詢
 │   │   ├── gds_boolean.py       # 遞迴下降 parser + shapely Boolean 引擎 + mask
@@ -195,6 +196,9 @@ HMI 風格表達式 → 遞迴下降 parser → AST → shapely 運算。運算�
 
 ### 待辦 (Backlog)
 
+- [F16-B] S_BOUNDING_BOX 的後續：給「大檔 + 無 S_BOUNDING_BOX + 無 CE 層」型做一次性 bbox sweep + sidecar
+  快取（方案 B）。**目前已知三個測試檔都用不到**（會慢的大檔都帶 S_BOUNDING_BOX）→ 低優先。方案 A 已完成
+  （`docs/plans/F16-sbbox-roi-prune.md`）。
 - [F11] ~~整顆 chip OASIS 匯出（原始 + Boolean 全 chip 重算）+ GDS 座標可見性~~ — **撤案**（2026-06-03，
   user 決定不做）。plan 仍保留於 `docs/plans/F11-whole-chip-export.md` 供日後參考。
 - [F12] 無索引表 OASIS：**部分完成（2026-06-04）**。原「全原生支援」（含無 per-cell bbox 的隨機存取）
