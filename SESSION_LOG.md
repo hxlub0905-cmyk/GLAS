@@ -4,6 +4,19 @@
 
 ---
 
+## [2026-06-04] [F16-B] 大型 cell 解碼快取 — plan 撰寫（待核准，未動工）
+
+**變更類型：** 文件（plan）·  **狀態：planned（等 user 指示）**
+
+**動機：** decode 計時定論：ROI walk 剩餘瓶頸是單一巨大 flat cell `44995`（880萬 rect + 150萬 placement + 48萬 poly
+≈ 1080萬筆）首次解碼 ~292s。session 內已 memoized（第二顆 layer / 鄰近 ROI 重用很快），痛點是每個 session 第一次等 ~5min。
+user 選定「持久化磁碟快取」方向（F16-B）。已寫 plan `docs/plans/F16-B-cell-decode-cache.md`（只快取大 cell、numpy 欄狀
+.npz + 稀疏 repetition 側表、第二次起秒級）。**核准問題被 user dismiss → 暫不動工，等下一步指示。**
+
+**影響檔案：** `docs/plans/F16-B-cell-decode-cache.md`、`SESSION_LOG.md`。
+
+---
+
 ## [2026-06-04] [F16 後續] walk_roi 加 decode 計時（定位剩餘 345s）
 
 **變更類型：** 診斷 ·  **狀態：完成（待 user 數據定論）**
