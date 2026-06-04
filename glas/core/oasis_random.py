@@ -1182,31 +1182,33 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
                  f"(placements={len(content.placements)}, "
                  f"rect_specs={content.total_rects()}, "
                  f"poly_specs={content.total_polys()})")
-        # Debug: does the CE early-stop bbox actually bound the cell's real
-        # geometry? (M3.5e.3 assumes CE rect == cell full bbox.) Compare the
-        # full-decode own bbox against the CE-only bbox for descended cells.
+        # Debug-only consistency checks. When the cell has a name-table
+        # S_BOUNDING_BOX (the prune path we actually use), validate THAT against
+        # the decoded bbox and skip the CE check entirely — the CE check calls
+        # load_cell_bbox, which on a giant flat cell decodes up to a deep
+        # boundary rect (tens of seconds) for information we don't rely on.
         if DEBUG and content.bbox is not None:
-            _ce = rar.load_cell_bbox(cid)
-            _ceb = _ce.bbox if _ce is not None else None
             ob = content.bbox
-            inside = (_ceb is not None and _ceb[0] <= ob[0] and _ceb[1] <= ob[1]
-                      and _ceb[2] >= ob[2] and _ceb[3] >= ob[3])
-            if not inside:
-                _feat["ce_viol"] += 1
-                if _feat["ce_viol"] <= 6:
-                    _dbg(f"  CE-VIOLATION cell {cid!r}: own_bbox={ob} "
-                         f"ce_bbox={_ceb}")
-            # F16: validate the name-table S_BOUNDING_BOX actually contains the
-            # cell's own geometry (it must, being the complete bbox). A miss
-            # would mean the flag semantics differ and the prune is unsafe.
             _sb = rar.sbbox_for(cid)
-            if _sb is not None and not (
-                    _sb[0] <= ob[0] and _sb[1] <= ob[1]
-                    and _sb[2] >= ob[2] and _sb[3] >= ob[3]):
-                _feat["sbbox_viol"] += 1
-                if _feat["sbbox_viol"] <= 6:
-                    _dbg(f"  SBBOX-VIOLATION cell {cid!r}: own_bbox={ob} "
-                         f"sbbox={_sb}")
+            if _sb is not None:
+                if not (_sb[0] <= ob[0] and _sb[1] <= ob[1]
+                        and _sb[2] >= ob[2] and _sb[3] >= ob[3]):
+                    _feat["sbbox_viol"] += 1
+                    if _feat["sbbox_viol"] <= 6:
+                        _dbg(f"  SBBOX-VIOLATION cell {cid!r}: own_bbox={ob} "
+                             f"sbbox={_sb}")
+            else:
+                # No sbbox -> the CE boundary IS the prune path; validate it.
+                _ce = rar.load_cell_bbox(cid)
+                _ceb = _ce.bbox if _ce is not None else None
+                inside = (_ceb is not None and _ceb[0] <= ob[0]
+                          and _ceb[1] <= ob[1] and _ceb[2] >= ob[2]
+                          and _ceb[3] >= ob[3])
+                if not inside:
+                    _feat["ce_viol"] += 1
+                    if _feat["ce_viol"] <= 6:
+                        _dbg(f"  CE-VIOLATION cell {cid!r}: own_bbox={ob} "
+                             f"ce_bbox={_ceb}")
         for _pl in content.placements:
             _feat["rtype"].add(_pl.repetition_type)
             _feat["angle"].add(_pl.angle)

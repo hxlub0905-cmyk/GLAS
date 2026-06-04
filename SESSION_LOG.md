@@ -4,6 +4,21 @@
 
 ---
 
+## [2026-06-04] [F16-B] --debug 跳過有 sbbox 之 cell 的 CE 檢查（移除首載 ~53s）
+
+**變更類型：** 效能（診斷路徑）·  **狀態：完成**
+
+**動機：** user 實測（重開 app、快取已建）：換 ROI 已降到 9–12s（M6 生效，t_place 14.9s→0.7s）、44995 從磁碟載入 19.8s（vs 解碼
+292s）。但每 session 第一個 ROI 仍 128.8s，其中 ~53s 不在分段計時內 → 為 `--debug` 的 CE-violation 檢查對 44995 呼叫
+`load_cell_bbox`（解碼到深處的 CE 邊界矩形）。因本檔用 S_BOUNDING_BOX 剪枝、根本不靠 CE，此檢查多餘。
+
+**修復：** walk 的 DEBUG 一致性檢查改為：有 sbbox → 只驗 sbbox-violation（便宜）、**跳過 CE 檢查（不呼叫 load_cell_bbox）**；
+無 sbbox 才驗 CE（CE 是該情境的剪枝路徑）。非 --debug 本就整段跳過。移除大檔首載的 ~53s 診斷開銷。
+
+**測試：** `pytest tests/` 600 全綠（CE early-stop 測試用無 sbbox 的 cell，仍走 CE 檢查）。**影響檔案：** `glas/core/oasis_random.py`、`SESSION_LOG.md`。
+
+---
+
 ## [2026-06-04] [F16-B M6] walk placement gather per-cell 快取（換 ROI 加速）
 
 **變更類型：** 效能 ·  **狀態：完成**
