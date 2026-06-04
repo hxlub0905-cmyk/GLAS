@@ -19,9 +19,14 @@
 layer/datatype（例 `17/101`、`6/0`）。目前「Scan layers」靠 `LAYERNAME_GEOM/TEXT`
 記錄列舉 layer，沒有這些記錄就**列空 → 強制 user 手 key**。
 
-**成功長相：** 對沒有 LAYERNAME 表的檔按「Scan layers」，能從**實際幾何記錄**列舉出
-出現過的數字 (layer/datatype)，丟進既有 `LayerPickDialog` 讓 user 勾選；**只顯示數字**
-（無名稱），免手 key。有 LAYERNAME 表的檔維持原本秒級 fast-path 不變。
+**成功長相：** 對沒有 LAYERNAME 表的檔按「Scan layers」，用**有上限、保證會結束**的
+**bounded 抽樣**從幾何記錄列舉出現過的數字 (layer/datatype)，丟進既有 `LayerPickDialog`
+讓 user 勾選；**只顯示數字**（無名稱），免手 key。有 LAYERNAME 表的檔維持原本秒級
+fast-path 不變。
+
+**🚫 不做全檔掃描（2026-06-04 user 追加限制）：** 這類檔多 GB，全檔 fallback 掃描「根本
+開不完」，故**禁止 O(檔案) 全掃**。改用 cell-offset 抽樣 + 早停 + 時間預算 + cancel +
+掃描中即時顯示，**接受抽樣不保證列出 100% layer**（漏的罕見/深層 layer 仍可手 key 補）。
 
 **跟現有系統的關係：** 延伸 `_scan_oas_with_streamer` 的 fallback 分支；不動隨機存取
 / bbox / walk 熱路徑（§7 不變式完全不碰）。`LayerPickDialog` 已支援無名稱條目
@@ -45,40 +50,59 @@ bbox 索引。**本 plan 不含任何 bbox / 隨機存取索引工作。**
 **選擇：** **A 只顯示數字即可**（如 `L17/D101`）。
 **理由：** 多數對位流程夠用；`LayerPickDialog` 已能顯示無名稱條目，省 UI 工。
 
+### Q4: 無表時用哪種「有上限、保證會結束」的掃描策略？
+**選項：** A 順讀前 N 量 + cancel / B 按 cell-offset 抽樣 + 早停 / C 只掃 root + 直接子 cell
+**選擇：** **B 按 cell-offset 抽樣 + 早停**（user 兩題皆「無偏好」→ 由實作定奪）。
+**理由：** user 流程已用 KLayout 轉檔補 `S_CELL_OFFSET` → 直接複用既有 `oasis_random`
+隨機存取 seek 到分散各處的 cell、只解本地幾何，**涵蓋面比順讀廣、較不易漏**，且天然 bounded
+（N 顆 × 每顆 K 筆 + 時間預算）。順讀只看檔頭（可能是純 placement 的 top cell）易漏。
+
+### Q5: 抽樣不保證列出 100% layer，可接受嗎？
+**選擇：** **可接受**（user「無偏好」→ 採能開完優先）。漏的罕見/深層 layer 保留手 key 退路。
+
 ---
 
 ## Milestones
 
-### M1: core — `enumerate_layers` 加幾何 fallback  [status: planned]
+### M1: core — `enumerate_layers` + bounded 抽樣  [status: planned]
 
-把純掃描邏輯抽進 core（Qt-free、可單元測試），LAYERNAME 缺席時改掃幾何記錄。
+把純掃描邏輯抽進 core（Qt-free、可單元測試）。**絕不全檔掃**。
 
 - [ ] `oasis_streamer.py` 新增 `enumerate_layers(path, *, shared_buf=None,
       progress_cb=None) -> list[dict]`：
-  - 先走現有 fast-path：收集 `LAYERNAME_GEOM/TEXT`，在首個 CELL 記錄前若已見過
-    LAYERNAME → 回傳（與現行行為 byte-for-byte 等價）。
-  - **fallback**：抵達首個 CELL 記錄時若 `seen_layername == False` → 不 break，
-    切換成幾何列舉模式，繼續 `iter_records` 到 EOF，從 RECTANGLE(20)/POLYGON(21)/
-    PATH(22)/TRAPEZOID(23)/CTRAPEZOID(26)/CIRCLE(27) 的 `payload["layer"]` /
-    `payload["datatype"]` 收 distinct pair（name=""）。
-  - `progress_cb(records_scanned, layers_so_far)` 週期性回報（供 UI 串流 + 早停）。
-- [ ] de-dup 用 `(layer, datatype)`；輸出 dict 結構 `{"layer","datatype","name"}`
-      與 fast-path 一致，供 `LayerPickDialog` 直接吃。
+  - **fast-path（不變）**：掃 START→首個 CELL 之間的 `LAYERNAME_GEOM/TEXT`，
+    有就回傳（與現行行為 byte-for-byte 等價，秒級）。
+- [ ] **無 LAYERNAME 時走 bounded 抽樣**（新函式，建議放 `oasis_random.py` 因需用
+      cell-offset 隨機存取，或 streamer 內呼叫 random 模組）：
+  - `sample_layers(path, *, max_cells=64, max_records_per_cell=2000,
+    time_budget_s=15.0, stop_after_no_new=16, progress_cb=None) -> list[dict]`
+  - 用 `scan_cell_offsets` 取 cell-offset 表；**無 offset 表 → 回空 + 提示先 KLayout
+    轉檔**（不退化成全掃）。
+  - 從 offset 清單**均勻抽樣** ≤ `max_cells` 顆（含 root），各 seek 後**只解本地幾何前
+    `max_records_per_cell` 筆**，收 RECTANGLE(20)/POLYGON(21)/PATH(22)/TRAPEZOID(23)/
+    CTRAPEZOID(26)/CIRCLE(27) 的 `(layer,datatype)` distinct pair（name=""）。
+  - **早停**：連續 `stop_after_no_new` 顆 cell 無新 layer，或超過 `time_budget_s`，即停。
+  - `progress_cb(cells_done, layers_so_far)` 回報（供 UI 串流 + user 早停）。
+- [ ] de-dup `(layer, datatype)`；輸出 `{"layer","datatype","name"}` 與 fast-path 一致，
+      供 `LayerPickDialog` 直接吃。
 - [ ] 驗證：`tests/test_oasis_layer_scan.py`
-  - 用 `oasis_writer.write_oasis` 造一個「有幾何、無 LAYERNAME」的小檔（rect 落在
-    17/101 與 6/0）→ `enumerate_layers` 回傳恰好這兩 pair、name 皆空。
-  - 有 LAYERNAME 的檔（fixture 或手造）→ 走 fast-path、不進幾何掃描（用 progress_cb
-    呼叫次數或 sentinel 斷言未進 fallback）。
+  - 用 `oasis_writer.write_oasis` 造「有幾何、無 LAYERNAME」小檔（rect 落 17/101 與 6/0）
+    → `enumerate_layers` 抽樣回傳含這兩 pair、name 皆空。
+  - **bounded 斷言**：造一個 cell 數 > `max_cells` 的檔 → 確認只解 ≤ max_cells 顆、
+    `progress_cb` 呼叫次數有上限（證明非全掃）。
+  - 有 LAYERNAME 的檔 → 走 fast-path、完全不進抽樣（sentinel 斷言）。
+  - 無 offset 表的檔 → 回空 + 不全掃（不 hang）。
 
 ### M2: app — 接線 + 串流進度 + cancel  [status: planned]
 
 - [ ] `_scan_oas_with_streamer`（`gds_align_tool.py:967`）改呼叫 core
-      `enumerate_layers`，progress_cb 內 `q.put(("progress", "...found N layers:
-      17/101, 6/0 …"))`，讓 user 在掃描中就看到 layer 浮現。
-- [ ] cancel：沿用 `LayerScanWorker` 既有 subprocess terminate（已可中止長掃描）。
-      確認 fallback 的長迴圈不吞 SIGTERM（純 Python 迴圈，process terminate 即停）。
-- [ ] `_on_scan_finished`（:673）路徑不變（已能開 `LayerPickDialog`）。空結果文案
-      可微調為「此檔無 LAYERNAME 且幾何中未見 layer」。
+      `enumerate_layers`，progress_cb 內 `q.put(("progress", "Sampled K cells —
+      found N layers: 17/101, 6/0 …"))`，讓 user 在抽樣中就看到 layer 浮現、要的有了
+      就按 cancel。
+- [ ] cancel：沿用 `LayerScanWorker` 既有 subprocess terminate（純 Python 迴圈，
+      process terminate 即停）；抽樣天然有上限不會 hang。
+- [ ] `_on_scan_finished`（:673）路徑不變（已能開 `LayerPickDialog`）。空結果文案改：
+      無 offset 表 → 「請先用 KLayout 另存補索引」；有 offset 但抽樣無幾何 → 提示可手 key。
 - [ ] 驗證：`QT_QPA_PLATFORM=offscreen pytest tests/test_gds_align*.py` 綠；
       手動：開無 LAYERNAME 檔 → Scan → 數字 layer 列出 → 勾選 → 帶入 edit。
 
@@ -111,9 +135,10 @@ bbox 索引。**本 plan 不含任何 bbox / 隨機存取索引工作。**
 
 ## Risks / Open Questions
 
-- **效能**：幾何 fallback 是 O(檔案)，多 GB 檔可能分鐘級。緩解：(1) 進度串流 + cancel，
-  user 看到要的 layer 即可早停；(2) M3 sidecar 快取讓 2 次後即時。**不做早停啟發式**
-  （怕漏掉罕見 layer）。
+- **效能（核心限制）**：**禁止 O(檔案) 全掃**（多 GB 開不完）。抽樣天然 bounded
+  （max_cells × max_records_per_cell + time_budget）。緩解漏 layer：進度串流 + cancel
+  + 手 key 退路 + M3 快取。`max_cells` / `time_budget` 等預設值待實機調（先用 64 / 15s）。
+- **完整性**：抽樣不保證 100% layer（已與 user 確認可接受，Q5）。
 - **TEXT 記錄**：先只列幾何 layer（RECTANGLE…CIRCLE）；TEXT(19) 用 `text_layer`，
   視需要再納入（預設不納，避免文字層混入量測層清單）。
 - **§7 不變式**：本 plan 完全不碰隨機存取 / walk / early-stop / bbox，無觸及風險。
