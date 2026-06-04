@@ -4,6 +4,31 @@
 
 ---
 
+## [2026-06-04] [F16 後續] walk_roi 剪枝向量化（消除 per-record numpy 開銷）— 真正的慢點
+
+**變更類型：** 效能修復 + 測試 ·  **狀態：完成**
+
+**動機現象：** 裁剪做完後再測 LTV，`max_array_k=1525`、`instances_materialized≈110k`、`visited=1165`、`decoded=342`
+**全都很小**，但仍 ~513s/層；user 描述「進度條卡在 342/44997 二十分鐘然後瞬間跑完」＝解碼早完成，那 20 分鐘是**純計算**。
+定位：walk 的剪枝對**每一筆 placement / 每一個 rect spec 都單獨呼叫一次 `apply_to_rects`(單盒)+mask**，這些 numpy 呼叫
+有高固定開銷（allocate corners／matmul／min-max）。當 cell 帶數百萬筆 placement／個別矩形時，百萬次 × ~30µs ≈ 數百秒。
+`pruned=16M` 三層一致＝placement 迴圈與層無關（baseline），各層額外時間來自幾何迴圈，且與「掃描的 spec 數」相關（非輸出數）。
+
+**修復實作（向量化批次剪枝）：**
+- **placement 迴圈**：先用純 Python 迴圈把整顆 cell 的所有 placement 的 base 矩陣／child bbox／repetition extent 填進預配置
+  ndarray（用 `_D4_ROT` scalar 填矩陣，不再 per-item `Transform.from_placement`/`np.array`），再以**單次** einsum 算 placed bbox、
+  **單次** `apply_to_rects`＋單次 mask 完成整批 whole-array 剪枝；只有少數命中 ROI 的 survivor 才做 `_clip_grid_offsets` 展開＋遞迴。
+- **rect / poly 自身幾何**：同樣批次化 —— 一次 `apply_to_rects` 篩出命中的 spec，survivor 才展開；rect 最後再以單次 transform 收集發射。
+- 新增 `placements_scanned / rect_specs_scanned / poly_specs_scanned` 計數（`[roi]   scanned: ...` 行），直接顯示「掃了幾筆」。
+  語義與舊版逐筆迴圈完全等價（591→592 測試全綠，含 far-prune/clip/cycle/CE/sbbox）。
+
+**測試：** 新增 `test_many_individual_placements_pruned_vectorized`：2 萬筆個別 placement，tiny ROI 只命中 1 顆，
+`placements_scanned==20000`、`instances_visited==1`、`pruned==19999`。`pytest tests/` → 592 passed。
+
+**影響檔案：** `glas/core/oasis_random.py`、`tests/test_oasis_random.py`、`SESSION_LOG.md`。
+
+---
+
 ## [2026-06-04] [F16 後續] walk_roi 自身幾何（RECTANGLE/POLYGON）阵列也裁剪 + type-8 grid 支援
 
 **變更類型：** 效能修復 + 測試 ·  **狀態：完成**

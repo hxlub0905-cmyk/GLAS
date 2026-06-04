@@ -581,6 +581,19 @@ class TestWalkRoi:
         assert res["stats"].instances_visited == 3
         assert res["stats"].instances_pruned == 0
 
+    def test_many_individual_placements_pruned_vectorized(self, tmp_path):
+        # A cell with thousands of *individual* placements (no repetition) must
+        # be pruned with a single batched apply_to_rects, not one numpy call per
+        # placement (the regression that made big real chips take minutes).
+        n = 20_000
+        places = [(i * 100, 0) for i in range(n)]   # x = 0 .. 1,999,900
+        rar = self._reader(tmp_path, places)
+        res = orx.walk_roi(rar, 0, (1_499_995, -50, 1_500_015, 50), 17, 0)
+        assert res["rects"].tolist() == [[1_500_000, 0, 1_500_010, 10]]
+        assert res["stats"].instances_visited == 1
+        assert res["stats"].placements_scanned == n      # all scanned, batched
+        assert res["stats"].instances_pruned == n - 1
+
     def test_roi_outside_everything(self, tmp_path):
         rar = self._reader(tmp_path, [(0, 0), (1000, 0)])
         res = orx.walk_roi(rar, 0, (50_000, 50_000, 60_000, 60_000), 17, 0)

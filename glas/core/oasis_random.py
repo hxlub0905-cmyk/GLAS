@@ -646,6 +646,12 @@ class RoiWalkStats:
     arrays_materialized: int = 0
     instances_materialized: int = 0
     max_array_k: int = 0
+    # Per-record scan counts (the cost is per-record numpy overhead, so these
+    # reveal how many placements / geometry specs the walk iterates — large here
+    # with small instances_materialized => the prune loop, not expansion, is hot).
+    placements_scanned: int = 0
+    rect_specs_scanned: int = 0
+    poly_specs_scanned: int = 0
 
 
 def _xform_bbox(T: Transform, bbox: Bbox) -> np.ndarray:
@@ -672,6 +678,13 @@ def _roi_overlap_mask(boxes: np.ndarray, roi: Bbox) -> np.ndarray:
     bx2 = np.maximum(boxes[:, 0], boxes[:, 2])
     by2 = np.maximum(boxes[:, 1], boxes[:, 3])
     return (bx1 <= roi[2]) & (bx2 >= roi[0]) & (by1 <= roi[3]) & (by2 >= roi[1])
+
+
+# Quarter-turn rotation matrices (m00, m01, m10, m11), CCW — matches
+# Transform.from_placement. Used to build placement transforms in bulk without
+# allocating a Transform/ndarray per placement record.
+_D4_ROT = ((1.0, 0.0, 0.0, 1.0), (0.0, -1.0, 1.0, 0.0),
+           (-1.0, 0.0, 0.0, -1.0), (0.0, 1.0, -1.0, 0.0))
 
 
 def _roi_to_local(T: "Transform", roi: Bbox) -> Bbox:
@@ -903,89 +916,155 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
         # materializing — the same analytic sub-grid clip as the placement loop.
         # A cheap whole-array extent prune skips arrays that miss the ROI in O(1)
         # (the old content.rects()/polys() expanded *every* spec in full).
-        for x1, y1, x2, y2, rt, rr in content.rect_specs.get(key, ()):
-            bb_local = np.array([min(x1, x2), min(y1, y2),
-                                 max(x1, x2), max(y1, y2)], dtype=np.float64)
-            ex0, ey0, ex1, ey1 = oas.repetition_extent(rt, rr)
-            arr_local = np.array([[bb_local[0] + ex0, bb_local[1] + ey0,
-                                   bb_local[2] + ex1, bb_local[3] + ey1]])
-            if not _roi_overlap_mask(T.apply_to_rects(arr_local), roi)[0]:
-                continue
-            oa = _clip_grid_offsets(rt, rr, bb_local, T, roi)
-            if oa.shape[0] == 0:
-                continue
-            stats.arrays_materialized += 1
-            stats.instances_materialized += oa.shape[0]
-            if oa.shape[0] > stats.max_array_k:
-                stats.max_array_k = oa.shape[0]
-            arr = np.empty((oa.shape[0], 4), dtype=np.float64)
-            arr[:, 0] = x1 + oa[:, 0]; arr[:, 1] = y1 + oa[:, 1]
-            arr[:, 2] = x2 + oa[:, 0]; arr[:, 3] = y2 + oa[:, 1]
-            r = T.apply_to_rects(arr)
-            m = _roi_overlap_mask(r, roi)
-            if m.any():
-                rect_out.append(r[m])
-                stats.rects_emitted += int(m.sum())
-        for base, rt, rr in content.poly_specs.get(key, ()):
-            bb_local = np.array([base[:, 0].min(), base[:, 1].min(),
-                                 base[:, 0].max(), base[:, 1].max()],
-                                dtype=np.float64)
-            ex0, ey0, ex1, ey1 = oas.repetition_extent(rt, rr)
-            arr_local = np.array([[bb_local[0] + ex0, bb_local[1] + ey0,
-                                   bb_local[2] + ex1, bb_local[3] + ey1]])
-            if not _roi_overlap_mask(T.apply_to_rects(arr_local), roi)[0]:
-                continue
-            oa = _clip_grid_offsets(rt, rr, bb_local, T, roi)
-            if oa.shape[0]:
+        rspecs = content.rect_specs.get(key, ())
+        if rspecs:
+            # Batched whole-array extent prune: build every spec's array-extent
+            # bbox (parent-local) and test them with ONE apply_to_rects + mask.
+            # Then expand+clip only the survivors and emit with ONE more
+            # transform (avoids a per-spec numpy call on cells with millions of
+            # individual rectangles — the real cost the profiling exposed).
+            M = len(rspecs)
+            stats.rect_specs_scanned += M
+            bb = np.empty((M, 4), dtype=np.float64)
+            arr_local = np.empty((M, 4), dtype=np.float64)
+            for i, (x1, y1, x2, y2, rt, rr) in enumerate(rspecs):
+                xa, xb = (x1, x2) if x1 <= x2 else (x2, x1)
+                ya, yb = (y1, y2) if y1 <= y2 else (y2, y1)
+                bb[i, 0] = xa; bb[i, 1] = ya; bb[i, 2] = xb; bb[i, 3] = yb
+                e0, e1, e2, e3 = oas.repetition_extent(rt, rr)
+                arr_local[i, 0] = xa + e0; arr_local[i, 1] = ya + e1
+                arr_local[i, 2] = xb + e2; arr_local[i, 3] = yb + e3
+            keep = _roi_overlap_mask(T.apply_to_rects(arr_local), roi)
+            parts = []
+            for i in np.flatnonzero(keep):
+                x1, y1, x2, y2, rt, rr = rspecs[i]
+                oa = _clip_grid_offsets(rt, rr, bb[i], T, roi)
+                if oa.shape[0] == 0:
+                    continue
                 stats.arrays_materialized += 1
                 stats.instances_materialized += oa.shape[0]
                 if oa.shape[0] > stats.max_array_k:
                     stats.max_array_k = oa.shape[0]
-            basef = base.astype(np.float64)
-            for dx, dy in oa:
-                s = basef.copy()
-                s[:, 0] += dx; s[:, 1] += dy
-                tp = T.apply_to_points(s)
-                bb = np.array([[tp[:, 0].min(), tp[:, 1].min(),
-                                tp[:, 0].max(), tp[:, 1].max()]])
-                if _roi_overlap_mask(bb, roi)[0]:
-                    poly_out.append(tp)
-                    stats.polys_emitted += 1
+                a = np.empty((oa.shape[0], 4), dtype=np.float64)
+                a[:, 0] = x1 + oa[:, 0]; a[:, 1] = y1 + oa[:, 1]
+                a[:, 2] = x2 + oa[:, 0]; a[:, 3] = y2 + oa[:, 1]
+                parts.append(a)
+            if parts:
+                allr = parts[0] if len(parts) == 1 else np.concatenate(parts)
+                r = T.apply_to_rects(allr)
+                m = _roi_overlap_mask(r, roi)
+                if m.any():
+                    rect_out.append(r[m])
+                    stats.rects_emitted += int(m.sum())
+        pspecs = content.poly_specs.get(key, ())
+        if pspecs:
+            P = len(pspecs)
+            stats.poly_specs_scanned += P
+            arr_local = np.empty((P, 4), dtype=np.float64)
+            bbs = np.empty((P, 4), dtype=np.float64)
+            for i, (base, rt, rr) in enumerate(pspecs):
+                bx0 = float(base[:, 0].min()); by0 = float(base[:, 1].min())
+                bx1 = float(base[:, 0].max()); by1 = float(base[:, 1].max())
+                bbs[i, 0] = bx0; bbs[i, 1] = by0; bbs[i, 2] = bx1; bbs[i, 3] = by1
+                e0, e1, e2, e3 = oas.repetition_extent(rt, rr)
+                arr_local[i, 0] = bx0 + e0; arr_local[i, 1] = by0 + e1
+                arr_local[i, 2] = bx1 + e2; arr_local[i, 3] = by1 + e3
+            keep = _roi_overlap_mask(T.apply_to_rects(arr_local), roi)
+            for i in np.flatnonzero(keep):
+                base, rt, rr = pspecs[i]
+                oa = _clip_grid_offsets(rt, rr, bbs[i], T, roi)
+                if oa.shape[0]:
+                    stats.arrays_materialized += 1
+                    stats.instances_materialized += oa.shape[0]
+                    if oa.shape[0] > stats.max_array_k:
+                        stats.max_array_k = oa.shape[0]
+                basef = base.astype(np.float64)
+                for dx, dy in oa:
+                    s = basef.copy()
+                    s[:, 0] += dx; s[:, 1] += dy
+                    tp = T.apply_to_points(s)
+                    bb = np.array([[tp[:, 0].min(), tp[:, 1].min(),
+                                    tp[:, 0].max(), tp[:, 1].max()]])
+                    if _roi_overlap_mask(bb, roi)[0]:
+                        poly_out.append(tp)
+                        stats.polys_emitted += 1
         if depth >= max_depth:
             return
         if depth == 0:
             _dbg(f"  root own-geometry done at {time.perf_counter() - _t0:.1f}s "
                  f"(rects={stats.rects_emitted}, polys={stats.polys_emitted}); "
                  f"descending {len(content.placements)} placements…")
-        for pl in content.placements:
-            rtype, rraw = pl.repetition_type, pl.repetition_raw
-            base = Transform.from_placement(pl.x, pl.y, pl.angle, pl.flip,
-                                            pl.magnification)
-            if base is None:
-                stats.arbitrary_angle_skipped += oas.repetition_count(rtype, rraw)
+        placements = content.placements
+        if not placements:
+            return
+        # Vectorized whole-array prune over ALL placements of this cell at once:
+        # build each placement's array-extent bbox (parent-local) and test them
+        # with a SINGLE apply_to_rects + ROI mask. A per-placement numpy call
+        # here is death by overhead on cells with millions of placements; the
+        # batched form turns it into a handful of array ops. Only the few
+        # survivors are expanded/clipped and recursed into.
+        N = len(placements)
+        stats.placements_scanned += N
+        base_M = np.zeros((N, 2, 2), dtype=np.float64)
+        base_t = np.zeros((N, 2), dtype=np.float64)
+        cb_arr = np.zeros((N, 4), dtype=np.float64)
+        ext = np.zeros((N, 4), dtype=np.float64)
+        rcount = np.ones(N, dtype=np.int64)
+        valid = np.zeros(N, dtype=bool)
+        for i, pl in enumerate(placements):
+            rt, rr = pl.repetition_type, pl.repetition_raw
+            rc = oas.repetition_count(rt, rr)
+            rcount[i] = rc
+            a = pl.angle % 360.0
+            q = int(round(a / 90.0))
+            if abs(a - q * 90.0) > 0.01:        # non-quarter-turn -> skip
+                stats.arbitrary_angle_skipped += rc
                 continue
             cb = reachable_bbox(pl.target)
             if cb is None:
                 stats.unknown_target_skipped += 1
                 continue
-            placed = _xform_bbox(base, cb)            # parent-local, offset 0
-            # Cheap whole-array prune: extend placed bbox by the repetition
-            # extent and test the whole array against ROI before touching
-            # any individual instance (avoids materializing huge grids).
-            ex0, ey0, ex1, ey1 = oas.repetition_extent(rtype, rraw)
-            arr_local = np.array([[placed[0] + ex0, placed[1] + ey0,
-                                   placed[2] + ex1, placed[3] + ey1]])
-            if not _roi_overlap_mask(T.apply_to_rects(arr_local), roi)[0]:
-                stats.instances_pruned += oas.repetition_count(rtype, rraw)
-                continue
+            m00, m01, m10, m11 = _D4_ROT[q % 4]
+            if pl.flip:                         # mirror after rotation (col 1)
+                m01, m11 = -m01, -m11
+            mag = pl.magnification
+            if mag != 1.0:
+                m00 *= mag; m01 *= mag; m10 *= mag; m11 *= mag
+            base_M[i, 0, 0] = m00; base_M[i, 0, 1] = m01
+            base_M[i, 1, 0] = m10; base_M[i, 1, 1] = m11
+            base_t[i, 0] = pl.x; base_t[i, 1] = pl.y
+            cb_arr[i] = cb
+            ex = oas.repetition_extent(rt, rr)
+            ext[i, 0] = ex[0]; ext[i, 1] = ex[1]
+            ext[i, 2] = ex[2]; ext[i, 3] = ex[3]
+            valid[i] = True
+        # placed bbox = base applied to child bbox (batched corner transform),
+        # then extended by the repetition extent -> array-extent bbox.
+        corners = np.empty((N, 4, 2), dtype=np.float64)
+        corners[:, 0, 0] = cb_arr[:, 0]; corners[:, 0, 1] = cb_arr[:, 1]
+        corners[:, 1, 0] = cb_arr[:, 2]; corners[:, 1, 1] = cb_arr[:, 1]
+        corners[:, 2, 0] = cb_arr[:, 2]; corners[:, 2, 1] = cb_arr[:, 3]
+        corners[:, 3, 0] = cb_arr[:, 0]; corners[:, 3, 1] = cb_arr[:, 3]
+        tc = np.einsum('nij,nkj->nki', base_M, corners) + base_t[:, None, :]
+        px, py = tc[:, :, 0], tc[:, :, 1]
+        placed_all = np.empty((N, 4), dtype=np.float64)
+        placed_all[:, 0] = px.min(axis=1); placed_all[:, 1] = py.min(axis=1)
+        placed_all[:, 2] = px.max(axis=1); placed_all[:, 3] = py.max(axis=1)
+        arr_local = placed_all + ext
+        keep = valid & _roi_overlap_mask(T.apply_to_rects(arr_local), roi)
+        stats.instances_pruned += int(rcount[valid & ~keep].sum())
+        for i in np.flatnonzero(keep):
+            pl = placements[i]
+            rtype, rraw = pl.repetition_type, pl.repetition_raw
+            full_k = int(rcount[i])
             if pl.target in visiting:
-                stats.cycles_skipped += oas.repetition_count(rtype, rraw)
+                stats.cycles_skipped += full_k
                 continue
-            # Array may intersect ROI — materialize only the sub-grid whose
-            # instances can reach the ROI (analytic clip for regular grids;
-            # full array for arbitrary-list types), then exact-mask in root
-            # coords. full_k is the true instance count for honest pruned stats.
-            full_k = oas.repetition_count(rtype, rraw)
+            placed = placed_all[i]
+            base = Transform(M=base_M[i], t=base_t[i])
+            # Materialize only the sub-grid whose instances can reach the ROI
+            # (analytic clip for regular grids; full array for arbitrary lists),
+            # then exact-mask in root coords.
             oa = _clip_grid_offsets(rtype, rraw, placed, T, roi)  # (K,2)
             K = oa.shape[0]
             stats.arrays_materialized += 1
@@ -1033,6 +1112,9 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
          f"arrays_materialized={stats.arrays_materialized} "
          f"instances_materialized={stats.instances_materialized} "
          f"max_array_k={stats.max_array_k}")
+    _dbg(f"  scanned: placements={stats.placements_scanned} "
+         f"rect_specs={stats.rect_specs_scanned} "
+         f"poly_specs={stats.poly_specs_scanned}")
     _dbg(f"  features: place_rtypes={sorted(str(x) for x in _feat['rtype'])} "
          f"angles={sorted(_feat['angle'])} flip={_feat['flip']} "
          f"mags={sorted(_feat['mag'])} name_ref={_feat['name_ref']} "
