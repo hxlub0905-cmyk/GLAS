@@ -427,6 +427,35 @@ class TestCache:
         assert layerscan_cache.load(p) is None
 
 
+class TestScanParams:
+    def test_defaults_are_generous(self):
+        assert orx._SCAN_DEFAULTS["max_cells"] >= 256
+        assert orx._SCAN_DEFAULTS["stop_after_no_new"] >= 64
+
+    def test_explicit_beats_env_beats_default(self, monkeypatch):
+        assert orx._scan_param("max_cells", 5, int) == 5          # explicit wins
+        monkeypatch.setenv("GLAS_SCAN_MAX_CELLS", "999")
+        assert orx._scan_param("max_cells", None, int) == 999     # env next
+        monkeypatch.delenv("GLAS_SCAN_MAX_CELLS")
+        assert orx._scan_param("max_cells", None, int) == \
+            orx._SCAN_DEFAULTS["max_cells"]                       # default last
+
+    def test_env_widens_coverage_via_enumerate(self, tmp_path, monkeypatch):
+        # 30 cells, each a distinct layer. A tiny budget misses most; a wide
+        # one (via env) catches them all.
+        cells = [(f"C{i}", _rect(i + 1, 0, 10, 10, i * 100, 0)) for i in range(30)]
+        p = tmp_path / "many.oas"
+        p.write_bytes(_build_file(cells))
+
+        narrow = orx.enumerate_layers(p, max_cells=3, stop_after_no_new=999)
+        assert len(narrow["layers"]) <= 3
+
+        monkeypatch.setenv("GLAS_SCAN_MAX_CELLS", "64")
+        monkeypatch.setenv("GLAS_SCAN_STOP_AFTER_NO_NEW", "999")
+        wide = orx.enumerate_layers(p)        # env-driven, no explicit args
+        assert len(wide["layers"]) == 30
+
+
 class TestSampleOffsets:
     def test_spreads_and_dedups(self):
         offs = list(range(0, 1000, 10))   # 100 offsets

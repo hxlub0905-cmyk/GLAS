@@ -852,6 +852,31 @@ _GEOM_LAYER_RIDS = (
     oas.CTRAPEZOID, oas.CIRCLE,
 )
 
+# Default bounds for the no-LAYERNAME layer sample. Generous enough to catch
+# layers that live in only a few cells while still finishing on a multi-GB file
+# (the wall-clock budget is the hard backstop). Each is overridable per-call
+# and via an env var (GLAS_SCAN_*) so coverage can be widened without a code
+# change when a file turns out to segregate layers across many cells.
+_SCAN_DEFAULTS = {
+    "max_cells": 512,
+    "max_records_per_cell": 8000,
+    "time_budget_s": 30.0,
+    "stop_after_no_new": 128,
+}
+
+
+def _scan_param(name: str, explicit, cast):
+    """Resolve a sample bound: explicit arg > env GLAS_SCAN_<NAME> > default."""
+    if explicit is not None:
+        return explicit
+    env = os.environ.get("GLAS_SCAN_" + name.upper())
+    if env:
+        try:
+            return cast(env)
+        except ValueError:
+            pass
+    return _SCAN_DEFAULTS[name]
+
 
 def _layernames_to_layer_dicts(layernames: list) -> list[dict]:
     """Fast path: turn a LAYERNAME table (``[(name, layer_iv, dtype_iv), …]``)
@@ -972,8 +997,8 @@ def sample_layers(rar: "RandomAccessReader", *,
 
 
 def enumerate_layers(path: str | Path, *, progress_cb=None, use_cache: bool = True,
-                     max_cells: int = 64, max_records_per_cell: int = 2000,
-                     time_budget_s: float = 15.0, stop_after_no_new: int = 16,
+                     max_cells: int = None, max_records_per_cell: int = None,
+                     time_budget_s: float = None, stop_after_no_new: int = None,
                      include_text: bool = True) -> dict:
     """Enumerate the layers in an OASIS file for the "Scan layers" UI (F12).
 
@@ -990,10 +1015,20 @@ def enumerate_layers(path: str | Path, *, progress_cb=None, use_cache: bool = Tr
     A single RandomAccessReader is built so the name-table (LAYERNAME +
     S_CELL_OFFSET) is read once and shared with the sampling pass.
 
-    ``use_cache`` (F12 M3): a hit on the per-file sidecar (keyed by mtime+size)
-    returns instantly and skips the reader/sample entirely (no ``progress_cb``
-    calls); the result is cached on every miss. Caching is best-effort and can
-    never break a scan."""
+    The sample bounds (``max_cells`` / ``max_records_per_cell`` /
+    ``time_budget_s`` / ``stop_after_no_new``) default to ``_SCAN_DEFAULTS`` but
+    may be passed explicitly or set via ``GLAS_SCAN_*`` env vars to widen
+    coverage when a file segregates layers across many cells.
+
+    ``use_cache`` (F12 M3): a hit on the per-file sidecar (keyed by mtime+size
+    + the resolved sample bounds) returns instantly and skips the
+    reader/sample entirely (no ``progress_cb`` calls); the result is cached on
+    every miss. Caching is best-effort and can never break a scan."""
+    max_cells = _scan_param("max_cells", max_cells, int)
+    max_records_per_cell = _scan_param("max_records_per_cell",
+                                       max_records_per_cell, int)
+    time_budget_s = _scan_param("time_budget_s", time_budget_s, float)
+    stop_after_no_new = _scan_param("stop_after_no_new", stop_after_no_new, int)
     cache_params = {
         "max_cells": max_cells,
         "max_records_per_cell": max_records_per_cell,
@@ -1028,6 +1063,12 @@ def enumerate_layers(path: str | Path, *, progress_cb=None, use_cache: bool = Tr
             "n_layernames": len(rar._layernames),
             "n_layers": len(result["layers"]),
             "source": result["source"],
+            "sample_bounds": {
+                "max_cells": max_cells,
+                "max_records_per_cell": max_records_per_cell,
+                "time_budget_s": time_budget_s,
+                "stop_after_no_new": stop_after_no_new,
+            },
         }
     finally:
         rar.close()

@@ -1062,6 +1062,12 @@ def _scan_oas_with_streamer(path: "Path", q: "mp.Queue") -> None:
         f"[gds-scan]   layers found  = {len(layers)}  "
         + ", ".join(f"{d['layer']}/{d['datatype']}" for d in layers[:20])
         + (" …" if len(layers) > 20 else "") + "\n")
+    if res.get("source") == "sampled":
+        sb = diag.get("sample_bounds") or {}
+        _sys.stderr.write(
+            f"[gds-scan]   sample bounds = {sb}  "
+            "(numeric scan is a sample, not exhaustive; widen via GLAS_SCAN_* "
+            "env vars if a layer is missing)\n")
     if res.get("source") == "no-index":
         _sys.stderr.write(
             "[gds-scan]   NOTE: no LAYERNAME table and no S_CELL_OFFSET index "

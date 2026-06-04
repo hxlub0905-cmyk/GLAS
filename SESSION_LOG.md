@@ -4,6 +4,28 @@
 
 ---
 
+## [2026-06-04] [F12 tune] 放寬 layer 抽樣預算（漏 layer 修正）+ GLAS_SCAN_* env 覆寫
+
+**變更類型：** 調參（core 預設值）+ env 覆寫 + 終端機顯示 + 測試 ·  **狀態：完成，待 user 實機確認覆蓋率**
+
+**現象：** user 回報 strict-mode 修好後，scan 出來的 layer「少一點點」——bounded 抽樣的預期取捨（早停 +
+每顆 cell 記錄上限 + max_cells 上限漏掉只出現在少數/深層 cell 的 layer）。
+
+**修法（`oasis_random.enumerate_layers`）：** 預設預算大幅放寬（仍有時間上限保證會結束）：`_SCAN_DEFAULTS`
+= max_cells 64→512、max_records_per_cell 2000→8000、stop_after_no_new 16→128、time_budget 15→30s。
+參數改 `None` sentinel + `_scan_param()` 解析優先序 **explicit arg > `GLAS_SCAN_<NAME>` env > 預設**，
+讓覆蓋率可無痛再調（如 `GLAS_SCAN_MAX_CELLS` / `GLAS_SCAN_STOP_AFTER_NO_NEW` / `GLAS_SCAN_TIME_BUDGET_S`
+/ `GLAS_SCAN_MAX_RECORDS_PER_CELL`）。cache params 指紋含解析後的 bounds → 改預算自動失效重掃。diag 加
+`sample_bounds`；app 終端機在 sampled 時印出 bounds + 「不完整可用 GLAS_SCAN_* 放寬」提示。
+
+**測試：** 新增 `TestScanParams`（預設夠大、explicit>env>default 解析、env 放寬後 enumerate 由 ≤3 → 全 30
+layer）。`pytest tests/` **580 passed**。
+
+**影響檔案：** `glas/core/oasis_random.py`、`glas/app/gds_align_tool.py`、`tests/test_oasis_layer_scan.py`、
+`README.md`、`docs/plans/F12-no-layername-scan.md`、`SESSION_LOG.md`。 **Branch：** `claude/friendly-franklin-9uZqU`
+
+---
+
 ## [2026-06-04] [F12 bugfix] strict-mode（表在檔尾）OASIS 的 S_CELL_OFFSET/LAYERNAME 找不到 + scan 診斷強化
 
 **變更類型：** bug fix（core `scan_cell_offsets` 補 strict-mode table-offset 跟隨）+ 終端機/Diagnose 診斷強化

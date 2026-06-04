@@ -15,8 +15,10 @@ alignment offset 供下游量測工具使用。
 - **Layer 掃描（含無 LAYERNAME 檔）**：「Scan layers」優先讀 LAYERNAME 表（秒級、帶層名）；
   若檔案沒有 LAYERNAME 表（常見於非 Calibre 寫出、KLayout 轉檔補過索引的檔），改用
   **有上限的 cell 抽樣**從幾何列舉出現過的數字 `layer/datatype`（只顯示數字、免手 key），
-  結果有 sidecar 快取。抽樣不保證列出 100% layer（罕見層仍可手動輸入）；若連 S_CELL_OFFSET
-  索引都沒有，會提示先用 KLayout 另存補索引。
+  結果有 sidecar 快取。抽樣不保證列出 100% layer（罕見層仍可手動輸入，或用 `GLAS_SCAN_*`
+  環境變數放寬抽樣預算，如 `GLAS_SCAN_MAX_CELLS` / `GLAS_SCAN_STOP_AFTER_NO_NEW`）；若連
+  S_CELL_OFFSET 索引都沒有，會提示先用 KLayout 另存（strict mode）補索引。掃描細節會印在終端機
+  `[gds-scan]` 區塊（含 offset_flag / 找到的 cell-offset 數 / layer 清單）。
 - **KLARF ↔ GDS 座標換算**：由 SEM defect 的 die-corner 座標定位到 layout，自動跳位 + FOV 框。
 - **即時 Boolean 表達式引擎**：HMI 風格表達式（`L0 = [(A > W:10) & B] < H:10`）即時合成 layer，
   輸出 shapely polygon + uint8 mask。

@@ -136,7 +136,9 @@ bbox 索引。**本 plan 不含任何 bbox / 隨機存取索引工作。**
 
 - **效能（核心限制）**：**禁止 O(檔案) 全掃**（多 GB 開不完）。抽樣天然 bounded
   （max_cells × max_records_per_cell + time_budget）。緩解漏 layer：進度串流 + cancel
-  + 手 key 退路 + M3 快取。`max_cells` / `time_budget` 等預設值待實機調（先用 64 / 15s）。
+  + 手 key 退路 + M3 快取。**預設值（2026-06-04 調）`_SCAN_DEFAULTS` = 512 cell / 8000 rec /
+  30s / stop_after_no_new 128**；可用 `GLAS_SCAN_*` env 覆寫再放寬（user 反映 strict 修好後仍
+  「少一點點」→ 放寬預設 + env 逃生口）。
 - **完整性**：抽樣不保證 100% layer（已與 user 確認可接受，Q5）。
 - **TEXT 記錄**：user 確認**納入** TEXT(19)（用 `text_layer` / `texttype`），與幾何層
   一起列舉、de-dup 後同樣只顯示數字。
