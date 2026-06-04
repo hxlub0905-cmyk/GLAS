@@ -4,6 +4,21 @@
 
 ---
 
+## [2026-06-04] [F16-B] 收尾：命名正名 + §8/§4/§7 + plan 收成 done
+
+**變更類型：** 文件/housekeeping ·  **狀態：完成**
+
+**動機：** 「大 cell 解碼快取」這串沿用了 `F16-B` 標籤，與 §8 既有的 `[F16-B]`（無 sbbox 檔的 bbox sweep，方案 B）撞名。
+
+**處理：** 維持本串 = `F16-B`（已遍布 16 個 commit / SESSION_LOG / plan），把 §8 舊的 `[F16-B]` 改號為 `[F17]`（加註）。
+新增 backlog `[F18]`（lazy placement deser，砍 cache 載回重建 150 萬 Placement 的 ~10s）、`[F19]`（sidecar 無自動清理 → LRU/上限）。
+`CLAUDE.md` §4 加 `cellcache.py`；§7 加兩條快取不變式（cell key 含 wanted_layers、prep key 只含 file+cell、mtime/size 驗證、
+prep index 對齊 placements 順序）。`docs/plans/F16-B-cell-decode-cache.md` 收成 `done`（M5 撤案、後續登 F18/F19）。
+
+**影響檔案：** `CLAUDE.md`、`docs/plans/F16-B-cell-decode-cache.md`、`SESSION_LOG.md`。
+
+---
+
 ## [2026-06-04] [F16-B] debug 分層 + ROI 進度畫面精確化 + 收雜訊
 
 **變更類型：** 診斷/UX ·  **狀態：完成**

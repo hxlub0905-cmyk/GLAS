@@ -1,8 +1,8 @@
-# [F16-B] 大型 cell 解碼加速（欄狀儲存 + 磁碟快取 + ROI 過濾解碼）
+# [F16-B] 大型 cell 解碼加速（欄狀儲存 + 磁碟快取 + placement prep 快取）
 
-> **狀態：** in progress
-> **§8 ID：** [F16-B]
-> **建立：** 2026-06-04
+> **狀態：** done（核心 M1–M7 + debug/UX；M5 撤案；後續見 §收尾）
+> **§8 ID：** F16-B（注意：與舊 §8 `[F16-B]` 無 sbbox bbox-sweep 不同，後者已改號 `[F17]`）
+> **建立：** 2026-06-04 · **完成：** 2026-06-04
 > **負責 branch：** claude/friendly-franklin-9uZqU
 
 ---
@@ -139,3 +139,21 @@ repetition descriptor（`rt`/`rr`）多數為 None，非 None 的存稀疏側表
 - **記憶體**：44995 欄狀 ≈ rects (8.8M×4×8=281MB) + polys + placements。與目前 in-memory 同量級；`.npz` 壓縮後磁碟較小。
 - **門檻**：太低 → 大量小 sidecar；預設 100K records，env 可調。
 - **不解決**：首次（cache 尚未建立）仍需 292s 解碼——本案目標是「第二次起秒級」，不是消滅首解。若日後要連首解都快，再評估 ROI 過濾解碼 / parser 加速（已記於思路，非本案）。
+
+---
+
+## 收尾備註（2026-06-04）
+
+**已完成（commit 4af7f5b … 502e3df）：** M1（Placement→NamedTuple + lean decode）、M2（CellContent 欄狀雙後端）、
+M3/M4（`cellcache` 序列化 + load_cell 整合）、M6（placement gather per-cell 記憶體快取，換 ROI 秒級）、
+M7（prep sidecar 持久化 + `_feat` DEBUG gate，batch 暖機）、ext build 向量化、`--debug` 分層（L1 摘要 / L2 trace）+
+ROI 進度畫面精確化 + Qt/jump 雜訊收掉。`pytest tests/` 602 全綠。
+
+**實測（user，重開 app／快取已建）：** 換 ROI ~9–12s（原 ~2min）；44995 磁碟載入 ~20s（原解碼 292s）；
+每 session 第一個 ROI ~76s→（ext 向量化後）更低。
+
+**M5（ROI 過濾解碼）撤案：** 對「看多 defect」工作流更差（每換區域要重 parse）+ 與 cell 快取相斥。
+
+**後續（已登 §8）：**
+- **[F18]** lazy placement：`load_cell` 從 cache 載回仍重建 ~150 萬 Placement（~10s）。改 lazy（SoA + property）可砍掉、再壓 batch 暖機。
+- **[F19]** sidecar 無自動清理 → 加 LRU / 容量上限。

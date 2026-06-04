@@ -96,6 +96,7 @@ GLAS/
 │   │   ├── gds_fov.py           # KLARF↔GDS 座標換算 + FOV 空間查詢
 │   │   ├── gds_boolean.py       # 遞迴下降 parser + shapely Boolean 引擎 + mask
 │   │   ├── gds_layer_cache.py   # layer .npz cache + metadata
+│   │   ├── cellcache.py         # F16-B：大 cell 解碼結果 + placement prep 的 sidecar 快取（欄狀 .npz）
 │   │   └── klarf_parser.py      # KLARF I/O（自 MMH 複製，純標準庫）
 │   └── app/                 # 🖼 PyQt6 app 殼
 │       ├── gds_align_tool.py    # 主視窗 + 所有 widget（~4500 行）
@@ -180,6 +181,8 @@ HMI 風格表達式 → 遞迴下降 parser → AST → shapely 運算。運算�
 | SemViewer 折疊不變式 `render(anchor,drag)==render(anchor−drag,0)` | Set Offset 把拖動折進原點 δ 的基礎 |
 | `oasis_random` CE 邊界 early-stop：reachable_bbox 用 `load_cell_bbox`、walk 用完整 `load_cell` | 剪枝靠 bbox、命中才全 decode；混用會慢或漏幾何 |
 | layer cache `.npz` 原子寫入 + SCHEMA_VERSION 遷移 | 跨版本舊 cache 必須能開 |
+| `cellcache` cell key 含 `wanted_layers`（幾何過濾）；prep key 只含 (file, cell)（placement 不被 layer 過濾、reachable_bbox 用 sbbox → layer 無關） | 鍵錯會回傳不完整/不對的幾何或對不到的 prep |
+| `cellcache` 一律 mtime+size 驗證、毀損/版本不符當 miss、原子寫；`_place_prep` 的 index 必須對齊 `content.placements` 順序 | cache 永不可破壞正確性；prep survivor 用 index 取 placement |
 
 完整演進與每個決策理由見 `docs/plans/F2-gds-align-tool.md`（design history）。
 
@@ -196,9 +199,14 @@ HMI 風格表達式 → 遞迴下降 parser → AST → shapely 運算。運算�
 
 ### 待辦 (Backlog)
 
-- [F16-B] S_BOUNDING_BOX 的後續：給「大檔 + 無 S_BOUNDING_BOX + 無 CE 層」型做一次性 bbox sweep + sidecar
-  快取（方案 B）。**目前已知三個測試檔都用不到**（會慢的大檔都帶 S_BOUNDING_BOX）→ 低優先。方案 A 已完成
-  （`docs/plans/F16-sbbox-roi-prune.md`）。
+- [F17] （原 `[F16-B]`，改號避免與「大 cell 解碼快取」F16-B 撞名）S_BOUNDING_BOX 的後續：給「大檔 + 無
+  S_BOUNDING_BOX + 無 CE 層」型做一次性 bbox sweep + sidecar 快取。**目前已知三個測試檔都用不到**（會慢的大檔
+  都帶 S_BOUNDING_BOX）→ 低優先。F16 方案 A 已完成（`docs/plans/F16-sbbox-roi-prune.md`）。
+- [F18] 大 cell 解碼快取的後續：`load_cell` 從 sidecar 載回時仍會**重建 ~150 萬個 Placement 物件**（~10s）。
+  把 `placements` 改 lazy（cache 存 SoA、用到 survivor 才建），可砍掉這段、進一步壓低 batch 暖機 + 每 session 第一個 ROI。
+  風險中等（需 `placements` property 重構）。詳見 `docs/plans/F16-B-cell-decode-cache.md` 收尾備註。
+- [F19] cell/prep sidecar 快取**無自動清理**（`%LOCALAPPDATA%\glas\celldecode\`，每大檔 ~300MB cell + ~180MB prep），
+  看越多檔越占磁碟 → 加「總量超過上限刪最舊（LRU）」或手動清理入口。
 - [F11] ~~整顆 chip OASIS 匯出（原始 + Boolean 全 chip 重算）+ GDS 座標可見性~~ — **撤案**（2026-06-03，
   user 決定不做）。plan 仍保留於 `docs/plans/F11-whole-chip-export.md` 供日後參考。
 - [F12] 無索引表 OASIS：**部分完成（2026-06-04）**。原「全原生支援」（含無 per-cell bbox 的隨機存取）
