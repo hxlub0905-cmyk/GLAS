@@ -868,6 +868,8 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
     _feat = {"rtype": set(), "angle": set(), "flip": False,
              "mag": set(), "name_ref": False, "rect_rtype": set(),
              "poly_rtype": set(), "ce_viol": 0, "sbbox_viol": 0}
+    _decode_prof = {"total": 0.0, "max": 0.0, "cell": None,
+                    "np": 0, "nr": 0, "npl": 0}
 
     def reachable_bbox(cid: object) -> Optional[Bbox]:
         """Bbox (cid-local frame) of all geometry reachable from cid —
@@ -914,8 +916,18 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
 
     def walk(cid: object, T: Transform, visiting: set, depth: int) -> None:
         _check_cancel()
-        _t_load = time.perf_counter() if depth == 0 else 0.0
+        _t_load = time.perf_counter()
+        _fresh = cid not in rar._memo
         content = rar.load_cell(cid)
+        if _fresh:
+            _dt = time.perf_counter() - _t_load
+            _decode_prof["total"] += _dt
+            if _dt > _decode_prof["max"]:
+                _decode_prof["max"] = _dt
+                _decode_prof["cell"] = cid
+                _decode_prof["np"] = len(content.placements)
+                _decode_prof["nr"] = sum(len(v) for v in content.rect_specs.values())
+                _decode_prof["npl"] = sum(len(v) for v in content.poly_specs.values())
         stats.cell_visits += 1
         if depth == 0:
             _dbg(f"  root {cid!r} loaded in {time.perf_counter() - _t_load:.1f}s "
@@ -1157,6 +1169,10 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
          f"poly_specs={stats.poly_specs_scanned}")
     _dbg(f"  section time: placements={stats.t_place:.1f}s "
          f"rects={stats.t_rect:.1f}s polys={stats.t_poly:.1f}s")
+    _dbg(f"  decode: total={_decode_prof['total']:.1f}s "
+         f"slowest cell {_decode_prof['cell']!r}={_decode_prof['max']:.1f}s "
+         f"(placements={_decode_prof['np']}, rect_specs={_decode_prof['nr']}, "
+         f"poly_specs={_decode_prof['npl']})")
     _dbg(f"  features: place_rtypes={sorted(str(x) for x in _feat['rtype'])} "
          f"angles={sorted(_feat['angle'])} flip={_feat['flip']} "
          f"mags={sorted(_feat['mag'])} name_ref={_feat['name_ref']} "

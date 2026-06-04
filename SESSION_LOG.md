@@ -4,6 +4,19 @@
 
 ---
 
+## [2026-06-04] [F16 後續] walk_roi 加 decode 計時（定位剩餘 345s）
+
+**變更類型：** 診斷 ·  **狀態：完成（待 user 數據定論）**
+
+**動機現象：** 分段計時顯示 walk 6/0 總 370s 但 placements+rects+polys 三段只佔 24.9s → **345s 不在 walk 邏輯**。
+且此 gap 只出現在第一層（`newly_decoded_cells=721`），後兩層（decode=0、重用快取）幾乎無 gap → 345s 在 `load_cell`
+**解碼**本身。加 `_decode_prof`（總 decode 時間 + 最慢單一 cell 與其 placement/rect/poly 數）印在 `[roi] decode:` 行，
+確認是否為單一巨大 cell（疑似 chip-spanning 的 44995，~1.5M placements）所致。
+
+**影響檔案：** `glas/core/oasis_random.py`、`SESSION_LOG.md`。
+
+---
+
 ## [2026-06-04] [F16 後續] walk_roi 幾何 extent 快取（per-cell）+ 分段計時
 
 **變更類型：** 效能修復 + 診斷 ·  **狀態：完成**
