@@ -981,8 +981,11 @@ def sample_layers(rar: "RandomAccessReader", *,
                 recs += 1
                 if recs >= max_records_per_cell:
                     break
-        except oas.OasisFormatError:
-            continue                       # skip a bad cell, keep sampling
+        except (oas.OasisFormatError, oas.OasisNotImplemented):
+            # Skip a cell that desyncs OR contains an unimplemented record
+            # (e.g. XGEOMETRY) and keep sampling the rest — one extension
+            # record must not fail the whole layer scan.
+            continue
 
         if len(found) == before:
             no_new += 1

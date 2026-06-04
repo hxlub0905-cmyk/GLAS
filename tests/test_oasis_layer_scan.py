@@ -228,6 +228,21 @@ class TestSampledEnumeration:
         # geometry layer always present regardless of the text toggle
         assert (17, 0) in {(d["layer"], d["datatype"]) for d in off["layers"]}
 
+    def test_unimplemented_record_in_cell_is_skipped(self, tmp_path):
+        # A sampled cell carrying an unimplemented extension record (XGEOMETRY)
+        # makes iter_records raise OasisNotImplemented; that must skip the cell,
+        # not fail the whole scan (PR #10 review). Other cells' layers survive.
+        data = _build_file([
+            ("A", bytes([oas.XGEOMETRY])),          # raises on decode -> skipped
+            ("B", _rect(6, 0, 20, 20, 100, 100)),
+        ])
+        p = tmp_path / "xgeom.oas"
+        p.write_bytes(data)
+
+        res = orx.enumerate_layers(p)
+        assert res["source"] == "sampled"
+        assert {(d["layer"], d["datatype"]) for d in res["layers"]} == {(6, 0)}
+
     def test_mixed_shapes_one_cell(self, tmp_path):
         data = _build_file([
             ("A", _rect(1, 2, 10, 10, 0, 0) + _rect(3, 4, 10, 10, 50, 0)),
