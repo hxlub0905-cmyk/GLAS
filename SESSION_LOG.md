@@ -4,6 +4,27 @@
 
 ---
 
+## [2026-06-04] [F16-B] debug 分層 + ROI 進度畫面精確化 + 收雜訊
+
+**變更類型：** 診斷/UX ·  **狀態：完成**
+
+**動機：** user 反映 GDS function 複雜、來回 commit 耗時，希望 `--debug` 直接給「每環節花多少時間、解碼遇到什麼問題」；
+且移動 ROI 的等待畫面要更準。
+
+**實作：**
+- **debug 分層：** `MMH_GDS_DEBUG=1`/`--debug`=**精簡**(每層一行摘要:`L/D in Xs | decode Ys (n cached, m decoded) | place Zs | geom Ws | out Rr Pp [| ⚠ N errors]`
+  + 整體 `── loaded in ...`)；`MMH_GDS_DEBUG=2`/`--trace`=**全 trace**(root/heartbeat/perf/scanned/features/violations/jump)。
+  `_dbg`(L1)/`_trace`(L2) 兩級;reader 加 `_n_cache_hits`、stats 加 `cells_cached`/`t_decode` → 摘要能顯示「快取命中 vs 解碼」。
+- **ROI 進度畫面：** `RoiWalkWorker` 加 `progress(idx,total,key)` signal、`roi_document_from_reader` 加 `progress_cb` 逐層回報；
+  `_tick_roi_progress` 改顯示「目前第幾層(L/D) + 已載入 cell 數 + 幾顆來自快取」，並在首載大 cell 時提示「第一次較久、之後重用快取」；
+  移除誤導的 `/44997 (pct%)`。
+- **收雜訊：** `[jump]` 每次跳點輸出降到 L2;`qInstallMessageHandler` 過濾掉無害的 `QFont::setPointSize: Point size <= 0` 警告
+  (pixel-size 字體 pointSize()==-1 的 Qt 內部抱怨)，其餘 Qt 訊息照常。
+
+**測試：** `pytest tests/` 602 全綠;L1/L2 輸出手動比對 OK。**影響檔案：** `glas/core/oasis_random.py`、`glas/app/gds_align_tool.py`、`SESSION_LOG.md`。
+
+---
+
 ## [2026-06-04] [F16-B M7] batch 暖機加速：persist placement prep + _feat gate
 
 **變更類型：** 效能 ·  **狀態：完成**

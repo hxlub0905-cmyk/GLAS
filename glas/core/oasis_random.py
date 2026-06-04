@@ -58,17 +58,36 @@ DEFAULT_BBOX_LAYER: LayerKey = (108, 250)
 class WalkCancelled(Exception):
     """Raised inside walk_roi when the caller's cancel_cb returns True."""
 
-DEBUG = os.environ.get("MMH_GDS_DEBUG", "").lower() in ("1", "true", "yes", "on")
+def _env_debug_level() -> int:
+    v = os.environ.get("MMH_GDS_DEBUG", "").lower()
+    if v in ("2", "trace", "verbose", "all"):
+        return 2
+    if v in ("1", "true", "yes", "on"):
+        return 1
+    return 0
 
 
-def set_debug(on: bool) -> None:
-    """Toggle ROI debug tracing (also via env MMH_GDS_DEBUG=1)."""
-    global DEBUG
-    DEBUG = bool(on)
+_DEBUG_LEVEL = _env_debug_level()
+DEBUG = _DEBUG_LEVEL >= 1     # level 1: concise per-load summary
+TRACE = _DEBUG_LEVEL >= 2     # level 2: deep per-cell / per-section telemetry
+
+
+def set_debug(on: bool, level: int = 1) -> None:
+    """Toggle ROI debug output. ``level`` 1 = concise summary (decode/walk
+    timings, cache hits, errors); 2 = full trace. Also via MMH_GDS_DEBUG=1|2."""
+    global DEBUG, TRACE, _DEBUG_LEVEL
+    _DEBUG_LEVEL = (level if on else 0)
+    DEBUG = _DEBUG_LEVEL >= 1
+    TRACE = _DEBUG_LEVEL >= 2
 
 
 def _dbg(msg: str) -> None:
     if DEBUG:
+        print(f"[roi] {msg}", file=sys.stderr, flush=True)
+
+
+def _trace(msg: str) -> None:
+    if TRACE:
         print(f"[roi] {msg}", file=sys.stderr, flush=True)
 
 
@@ -561,6 +580,7 @@ class RandomAccessReader:
         # and reports these instead of crashing.
         self.errors: list[tuple] = []
         self._n_loaded = 0
+        self._n_cache_hits = 0   # cells served from the on-disk decode cache
         _dbg(f"RandomAccessReader: {len(self._by_refnum):,} offsets indexed "
              f"from {self._path.name} (wanted={wanted_layers} "
              f"bbox_layer={bbox_layer})")
@@ -640,6 +660,8 @@ class RandomAccessReader:
         if cached is not None:
             self._memo[cell_id] = cached
             self._n_loaded += 1
+            self._n_cache_hits += 1
+            _trace(f"load_cell {cell_id!r}: served from on-disk cache")
             return cached
         offset = self.offset_for(cell_id)
         if offset is None:
@@ -676,16 +698,16 @@ class RandomAccessReader:
             # per-line flush is slow on Windows). Print a heartbeat every
             # 500 cells instead; errors above are always shown.
             self._n_loaded += 1
-            if DEBUG and self._n_loaded % 500 == 0:
-                _dbg(f"… {self._n_loaded:,} cells decoded so far "
-                     f"(last {cell_id!r} @ {offset})")
+            if TRACE and self._n_loaded % 500 == 0:
+                _trace(f"… {self._n_loaded:,} cells decoded so far "
+                       f"(last {cell_id!r} @ {offset})")
             # F16-B: persist big cells so the next session loads them in seconds.
             nrec = (len(content.placements) + content.total_rects()
                     + content.total_polys())
             if nrec >= cellcache.min_records():
                 if cellcache.save(self._path, cell_id, self._init_wanted, content):
-                    _dbg(f"… cached decoded cell {cell_id!r} "
-                         f"({nrec:,} records) to sidecar")
+                    _dbg(f"cached decoded cell {cell_id!r} "
+                         f"({nrec:,} records) → sidecar (next session loads fast)")
         self._memo[cell_id] = content
         return content
 
@@ -955,6 +977,8 @@ class RoiWalkStats:
     # was in effect. cells_decoded staying high on a tiny FOV => the prune isn't
     # biting (no S_BOUNDING_BOX and no per-cell CE boundary => bbox-by-decode).
     cells_decoded: int = 0
+    cells_cached: int = 0      # cells served from the on-disk decode cache
+    t_decode: float = 0.0      # wall-clock inside load_cell (decode + cache load)
     elapsed_s: float = 0.0
     sbbox_prune: bool = False
     # F16 perf-triage: arrays that survived the cheap whole-array prune and had
@@ -1121,10 +1145,11 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
     scale = getattr(rar, "_nm_per_grid", 1.0) or 1.0
     roi = (float(roi_bbox[0]) / scale, float(roi_bbox[1]) / scale,
            float(roi_bbox[2]) / scale, float(roi_bbox[3]) / scale)
-    _dbg(f"walk_roi root={root_id!r} layer={layer}/{datatype} "
+    _trace(f"walk_roi root={root_id!r} layer={layer}/{datatype} "
          f"roi_nm={tuple(roi_bbox)} scale={scale} roi_grid={roi}")
     _t0 = time.perf_counter()
     cells_at_start = rar._n_loaded
+    hits_at_start = rar._n_cache_hits
     stats = RoiWalkStats()
     rect_out: list = []
     poly_out: list = []
@@ -1200,7 +1225,7 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
                 _decode_prof["npl"] = content.total_polys()
         stats.cell_visits += 1
         if depth == 0:
-            _dbg(f"  root {cid!r} loaded in {time.perf_counter() - _t_load:.1f}s "
+            _trace(f"  root {cid!r} loaded in {time.perf_counter() - _t_load:.1f}s "
                  f"(placements={len(content.placements)}, "
                  f"rect_specs={content.total_rects()}, "
                  f"poly_specs={content.total_polys()})")
@@ -1217,7 +1242,7 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
                         and _sb[2] >= ob[2] and _sb[3] >= ob[3]):
                     _feat["sbbox_viol"] += 1
                     if _feat["sbbox_viol"] <= 6:
-                        _dbg(f"  SBBOX-VIOLATION cell {cid!r}: own_bbox={ob} "
+                        _trace(f"  SBBOX-VIOLATION cell {cid!r}: own_bbox={ob} "
                              f"sbbox={_sb}")
             else:
                 # No sbbox -> the CE boundary IS the prune path; validate it.
@@ -1229,7 +1254,7 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
                 if not inside:
                     _feat["ce_viol"] += 1
                     if _feat["ce_viol"] <= 6:
-                        _dbg(f"  CE-VIOLATION cell {cid!r}: own_bbox={ob} "
+                        _trace(f"  CE-VIOLATION cell {cid!r}: own_bbox={ob} "
                              f"ce_bbox={_ceb}")
         # Feature collection is only for the DEBUG dump; iterating millions of
         # placements per cell is pure waste otherwise (F16-B M7).
@@ -1310,7 +1335,7 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
         if depth >= max_depth:
             return
         if depth == 0:
-            _dbg(f"  root own-geometry done at {time.perf_counter() - _t0:.1f}s "
+            _trace(f"  root own-geometry done at {time.perf_counter() - _t0:.1f}s "
                  f"(rects={stats.rects_emitted}, polys={stats.polys_emitted}); "
                  f"descending {len(content.placements)} placements…")
         placements = content.placements
@@ -1442,27 +1467,37 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
         poly_out = [p * scale for p in poly_out]
     rects = np.rint(rects).astype(np.int64)
     poly_out = [np.rint(p).astype(np.int64) for p in poly_out]
-    stats.cells_decoded = rar._n_loaded - cells_at_start
+    loaded = rar._n_loaded - cells_at_start
+    cached = rar._n_cache_hits - hits_at_start
+    fresh = loaded - cached
+    stats.cells_decoded = fresh
+    stats.cells_cached = cached
+    stats.t_decode = _decode_prof["total"]
     stats.elapsed_s = time.perf_counter() - _t0
     stats.sbbox_prune = bool(rar._sbbox_by_refnum or rar._sbbox_by_name)
-    _dbg(f"walk_roi done in {time.perf_counter() - _t0:.1f}s: "
-         f"rects={stats.rects_emitted} polys={stats.polys_emitted} "
-         f"newly_decoded_cells={rar._n_loaded - cells_at_start} "
-         f"pruned={stats.instances_pruned} reader_errors={len(rar.errors)}")
-    _dbg(f"  perf: visited={stats.instances_visited} "
+    n_err = len(rar.errors)
+    # Level-1 (--debug) summary: one readable line — where the time went, what
+    # the cache did, and whether anything went wrong. Deep per-cell / per-spec
+    # counters are level-2 (MMH_GDS_DEBUG=2).
+    _dbg(f"{layer}/{datatype} in {stats.elapsed_s:.1f}s | "
+         f"decode {_decode_prof['total']:.1f}s "
+         f"({cached} cached, {fresh} decoded) | "
+         f"place {stats.t_place:.1f}s | "
+         f"geom {stats.t_rect + stats.t_poly:.1f}s | "
+         f"out {stats.rects_emitted}r {stats.polys_emitted}p"
+         + (f" | ⚠ {n_err} decode error(s)" if n_err else ""))
+    if _decode_prof["cell"] is not None:
+        _trace(f"  slowest decode: cell {_decode_prof['cell']!r} "
+               f"{_decode_prof['max']:.1f}s (placements={_decode_prof['np']}, "
+               f"rect_specs={_decode_prof['nr']}, poly_specs={_decode_prof['npl']})")
+    _trace(f"  perf: visited={stats.instances_visited} "
          f"arrays_materialized={stats.arrays_materialized} "
          f"instances_materialized={stats.instances_materialized} "
          f"max_array_k={stats.max_array_k}")
-    _dbg(f"  scanned: placements={stats.placements_scanned} "
+    _trace(f"  scanned: placements={stats.placements_scanned} "
          f"rect_specs={stats.rect_specs_scanned} "
          f"poly_specs={stats.poly_specs_scanned}")
-    _dbg(f"  section time: placements={stats.t_place:.1f}s "
-         f"rects={stats.t_rect:.1f}s polys={stats.t_poly:.1f}s")
-    _dbg(f"  decode: total={_decode_prof['total']:.1f}s "
-         f"slowest cell {_decode_prof['cell']!r}={_decode_prof['max']:.1f}s "
-         f"(placements={_decode_prof['np']}, rect_specs={_decode_prof['nr']}, "
-         f"poly_specs={_decode_prof['npl']})")
-    _dbg(f"  features: place_rtypes={sorted(str(x) for x in _feat['rtype'])} "
+    _trace(f"  features: place_rtypes={sorted(str(x) for x in _feat['rtype'])} "
          f"angles={sorted(_feat['angle'])} flip={_feat['flip']} "
          f"mags={sorted(_feat['mag'])} name_ref={_feat['name_ref']} "
          f"rect_rtypes={sorted(str(x) for x in _feat['rect_rtype'])} "

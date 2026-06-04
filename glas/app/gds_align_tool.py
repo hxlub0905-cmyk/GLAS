@@ -460,17 +460,21 @@ def _roi_entry(rar, root, layer: int, datatype: int, roi_bbox, color,
     return entry, res["stats"]
 
 
-def roi_document_from_reader(rar, root, layer_keys, roi_bbox, cancel_cb=None):
+def roi_document_from_reader(rar, root, layer_keys, roi_bbox, cancel_cb=None,
+                             progress_cb=None):
     """ROI load using an already-built :class:`RandomAccessReader` (the big
     file is slurped + indexed once, reused across image clicks). Builds one
     LayerEntry per ``(layer, datatype)`` in ``layer_keys``. Returns
-    ``(doc, [(layer_key, stats), ...])``."""
+    ``(doc, [(layer_key, stats), ...])``. ``progress_cb(idx, total, key)`` is
+    called before each layer so the UI can show an accurate phase."""
     doc = GdsDocument()
     doc.path = rar._path
     doc.format = "OASIS-ROI"
     doc.top_cell_name = str(root)
     per_layer: list = []
     for idx, (layer, datatype) in enumerate(layer_keys):
+        if progress_cb is not None:
+            progress_cb(idx, len(layer_keys), (layer, datatype))
         color = QColor(_LAYER_PALETTE[idx % len(_LAYER_PALETTE)])
         entry, stats = _roi_entry(rar, root, layer, datatype, roi_bbox, color,
                                   cancel_cb=cancel_cb)
@@ -1152,6 +1156,7 @@ class RoiWalkWorker(QObject):
     finished = pyqtSignal(object, object)   # (GdsDocument, per_layer list)
     failed = pyqtSignal(str)
     cancelled = pyqtSignal()
+    progress = pyqtSignal(int, int, object)   # (layer idx, total, (layer,dt))
 
     def __init__(self, rar, root, layer_keys, roi) -> None:
         super().__init__()
@@ -1168,7 +1173,8 @@ class RoiWalkWorker(QObject):
         try:
             doc, per_layer = roi_document_from_reader(
                 self._rar, self._root, self._layers, self._roi,
-                cancel_cb=lambda: self._cancel)
+                cancel_cb=lambda: self._cancel,
+                progress_cb=lambda i, n, k: self.progress.emit(i, n, k))
         except oasis_random.WalkCancelled:
             self.cancelled.emit()
         except Exception as exc:                       # noqa: BLE001
@@ -5545,8 +5551,9 @@ class MainWindow(QMainWindow):
         self._status_cursor.setText(
             f"image {img.image_id} → GDS ({gx/1e3:,.1f}, {gy/1e3:,.1f}) µm "
             f"= ({gx:,.0f}, {gy:,.0f}) nm")
-        # Debug (--debug): print the conversion for klayout/diag comparison.
-        if oasis_random.DEBUG:
+        # Trace (--trace): print the conversion for klayout/diag comparison.
+        # Fires on every jump/drag, so it's level-2 only.
+        if oasis_random.TRACE:
             print(f"[jump] DID={img.image_id}  XREL={img.xrel} YREL={img.yrel}  "
                   f"chip_corner=({self._chip_corner_x:,.0f}, "
                   f"{self._chip_corner_y:,.0f}) nm  "
@@ -6286,9 +6293,8 @@ class MainWindow(QMainWindow):
         self._capture_fa_setup()
 
         self._roi_progress = LoadProgressDialog(self)
-        self._roi_progress.set_text(
-            "Loading GDS ROI…\nScanning cell sizes (first load is slowest; "
-            "later loads reuse the cache). Cancellable.")
+        self._roi_phase = (0, len(self._roi_layers), None)
+        self._roi_progress.set_text("Loading GDS ROI…\nStarting…")
         self._roi_thread = QThread(self)
         self._roi_worker = RoiWalkWorker(
             self._rar, self._roi_root, self._roi_layers, roi)
@@ -6297,6 +6303,7 @@ class MainWindow(QMainWindow):
         self._roi_worker.finished.connect(self._on_roi_finished)
         self._roi_worker.failed.connect(self._on_roi_failed)
         self._roi_worker.cancelled.connect(self._on_roi_cancelled)
+        self._roi_worker.progress.connect(self._on_roi_phase)
         self._roi_progress.cancel_requested.connect(self._roi_worker.cancel)
         for sig in (self._roi_worker.finished, self._roi_worker.failed,
                     self._roi_worker.cancelled):
@@ -6313,15 +6320,28 @@ class MainWindow(QMainWindow):
         QApplication.processEvents()
         self._roi_thread.start()
 
+    def _on_roi_phase(self, idx: int, total: int, key) -> None:
+        self._roi_phase = (idx, total, key)
+
     def _tick_roi_progress(self) -> None:
-        if self._roi_progress is not None and self._rar is not None:
-            done = self._rar._n_loaded
-            total = len(self._rar._by_refnum) or 1
-            pct = min(100, int(100 * done / total))
-            self._roi_progress.set_text(
-                f"Loading GDS ROI…\n{done:,} / ≤{total:,} cells scanned "
-                f"({pct}%)\nFirst load is slowest; later loads reuse the "
-                f"cache. Cancellable.")
+        if self._roi_progress is None or self._rar is None:
+            return
+        idx, total, key = getattr(self, "_roi_phase", (0, 1, None))
+        loaded = self._rar._n_loaded
+        cached = getattr(self._rar, "_n_cache_hits", 0)
+        layer_txt = (f"layer {idx + 1}/{total} ({key[0]}/{key[1]})"
+                     if key is not None else "starting…")
+        lines = [f"Loading GDS ROI… ({layer_txt})",
+                 f"{loaded:,} cell(s) loaded" + (f", {cached:,} from cache"
+                                                 if cached else "")]
+        # First load of the big flat merge cell is the slow part; once cached it
+        # (and every nearby ROI) is fast. Make that explicit so the wait reads
+        # as expected rather than stuck.
+        if cached == 0 and loaded < 3:
+            lines.append("Decoding a large cell (first time may take minutes; "
+                         "later ROIs reuse the cache).")
+        lines.append("Cancellable.")
+        self._roi_progress.set_text("\n".join(lines))
 
     def _on_roi_finished(self, doc, per_layer) -> None:
         self._doc = doc
@@ -6356,10 +6376,14 @@ class MainWindow(QMainWindow):
         # S_BOUNDING_BOX, no per-cell CE boundary) — the slow first-load case.
         elapsed = sum(s.elapsed_s for _, s in per_layer)
         decoded = sum(s.cells_decoded for _, s in per_layer)
+        cached = sum(getattr(s, "cells_cached", 0) for _, s in per_layer)
+        t_decode = sum(getattr(s, "t_decode", 0.0) for _, s in per_layer)
         sbbox_on = any(s.sbbox_prune for _, s in per_layer)
-        print(f"[roi] loaded in {elapsed:.1f}s · cells decoded={decoded:,} · "
-              f"{pruned:,} instances pruned · S_BOUNDING_BOX prune="
-              f"{'ON' if sbbox_on else 'off'}", flush=True)
+        print(f"[roi] ── loaded in {elapsed:.1f}s · {len(per_layer)} layer(s) · "
+              f"{total_rects:,} rects {total_polys:,} polys · "
+              f"decode {t_decode:.1f}s ({cached} from cache, {decoded} decoded) · "
+              f"prune {'ON' if sbbox_on else 'off'}"
+              + (f" · ⚠ {errs} decode error(s)" if errs else ""), flush=True)
         if errs:
             msg += f" · ⚠ {errs} cell decode error(s) — run with --debug"
         if expr_errs:
@@ -7116,11 +7140,30 @@ def main() -> int:
     # Required on Windows so the child loader process re-imports this module
     # cleanly when it spawns. No-op on POSIX.
     mp.freeze_support()
-    if "--debug" in sys.argv:
-        oasis_random.set_debug(True)
-        sys.argv = [a for a in sys.argv if a != "--debug"]
-        print("[gds-align] debug mode ON (ROI walk tracing -> stderr)",
+    # Silence one harmless, very chatty Qt warning (a pixel-sized font reports
+    # pointSize()==-1, which Qt's internals then complain about) while letting
+    # every other Qt message through.
+    try:
+        from PyQt6.QtCore import qInstallMessageHandler
+
+        def _qt_msg_filter(mode, ctx, message):
+            if "setPointSize: Point size <= 0" in message:
+                return
+            print(message, file=sys.stderr, flush=True)
+
+        qInstallMessageHandler(_qt_msg_filter)
+    except Exception:
+        pass
+    if "--trace" in sys.argv:
+        oasis_random.set_debug(True, level=2)
+        sys.argv = [a for a in sys.argv if a != "--trace"]
+        print("[gds-align] trace mode ON (level 2: deep per-cell telemetry)",
               file=sys.stderr, flush=True)
+    elif "--debug" in sys.argv:
+        oasis_random.set_debug(True, level=1)
+        sys.argv = [a for a in sys.argv if a != "--debug"]
+        print("[gds-align] debug mode ON (concise ROI summaries; use --trace "
+              "for full detail)", file=sys.stderr, flush=True)
     app = QApplication(sys.argv)
 
     app.setApplicationName("GLAS")
