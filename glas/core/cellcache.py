@@ -109,19 +109,39 @@ def load(src, cell_id, wanted_layers):
         return None
 
 
+def _fresh_entry(p: Path, mtime: float, size: int) -> bool:
+    """True if ``p`` is an existing, current cache entry (schema + source
+    mtime/size match). Reads only the tiny meta arrays, not the geometry."""
+    try:
+        if not p.exists():
+            return False
+        with np.load(p, allow_pickle=True) as z:
+            return (int(z["__schema__"]) == SCHEMA_VERSION
+                    and int(z["__size__"]) == size
+                    and float(z["__mtime__"]) == mtime)
+    except Exception:
+        return False
+
+
 def save(src, cell_id, wanted_layers, content) -> bool:
     """Serialise ``content`` to the sidecar. Returns True on success; never
     raises (a cache write must not break a decode)."""
     if not enabled():
         return False
+    tmp = None
     try:
         src = Path(src)
         mtime, size = _stat(src)
+        p = _key_path(src, cell_id, wanted_layers)
+        # A concurrent batch worker (each process decodes independently) may
+        # already have written this entry — skip the redundant ~hundreds-MB
+        # serialise+write rather than racing to rewrite it.
+        if _fresh_entry(p, mtime, size):
+            return True
         arrays = content.to_cache_arrays()
         arrays["__schema__"] = np.int64(SCHEMA_VERSION)
         arrays["__size__"] = np.int64(size)
         arrays["__mtime__"] = np.float64(mtime)
-        p = _key_path(src, cell_id, wanted_layers)
         p.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(suffix=".npz", dir=str(p.parent))
         os.close(fd)
@@ -132,7 +152,7 @@ def save(src, cell_id, wanted_layers, content) -> bool:
         return True
     except Exception:
         try:
-            if os.path.exists(tmp):
+            if tmp and os.path.exists(tmp):
                 os.remove(tmp)
         except Exception:
             pass
