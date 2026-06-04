@@ -4,6 +4,23 @@
 
 ---
 
+## [2026-06-04] [F16-B] 向量化 geometry extent 建構（每 session 第一個 ROI 加速）
+
+**變更類型：** 效能 ·  **狀態：完成**
+
+**動機：** 快取載入後，每 session 第一個 ROI 仍需建 `_ext_cache`（rect_arrays/poly_arrays 的 base+extent），其中 17/101 那層
+870 萬矩形逐筆 Python 迴圈 ~35s。但多數矩形無 repetition → extent == base。
+
+**修復（向量化）：** `rect_arrays` 欄狀路徑：`base = coords.astype(float)`（向量化）、`ext = base.copy()`，只對 `rt>0`（有
+repetition 的少數）跑迴圈算 extent；tuple 路徑用 `np.array([s[:4] for s in specs])` 一次建 base、同樣只補 repeated。
+`poly_arrays` 欄狀路徑：用 `np.minimum/maximum.reduceat` 在 CSR point buffer 上一次算出每個多邊形 bbox，免逐筆 min/max；
+repeated 才補 extent。預期把第一個 ROI 的 ext 建構從 ~35s 降到 ~數秒（取決於 repeated 比例）。
+
+**測試：** 新增 `test_arrays_match_columnar_vs_tuple`（tuple vs 快取欄狀的 rect/poly arrays 逐值相等，含不等長多邊形驗 reduceat）。
+`pytest tests/` 600 全綠。**影響檔案：** `glas/core/oasis_random.py`、`tests/test_cellcache.py`、`SESSION_LOG.md`。
+
+---
+
 ## [2026-06-04] [F16-B] --debug 跳過有 sbbox 之 cell 的 CE 檢查（移除首載 ~53s）
 
 **變更類型：** 效能（診斷路徑）·  **狀態：完成**

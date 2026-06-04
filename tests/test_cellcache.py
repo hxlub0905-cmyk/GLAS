@@ -87,6 +87,34 @@ class TestColumnarRoundTrip:
         assert rt.is_empty()
         assert rt.bbox is None
 
+    def test_arrays_match_columnar_vs_tuple(self):
+        # rect_arrays / poly_arrays must give identical (base, extent) whether
+        # built from the tuple specs or the cache-loaded columnar form (the
+        # latter uses the vectorized base + reduceat path). Polygons have
+        # varying point counts to exercise the CSR reduceat.
+        c = orx.CellContent()
+        c.rect_specs[(17, 0)] = [
+            (0, 0, 10, 10, None, None),
+            (5, 5, 9, 8, 1, (4, 3, 100, 200)),     # repeated
+            (-3, -2, 7, 1, None, None),
+        ]
+        c.poly_specs[(6, 0)] = [
+            (np.array([[0, 0], [10, 0], [10, 10], [0, 10]], dtype=np.int64),
+             None, None),
+            (np.array([[1, 1], [4, 1], [4, 4]], dtype=np.int64), 2, (5, 50)),
+            (np.array([[-2, -2], [2, -2], [2, 2], [-2, 2], [0, 4]],
+                      dtype=np.int64), None, None),
+        ]
+        rt = _roundtrip(c)
+        for key in [(17, 0)]:
+            b0, e0 = c.rect_arrays(key)
+            b1, e1 = rt.rect_arrays(key)
+            assert np.array_equal(b0, b1) and np.array_equal(e0, e1)
+        for key in [(6, 0)]:
+            b0, e0 = c.poly_arrays(key)
+            b1, e1 = rt.poly_arrays(key)
+            assert np.array_equal(b0, b1) and np.array_equal(e0, e1)
+
 
 class TestWalkEquivalence:
     """walk_roi over a cache-rebuilt cell must be bit-identical to the decode."""

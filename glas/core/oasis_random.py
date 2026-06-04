@@ -190,56 +190,78 @@ class CellContent:
     def rect_arrays(self, key: LayerKey):
         """``(base (M,4), extent (M,4))`` local-frame bbox arrays for the
         rectangles on ``key`` — ``base`` is each rect's own bbox, ``extent`` is
-        that bbox grown by the repetition extent. Built once and cached."""
+        that bbox grown by the repetition extent. Built once and cached.
+
+        Vectorized: most rects have no repetition, so ``extent == base`` for them
+        (one array copy); only the few repeated rects need a per-spec extent."""
         ck = ("r", key)
         got = self._ext_cache.get(ck)
         if got is None:
             col = self._rcol.get(key)
             if col is not None:
                 c, rt, rr = col
-                base = c.astype(np.float64)
+                base = c.astype(np.float64)              # vectorized
                 ext = base.copy()
-                for i in range(base.shape[0]):
-                    e0, e1, e2, e3 = oas.repetition_extent(
-                        None if rt[i] < 0 else int(rt[i]), rr[i])
+                for i in np.flatnonzero(rt > 0):         # repeated rects only
+                    e0, e1, e2, e3 = oas.repetition_extent(int(rt[i]), rr[i])
                     ext[i, 0] += e0; ext[i, 1] += e1
                     ext[i, 2] += e2; ext[i, 3] += e3
             else:
                 specs = self.rect_specs.get(key) or ()
                 M = len(specs)
-                base = np.empty((M, 4), dtype=np.float64)
-                ext = np.empty((M, 4), dtype=np.float64)
-                for i, (x1, y1, x2, y2, rt, rr) in enumerate(specs):
-                    xa, xb = (x1, x2) if x1 <= x2 else (x2, x1)
-                    ya, yb = (y1, y2) if y1 <= y2 else (y2, y1)
-                    base[i, 0] = xa; base[i, 1] = ya
-                    base[i, 2] = xb; base[i, 3] = yb
-                    e0, e1, e2, e3 = oas.repetition_extent(rt, rr)
-                    ext[i, 0] = xa + e0; ext[i, 1] = ya + e1
-                    ext[i, 2] = xb + e2; ext[i, 3] = yb + e3
+                if M:
+                    base = np.array([s[:4] for s in specs], dtype=np.float64)
+                else:
+                    base = np.empty((0, 4), dtype=np.float64)
+                ext = base.copy()
+                for i, s in enumerate(specs):
+                    if s[4]:                             # rtype not None / 0
+                        e0, e1, e2, e3 = oas.repetition_extent(s[4], s[5])
+                        ext[i, 0] += e0; ext[i, 1] += e1
+                        ext[i, 2] += e2; ext[i, 3] += e3
             got = (base, ext)
             self._ext_cache[ck] = got
         return got
 
     def poly_arrays(self, key: LayerKey):
         """``(base (P,4), extent (P,4))`` local-frame bbox arrays for the
-        polygons on ``key``. Built once and cached (the per-polygon min/max and
-        any arbitrary-list extent expansion run a single time)."""
+        polygons on ``key``. Built once and cached. The columnar path computes
+        every polygon's bbox with a single vectorized ``reduceat`` over the CSR
+        point buffer; only repeated polygons need a per-spec extent."""
         ck = ("p", key)
         got = self._ext_cache.get(ck)
         if got is None:
-            P = self.poly_count(key)
-            base = np.empty((P, 4), dtype=np.float64)
-            ext = np.empty((P, 4), dtype=np.float64)
-            for i in range(P):
-                b, rt, rr = self.poly_spec_at(key, i)
-                bx0 = float(b[:, 0].min()); by0 = float(b[:, 1].min())
-                bx1 = float(b[:, 0].max()); by1 = float(b[:, 1].max())
-                base[i, 0] = bx0; base[i, 1] = by0
-                base[i, 2] = bx1; base[i, 3] = by1
-                e0, e1, e2, e3 = oas.repetition_extent(rt, rr)
-                ext[i, 0] = bx0 + e0; ext[i, 1] = by0 + e1
-                ext[i, 2] = bx1 + e2; ext[i, 3] = by1 + e3
+            col = self._pcol.get(key)
+            if col is not None:
+                pts, off, rt, rr = col
+                P = rt.shape[0]
+                if P:
+                    seg = off[:-1]
+                    base = np.empty((P, 4), dtype=np.float64)
+                    base[:, 0] = np.minimum.reduceat(pts[:, 0], seg)
+                    base[:, 1] = np.minimum.reduceat(pts[:, 1], seg)
+                    base[:, 2] = np.maximum.reduceat(pts[:, 0], seg)
+                    base[:, 3] = np.maximum.reduceat(pts[:, 1], seg)
+                else:
+                    base = np.empty((0, 4), dtype=np.float64)
+                ext = base.copy()
+                for i in np.flatnonzero(rt > 0):
+                    e0, e1, e2, e3 = oas.repetition_extent(int(rt[i]), rr[i])
+                    ext[i, 0] += e0; ext[i, 1] += e1
+                    ext[i, 2] += e2; ext[i, 3] += e3
+            else:
+                P = self.poly_count(key)
+                base = np.empty((P, 4), dtype=np.float64)
+                ext = np.empty((P, 4), dtype=np.float64)
+                for i in range(P):
+                    b, rt, rr = self.poly_spec_at(key, i)
+                    bx0 = float(b[:, 0].min()); by0 = float(b[:, 1].min())
+                    bx1 = float(b[:, 0].max()); by1 = float(b[:, 1].max())
+                    base[i, 0] = bx0; base[i, 1] = by0
+                    base[i, 2] = bx1; base[i, 3] = by1
+                    e0, e1, e2, e3 = oas.repetition_extent(rt, rr)
+                    ext[i, 0] = bx0 + e0; ext[i, 1] = by0 + e1
+                    ext[i, 2] = bx1 + e2; ext[i, 3] = by1 + e3
             got = (base, ext)
             self._ext_cache[ck] = got
         return got
