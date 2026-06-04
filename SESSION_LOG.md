@@ -28,9 +28,10 @@
 
 **影響檔案：** `glas/core/oasis_random.py`、`tests/test_oasis_random.py`、`SESSION_LOG.md`。
 
----
-
-## [2026-06-04] [F16 後續] walk_roi 大型 repetition 阵列「解析子網格裁剪」（修真正的慢點）
+**追加（開頭階段計時）：** user 回報進度條一開始卡在 `1 / <44997` 很久（`_n_loaded` 卡在 1＝只載入 root、還沒往下遞迴）。
+在 `walk()` depth==0 加兩行 `_dbg`：`root ... loaded in Xs (placements=…, rect_specs=…, poly_specs=…)` 與
+`root own-geometry done at Xs (rects=…, polys=…); descending N placements…`，把「載 root / 發射 root 自身幾何 / 開始遞迴」
+三段分開,定位開頭停頓究竟在哪。最可能就是 root 自帶橫跨全 chip 的矩形阵列（已由本次幾何裁剪修掉）。
 
 **變更類型：** 效能修復 + 測試 ·  **狀態：完成**
 

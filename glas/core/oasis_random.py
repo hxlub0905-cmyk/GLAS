@@ -847,8 +847,14 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
 
     def walk(cid: object, T: Transform, visiting: set, depth: int) -> None:
         _check_cancel()
+        _t_load = time.perf_counter() if depth == 0 else 0.0
         content = rar.load_cell(cid)
         stats.cell_visits += 1
+        if depth == 0:
+            _dbg(f"  root {cid!r} loaded in {time.perf_counter() - _t_load:.1f}s "
+                 f"(placements={len(content.placements)}, rect_specs="
+                 f"{sum(len(v) for v in content.rect_specs.values())}, poly_specs="
+                 f"{sum(len(v) for v in content.poly_specs.values())})")
         # Debug: does the CE early-stop bbox actually bound the cell's real
         # geometry? (M3.5e.3 assumes CE rect == cell full bbox.) Compare the
         # full-decode own bbox against the CE-only bbox for descended cells.
@@ -947,6 +953,10 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
                     stats.polys_emitted += 1
         if depth >= max_depth:
             return
+        if depth == 0:
+            _dbg(f"  root own-geometry done at {time.perf_counter() - _t0:.1f}s "
+                 f"(rects={stats.rects_emitted}, polys={stats.polys_emitted}); "
+                 f"descending {len(content.placements)} placements…")
         for pl in content.placements:
             rtype, rraw = pl.repetition_type, pl.repetition_raw
             base = Transform.from_placement(pl.x, pl.y, pl.angle, pl.flip,
