@@ -4,6 +4,31 @@
 
 ---
 
+## [2026-06-04] [F16-B M2-M4] CellContent 欄狀雙後端 + 解碼 cell 磁碟快取（① + ③）
+
+**變更類型：** 功能（持久化快取）+ 重構 ·  **狀態：完成（M2/M3/M4；剩 M5 ROI 過濾）**
+
+**動機：** 大 flat cell（44995，1080 萬筆）首解 292s，session 內已 memoized 但每個 session 第一次仍要等。做磁碟 sidecar
+快取讓「第二個 session 起」秒級。
+
+**M2（③ 欄狀儲存）：** `CellContent` 加 optional 欄狀後端 `_rcol[key]=(coords,rt,rr)` / `_pcol[key]=(pts,off,rt,rr)`
+（decode 仍產 tuple-list，cache 載入填欄狀）。新增 accessor（`rect_count/poly_count`、`rect_spec_at/poly_spec_at`、
+`all_rect_rtypes/all_poly_rtypes`、`total_rects/total_polys`、`rect_keys/poly_keys`）優先吃欄狀否則退回 tuple；
+`rect_arrays/poly_arrays/rects()/polys()/is_empty` 與 walk 的 _feat/survivor/count 全改走 accessor。decoded cell 行為不變。
+
+**M3（① 序列化）：** `CellContent.to_cache_arrays/from_cache_arrays`（欄狀 + 稀疏 rr：只存非 None 的 idx/val，避免 880 萬
+mostly-None object array 拖慢 pickle）；placement 走 SoA、載入時重建 list。新增 `glas/core/cellcache.py`（per-user cache dir、
+`SCHEMA_VERSION`、mtime/size/schema 驗證、原子寫、毀損/版本不符/檔變更當 miss、env：`GLAS_CELLCACHE`/`_DIR`/`_MIN_RECORDS`）。
+
+**M4（① 整合）：** `RandomAccessReader.load_cell` 先 `cellcache.load`（命中→欄狀直用、不重建 tuple），decode 後 record 數
+≥ 門檻（預設 10 萬）→ `cellcache.save`。numpy 物件陣列陷阱（等長 tuple 被當 2D）以逐元素填 object array 解掉。
+
+**測試：** 新增 `tests/test_cellcache.py`（各 repetition type round-trip 逐 spec 相等、walk decode-vs-cache bit-identical、
+e2e load_cell 快取、失效、env 關閉）。`pytest tests/` 599 全綠。**影響檔案：** `glas/core/oasis_random.py`、
+`glas/core/cellcache.py`、`tests/test_cellcache.py`、`docs/plans/F16-B-cell-decode-cache.md`、`SESSION_LOG.md`。
+
+---
+
 ## [2026-06-04] [F16-B M1] Placement→NamedTuple + decode 內圈微優化（③ parser 加速）
 
 **變更類型：** 效能 + 重構 ·  **狀態：完成（M1/5；user 選 1+2+3 全做）**

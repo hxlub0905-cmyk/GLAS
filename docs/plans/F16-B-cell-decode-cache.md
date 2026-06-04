@@ -93,23 +93,25 @@ repetition descriptor（`rt`/`rr`）多數為 None，非 None 的存稀疏側表
 - [x] decode 內圈微優化：last-key 快取避免每筆 `setdefault` 的 throwaway `[]` 配置；幾何分支排前（CELL/END 排後）；`Placement` 改 positional 建構。
 - [x] 驗證：`pytest tests/` 592 全綠（行為不變）。
 
-### M2: ③ 幾何欄狀儲存（CellContent 內部改陣列）  [status: planned]
+### M2: ③ 幾何欄狀儲存（CellContent 雙後端）  [status: done]
 
-- [ ] `rect_specs`/`poly_specs` 內部改欄狀：每 key 存 `(coords ndarray, rt ndarray, 稀疏 rr)`；對外保留 `rects()/polys()/rect_arrays()/poly_arrays()/逐 spec 取用` 介面（walk survivor 用 index 取 `(x1,y1,x2,y2,rt,rr)`）。
-- [ ] 調整 `_analytic_bbox`、`rects()`、`polys()`、export 路徑與相關測試。
-- [ ] 驗證：`pytest tests/` 全綠；首解時間下降（少建 880 萬 tuple）。
+- [x] `CellContent` 加 optional 欄狀後端 `_rcol[key]=(coords, rt, rr)` / `_pcol[key]=(pts, off, rt, rr)`；decode 仍產 tuple-list（M1 不變），cache 載入則填欄狀。
+- [x] 加 accessors（`rect_keys/poly_keys`、`rect_count/poly_count`、`rect_spec_at/poly_spec_at`、`all_rect_rtypes/all_poly_rtypes`、`total_rects/total_polys`）優先吃欄狀、否則退回 tuple；`rect_arrays/poly_arrays/rects()/polys()/is_empty` 改走 accessor。
+- [x] walk 的 _feat / survivor / count 改用 accessor（decoded cell 行為不變 → 退回 tuple）。
+- [x] 驗證：`pytest tests/` 592 全綠。
 
-### M3: ① cellcache 序列化模組 + round-trip 測試  [status: planned]
+### M3: ① cellcache 序列化模組 + round-trip 測試  [status: done]
 
-- [ ] 新增 `glas/core/cellcache.py`：`to_cache/from_cache`（直接存/取 M2 的欄狀陣列 + 稀疏 rr 側表）、`SCHEMA_VERSION`、per-user cache dir（沿用 layerscan 慣例）、`load/save`（mtime/size/key 比對、原子寫、毀損當 miss）。
-- [ ] 測試：隨機構造含各 repetition type（1/2/3/8/10/11/None）的 CellContent，`from_cache(to_cache(...))` 逐 spec 相等；name-target placement、空 cell、多 layer。
-- [ ] 驗證：`pytest tests/test_cellcache.py -v` 綠。
+- [x] `CellContent.to_cache_arrays/from_cache_arrays`（欄狀 + 稀疏 rr 側表 idx/val，避免 880 萬 mostly-None object array pickle）。
+- [x] 新增 `glas/core/cellcache.py`：`SCHEMA_VERSION`、per-user cache dir、`load/save`（mtime/size/schema 驗證、原子寫、毀損/版本不符當 miss、env 開關與門檻）。
+- [x] `tests/test_cellcache.py`：各 repetition type（1/2/3/8/10/11/None）+ name-target + 空 cell 的 round-trip 逐 spec 相等；walk_roi decode-vs-cache bit-identical。
+- [x] 驗證：`pytest tests/test_cellcache.py` 綠。
 
-### M4: ① 整合進 load_cell + 真檔等價/失效測試  [status: planned]
+### M4: ① 整合進 load_cell + 真檔等價/失效測試  [status: done]
 
-- [ ] `RandomAccessReader.load_cell` 接快取讀/寫（大 cell 門檻 `GLAS_CELLCACHE_MIN_RECORDS`、目錄 `GLAS_CELLCACHE_DIR`、開關 `GLAS_CELLCACHE=0`）。
-- [ ] 測試：fixture 大 cell「解碼 vs 快取讀回」`walk_roi` bit-identical；改檔（碰 mtime）→ miss 重解；wanted_layers 不同 → 不同條目。
-- [ ] 驗證：`pytest tests/ -k "cellcache or oasis_random"` 綠；手動 LTV：第一次寫快取、重開 app 第一次載入秒級（貼 `[roi]` 計時）。
+- [x] `load_cell` 先查 `cellcache.load`（命中→填 `_memo`、`_n_loaded+=1`、return）；decode 後若 record 數 ≥ 門檻 → `cellcache.save`。門檻 `GLAS_CELLCACHE_MIN_RECORDS`、目錄 `GLAS_CELLCACHE_DIR`、開關 `GLAS_CELLCACHE=0`。
+- [x] 測試：e2e「decode 寫 sidecar → 新 reader load_cell 走欄狀」walk_roi bit-identical；改檔→miss、不同 wanted_layers→不同條目、env 關閉。
+- [x] 驗證：`pytest tests/` 599 全綠。手動 LTV 待 user 量測（首次寫快取、重開 app 秒級）。
 
 ### M5: ② ROI 過濾解碼（env 開關）  [status: planned]
 

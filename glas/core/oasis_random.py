@@ -26,6 +26,7 @@ Public surface::
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -39,6 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import oasis_streamer as oas      # noqa: E402
 import layerscan_cache             # noqa: E402  (F12 M3: layer-scan sidecar)
+import cellcache                   # noqa: E402  (F16-B: decoded-cell sidecar)
 from oasis_store import Placement  # noqa: E402
 from oasis_walker import Transform  # noqa: E402
 
@@ -102,6 +104,83 @@ class CellContent:
     # build (incl. expand_repetition for arbitrary-list types) is otherwise
     # repeated per visit per layer, which dominated big-chip ROI loads (F16).
     _ext_cache: dict = field(default_factory=dict, repr=False, compare=False)
+    # Optional columnar backing (F16-B M2). Populated only when a cell is loaded
+    # from the on-disk decode cache; empty for freshly decoded cells (which keep
+    # the rect_specs/poly_specs tuple-lists). The accessors below prefer the
+    # columnar form when present, so a cache load never rebuilds millions of
+    # tuples. Layout:
+    #   _rcol[key] = (coords (N,4) int64, rt (N,) int16 [None->-1], rr (N,) object)
+    #   _pcol[key] = (pts (Σn,2) int, off (P+1,) int64, rt (P,) int16, rr (P,) object)
+    _rcol: dict = field(default_factory=dict, repr=False, compare=False)
+    _pcol: dict = field(default_factory=dict, repr=False, compare=False)
+
+    # ── columnar-or-tuple accessors used by the walk ──────────────────────────
+    def rect_keys(self):
+        return self._rcol.keys() if self._rcol else self.rect_specs.keys()
+
+    def poly_keys(self):
+        return self._pcol.keys() if self._pcol else self.poly_specs.keys()
+
+    def rect_count(self, key: LayerKey) -> int:
+        col = self._rcol.get(key)
+        if col is not None:
+            return col[0].shape[0]
+        s = self.rect_specs.get(key)
+        return len(s) if s else 0
+
+    def poly_count(self, key: LayerKey) -> int:
+        col = self._pcol.get(key)
+        if col is not None:
+            return col[2].shape[0]
+        s = self.poly_specs.get(key)
+        return len(s) if s else 0
+
+    def total_rects(self) -> int:
+        return sum(self.rect_count(k) for k in self.rect_keys())
+
+    def total_polys(self) -> int:
+        return sum(self.poly_count(k) for k in self.poly_keys())
+
+    def rect_spec_at(self, key: LayerKey, i: int):
+        """``(x1, y1, x2, y2, rtype, raw)`` for the i-th rect on ``key``."""
+        col = self._rcol.get(key)
+        if col is not None:
+            c, rt, rr = col
+            r = int(rt[i])
+            return (int(c[i, 0]), int(c[i, 1]), int(c[i, 2]), int(c[i, 3]),
+                    (None if r < 0 else r), rr[i])
+        return self.rect_specs[key][i]
+
+    def poly_spec_at(self, key: LayerKey, i: int):
+        """``(base_pts (n,2), rtype, raw)`` for the i-th polygon on ``key``."""
+        col = self._pcol.get(key)
+        if col is not None:
+            pts, off, rt, rr = col
+            r = int(rt[i])
+            return (pts[off[i]:off[i + 1]], (None if r < 0 else r), rr[i])
+        return self.poly_specs[key][i]
+
+    def all_rect_rtypes(self) -> set:
+        out: set = set()
+        if self._rcol:
+            for c, rt, rr in self._rcol.values():
+                out.update(None if int(v) < 0 else int(v) for v in np.unique(rt))
+        else:
+            for specs in self.rect_specs.values():
+                for s in specs:
+                    out.add(s[4])
+        return out
+
+    def all_poly_rtypes(self) -> set:
+        out: set = set()
+        if self._pcol:
+            for pts, off, rt, rr in self._pcol.values():
+                out.update(None if int(v) < 0 else int(v) for v in np.unique(rt))
+        else:
+            for specs in self.poly_specs.values():
+                for s in specs:
+                    out.add(s[1])
+        return out
 
     def rect_arrays(self, key: LayerKey):
         """``(base (M,4), extent (M,4))`` local-frame bbox arrays for the
@@ -110,17 +189,29 @@ class CellContent:
         ck = ("r", key)
         got = self._ext_cache.get(ck)
         if got is None:
-            specs = self.rect_specs.get(key) or ()
-            M = len(specs)
-            base = np.empty((M, 4), dtype=np.float64)
-            ext = np.empty((M, 4), dtype=np.float64)
-            for i, (x1, y1, x2, y2, rt, rr) in enumerate(specs):
-                xa, xb = (x1, x2) if x1 <= x2 else (x2, x1)
-                ya, yb = (y1, y2) if y1 <= y2 else (y2, y1)
-                base[i, 0] = xa; base[i, 1] = ya; base[i, 2] = xb; base[i, 3] = yb
-                e0, e1, e2, e3 = oas.repetition_extent(rt, rr)
-                ext[i, 0] = xa + e0; ext[i, 1] = ya + e1
-                ext[i, 2] = xb + e2; ext[i, 3] = yb + e3
+            col = self._rcol.get(key)
+            if col is not None:
+                c, rt, rr = col
+                base = c.astype(np.float64)
+                ext = base.copy()
+                for i in range(base.shape[0]):
+                    e0, e1, e2, e3 = oas.repetition_extent(
+                        None if rt[i] < 0 else int(rt[i]), rr[i])
+                    ext[i, 0] += e0; ext[i, 1] += e1
+                    ext[i, 2] += e2; ext[i, 3] += e3
+            else:
+                specs = self.rect_specs.get(key) or ()
+                M = len(specs)
+                base = np.empty((M, 4), dtype=np.float64)
+                ext = np.empty((M, 4), dtype=np.float64)
+                for i, (x1, y1, x2, y2, rt, rr) in enumerate(specs):
+                    xa, xb = (x1, x2) if x1 <= x2 else (x2, x1)
+                    ya, yb = (y1, y2) if y1 <= y2 else (y2, y1)
+                    base[i, 0] = xa; base[i, 1] = ya
+                    base[i, 2] = xb; base[i, 3] = yb
+                    e0, e1, e2, e3 = oas.repetition_extent(rt, rr)
+                    ext[i, 0] = xa + e0; ext[i, 1] = ya + e1
+                    ext[i, 2] = xb + e2; ext[i, 3] = yb + e3
             got = (base, ext)
             self._ext_cache[ck] = got
         return got
@@ -132,14 +223,15 @@ class CellContent:
         ck = ("p", key)
         got = self._ext_cache.get(ck)
         if got is None:
-            specs = self.poly_specs.get(key) or ()
-            P = len(specs)
+            P = self.poly_count(key)
             base = np.empty((P, 4), dtype=np.float64)
             ext = np.empty((P, 4), dtype=np.float64)
-            for i, (b, rt, rr) in enumerate(specs):
+            for i in range(P):
+                b, rt, rr = self.poly_spec_at(key, i)
                 bx0 = float(b[:, 0].min()); by0 = float(b[:, 1].min())
                 bx1 = float(b[:, 0].max()); by1 = float(b[:, 1].max())
-                base[i, 0] = bx0; base[i, 1] = by0; base[i, 2] = bx1; base[i, 3] = by1
+                base[i, 0] = bx0; base[i, 1] = by0
+                base[i, 2] = bx1; base[i, 3] = by1
                 e0, e1, e2, e3 = oas.repetition_extent(rt, rr)
                 ext[i, 0] = bx0 + e0; ext[i, 1] = by0 + e1
                 ext[i, 2] = bx1 + e2; ext[i, 3] = by1 + e3
@@ -148,17 +240,18 @@ class CellContent:
         return got
 
     def is_empty(self) -> bool:
-        return (not self.rect_specs and not self.poly_specs
-                and not self.placements)
+        return not (self.rect_specs or self.poly_specs or self.placements
+                    or self._rcol or self._pcol)
 
     def rects(self, key: LayerKey, dtype=np.int32) -> np.ndarray:
         """Materialize all rectangles on ``key`` as ``(N, 4)`` (vectorized
         repetition expansion). Empty ``(0, 4)`` when none."""
-        specs = self.rect_specs.get(key)
-        if not specs:
+        n = self.rect_count(key)
+        if not n:
             return np.empty((0, 4), dtype=dtype)
         out = []
-        for x1, y1, x2, y2, rt, rr in specs:
+        for i in range(n):
+            x1, y1, x2, y2, rt, rr = self.rect_spec_at(key, i)
             offs = oas.repetition_offsets_np(rt, rr)        # (M, 2)
             arr = np.empty((offs.shape[0], 4), dtype=np.float64)
             arr[:, 0] = x1 + offs[:, 0]; arr[:, 1] = y1 + offs[:, 1]
@@ -168,16 +261,142 @@ class CellContent:
 
     def polys(self, key: LayerKey) -> list:
         """Materialize polygons on ``key`` as a list of ``(n, 2)`` arrays."""
-        specs = self.poly_specs.get(key)
-        if not specs:
-            return []
         out = []
-        for base, rt, rr in specs:
+        for i in range(self.poly_count(key)):
+            base, rt, rr = self.poly_spec_at(key, i)
             for dx, dy in oas.repetition_offsets_np(rt, rr):
                 s = base.copy()
                 s[:, 0] += int(dx); s[:, 1] += int(dy)
                 out.append(s)
         return out
+
+    # ── on-disk decode cache (F16-B M3): columnar (de)serialization ───────────
+    #
+    # The repetition descriptor ``rr`` is None for the vast majority of records,
+    # so it is stored *sparsely* (only the non-None positions + their raws) to
+    # keep the object-array pickled by savez tiny — otherwise serialising/loading
+    # an 8.8M-entry mostly-None object array would dominate the cache round-trip.
+    @staticmethod
+    def _sparse_rr(rr_list):
+        idx = [i for i, r in enumerate(rr_list) if r is not None]
+        # Build the object array element-wise: np.array([(a,b,c,d)], object)
+        # would wrongly make a 2-D array when the raws are equal-length tuples.
+        val = np.empty(len(idx), dtype=object)
+        for j, i in enumerate(idx):
+            val[j] = rr_list[i]
+        return (np.array(idx, dtype=np.int64), val)
+
+    @staticmethod
+    def _dense_rr(n, idx, val):
+        rr = np.full(n, None, dtype=object)
+        if idx.shape[0]:
+            rr[idx] = val
+        return rr
+
+    def to_cache_arrays(self) -> dict:
+        """Flatten this cell into a dict of ndarrays for ``np.savez`` — columnar
+        geometry (sparse ``rr``) + SoA placements + a tiny JSON meta. ``rt``
+        arrays use -1 for a None repetition type; raws round-trip verbatim."""
+        out: dict = {}
+        rkeys = []
+        for key in list(self.rect_keys()):
+            n = self.rect_count(key)
+            coords = np.empty((n, 4), dtype=np.int64)
+            rt = np.empty(n, dtype=np.int16)
+            rrs = []
+            for i in range(n):
+                x1, y1, x2, y2, t, r = self.rect_spec_at(key, i)
+                coords[i, 0] = x1; coords[i, 1] = y1
+                coords[i, 2] = x2; coords[i, 3] = y2
+                rt[i] = -1 if t is None else t
+                rrs.append(r)
+            l, d = key
+            ri, rv = self._sparse_rr(rrs)
+            out[f"r__{l}__{d}__coords"] = coords
+            out[f"r__{l}__{d}__rt"] = rt
+            out[f"r__{l}__{d}__rri"] = ri
+            out[f"r__{l}__{d}__rrv"] = rv
+            rkeys.append([l, d])
+        pkeys = []
+        for key in list(self.poly_keys()):
+            P = self.poly_count(key)
+            parts = []
+            off = np.zeros(P + 1, dtype=np.int64)
+            rt = np.empty(P, dtype=np.int16)
+            rrs = []
+            for i in range(P):
+                b, t, r = self.poly_spec_at(key, i)
+                b = np.asarray(b)
+                parts.append(b)
+                off[i + 1] = off[i] + b.shape[0]
+                rt[i] = -1 if t is None else t
+                rrs.append(r)
+            pts = (np.concatenate(parts) if parts
+                   else np.empty((0, 2), dtype=np.int64))
+            l, d = key
+            pi, pv = self._sparse_rr(rrs)
+            out[f"p__{l}__{d}__pts"] = pts
+            out[f"p__{l}__{d}__off"] = off
+            out[f"p__{l}__{d}__rt"] = rt
+            out[f"p__{l}__{d}__rri"] = pi
+            out[f"p__{l}__{d}__rrv"] = pv
+            pkeys.append([l, d])
+        pl = self.placements
+        n = len(pl)
+        out["pl__target"] = np.array([p.target for p in pl], dtype=object)
+        out["pl__kind"] = np.array([p.target_kind for p in pl], dtype=object)
+        out["pl__x"] = np.fromiter((p.x for p in pl), dtype=np.int64, count=n)
+        out["pl__y"] = np.fromiter((p.y for p in pl), dtype=np.int64, count=n)
+        out["pl__angle"] = np.fromiter((p.angle for p in pl), dtype=np.float64, count=n)
+        out["pl__mag"] = np.fromiter((p.magnification for p in pl), dtype=np.float64, count=n)
+        out["pl__flip"] = np.fromiter((p.flip for p in pl), dtype=bool, count=n)
+        out["pl__rt"] = np.fromiter(
+            ((-1 if p.repetition_type is None else p.repetition_type) for p in pl),
+            dtype=np.int16, count=n)
+        pli, plv = self._sparse_rr([p.repetition_raw for p in pl])
+        out["pl__rri"] = pli
+        out["pl__rrv"] = plv
+        meta = {"rkeys": rkeys, "pkeys": pkeys, "n_pl": n,
+                "bbox": list(self.bbox) if self.bbox is not None else None}
+        out["__meta__"] = np.frombuffer(
+            json.dumps(meta).encode("utf-8"), dtype=np.uint8)
+        return out
+
+    @classmethod
+    def from_cache_arrays(cls, a: dict) -> "CellContent":
+        """Rebuild a :class:`CellContent` from :meth:`to_cache_arrays` output.
+        Geometry stays columnar (``_rcol``/``_pcol``) so no per-rect/poly tuple
+        is rebuilt; only the placement list is reconstructed."""
+        meta = json.loads(bytes(a["__meta__"]).decode("utf-8"))
+        rcol = {}
+        for l, d in meta["rkeys"]:
+            coords = a[f"r__{l}__{d}__coords"]; rt = a[f"r__{l}__{d}__rt"]
+            rr = cls._dense_rr(coords.shape[0], a[f"r__{l}__{d}__rri"],
+                               a[f"r__{l}__{d}__rrv"])
+            rcol[(l, d)] = (coords, rt, rr)
+        pcol = {}
+        for l, d in meta["pkeys"]:
+            rt = a[f"p__{l}__{d}__rt"]
+            rr = cls._dense_rr(rt.shape[0], a[f"p__{l}__{d}__rri"],
+                               a[f"p__{l}__{d}__rrv"])
+            pcol[(l, d)] = (a[f"p__{l}__{d}__pts"], a[f"p__{l}__{d}__off"], rt, rr)
+        n = int(meta["n_pl"])
+        placements = []
+        if n:
+            tx = a["pl__target"]; tk = a["pl__kind"]
+            px = a["pl__x"]; py = a["pl__y"]; pa = a["pl__angle"]
+            pm = a["pl__mag"]; pf = a["pl__flip"]; prt = a["pl__rt"]
+            prr = cls._dense_rr(n, a["pl__rri"], a["pl__rrv"])
+            for i in range(n):
+                r = int(prt[i])
+                placements.append(Placement(
+                    tx[i].item() if hasattr(tx[i], "item") else tx[i],
+                    str(tk[i]), int(px[i]), int(py[i]), float(pa[i]),
+                    float(pm[i]), bool(pf[i]), (None if r < 0 else r), [],
+                    prr[i]))
+        bbox = tuple(meta["bbox"]) if meta["bbox"] is not None else None
+        return cls(rect_specs={}, poly_specs={}, placements=placements,
+                   bbox=bbox, _rcol=rcol, _pcol=pcol)
 
 
 def _iv_contains(iv: tuple, v: int) -> bool:
@@ -388,6 +607,13 @@ class RandomAccessReader:
         :class:`CellContent` if the cell has no known offset."""
         if cell_id in self._memo:
             return self._memo[cell_id]
+        # F16-B: a big flat merge cell costs minutes to decode; reuse a sidecar
+        # from a previous session if the source file is unchanged.
+        cached = cellcache.load(self._path, cell_id, self._init_wanted)
+        if cached is not None:
+            self._memo[cell_id] = cached
+            self._n_loaded += 1
+            return cached
         offset = self.offset_for(cell_id)
         if offset is None:
             _dbg(f"load_cell {cell_id!r}: no offset (unknown cell)")
@@ -426,6 +652,13 @@ class RandomAccessReader:
             if DEBUG and self._n_loaded % 500 == 0:
                 _dbg(f"… {self._n_loaded:,} cells decoded so far "
                      f"(last {cell_id!r} @ {offset})")
+            # F16-B: persist big cells so the next session loads them in seconds.
+            nrec = (len(content.placements) + content.total_rects()
+                    + content.total_polys())
+            if nrec >= cellcache.min_records():
+                if cellcache.save(self._path, cell_id, self._init_wanted, content):
+                    _dbg(f"… cached decoded cell {cell_id!r} "
+                         f"({nrec:,} records) to sidecar")
         self._memo[cell_id] = content
         return content
 
@@ -936,14 +1169,14 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
                 _decode_prof["max"] = _dt
                 _decode_prof["cell"] = cid
                 _decode_prof["np"] = len(content.placements)
-                _decode_prof["nr"] = sum(len(v) for v in content.rect_specs.values())
-                _decode_prof["npl"] = sum(len(v) for v in content.poly_specs.values())
+                _decode_prof["nr"] = content.total_rects()
+                _decode_prof["npl"] = content.total_polys()
         stats.cell_visits += 1
         if depth == 0:
             _dbg(f"  root {cid!r} loaded in {time.perf_counter() - _t_load:.1f}s "
-                 f"(placements={len(content.placements)}, rect_specs="
-                 f"{sum(len(v) for v in content.rect_specs.values())}, poly_specs="
-                 f"{sum(len(v) for v in content.poly_specs.values())})")
+                 f"(placements={len(content.placements)}, "
+                 f"rect_specs={content.total_rects()}, "
+                 f"poly_specs={content.total_polys()})")
         # Debug: does the CE early-stop bbox actually bound the cell's real
         # geometry? (M3.5e.3 assumes CE rect == cell full bbox.) Compare the
         # full-decode own bbox against the CE-only bbox for descended cells.
@@ -980,20 +1213,15 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
                 _feat["name_ref"] = True
         # RECTANGLE / POLYGON own repetition types — the geometry array
         # encoding (may differ from placement repetition; CMG arrays).
-        for _specs in content.rect_specs.values():
-            for _s in _specs:
-                _feat["rect_rtype"].add(_s[4])
-        for _specs in content.poly_specs.values():
-            for _s in _specs:
-                _feat["poly_rtype"].add(_s[1])
+        _feat["rect_rtype"].update(content.all_rect_rtypes())
+        _feat["poly_rtype"].update(content.all_poly_rtypes())
         # Emit this cell's own geometry (transformed) that hits the ROI.
         # Each RECTANGLE/POLYGON may carry its own repetition (CMG arrays that
         # explode to millions), so clip every spec's array to the ROI before
         # materializing — the same analytic sub-grid clip as the placement loop.
         # A cheap whole-array extent prune skips arrays that miss the ROI in O(1)
         # (the old content.rects()/polys() expanded *every* spec in full).
-        rspecs = content.rect_specs.get(key)
-        if rspecs:
+        if content.rect_count(key):
             # Whole-array extent prune over all rect specs at once (cached local
             # extent bboxes -> one apply_to_rects + mask); expand+clip only the
             # survivors and emit with one more transform.
@@ -1003,7 +1231,7 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
             keep = _roi_overlap_mask(T.apply_to_rects(ext_bb), roi)
             parts = []
             for i in np.flatnonzero(keep):
-                x1, y1, x2, y2, rt, rr = rspecs[i]
+                x1, y1, x2, y2, rt, rr = content.rect_spec_at(key, int(i))
                 oa = _clip_grid_offsets(rt, rr, base_bb[i], T, roi)
                 if oa.shape[0] == 0:
                     continue
@@ -1023,14 +1251,13 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
                     rect_out.append(r[m])
                     stats.rects_emitted += int(m.sum())
             stats.t_rect += time.perf_counter() - _ts
-        pspecs = content.poly_specs.get(key)
-        if pspecs:
+        if content.poly_count(key):
             _ts = time.perf_counter()
             base_bb, ext_bb = content.poly_arrays(key)
             stats.poly_specs_scanned += base_bb.shape[0]
             keep = _roi_overlap_mask(T.apply_to_rects(ext_bb), roi)
             for i in np.flatnonzero(keep):
-                base, rt, rr = pspecs[i]
+                base, rt, rr = content.poly_spec_at(key, int(i))
                 oa = _clip_grid_offsets(rt, rr, base_bb[i], T, roi)
                 if oa.shape[0]:
                     stats.arrays_materialized += 1
