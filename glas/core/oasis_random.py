@@ -616,22 +616,27 @@ class RandomAccessReader:
         placements: list = []
         seen_cell_header = False
 
+        # Hot loop over a flat cell can see millions of records, so keep it
+        # lean (F16-B M1): cache the last (layer, datatype) -> list so the
+        # common run of same-layer geometry skips dict.setdefault (which would
+        # allocate a throwaway [] on every call), and build the immutable
+        # Placement positionally.
+        _rk = _pk = None
+        _rlist = _plist = None
         for rid, payload in reader.iter_records():
-            if rid in (oas.CELL_REFNUM, oas.CELL_NAME):
-                if seen_cell_header:
-                    break                  # next cell -> our cell is done
-                seen_cell_header = True
-                continue
-            if rid == oas.END:
-                break
             if rid == oas.RECTANGLE:
                 if payload.get("filtered_out"):
                     continue
                 key = (payload["layer"], payload["datatype"])
+                if key != _rk:
+                    _rlist = rect_specs.get(key)
+                    if _rlist is None:
+                        _rlist = rect_specs[key] = []
+                    _rk = key
                 x1 = payload["x"]; y1 = payload["y"]
                 # Store the base rect + its repetition descriptor; expanded
                 # lazily (and vectorized) only if this cell lands in the ROI.
-                rect_specs.setdefault(key, []).append((
+                _rlist.append((
                     x1, y1, x1 + payload["width"], y1 + payload["height"],
                     payload.get("repetition_type"), payload.get("repetition_raw")))
             elif rid == oas.POLYGON:
@@ -640,26 +645,31 @@ class RandomAccessReader:
                 pts = payload.get("points") or []
                 if not pts:
                     continue
+                pkey = (payload["layer"], payload["datatype"])
+                if pkey != _pk:
+                    _plist = poly_specs.get(pkey)
+                    if _plist is None:
+                        _plist = poly_specs[pkey] = []
+                    _pk = pkey
                 ax = payload["x"]; ay = payload["y"]
                 base = np.asarray(pts, dtype=self._dtype)
                 base[:, 0] += ax
                 base[:, 1] += ay
-                pkey = (payload["layer"], payload["datatype"])
-                poly_specs.setdefault(pkey, []).append((
-                    base, payload.get("repetition_type"),
-                    payload.get("repetition_raw")))
+                _plist.append((base, payload.get("repetition_type"),
+                               payload.get("repetition_raw")))
             elif rid in (oas.PLACEMENT_NOMAG, oas.PLACEMENT_MAG):
                 placements.append(Placement(
-                    target=payload["cell_ref"],
-                    target_kind=payload["cell_ref_kind"],
-                    x=payload["x"], y=payload["y"],
-                    angle=float(payload["angle"]),
-                    magnification=float(payload["magnification"]),
-                    flip=bool(payload["flip"]),
-                    repetition_type=payload.get("repetition_type"),
-                    repetition_offsets=[],
-                    repetition_raw=payload.get("repetition_raw"),
-                ))
+                    payload["cell_ref"], payload["cell_ref_kind"],
+                    payload["x"], payload["y"], float(payload["angle"]),
+                    float(payload["magnification"]), bool(payload["flip"]),
+                    payload.get("repetition_type"), [],
+                    payload.get("repetition_raw")))
+            elif rid in (oas.CELL_REFNUM, oas.CELL_NAME):
+                if seen_cell_header:
+                    break                  # next cell -> our cell is done
+                seen_cell_header = True
+            elif rid == oas.END:
+                break
 
         return CellContent(rect_specs=rect_specs, poly_specs=poly_specs,
                            placements=placements,

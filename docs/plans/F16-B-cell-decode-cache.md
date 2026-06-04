@@ -1,6 +1,6 @@
-# [F16-B] 大型 cell 解碼結果持久化磁碟快取（sidecar）
+# [F16-B] 大型 cell 解碼加速（欄狀儲存 + 磁碟快取 + ROI 過濾解碼）
 
-> **狀態：** planned
+> **狀態：** in progress
 > **§8 ID：** [F16-B]
 > **建立：** 2026-06-04
 > **負責 branch：** claude/friendly-franklin-9uZqU
@@ -43,6 +43,14 @@
 **理由：** pickle 重建 880 萬 tuple / 150 萬 dataclass 仍要數十秒，達不到「秒級」。欄狀 `.npz` 載入是少數大陣列、~幾秒。
 repetition descriptor（`rt`/`rr`）多數為 None，非 None 的存稀疏側表（index→(rt,raw)），用 JSON/pickle 存少量即可。
 
+### Q4: 三招（①磁碟快取 ②ROI 過濾解碼 ③parser 加速）的範圍與順序？
+**選擇：** user 2026-06-04 選定「1+2+3 全做」。
+**關鍵互動（重要）：** 那顆 flat 大 cell（44995）**內部無空間索引**，任何一次 view 都得把它整段 byte-stream parse 一遍。
+- **①磁碟快取是 keystone**：把「parse 一次」的結果存欄狀、之後每個 session 秒級重用——這才是讓「重複使用變快」的根本。
+- **②ROI 過濾解碼只省「那一次 parse」**：parse 時把 FOV 外的幾何不建物件，降低首解的物件建構成本（但仍要循序 parse 維持 modal；且過濾後的結果不適合當「整顆 cell」快取重用，故設為 cache miss 時的首解加速、且只在 cache 關閉/首建時用）。
+- **③parser/儲存加速貫穿全程**：欄狀儲存 + `Placement` 改 NamedTuple(slots)，同時加速首解、降低記憶體、並讓①序列化變 trivial。
+**預設策略：** 快取存「整顆 cell（未過濾）」；命中→秒級載入（①）。未命中→走「③ 加速過的完整解碼」並寫快取（首解較舊版快、之後 session 秒級）。②ROI 過濾解碼做成 env 開關 `GLAS_ROI_DECODE=1`（預設關），給「不在意快取、只要首解更快」的情境；開啟時不寫整顆快取。
+
 ---
 
 ## 設計細節
@@ -77,22 +85,37 @@ repetition descriptor（`rt`/`rr`）多數為 None，非 None 的存稀疏側表
 
 ## Milestones
 
-### M1: cellcache 序列化模組 + round-trip 測試  [status: planned]
+> 順序原則：先把「儲存/型別」打底（③ 的一部分，也是 ① 的前提），再做 ①，最後 ②。每步測試全綠才前進。
 
-- [ ] 新增 `glas/core/cellcache.py`：`to_cache/from_cache`（欄狀 + 稀疏 rr 側表）、`SCHEMA_VERSION`、per-user cache dir（沿用 layerscan 慣例）、`load/save`（mtime/size/key 比對、原子寫、毀損當 miss）。
-- [ ] 測試：隨機構造含各 repetition type（1/2/3/8/10/11/None）的 rect/poly/placement 的 CellContent，`from_cache(to_cache(...))` 逐 spec 相等；name-target placement、空 cell、多 layer。
+### M1: ③ Placement → NamedTuple（slots）+ decode 微優化  [status: done]
+
+- [x] `Placement` dataclass 改 `NamedTuple`（immutable、無 `__dict__`、建構更快、150 萬實例記憶體砍半）。確認無欄位 mutation、僅屬性存取。
+- [x] decode 內圈微優化：last-key 快取避免每筆 `setdefault` 的 throwaway `[]` 配置；幾何分支排前（CELL/END 排後）；`Placement` 改 positional 建構。
+- [x] 驗證：`pytest tests/` 592 全綠（行為不變）。
+
+### M2: ③ 幾何欄狀儲存（CellContent 內部改陣列）  [status: planned]
+
+- [ ] `rect_specs`/`poly_specs` 內部改欄狀：每 key 存 `(coords ndarray, rt ndarray, 稀疏 rr)`；對外保留 `rects()/polys()/rect_arrays()/poly_arrays()/逐 spec 取用` 介面（walk survivor 用 index 取 `(x1,y1,x2,y2,rt,rr)`）。
+- [ ] 調整 `_analytic_bbox`、`rects()`、`polys()`、export 路徑與相關測試。
+- [ ] 驗證：`pytest tests/` 全綠；首解時間下降（少建 880 萬 tuple）。
+
+### M3: ① cellcache 序列化模組 + round-trip 測試  [status: planned]
+
+- [ ] 新增 `glas/core/cellcache.py`：`to_cache/from_cache`（直接存/取 M2 的欄狀陣列 + 稀疏 rr 側表）、`SCHEMA_VERSION`、per-user cache dir（沿用 layerscan 慣例）、`load/save`（mtime/size/key 比對、原子寫、毀損當 miss）。
+- [ ] 測試：隨機構造含各 repetition type（1/2/3/8/10/11/None）的 CellContent，`from_cache(to_cache(...))` 逐 spec 相等；name-target placement、空 cell、多 layer。
 - [ ] 驗證：`pytest tests/test_cellcache.py -v` 綠。
 
-### M2: 整合進 load_cell + 真檔等價/失效測試  [status: planned]
+### M4: ① 整合進 load_cell + 真檔等價/失效測試  [status: planned]
 
-- [ ] `RandomAccessReader.load_cell` 接快取讀/寫（大 cell 門檻、env override）；快取目錄可由 `GLAS_CELLCACHE_DIR` override，可由 `GLAS_CELLCACHE=0` 關閉。
+- [ ] `RandomAccessReader.load_cell` 接快取讀/寫（大 cell 門檻 `GLAS_CELLCACHE_MIN_RECORDS`、目錄 `GLAS_CELLCACHE_DIR`、開關 `GLAS_CELLCACHE=0`）。
 - [ ] 測試：fixture 大 cell「解碼 vs 快取讀回」`walk_roi` bit-identical；改檔（碰 mtime）→ miss 重解；wanted_layers 不同 → 不同條目。
-- [ ] 驗證：`pytest tests/ -k "cellcache or oasis_random"` 綠；手動 LTV：第一次 ~5min 寫快取、重開 app 第一次載入秒級（貼 `[roi]` 計時）。
+- [ ] 驗證：`pytest tests/ -k "cellcache or oasis_random"` 綠；手動 LTV：第一次寫快取、重開 app 第一次載入秒級（貼 `[roi]` 計時）。
 
-### M3:（選做）walk 直接吃欄狀、免重建 tuple list  [status: planned]
+### M5: ② ROI 過濾解碼（env 開關）  [status: planned]
 
-- [ ] `rect_arrays/poly_arrays` 與 walk survivor 展開直接用欄狀陣列，`from_cache` 不重建 8.8M tuple（進一步壓低載入與記憶體）。
-- [ ] 驗證：載入時間再降；全測試綠。
+- [ ] `_decode_at` 接受可選的 local-ROI bbox；descend 到大 cell 時把 root-ROI 經 `T⁻¹` 映回 local 傳入，跳過 FOV 外幾何/placement 的「建物件」（仍循序 parse 維持 modal）。
+- [ ] 預設關（`GLAS_ROI_DECODE=1` 開）；開啟時該 cell 不寫整顆快取（內容不完整）。
+- [ ] 驗證：開/關下 `walk_roi` 對 ROI 結果 bit-identical；手動量測首解時間下降。
 
 ---
 

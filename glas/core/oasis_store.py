@@ -56,7 +56,7 @@ from __future__ import annotations
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, NamedTuple, Optional
 
 import numpy as np
 
@@ -82,8 +82,7 @@ filter would balloon to multi-GB of rectangles."""
 # ── Per-cell PLACEMENT entry ─────────────────────────────────────────────────
 
 
-@dataclass
-class Placement:
+class Placement(NamedTuple):
     """One PLACEMENT record stored verbatim from the parser payload.
 
     The transform fields (x, y, angle, magnification, flip) plus the
@@ -91,6 +90,11 @@ class Placement:
     to expand instances into root-cell coordinates. ``target`` is
     either a cellname refnum (int) or an inline a-string (str),
     matching ``OasisReader``'s ``cell_ref`` field.
+
+    A ``NamedTuple`` (F16-B M1): never mutated, only attribute-accessed, so
+    the immutable/slotted tuple form constructs faster and uses about half the
+    memory of a dataclass — material when a single flat merge cell holds >1M
+    placements.
     """
     target: object
     target_kind: str        # 'refnum' | 'name' | 'modal'
@@ -100,7 +104,7 @@ class Placement:
     magnification: float
     flip: bool
     repetition_type: Optional[int]
-    repetition_offsets: list[tuple[int, int]]
+    repetition_offsets: list      # tuple[int, int] entries; [] when deferred
     # Compact (rtype, raw) descriptor when offsets are deferred (M3.5e
     # random-access load); None for the eager full-decode path.
     repetition_raw: Optional[tuple] = None
