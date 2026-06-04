@@ -4,6 +4,20 @@
 
 ---
 
+## [2026-06-04] [F19] cell/prep sidecar 快取 LRU 自動清理 + clear()
+
+**變更類型：** 功能（維護）·  **狀態：完成**
+
+**動機：** sidecar 快取（每大檔 cell ~300MB + prep ~180MB）無自動清理，看越多檔越占磁碟。
+
+**實作（`cellcache.py`）：** `_max_bytes()`（`GLAS_CELLCACHE_MAX_MB`，預設 8192MB；0=不限）；`_evict()` best-effort LRU
+（掃 cache dir、超過上限就刪最舊 .npz；被 reader 開啟中刪不掉就跳過，永不拋；誤刪只是下次重解）；`save`/`save_prep` 寫完
+呼叫 `_evict()`；`clear()` 清空回傳刪除數。
+
+**測試：** `test_evict_lru_and_clear`（超上限刪最舊、clear 清空）。`pytest tests/` 603 全綠。**影響檔案：** `glas/core/cellcache.py`、`tests/test_cellcache.py`、`SESSION_LOG.md`。
+
+---
+
 ## [2026-06-04] [F16-B] 收尾：命名正名 + §8/§4/§7 + plan 收成 done
 
 **變更類型：** 文件/housekeeping ·  **狀態：完成**

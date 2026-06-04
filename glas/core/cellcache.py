@@ -49,6 +49,64 @@ def min_records() -> int:
         return 100000
 
 
+def _max_bytes() -> int:
+    """Soft cap on total cache size. Override via ``GLAS_CELLCACHE_MAX_MB``;
+    default 8192 MB. 0 (or negative) disables eviction."""
+    try:
+        return int(os.environ.get("GLAS_CELLCACHE_MAX_MB", "8192")) * 1024 * 1024
+    except ValueError:
+        return 8192 * 1024 * 1024
+
+
+def _evict() -> None:
+    """Best-effort LRU: while the cache dir exceeds the cap, delete the oldest
+    ``.npz`` (by mtime). Never raises; a file held open by a concurrent reader
+    just fails to unlink and is skipped. A sidecar evicted by mistake only costs
+    a re-decode next time."""
+    cap = _max_bytes()
+    if cap <= 0:
+        return
+    try:
+        files = []
+        total = 0
+        for f in _cache_dir().glob("*.npz"):
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            files.append((st.st_mtime, st.st_size, f))
+            total += st.st_size
+        if total <= cap:
+            return
+        files.sort()                       # oldest first
+        for _mtime, size, f in files:
+            if total <= cap:
+                break
+            try:
+                f.unlink()
+                total -= size
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
+def clear() -> int:
+    """Delete every cache sidecar. Returns the number removed."""
+    n = 0
+    try:
+        for f in _cache_dir().glob("*.npz"):
+            try:
+                f.unlink()
+                n += 1
+            except OSError:
+                pass
+    except Exception:
+        pass
+    return n
+
+
+
 def _cache_dir() -> Path:
     base = os.environ.get("GLAS_CELLCACHE_DIR")
     if base:
@@ -158,6 +216,7 @@ def save(src, cell_id, wanted_layers, content) -> bool:
         # np.savez appends .npz to the path if missing
         tmp_npz = tmp if os.path.exists(tmp) else tmp + ".npz"
         os.replace(tmp_npz, p)
+        _evict()
         return True
     except Exception:
         try:
@@ -217,6 +276,7 @@ def save_prep(src, cell_id, prep) -> bool:
         np.savez(tmp, **arrays)
         tmp_npz = tmp if os.path.exists(tmp) else tmp + ".npz"
         os.replace(tmp_npz, p)
+        _evict()
         return True
     except Exception:
         try:

@@ -200,6 +200,26 @@ class TestSidecarIO:
         assert r2.load_cell(0)._place_prep is not None    # served from disk
         assert ref["rects"].tolist() == got["rects"].tolist()
 
+    def test_evict_lru_and_clear(self, tmp_path, monkeypatch):
+        import os as _os
+        monkeypatch.setenv("GLAS_CELLCACHE_DIR", str(tmp_path / "cache"))
+        d = tmp_path / "cache"
+        d.mkdir()
+        paths = []
+        for i in range(3):
+            f = d / f"e{i}.npz"
+            f.write_bytes(b"x" * 1000)
+            _os.utime(f, (1000 + i, 1000 + i))      # ascending mtime
+            paths.append(f)
+        # Cap below 3 files' total -> evict the oldest (e0) only.
+        monkeypatch.setattr(cellcache, "_max_bytes", lambda: 2500)
+        cellcache._evict()
+        assert not paths[0].exists()                # oldest gone
+        assert paths[1].exists() and paths[2].exists()
+        # clear() wipes the rest.
+        assert cellcache.clear() == 2
+        assert list(d.glob("*.npz")) == []
+
     def test_disabled_via_env(self, tmp_path, monkeypatch):
         monkeypatch.setenv("GLAS_CELLCACHE_DIR", str(tmp_path / "cache"))
         monkeypatch.setenv("GLAS_CELLCACHE", "0")
