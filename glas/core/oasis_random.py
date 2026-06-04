@@ -243,6 +243,11 @@ class RandomAccessReader:
         self._offset_flag = idx.get("offset_flag")
         self._offsets_via = idx.get("offsets_via")
         self._table_offsets = idx.get("table_offsets")
+        # S_BOUNDING_BOX presence (diagnostic): a per-cell bbox in the name
+        # table would let ROI prune without decoding geometry (fast path for
+        # files lacking the CE 108/250 layer). See docs / Load-GDS-ROI perf.
+        self._n_bbox_props = idx.get("n_bbox_props") or 0
+        self._bbox_sample = idx.get("bbox_sample") or []
         self._nm_per_grid = (1000.0 / self._unit) if self._unit else 1.0
         _dbg(f"OASIS unit (grid steps per micron) = {self._unit!r} "
              f"-> 1 grid = {self._nm_per_grid} nm "
@@ -1064,6 +1069,8 @@ def enumerate_layers(path: str | Path, *, progress_cb=None, use_cache: bool = Tr
             "table_offsets": rar._table_offsets,
             "n_cell_offsets": len(rar._by_refnum),
             "n_layernames": len(rar._layernames),
+            "n_bbox_props": rar._n_bbox_props,
+            "bbox_sample": rar._bbox_sample,
             "n_layers": len(result["layers"]),
             "source": result["source"],
             "sample_bounds": {

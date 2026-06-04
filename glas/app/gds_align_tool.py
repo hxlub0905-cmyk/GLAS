@@ -1059,6 +1059,9 @@ def _scan_oas_with_streamer(path: "Path", q: "mp.Queue") -> None:
         f"[gds-scan]   cell offsets  = {diag.get('n_cell_offsets')}  "
         f"(S_CELL_OFFSET entries)\n"
         f"[gds-scan]   LAYERNAME rows= {diag.get('n_layernames')}\n"
+        f"[gds-scan]   S_BOUNDING_BOX= {diag.get('n_bbox_props')}  "
+        f"(per-cell bbox in name table -> fast ROI prune without CE layer; "
+        f"sample {diag.get('bbox_sample')})\n"
         f"[gds-scan]   layers found  = {len(layers)}  "
         + ", ".join(f"{d['layer']}/{d['datatype']}" for d in layers[:20])
         + (" …" if len(layers) > 20 else "") + "\n")

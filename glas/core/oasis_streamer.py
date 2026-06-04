@@ -2304,6 +2304,12 @@ class OasisReader:
 # ── M3.5a: per-cell byte-offset index (S_CELL_OFFSET) ────────────────────────
 
 _CELL_OFFSET_PROP = "S_CELL_OFFSET"
+# Standard per-cell bounding-box property (SEMI P39 Annex). When a writer
+# (e.g. KLayout with "write standard properties") emits it on CELLNAME records,
+# each cell's bbox is available straight from the name table — no geometry
+# decode — which would let the ROI walk prune without the CE boundary layer.
+# scan_cell_offsets reports its presence + a raw value sample for diagnosis.
+_BBOX_PROP = "S_BOUNDING_BOX"
 
 
 def _name_str(v) -> str:
@@ -2402,10 +2408,12 @@ def scan_cell_offsets(path: str | Path, *, use_mmap: bool = False,
     # live in the name-table section, so this same pass picks them up for free
     # (F3 M2 — layer labels in the UI).
     layernames: list[tuple[str, tuple, tuple]] = []
+    bbox_sample: list = []   # S_BOUNDING_BOX raw samples (diagnostic, F12/ROI)
     # Mutable per-record state, shared between the inline pass and any
     # strict-mode table-follow pass below.
     st = {"pn_implicit": 0, "cn_implicit": 0, "last_propname": None,
-          "last_cell_ref": None, "last_cell_name": None, "cellnames": 0}
+          "last_cell_ref": None, "last_cell_name": None, "cellnames": 0,
+          "bbox_count": 0}
 
     def _consume(rid, payload) -> None:
         """Handle one name-table record (LAYERNAME / PROPNAME / CELLNAME /
@@ -2448,6 +2456,14 @@ def scan_cell_offsets(path: str | Path, *, use_mmap: bool = False,
                     by_refnum[st["last_cell_ref"]] = off
                     if st["last_cell_name"] is not None:
                         by_name[st["last_cell_name"]] = off
+            elif name == _BBOX_PROP:
+                # Diagnostic: count cells carrying S_BOUNDING_BOX and keep a
+                # small raw-value sample so the exact encoding can be confirmed
+                # on a real file before wiring it into ROI pruning.
+                st["bbox_count"] += 1
+                if len(bbox_sample) < 5:
+                    bbox_sample.append(
+                        (st["last_cell_name"], list(payload.get("values") or [])))
 
     unit = None
     offset_flag = None
@@ -2516,6 +2532,8 @@ def scan_cell_offsets(path: str | Path, *, use_mmap: bool = False,
         "offset_flag": offset_flag,
         "table_offsets": table_offsets,
         "offsets_via": offsets_via,
+        "n_bbox_props": st["bbox_count"],
+        "bbox_sample": bbox_sample,
     }
 
 

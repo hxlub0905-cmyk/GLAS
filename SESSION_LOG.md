@@ -4,6 +4,33 @@
 
 ---
 
+## [2026-06-04] [ROI perf 診斷] 偵測 S_BOUNDING_BOX（Load GDS ROI 變慢的解法探查第一步）
+
+**變更類型：** 診斷強化（core `scan_cell_offsets` 偵測 + Diagnose/終端機顯示）+ 測試 ·  **狀態：完成**
+
+**背景：** user 回報「Load GDS ROI 常常開很久」。查清現有邏輯：`walk_roi` 靠 `reachable_bbox`→`load_cell_bbox`
+取每顆 cell bbox 做 ROI 剪枝；有 CE 邊界層 (108/250) 時每顆只讀 ~1 矩形即停（快），**KLayout 轉檔無此層 →
+`_decode_bbox_at` 退化成每顆 cell 全解，第一次 ROI load 的 reachable_bbox 全階層 sweep ≈ 全 chip 解碼 → 慢**
+（即 F12 撤案的根本卡點）。Q&A 後 user 選「先診斷檔案有沒有 `S_BOUNDING_BOX`」——若 KLayout 有在 CELLNAME
+表寫每顆 cell 的 bbox 標準屬性，就能像 S_CELL_OFFSET 一樣**從 name table 直接讀 per-cell bbox、免解幾何**
+（方案 A，最快免費）；沒有則需做一次性 bbox 索引 + sidecar（方案 B）。
+
+**本次（診斷步驟）：** `scan_cell_offsets` 在掃 name table（含 strict 檔尾表）時順帶偵測 `S_BOUNDING_BOX`
+（`_BBOX_PROP`）：回傳 `n_bbox_props` 計數 + `bbox_sample`（前 5 筆 cell 的原始 values，供確認實際編碼格式）。
+`oasis_debug.report_file`（Diagnose OASIS file… 選單）新增「S_BOUNDING_BOX props」行 + 取樣 + 對 ROI 速度的
+解讀；scan 終端機 `[gds-scan]` 區塊同步加一行。**不改任何 ROI/解碼行為**，純診斷。
+
+**測試：** `TestBoundingBoxProp`（有 → 計數+取樣、無 → 0）。`pytest tests/` **583 passed**。
+
+**下一步：** 待 user 拿真實慢檔跑 Diagnose / scan，回報 `S_BOUNDING_BOX props` 數與取樣 → 有則實作方案 A
+（從 name table 餵 per-cell bbox 給 reader，繞過幾何解碼）、無則方案 B（一次性 bbox 索引 + sidecar）。
+
+**影響檔案：** `glas/core/oasis_streamer.py`、`glas/core/oasis_random.py`、`glas/core/oasis_debug.py`、
+`glas/app/gds_align_tool.py`、`tests/test_oasis_layer_scan.py`、`SESSION_LOG.md`。
+**Branch：** `claude/friendly-franklin-9uZqU`
+
+---
+
 ## [2026-06-04] [F12 tune] 放寬 layer 抽樣預算（漏 layer 修正）+ GLAS_SCAN_* env 覆寫
 
 **變更類型：** 調參（core 預設值）+ env 覆寫 + 終端機顯示 + 測試 ·  **狀態：完成，待 user 實機確認覆蓋率**

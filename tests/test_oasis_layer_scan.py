@@ -282,6 +282,51 @@ class TestFastPath:
         assert res["source"] == "layername"
 
 
+class TestBoundingBoxProp:
+    """Diagnostic: detect S_BOUNDING_BOX (per-cell bbox in the name table),
+    which would let ROI load prune without decoding geometry — the fast fix
+    for slow 'Load GDS ROI' on files lacking the CE 108/250 layer."""
+
+    @staticmethod
+    def _file_with_bbox(values):
+        start = (bytes([oas.START]) + _astr("1.0") + bytes([0])
+                 + _uint(1000) + _uint(0) + bytes([0] * 12))
+        pn0 = bytes([oas.PROPNAME_IMP]) + _astr("S_CELL_OFFSET")   # refnum 0
+        pn1 = bytes([oas.PROPNAME_IMP]) + _astr("S_BOUNDING_BOX")  # refnum 1
+        cn = bytes([oas.CELLNAME_IMP]) + _astr("A")
+
+        def prop_off(off):
+            return bytes([oas.PROPERTY_NORMAL, 0x16]) + _uint(0) + _uint(8) + _ufix(off, 4)
+
+        def prop_bbox(vals):
+            # info 0x56: U=5 values, C=1 (propname follows), N=1 (refnum).
+            body = bytes([oas.PROPERTY_NORMAL, 0x56]) + _uint(1)
+            for v in vals:
+                body += _uint(8) + _uint(v)
+            return body
+
+        hdr = oas.MAGIC + start + pn0 + pn1 + cn
+        cell = bytes([oas.CELL_REFNUM]) + _uint(0) + _rect(17, 0, 10, 10, 0, 0)
+        off = len(hdr + prop_off(0) + prop_bbox(values))
+        return (hdr + prop_off(off) + prop_bbox(values) + cell
+                + bytes([oas.END]) + _uint(0))
+
+    def test_detected_with_sample(self, tmp_path):
+        p = tmp_path / "bbox.oas"
+        p.write_bytes(self._file_with_bbox([1, 10, 20, 30, 40]))
+        idx = oas.scan_cell_offsets(p)
+        assert idx["n_bbox_props"] == 1
+        assert idx["bbox_sample"] == [("A", [1, 10, 20, 30, 40])]
+
+    def test_absent_reports_zero(self, tmp_path):
+        # A plain numeric file (no S_BOUNDING_BOX).
+        p = tmp_path / "nobbox.oas"
+        p.write_bytes(_build_file([("A", _rect(17, 0, 10, 10, 0, 0))]))
+        idx = oas.scan_cell_offsets(p)
+        assert idx["n_bbox_props"] == 0
+        assert idx["bbox_sample"] == []
+
+
 class TestStrictEndTables:
     """KLayout 'Save As ▸ OASIS (strict)' puts the cellname/S_CELL_OFFSET and
     LAYERNAME tables AFTER the cells; the byte offsets live in START or END.

@@ -96,6 +96,22 @@ def report_file(path, *, sent_layers: Optional[Iterable] = None,
         lines.append(f"  table_offsets: {idx.get('table_offsets')}")
         lines.append(f"  S_CELL_OFFSET entries: {n_off}")
         lines.append(f"  LAYERNAME rows       : {n_ln}")
+        # S_BOUNDING_BOX: a per-cell bbox in the name table would let ROI load
+        # prune without decoding geometry (no CE 108/250 layer needed) — the
+        # fast fix for slow "Load GDS ROI" on KLayout files. Report presence +
+        # a raw value sample so the exact encoding can be confirmed.
+        n_bb = idx.get("n_bbox_props") or 0
+        lines.append(f"  S_BOUNDING_BOX props : {n_bb}")
+        if n_bb:
+            for nm, vals in (idx.get("bbox_sample") or [])[:5]:
+                lines.append(f"      {nm!r}: {vals}")
+            lines.append("  -> per-cell bbox is in the name table: ROI load "
+                         "can prune WITHOUT decoding geometry (fast path "
+                         "without the CE 108/250 layer).")
+        else:
+            lines.append("  -> no S_BOUNDING_BOX: ROI prune must derive each "
+                         "cell bbox by decoding geometry (slow first load on "
+                         "files lacking the CE 108/250 boundary layer).")
         if n_off == 0:
             lines.append("  -> NO cell-offset index: random-access ROI load "
                          "and layer scan are unavailable. Re-save from KLayout "
