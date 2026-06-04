@@ -4,6 +4,24 @@
 
 ---
 
+## [2026-06-04] [F18] lazy placement 反序列化（cache 載入再砍 ~10s / batch 暖機）
+
+**變更類型：** 效能 + 重構 ·  **狀態：完成**
+
+**動機：** cache 載回大 cell 時仍重建 ~150 萬個 Placement 物件（+ object 陣列 unpickle target/kind）≈ ~10s，且
+prep 已持久化後 prune 根本不需要 placement 清單（只有 survivor + --debug 的 _feat 會碰）。
+
+**實作：** `CellContent.placements` 改 **lazy property**：decoded cell 設 `_placements`（list）；cache 載入設 `_pl_soa`
+（SoA 陣列），清單**用到才建**。新增 `placement_count()` / `placement_at(i)`（從 SoA 建單顆）/ `_pl_from_soa`。cache 格式改
+（SCHEMA_VERSION→2）：`target` 存 int64（refnum；-1=name，name 字串存稀疏側表）、`kind` 存 int8 code，避免 object 陣列
+unpickle。walk 改用 `placement_count()` + survivor `placement_at(i)`；gather（prep miss 才跑）才 materialize 清單。
+→ prep 命中時（batch worker 暖機 / 每 session 第一個 ROI）**完全不建 150 萬 placement**，cache 載入 placement 段 ~10s→~0.3s。
+
+**測試：** `test_placements_lazy_from_cache`（SoA-backed、placement_at 不建全清單、name-target 經稀疏側表、property 才 materialize）；
+既有 round-trip 仍逐筆相等。`pytest tests/` 604 全綠。**影響檔案：** `glas/core/oasis_random.py`、`glas/core/cellcache.py`、`tests/test_cellcache.py`、`SESSION_LOG.md`。
+
+---
+
 ## [2026-06-04] [F19] cell/prep sidecar 快取 LRU 自動清理 + clear()
 
 **變更類型：** 功能（維護）·  **狀態：完成**

@@ -31,7 +31,7 @@ from typing import Optional
 
 import numpy as np
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2     # v2: SoA placements (int target/kind + sparse names)
 
 
 def enabled() -> bool:

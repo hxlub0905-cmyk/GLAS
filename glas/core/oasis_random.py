@@ -116,7 +116,14 @@ class CellContent:
     """
     rect_specs: dict[LayerKey, list] = field(default_factory=dict)
     poly_specs: dict[LayerKey, list] = field(default_factory=dict)
-    placements: list = field(default_factory=list)
+    # Placements are lazy (F16-B F18): a freshly decoded cell sets ``_placements``
+    # (the list); a cache load sets ``_pl_soa`` (struct-of-arrays) and the list is
+    # built on demand. With the prep precompute persisted (M7), the prune never
+    # iterates placements, so a cache-loaded big cell skips rebuilding ~1.5M
+    # Placement objects entirely. Access via the ``placements`` property,
+    # ``placement_count()`` and ``placement_at(i)``.
+    _placements: Optional[list] = field(default=None, repr=False, compare=False)
+    _pl_soa: Optional[dict] = field(default=None, repr=False, compare=False)
     bbox: Optional[Bbox] = None
     # Cache of per-key (base_bbox, array_extent_bbox) ndarrays, built once and
     # reused across every ROI walk visit of this (memoized) cell — the extent
@@ -137,6 +144,44 @@ class CellContent:
     # independent, so it is built once and reused across every ROI and layer of a
     # session (the per-ROI walk then only does a vectorized transform + mask).
     _place_prep: object = field(default=None, repr=False, compare=False)
+
+    # ── lazy placements (F18) ────────────────────────────────────────────────
+    @property
+    def placements(self) -> list:
+        if self._placements is None:
+            s = self._pl_soa
+            self._placements = ([self._pl_from_soa(s, i)
+                                 for i in range(len(s["x"]))]
+                                if s is not None else [])
+        return self._placements
+
+    @placements.setter
+    def placements(self, value) -> None:
+        self._placements = value
+
+    def placement_count(self) -> int:
+        if self._placements is not None:
+            return len(self._placements)
+        if self._pl_soa is not None:
+            return len(self._pl_soa["x"])
+        return 0
+
+    def placement_at(self, i: int):
+        if self._placements is not None:
+            return self._placements[i]
+        if self._pl_soa is not None:
+            return self._pl_from_soa(self._pl_soa, i)
+        raise IndexError(i)
+
+    @staticmethod
+    def _pl_from_soa(s: dict, i: int):
+        r = int(s["rt"][i])
+        names = s["names"]
+        tgt = names[i] if (names and i in names) else int(s["target"][i])
+        return Placement(tgt, _KIND_NAMES[int(s["kind"][i])],
+                         int(s["x"][i]), int(s["y"][i]), float(s["angle"][i]),
+                         float(s["mag"][i]), bool(s["flip"][i]),
+                         (None if r < 0 else r), [], s["rr"][i])
 
     # ── columnar-or-tuple accessors used by the walk ──────────────────────────
     def rect_keys(self):
@@ -286,7 +331,7 @@ class CellContent:
         return got
 
     def is_empty(self) -> bool:
-        return not (self.rect_specs or self.poly_specs or self.placements
+        return not (self.rect_specs or self.poly_specs or self.placement_count()
                     or self._rcol or self._pcol)
 
     def rects(self, key: LayerKey, dtype=np.int32) -> np.ndarray:
@@ -387,10 +432,29 @@ class CellContent:
             out[f"p__{l}__{d}__rri"] = pi
             out[f"p__{l}__{d}__rrv"] = pv
             pkeys.append([l, d])
+        # Placements as SoA with int target/kind (no 1.5M-object pickle): refnum
+        # targets in an int64 array (-1 marks a name target, whose string goes in
+        # a sparse side-table); kind as an int8 code. This + lazy rebuild on load
+        # is what makes a cache load fast (F18).
         pl = self.placements
         n = len(pl)
-        out["pl__target"] = np.array([p.target for p in pl], dtype=object)
-        out["pl__kind"] = np.array([p.target_kind for p in pl], dtype=object)
+        targets = np.empty(n, dtype=np.int64)
+        kinds = np.empty(n, dtype=np.int8)
+        name_idx = []
+        name_val = []
+        for i, p in enumerate(pl):
+            t = p.target
+            if isinstance(t, (int, np.integer)):
+                targets[i] = int(t)
+            else:                                    # inline name target
+                targets[i] = -1
+                name_idx.append(i)
+                name_val.append(str(t))
+            kinds[i] = _KIND_CODES.get(p.target_kind, 2)
+        out["pl__target"] = targets
+        out["pl__kind"] = kinds
+        out["pl__nidx"] = np.array(name_idx, dtype=np.int64)
+        out["pl__nval"] = np.array(name_val, dtype=object)
         out["pl__x"] = np.fromiter((p.x for p in pl), dtype=np.int64, count=n)
         out["pl__y"] = np.fromiter((p.y for p in pl), dtype=np.int64, count=n)
         out["pl__angle"] = np.fromiter((p.angle for p in pl), dtype=np.float64, count=n)
@@ -411,8 +475,10 @@ class CellContent:
     @classmethod
     def from_cache_arrays(cls, a: dict) -> "CellContent":
         """Rebuild a :class:`CellContent` from :meth:`to_cache_arrays` output.
-        Geometry stays columnar (``_rcol``/``_pcol``) so no per-rect/poly tuple
-        is rebuilt; only the placement list is reconstructed."""
+        Geometry stays columnar (``_rcol``/``_pcol``) and placements stay SoA
+        (``_pl_soa``); neither the millions of geometry tuples nor the millions
+        of Placement objects are rebuilt — they're materialised lazily on the
+        rare paths that need them (F18)."""
         meta = json.loads(bytes(a["__meta__"]).decode("utf-8"))
         rcol = {}
         for l, d in meta["rkeys"]:
@@ -427,22 +493,19 @@ class CellContent:
                                a[f"p__{l}__{d}__rrv"])
             pcol[(l, d)] = (a[f"p__{l}__{d}__pts"], a[f"p__{l}__{d}__off"], rt, rr)
         n = int(meta["n_pl"])
-        placements = []
+        pl_soa = None
         if n:
-            tx = a["pl__target"]; tk = a["pl__kind"]
-            px = a["pl__x"]; py = a["pl__y"]; pa = a["pl__angle"]
-            pm = a["pl__mag"]; pf = a["pl__flip"]; prt = a["pl__rt"]
-            prr = cls._dense_rr(n, a["pl__rri"], a["pl__rrv"])
-            for i in range(n):
-                r = int(prt[i])
-                placements.append(Placement(
-                    tx[i].item() if hasattr(tx[i], "item") else tx[i],
-                    str(tk[i]), int(px[i]), int(py[i]), float(pa[i]),
-                    float(pm[i]), bool(pf[i]), (None if r < 0 else r), [],
-                    prr[i]))
+            nidx = a["pl__nidx"]; nval = a["pl__nval"]
+            names = {int(nidx[j]): str(nval[j]) for j in range(nidx.shape[0])}
+            pl_soa = {"target": a["pl__target"], "kind": a["pl__kind"],
+                      "x": a["pl__x"], "y": a["pl__y"], "angle": a["pl__angle"],
+                      "mag": a["pl__mag"], "flip": a["pl__flip"],
+                      "rt": a["pl__rt"],
+                      "rr": cls._dense_rr(n, a["pl__rri"], a["pl__rrv"]),
+                      "names": names}
         bbox = tuple(meta["bbox"]) if meta["bbox"] is not None else None
-        return cls(rect_specs={}, poly_specs={}, placements=placements,
-                   bbox=bbox, _rcol=rcol, _pcol=pcol)
+        return cls(rect_specs={}, poly_specs={}, _placements=None,
+                   _pl_soa=pl_soa, bbox=bbox, _rcol=rcol, _pcol=pcol)
 
 
 def _iv_contains(iv: tuple, v: int) -> bool:
@@ -702,7 +765,7 @@ class RandomAccessReader:
                 _trace(f"… {self._n_loaded:,} cells decoded so far "
                        f"(last {cell_id!r} @ {offset})")
             # F16-B: persist big cells so the next session loads them in seconds.
-            nrec = (len(content.placements) + content.total_rects()
+            nrec = (content.placement_count() + content.total_rects()
                     + content.total_polys())
             if nrec >= cellcache.min_records():
                 if cellcache.save(self._path, cell_id, self._init_wanted, content):
@@ -885,7 +948,7 @@ class RandomAccessReader:
             rect_specs = {}
             bbox = _union_bbox(run_boxes)
         return CellContent(rect_specs=rect_specs, poly_specs={},
-                           placements=placements, bbox=bbox)
+                           _placements=placements, bbox=bbox)
 
     def _decode_at(self, offset: int) -> CellContent:
         reader = self._reader
@@ -954,7 +1017,7 @@ class RandomAccessReader:
                 break
 
         return CellContent(rect_specs=rect_specs, poly_specs=poly_specs,
-                           placements=placements,
+                           _placements=placements,
                            bbox=_analytic_bbox(rect_specs, poly_specs))
 
 
@@ -1031,6 +1094,11 @@ def _roi_overlap_mask(boxes: np.ndarray, roi: Bbox) -> np.ndarray:
 # Quarter-turn rotation matrices (m00, m01, m10, m11), CCW — matches
 # Transform.from_placement. Used to build placement transforms in bulk without
 # allocating a Transform/ndarray per placement record.
+# Placement target_kind <-> int8 code, for the compact SoA cache (F18).
+_KIND_NAMES = ("refnum", "name", "modal")
+_KIND_CODES = {"refnum": 0, "name": 1, "modal": 2}
+
+
 _D4_ROT = ((1.0, 0.0, 0.0, 1.0), (0.0, -1.0, 1.0, 0.0),
            (-1.0, 0.0, 0.0, -1.0), (0.0, 1.0, -1.0, 0.0))
 
@@ -1220,13 +1288,13 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
             if _dt > _decode_prof["max"]:
                 _decode_prof["max"] = _dt
                 _decode_prof["cell"] = cid
-                _decode_prof["np"] = len(content.placements)
+                _decode_prof["np"] = content.placement_count()
                 _decode_prof["nr"] = content.total_rects()
                 _decode_prof["npl"] = content.total_polys()
         stats.cell_visits += 1
         if depth == 0:
             _trace(f"  root {cid!r} loaded in {time.perf_counter() - _t_load:.1f}s "
-                 f"(placements={len(content.placements)}, "
+                 f"(placements={content.placement_count()}, "
                  f"rect_specs={content.total_rects()}, "
                  f"poly_specs={content.total_polys()})")
         # Debug-only consistency checks. When the cell has a name-table
@@ -1334,15 +1402,14 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
             stats.t_poly += time.perf_counter() - _ts
         if depth >= max_depth:
             return
+        N = content.placement_count()
         if depth == 0:
             _trace(f"  root own-geometry done at {time.perf_counter() - _t0:.1f}s "
                  f"(rects={stats.rects_emitted}, polys={stats.polys_emitted}); "
-                 f"descending {len(content.placements)} placements…")
-        placements = content.placements
-        if not placements:
+                 f"descending {N} placements…")
+        if not N:
             return
         _ts_pl = time.perf_counter()
-        N = len(placements)
         # Vectorized whole-array prune over ALL placements of this cell. The
         # per-placement gather (matrices, child bboxes, repetition extents) is
         # cell-local and reachable_bbox-only — ROI/transform independent — so it
@@ -1358,6 +1425,10 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
             if prep is not None:
                 content._place_prep = prep
         if prep is None:
+            # The gather needs every placement, so materialise the list here
+            # (a cache-loaded cell builds it once from SoA — only on a prep
+            # miss; a prep hit below skips this entirely).
+            placements = content.placements
             base_M = np.zeros((N, 2, 2), dtype=np.float64)
             base_t = np.zeros((N, 2), dtype=np.float64)
             cb_arr = np.zeros((N, 4), dtype=np.float64)
@@ -1420,7 +1491,7 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
         stats.instances_pruned += int(rcount[valid & ~keep].sum())
         stats.t_place += time.perf_counter() - _ts_pl   # gather+prune only
         for i in np.flatnonzero(keep):
-            pl = placements[i]
+            pl = content.placement_at(int(i))     # lazy single (no full build)
             rtype, rraw = pl.repetition_type, pl.repetition_raw
             full_k = int(rcount[i])
             if pl.target in visiting:

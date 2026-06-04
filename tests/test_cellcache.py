@@ -81,6 +81,24 @@ class TestColumnarRoundTrip:
         c.bbox = (0, 0, 999, 999)
         self._specs_equal(c, _roundtrip(c))
 
+    def test_placements_lazy_from_cache(self):
+        # F18: a cache-loaded cell keeps placements as SoA; the Placement list is
+        # not rebuilt until something iterates it. placement_count/placement_at
+        # work from SoA, and a name-target round-trips via the sparse side-table.
+        c = orx.CellContent()
+        c.placements = [
+            orx.Placement(7, "refnum", 1, 2, 0.0, 1.0, False, None, [], None),
+            orx.Placement("CH", "name", 3, 4, 90.0, 2.0, True, 2, [], (3, 10)),
+        ]
+        rt = _roundtrip(c)
+        assert rt._placements is None and rt._pl_soa is not None   # lazy/SoA
+        assert rt.placement_count() == 2
+        assert rt.placement_at(0) == c.placements[0]
+        assert rt.placement_at(1) == c.placements[1]               # name-target
+        assert rt._placements is None              # placement_at didn't build list
+        assert rt.placements == c.placements       # property builds + correct
+        assert rt._placements is not None          # now materialised
+
     def test_empty_cell(self, tmp_path):
         c = orx.CellContent()
         rt = _roundtrip(c)
