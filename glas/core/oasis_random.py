@@ -38,6 +38,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import oasis_streamer as oas      # noqa: E402
+import layerscan_cache             # noqa: E402  (F12 M3: layer-scan sidecar)
 from oasis_store import Placement  # noqa: E402
 from oasis_walker import Transform  # noqa: E402
 
@@ -822,6 +823,203 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
         for cid, off, m in rar.errors[:8]:
             _dbg(f"  ERROR cell {cid!r} @ {off}: {m}")
     return {"rects": rects, "polys": poly_out, "stats": stats}
+
+
+# ── F12: layer enumeration for files with no LAYERNAME table ─────────────────
+#
+# Some production OASIS files (non-Calibre writers) ship without a LAYERNAME
+# table, so the UI's "Scan layers" finds nothing and the user is forced to type
+# raw (layer/datatype) pairs by hand. These files are multi-GB, so a full-file
+# geometry scan "never finishes" (user constraint, 2026-06-04). Instead we do a
+# *bounded* sample: KLayout-converted copies carry S_CELL_OFFSET, so we seek to
+# a spread of cells via that index and read only the first few records of each,
+# collecting the (layer, datatype) pairs that actually appear. This is capped by
+# max_cells x max_records_per_cell + a wall-clock budget, with early-stop once
+# the layer set stops growing. It is intentionally NOT exhaustive: a rare layer
+# living only in an unsampled deep cell may be missed (the user can still type
+# it). See docs/plans/F12-no-layername-scan.md.
+
+# Geometry record ids that carry a (layer, datatype) in their payload.
+_GEOM_LAYER_RIDS = (
+    oas.RECTANGLE, oas.POLYGON, oas.PATH,
+    oas.TRAPEZOID, oas.TRAPEZOID_VR, oas.TRAPEZOID_VL,
+    oas.CTRAPEZOID, oas.CIRCLE,
+)
+
+
+def _layernames_to_layer_dicts(layernames: list) -> list[dict]:
+    """Fast path: turn a LAYERNAME table (``[(name, layer_iv, dtype_iv), …]``)
+    into the ``[{layer, datatype, name}]`` rows the UI's LayerPickDialog eats.
+
+    De-dup is by ``(layer, datatype)`` (LAYERNAME-text and -geometry emit the
+    same pair under one name); keep the first name, prefer non-empty over blank.
+    The layer / datatype number is the low end of each interval, matching the
+    long-standing app scan (Calibre / KLayout write interval kind 3, n..INF)."""
+    out: list[dict] = []
+    seen: dict[tuple[int, int], dict] = {}
+    for name, liv, div in layernames:
+        L = int(liv[0]); D = int(div[0])
+        key = (L, D)
+        ent = seen.get(key)
+        if ent is None:
+            ent = {"layer": L, "datatype": D, "name": name or ""}
+            seen[key] = ent
+            out.append(ent)
+        elif name and not ent["name"]:
+            ent["name"] = name
+    return out
+
+
+def _sample_offsets(offsets: list[int], max_cells: int) -> list[int]:
+    """Pick ``<= max_cells`` byte offsets spread evenly across the (sorted)
+    offset table so the sample spans the whole file rather than clustering at
+    one end."""
+    offs = sorted(set(int(o) for o in offsets))
+    n = len(offs)
+    if n <= max_cells:
+        return offs
+    step = n / float(max_cells)
+    picked = [offs[min(int(i * step), n - 1)] for i in range(max_cells)]
+    # int(i*step) can collide near the tail; de-dup while keeping order.
+    seen: set[int] = set()
+    uniq = [o for o in picked if not (o in seen or seen.add(o))]
+    return uniq
+
+
+def sample_layers(rar: "RandomAccessReader", *,
+                  max_cells: int = 64, max_records_per_cell: int = 2000,
+                  time_budget_s: float = 15.0, stop_after_no_new: int = 16,
+                  include_text: bool = True,
+                  progress_cb=None) -> list[dict]:
+    """Bounded layer enumeration over an *already-built* RandomAccessReader.
+
+    Samples up to ``max_cells`` cells (spread across the S_CELL_OFFSET table),
+    seeking to each and reading at most ``max_records_per_cell`` records,
+    collecting distinct ``(layer, datatype)``. Stops early after
+    ``stop_after_no_new`` consecutive sampled cells add nothing, or once
+    ``time_budget_s`` elapses. Returns ``[{layer, datatype, name=""}]`` in
+    discovery order. NEVER scans the whole file.
+
+    ``progress_cb(cells_done, layers_so_far)`` (optional) is called after each
+    sampled cell so the UI can stream results and let the user cancel early."""
+    sample = _sample_offsets(list(rar._by_refnum.values()), max_cells)
+    if not sample:
+        return []
+
+    reader = rar._reader
+    f = reader._f
+    buf = f._buf
+    found: dict[tuple[int, int], dict] = {}
+    order: list[dict] = []
+    no_new = 0
+    t0 = time.monotonic()
+
+    for ci, off in enumerate(sample):
+        if time.monotonic() - t0 > time_budget_s:
+            break
+        first = buf[off] if 0 <= off < len(buf) else -1
+        if first not in (oas.CELL_REFNUM, oas.CELL_NAME):
+            continue                      # offset doesn't land on a CELL record
+        before = len(found)
+        f.clear_substreams()
+        f.seek(off)
+        seen_header = False
+        recs = 0
+        try:
+            for rid, payload in reader.iter_records():
+                if rid in (oas.CELL_REFNUM, oas.CELL_NAME):
+                    if seen_header:
+                        break             # next cell -> this cell is done
+                    seen_header = True
+                    continue
+                if rid == oas.END:
+                    break
+                key = None
+                if rid in _GEOM_LAYER_RIDS:
+                    L = payload.get("layer")
+                    if L is not None:
+                        key = (int(L), int(payload.get("datatype") or 0))
+                elif include_text and rid == oas.TEXT:
+                    L = payload.get("text_layer")
+                    if L is not None:
+                        key = (int(L), int(payload.get("text_type") or 0))
+                if key is not None and key not in found:
+                    ent = {"layer": key[0], "datatype": key[1], "name": ""}
+                    found[key] = ent
+                    order.append(ent)
+                recs += 1
+                if recs >= max_records_per_cell:
+                    break
+        except oas.OasisFormatError:
+            continue                       # skip a bad cell, keep sampling
+
+        if len(found) == before:
+            no_new += 1
+        else:
+            no_new = 0
+        if progress_cb is not None:
+            progress_cb(ci + 1, list(order))
+        if no_new >= stop_after_no_new:
+            break
+
+    return order
+
+
+def enumerate_layers(path: str | Path, *, progress_cb=None, use_cache: bool = True,
+                     max_cells: int = 64, max_records_per_cell: int = 2000,
+                     time_budget_s: float = 15.0, stop_after_no_new: int = 16,
+                     include_text: bool = True) -> dict:
+    """Enumerate the layers in an OASIS file for the "Scan layers" UI (F12).
+
+    Returns ``{"layers": [{layer, datatype, name}], "source": str}`` where
+    ``source`` is one of:
+
+    - ``"layername"`` — file has a LAYERNAME table; rows carry names (fast,
+      exhaustive, unchanged from the historical scan).
+    - ``"sampled"`` — no LAYERNAME table; rows are numeric-only (name="") from
+      a bounded cell sample (may be incomplete; user can type missing pairs).
+    - ``"no-index"`` — no LAYERNAME *and* no S_CELL_OFFSET; ``layers`` is empty.
+      The caller should advise re-saving via KLayout to add the index tables.
+
+    A single RandomAccessReader is built so the name-table (LAYERNAME +
+    S_CELL_OFFSET) is read once and shared with the sampling pass.
+
+    ``use_cache`` (F12 M3): a hit on the per-file sidecar (keyed by mtime+size)
+    returns instantly and skips the reader/sample entirely (no ``progress_cb``
+    calls); the result is cached on every miss. Caching is best-effort and can
+    never break a scan."""
+    cache_params = {
+        "max_cells": max_cells,
+        "max_records_per_cell": max_records_per_cell,
+        "time_budget_s": time_budget_s,
+        "stop_after_no_new": stop_after_no_new,
+        "include_text": include_text,
+    }
+    if use_cache:
+        cached = layerscan_cache.load(path, cache_params)
+        if cached is not None:
+            return cached
+
+    rar = RandomAccessReader(path, wanted_layers=None)
+    try:
+        if rar._layernames:
+            result = {"layers": _layernames_to_layer_dicts(rar._layernames),
+                      "source": "layername"}
+        elif not rar._by_refnum:
+            result = {"layers": [], "source": "no-index"}
+        else:
+            layers = sample_layers(
+                rar, max_cells=max_cells,
+                max_records_per_cell=max_records_per_cell,
+                time_budget_s=time_budget_s, stop_after_no_new=stop_after_no_new,
+                include_text=include_text, progress_cb=progress_cb)
+            result = {"layers": layers, "source": "sampled"}
+    finally:
+        rar.close()
+
+    if use_cache:
+        layerscan_cache.save(path, result, cache_params)
+    return result
 
 
 # ── Debug CLI: dump a single cell's record stream ────────────────────────────

@@ -90,6 +90,8 @@ GLAS/
 │   │   ├── oasis_store.py       # per-cell / per-layer geometry storage（chunked ndarray）
 │   │   ├── oasis_walker.py      # cell-graph walker + transform 展開 → root 座標
 │   │   ├── oasis_random.py      # S_CELL_OFFSET 隨機存取 + ROI walk + CE 邊界 early-stop
+│   │   │                        #   + F12 enumerate_layers/sample_layers（無 LAYERNAME 時 bounded 抽樣列 layer）
+│   │   ├── layerscan_cache.py   # F12 layer 列舉結果 sidecar 快取（keyed by mtime+size+params）
 │   │   ├── gds_fov.py           # KLARF↔GDS 座標換算 + FOV 空間查詢
 │   │   ├── gds_boolean.py       # 遞迴下降 parser + shapely Boolean 引擎 + mask
 │   │   ├── gds_layer_cache.py   # layer .npz cache + metadata
@@ -195,9 +197,11 @@ HMI 風格表達式 → 遞迴下降 parser → AST → shapely 運算。運算�
 
 - [F11] ~~整顆 chip OASIS 匯出（原始 + Boolean 全 chip 重算）+ GDS 座標可見性~~ — **撤案**（2026-06-03，
   user 決定不做）。plan 仍保留於 `docs/plans/F11-whole-chip-export.md` 供日後參考。
-- [F12] ~~無索引表 OASIS（無 LAYERNAME / 無 S_CELL_OFFSET）原生支援~~ — **撤案**（2026-05-28）。
-  根本卡在無 per-cell bbox → ROI 首次載入需全 chip 解碼。替代：用 KLayout 開→另存 `.oas` 補索引表後再開。
-  詳見 SESSION_LOG 2026-05-28 條目。
+- [F12] 無索引表 OASIS：**部分完成（2026-06-04）**。原「全原生支援」（含無 per-cell bbox 的隨機存取）
+  仍**撤案**——根本卡在無 bbox → ROI 首次載入需全 chip 解碼；替代仍是用 KLayout 開→另存 `.oas` 補索引。
+  但 user 反映「很多檔都這型」後，**已實作其中的 layer 列舉缺口**：無 LAYERNAME 表時，「Scan layers」改用
+  bounded cell 抽樣從幾何列舉數字 layer（`oasis_random.enumerate_layers` / `sample_layers`，sidecar 快取
+  `layerscan_cache`），免手 key。詳見 `docs/plans/F12-no-layername-scan.md` + SESSION_LOG 2026-05-28 / 06-04。
 
 ---
 

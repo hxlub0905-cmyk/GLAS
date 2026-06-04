@@ -4,6 +4,45 @@
 
 ---
 
+## [2026-06-04] [F12] 無 LAYERNAME 檔的 layer 列舉（bounded 抽樣 + sidecar 快取）M1–M4
+
+**變更類型：** 功能（core 2 新函式 + 新 cache 模組 + app scan 接線）+ 測試 + 文件 ·
+**狀態：實作完成、sandbox 全套件 574 passed，待 user 實機驗收**
+
+**動機：** 承本日 F12 重啟規劃。user 反映「很多 OASIS 都是無 LAYERNAME 表這型」（即使 KLayout 轉檔補了
+`S_CELL_OFFSET` 仍只有數字 layer，如 17/101、6/0），「Scan layers」列空→被迫手 key。**追加硬限制：檔案
+多 GB，全檔 fallback 掃描「根本開不完」，禁止 O(檔案) 全掃。** 兩個取捨題 user 皆「無偏好」→ 由實作定奪。
+
+**實作（plan `docs/plans/F12-no-layername-scan.md` M1–M4）：**
+- **M1 core `oasis_random.py`**：`enumerate_layers(path, *, progress_cb, use_cache, max_cells=64,
+  max_records_per_cell=2000, time_budget_s=15, stop_after_no_new=16, include_text=True)` →
+  `{"layers":[{layer,datatype,name}], "source": "layername"|"sampled"|"no-index"}`。有 LAYERNAME 表走
+  原秒級 fast-path（`_layernames_to_layer_dicts`，沿用 scan_cell_offsets 既得的 layernames）；無表則
+  `sample_layers`：用 `_sample_offsets` 從 S_CELL_OFFSET 表**均勻抽樣 ≤max_cells 顆 cell**，各 seek 後
+  只讀前 max_records_per_cell 筆記錄收 RECTANGLE/POLYGON/PATH/TRAPEZOID(+VR/VL)/CTRAPEZOID/CIRCLE
+  的 (layer,datatype) + TEXT 的 (text_layer,text_type)，連續 stop_after_no_new 顆無新 layer 或超時即
+  早停。**無 S_CELL_OFFSET → 回 source="no-index" 空清單，不退化成全掃。** 單一 RandomAccessReader
+  (wanted_layers=None) 共用 name-table。**完全不碰 §7 隨機存取/walk/early-stop/bbox 熱路徑。**
+- **M3 core `layerscan_cache.py`（新模組）**：列舉結果 sidecar JSON 快取，key=(abspath, mtime, size, 掃描
+  params 指紋)；存 per-user cache dir（XDG_CACHE_HOME/LOCALAPPDATA/~/.cache，不寫唯讀網路碟旁）；原子寫、
+  壞檔/stale 一律當 miss、最壞重抽，不會弄壞 scan。enumerate_layers `use_cache=True` 命中即跳整個 reader。
+- **M2 app `gds_align_tool.py`**：`_scan_oas_with_streamer` 改呼叫 `enumerate_layers`，progress_cb 節流
+  （0.15s）串流「已抽 K 顆、找到 N layer：…」到 LoadProgressDialog，user 看到要的即可 cancel（沿用既有
+  subprocess terminate）。`_on_scan_finished` 改吃 dict：no-index→提示用 KLayout 補索引；sampled→
+  `LayerPickDialog` 加 `note` 標明「抽樣可能不全、缺的可手 key」。LayerPickDialog 既有無名稱顯示（只顯數字）。
+- **M4 文件**：README features 加「Layer 掃描（含無 LAYERNAME 檔）」、CLAUDE §4 模組表 + §8 F12 更新、plan、本 log。
+
+**測試：** `tests/test_oasis_layer_scan.py`（14 筆，autouse fixture 把 cache 導到 tmp）——抽樣列舉/TEXT
+toggle/混合 shape、LAYERNAME fast-path + sentinel 斷言不進抽樣、no-index 不 hang、**bounded 上限與早停
+斷言**（證明非全掃）、cache 命中跳抽樣/檔變失效/use_cache=False bypass、`_sample_offsets` 分散去重。
+`QT_QPA_PLATFORM=offscreen pytest tests/` **574 passed**（560+14）。py_compile 全過。**手動 GUI 待 user 實機。**
+
+**影響檔案：** `glas/core/oasis_random.py`、`glas/core/layerscan_cache.py`(新)、`glas/app/gds_align_tool.py`、
+`tests/test_oasis_layer_scan.py`(新)、`README.md`、`CLAUDE.md`、`docs/plans/F12-no-layername-scan.md`、
+`SESSION_LOG.md`。 **Branch：** `claude/friendly-franklin-9uZqU`
+
+---
+
 ## [2026-06-04] F15 驗收（測試通過）+ [F12] 重啟規劃（範圍重界定 → plan 檔）
 
 **變更類型：** 驗收 + 規劃（新增 plan 檔，無程式碼異動）·  **狀態：F15 測試綠；F12 plan 待 user 核准**

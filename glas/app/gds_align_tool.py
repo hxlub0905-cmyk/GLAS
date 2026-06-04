@@ -491,7 +491,7 @@ class LayerPickDialog(QDialog):
     returns the chosen ``(layer, datatype)`` tuples in stable display order."""
 
     def __init__(self, parent: Optional[QWidget],
-                 layers: list[dict]) -> None:
+                 layers: list[dict], *, note: str = "") -> None:
         super().__init__(parent)
         self.setWindowTitle("Pick layers to load")
         self.setModal(True)
@@ -505,6 +505,11 @@ class LayerPickDialog(QDialog):
             f"<b>{len(layers)} layer(s)</b> discovered in this file. "
             "Ctrl/Shift-click for multi-select.", self,
         ))
+        if note:
+            note_lbl = QLabel(note, self)
+            note_lbl.setWordWrap(True)
+            note_lbl.setStyleSheet("color: #9a6a00;")
+            v.addWidget(note_lbl)
 
         self._list = QListWidget(self)
         self._list.setSelectionMode(
@@ -670,13 +675,34 @@ class LayerFilterDialog(QDialog):
         QApplication.processEvents()
         self._scan_thread.start()
 
-    def _on_scan_finished(self, layers: object) -> None:
-        # Open pick dialog and populate the line edit with the chosen pairs.
-        if not isinstance(layers, list) or not layers:
-            self._warning.setText(
-                "Scan completed but found no layers; type pairs manually.")
+    def _on_scan_finished(self, result: object) -> None:
+        # F12: result is {"layers": [...], "source": "layername"|"sampled"|
+        # "no-index"}. (A bare list is tolerated for safety.)
+        if isinstance(result, dict):
+            layers = result.get("layers") or []
+            source = result.get("source", "")
+        else:
+            layers = result if isinstance(result, list) else []
+            source = ""
+
+        if not layers:
+            if source == "no-index":
+                self._warning.setText(
+                    "This file has no LAYERNAME table and no S_CELL_OFFSET "
+                    "index, so layers can't be enumerated.\nRe-save it with "
+                    "KLayout (open ▸ Save As ▸ .oas) to add the index tables, "
+                    "then scan again — or type pairs manually.")
+            else:
+                self._warning.setText(
+                    "Scan found no layers; type pairs manually.")
             return
-        pick = LayerPickDialog(self, layers)
+
+        # A sampled (no-LAYERNAME) scan is not guaranteed exhaustive; tell the
+        # user they can still type a pair the sample missed.
+        note = ("Sampled from geometry (no LAYERNAME table) — a rarely-used "
+                "layer may be missing; type it manually if so."
+                if source == "sampled" else "")
+        pick = LayerPickDialog(self, layers, note=note)
         if pick.exec() == QDialog.DialogCode.Accepted:
             picks = pick.selected_pairs()
             if picks:
@@ -965,71 +991,63 @@ def _scan_layers_main(path: str, q: "mp.Queue") -> None:
 
 
 def _scan_oas_with_streamer(path: "Path", q: "mp.Queue") -> None:
-    """Stream-scan an OASIS file's LAYERNAME table without parsing cell
-    content (F2 M1.12b).
+    """Enumerate an OASIS file's layers for the "Scan layers" UI.
 
-    In a SEMI P39 layout the LAYERNAME records sit between START and
-    the first CELL, so we can stop iter_records as soon as we hit a
-    CELL header. On 300 MB D2DB this completes in under a second --
-    klayout's "instant scan" claim is misleading because it still
-    walks every shape record's layer field to decide whether to skip
-    it; the streamer skips that entire pass.
+    Delegates to ``oasis_random.enumerate_layers`` (F12), which:
 
-    De-dup is by ``(layer, datatype)`` since LAYERNAME-text and
-    LAYERNAME-geometry emit the same pair under one name. We keep the
-    first name we see and prefer non-empty over empty.
+    - returns the named LAYERNAME table in sub-second time when present
+      (the historical fast path — LAYERNAME records sit before the first
+      CELL, so the name table is read without touching cell content); else
+    - falls back to a **bounded** cell sample over the S_CELL_OFFSET index
+      to surface the numeric ``(layer/datatype)`` pairs that actually appear
+      (never a full-file scan — these files are multi-GB); else
+    - reports ``no-index`` when the file has neither table (the caller tells
+      the user to re-save via KLayout).
+
+    Results are sidecar-cached (F12 M3) so repeat scans of the same file are
+    instant. Progress (cells sampled + layers found so far) is streamed back
+    on ``q`` so the user can watch layers appear and cancel early.
     """
     import sys as _sys
     import time as _t
     from pathlib import Path as _Path
 
-    # Make sure the streamer module (glas/core) is importable in the
+    # Make sure the core modules (glas/core) are importable in the
     # subprocess context (spawn re-imports without main.py's path setup).
     _core = _Path(__file__).resolve().parent.parent / "core"
     if str(_core) not in _sys.path:
         _sys.path.insert(0, str(_core))
-    import oasis_streamer as oas
+    import oasis_random as _orx
 
     t0 = _t.monotonic()
     p = path
     size_mb = p.stat().st_size / 1024 / 1024
     q.put(("progress",
-           f"Scanning {p.name} ({size_mb:,.0f} MB) for layers via "
-           f"oasis_streamer…"))
+           f"Scanning {p.name} ({size_mb:,.0f} MB) for layers…"))
 
-    layers: list[dict] = []
-    seen: set[tuple[int, int]] = set()
-    record_count = 0
-    with oas.OasisReader(p) as reader:
-        for rid, payload in reader.iter_records():
-            record_count += 1
-            if rid in (oas.LAYERNAME_GEOM, oas.LAYERNAME_TEXT):
-                name = payload["name"].decode("ascii", "backslashreplace")
-                # Calibre / klayout typically write LAYERNAME with
-                # interval kind 3 (n..INF), so the layer / datatype
-                # number is the low end of each interval.
-                L = int(payload["layer_interval"][0])
-                D = int(payload["datatype_interval"][0])
-                key = (L, D)
-                if key not in seen:
-                    seen.add(key)
-                    layers.append({"layer": L, "datatype": D, "name": name})
-                elif name:
-                    # Update with non-empty name if previous was blank.
-                    for ent in layers:
-                        if ent["layer"] == L and ent["datatype"] == D and not ent["name"]:
-                            ent["name"] = name
-                            break
-            elif rid in (oas.CELL_REFNUM, oas.CELL_NAME):
-                # End of header: every LAYERNAME has been seen by now.
-                break
+    last_emit = [0.0]
+
+    def _progress(cells_done: int, layers_so_far: list) -> None:
+        # Throttle: a queue put per cell floods the UI on big samples.
+        now = _t.monotonic()
+        if now - last_emit[0] < 0.15:
+            return
+        last_emit[0] = now
+        preview = ", ".join(f"{d['layer']}/{d['datatype']}"
+                            for d in layers_so_far[:12])
+        more = " …" if len(layers_so_far) > 12 else ""
+        q.put(("progress",
+               f"Sampling {p.name} — {cells_done} cells scanned, "
+               f"{len(layers_so_far)} layer(s): {preview}{more}"))
+
+    res = _orx.enumerate_layers(p, progress_cb=_progress)
 
     elapsed = _t.monotonic() - t0
     _sys.stderr.write(
-        f"[gds-scan] {elapsed:.2f}s  enumerated {len(layers)} layers "
-        f"from {record_count:,} pre-CELL records\n")
+        f"[gds-scan] {elapsed:.2f}s  source={res.get('source')}  "
+        f"enumerated {len(res.get('layers') or [])} layers\n")
     _sys.stderr.flush()
-    q.put(("done", layers))
+    q.put(("done", res))
 
 
 class LayerScanWorker(QObject):

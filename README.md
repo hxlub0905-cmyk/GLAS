@@ -12,6 +12,11 @@ alignment offset 供下游量測工具使用。
 
 - **大檔 OASIS 解析**：自寫 streaming + random-access parser，對數百 MB production OASIS
   做秒級 ROI 隨機存取（不依賴 klayout / gdstk）。
+- **Layer 掃描（含無 LAYERNAME 檔）**：「Scan layers」優先讀 LAYERNAME 表（秒級、帶層名）；
+  若檔案沒有 LAYERNAME 表（常見於非 Calibre 寫出、KLayout 轉檔補過索引的檔），改用
+  **有上限的 cell 抽樣**從幾何列舉出現過的數字 `layer/datatype`（只顯示數字、免手 key），
+  結果有 sidecar 快取。抽樣不保證列出 100% layer（罕見層仍可手動輸入）；若連 S_CELL_OFFSET
+  索引都沒有，會提示先用 KLayout 另存補索引。
 - **KLARF ↔ GDS 座標換算**：由 SEM defect 的 die-corner 座標定位到 layout，自動跳位 + FOV 框。
 - **即時 Boolean 表達式引擎**：HMI 風格表達式（`L0 = [(A > W:10) & B] < H:10`）即時合成 layer，
   輸出 shapely polygon + uint8 mask。
