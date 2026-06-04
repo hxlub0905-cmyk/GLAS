@@ -77,6 +77,15 @@ def _key_path(src: Path, cell_id, wanted_layers) -> Path:
     return _cache_dir() / f"{digest}__{cell}__{_layers_tag(wanted_layers)}.npz"
 
 
+def _prep_path(src: Path, cell_id) -> Path:
+    """Sidecar for a cell's placement-prune precompute (the ~tens-of-seconds
+    gather). It is layer-independent (placements aren't layer-filtered), so it
+    is keyed by (file, cell) only — reused across any wanted-layers selection."""
+    digest = hashlib.sha1(str(src.resolve()).encode("utf-8")).hexdigest()[:16]
+    cell = hashlib.sha1(repr(cell_id).encode("utf-8")).hexdigest()[:12]
+    return _cache_dir() / f"{digest}__{cell}__prep.npz"
+
+
 def _stat(src: Path) -> tuple[float, int]:
     st = src.stat()
     return (st.st_mtime, st.st_size)
@@ -147,6 +156,65 @@ def save(src, cell_id, wanted_layers, content) -> bool:
         os.close(fd)
         np.savez(tmp, **arrays)
         # np.savez appends .npz to the path if missing
+        tmp_npz = tmp if os.path.exists(tmp) else tmp + ".npz"
+        os.replace(tmp_npz, p)
+        return True
+    except Exception:
+        try:
+            if tmp and os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        return False
+
+
+def load_prep(src, cell_id):
+    """Return the cached placement-prune precompute for ``(src, cell_id)`` or
+    ``None``. Tuple shape matches ``CellContent._place_prep``:
+    ``(base_M, base_t, placed_all, arr_local, rcount, valid, arb_skip, unk_skip)``.
+    Layer-independent, so it is reused across any wanted-layers selection."""
+    if not enabled():
+        return None
+    try:
+        src = Path(src)
+        p = _prep_path(src, cell_id)
+        if not p.exists():
+            return None
+        mtime, size = _stat(src)
+        with np.load(p, allow_pickle=False) as z:
+            if (int(z["__schema__"]) != SCHEMA_VERSION
+                    or int(z["__size__"]) != size
+                    or float(z["__mtime__"]) != mtime):
+                return None
+            return (z["base_M"], z["base_t"], z["placed_all"], z["arr_local"],
+                    z["rcount"], z["valid"],
+                    int(z["arb_skip"]), int(z["unk_skip"]))
+    except Exception:
+        return None
+
+
+def save_prep(src, cell_id, prep) -> bool:
+    """Persist a cell's placement-prune precompute. Never raises."""
+    if not enabled():
+        return False
+    tmp = None
+    try:
+        src = Path(src)
+        mtime, size = _stat(src)
+        p = _prep_path(src, cell_id)
+        if _fresh_entry(p, mtime, size):
+            return True
+        base_M, base_t, placed_all, arr_local, rcount, valid, arb, unk = prep
+        arrays = {
+            "base_M": base_M, "base_t": base_t, "placed_all": placed_all,
+            "arr_local": arr_local, "rcount": rcount, "valid": valid,
+            "arb_skip": np.int64(arb), "unk_skip": np.int64(unk),
+            "__schema__": np.int64(SCHEMA_VERSION),
+            "__size__": np.int64(size), "__mtime__": np.float64(mtime)}
+        p.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(suffix=".npz", dir=str(p.parent))
+        os.close(fd)
+        np.savez(tmp, **arrays)
         tmp_npz = tmp if os.path.exists(tmp) else tmp + ".npz"
         os.replace(tmp_npz, p)
         return True

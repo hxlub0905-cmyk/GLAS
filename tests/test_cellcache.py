@@ -182,6 +182,24 @@ class TestSidecarIO:
         got = orx.walk_roi(r2, 0, roi, 17, 0)
         assert ref["rects"].tolist() == got["rects"].tolist()
 
+    def test_prep_cache_round_trips(self, tmp_path, monkeypatch):
+        # F16-B M7: the placement-prune precompute is persisted and a fresh
+        # reader serves it from disk (so a batch worker skips the gather).
+        monkeypatch.setenv("GLAS_CELLCACHE_DIR", str(tmp_path / "cache"))
+        monkeypatch.setenv("GLAS_CELLCACHE_MIN_RECORDS", "1")
+        p = tmp_path / "h.oas"
+        p.write_bytes(tr._build_hierarchy([(0, 0), (1000, 0), (2000, 0)]))
+        roi = (900, -50, 1100, 50)
+
+        r1 = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
+        ref = orx.walk_roi(r1, 0, roi, 17, 0)
+        assert cellcache.load_prep(p, 0) is not None      # prep persisted
+
+        r2 = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
+        got = orx.walk_roi(r2, 0, roi, 17, 0)
+        assert r2.load_cell(0)._place_prep is not None    # served from disk
+        assert ref["rects"].tolist() == got["rects"].tolist()
+
     def test_disabled_via_env(self, tmp_path, monkeypatch):
         monkeypatch.setenv("GLAS_CELLCACHE_DIR", str(tmp_path / "cache"))
         monkeypatch.setenv("GLAS_CELLCACHE", "0")

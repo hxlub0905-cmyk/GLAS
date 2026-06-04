@@ -120,7 +120,14 @@ repetition descriptor（`rt`/`rr`）多數為 None，非 None 的存稀疏側表
 - [x] 驗證：`pytest tests/` 599 全綠。
 - 註：in-memory（跨 ROI 同 session）。geometry extent 早已由 `_ext_cache` 跨 ROI 快取。**故第二個 ROI 起秒級**；每 session 第一個 ROI 仍付 gather(~20s)+geom ext(~40s) 預計算。on-disk 持久化 prep/ext（連每 session 第一個 ROI 也快）列為日後選做。
 
-### M5: ② ROI 過濾解碼（env 開關）  [status: deferred — 待 user 測快取後決定]
+### M7: ① batch 暖機加速（persist prep + _feat gate）  [status: done]
+
+- [x] placement prune precompute（gather）做成獨立 sidecar：`cellcache.save_prep/load_prep`（keyed by file+cell，layer 無關，mtime/size 驗證、原子寫、毀損當 miss）。walk 對大 cell（N≥門檻）先 `load_prep`、未命中才 gather 並 `save_prep` → 每個 batch worker / 每 session 第一個 ROI 跳過 ~15s gather。
+- [x] `_feat` 收集用 `DEBUG` 包住（非 debug 不掃 150 萬 placement）。
+- [x] 測試：`test_prep_cache_round_trips`（prep 持久化 + 新 reader 走磁碟 prep + walk 結果一致）。`pytest tests/` 602 全綠。
+- 註：cell deser（~10s 重建 150 萬 placement）尚未 lazy（需 property 重構，風險高）→ 留待日後；目前 batch 暖機已大幅下降（省 15s gather + _feat）。
+
+### M5: ② ROI 過濾解碼（env 開關）  [status: 撤案 — 對「看多 defect」工作流更差]
 
 - 架構衝突：ROI 過濾結果是 ROI-specific，與「按 cell memo/快取」相斥；只省第一次解碼 ~2x。user 選「先測 ①/M6 再決定」。
 - [ ] （若要做）`_decode_at` 接 local-ROI、按 `(cell, roi)` memo、不寫整顆快取、env `GLAS_ROI_DECODE=1` 預設關。

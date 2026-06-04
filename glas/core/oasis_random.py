@@ -1231,19 +1231,22 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
                     if _feat["ce_viol"] <= 6:
                         _dbg(f"  CE-VIOLATION cell {cid!r}: own_bbox={ob} "
                              f"ce_bbox={_ceb}")
-        for _pl in content.placements:
-            _feat["rtype"].add(_pl.repetition_type)
-            _feat["angle"].add(_pl.angle)
-            if _pl.flip:
-                _feat["flip"] = True
-            if _pl.magnification != 1.0:
-                _feat["mag"].add(_pl.magnification)
-            if _pl.target_kind == "name":
-                _feat["name_ref"] = True
-        # RECTANGLE / POLYGON own repetition types — the geometry array
-        # encoding (may differ from placement repetition; CMG arrays).
-        _feat["rect_rtype"].update(content.all_rect_rtypes())
-        _feat["poly_rtype"].update(content.all_poly_rtypes())
+        # Feature collection is only for the DEBUG dump; iterating millions of
+        # placements per cell is pure waste otherwise (F16-B M7).
+        if DEBUG:
+            for _pl in content.placements:
+                _feat["rtype"].add(_pl.repetition_type)
+                _feat["angle"].add(_pl.angle)
+                if _pl.flip:
+                    _feat["flip"] = True
+                if _pl.magnification != 1.0:
+                    _feat["mag"].add(_pl.magnification)
+                if _pl.target_kind == "name":
+                    _feat["name_ref"] = True
+            # RECTANGLE / POLYGON own repetition types — the geometry array
+            # encoding (may differ from placement repetition; CMG arrays).
+            _feat["rect_rtype"].update(content.all_rect_rtypes())
+            _feat["poly_rtype"].update(content.all_poly_rtypes())
         # Emit this cell's own geometry (transformed) that hits the ROI.
         # Each RECTANGLE/POLYGON may carry its own repetition (CMG arrays that
         # explode to millions), so clip every spec's array to the ROI before
@@ -1321,6 +1324,14 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
         # is built once and cached on the CellContent (F16-B M6). Subsequent ROIs
         # and layers reuse it; only the apply_to_rects + ROI mask below is redone.
         prep = content._place_prep
+        _big = N >= cellcache.min_records()
+        if prep is None and _big:
+            # Reuse a persisted gather from a previous session/worker (it is ROI-
+            # and layer-independent), so a batch worker skips the ~tens-of-seconds
+            # build entirely (F16-B M7).
+            prep = cellcache.load_prep(rar._path, cid)
+            if prep is not None:
+                content._place_prep = prep
         if prep is None:
             base_M = np.zeros((N, 2, 2), dtype=np.float64)
             base_t = np.zeros((N, 2), dtype=np.float64)
@@ -1373,6 +1384,8 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
             prep = (base_M, base_t, placed_all, arr_local, rcount, valid,
                     arb_skip, unk_skip)
             content._place_prep = prep
+            if _big:                          # persist for next session/worker
+                cellcache.save_prep(rar._path, cid, prep)
         (base_M, base_t, placed_all, arr_local, rcount, valid,
          arb_skip, unk_skip) = prep
         stats.placements_scanned += N

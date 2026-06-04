@@ -4,6 +4,25 @@
 
 ---
 
+## [2026-06-04] [F16-B M7] batch 暖機加速：persist placement prep + _feat gate
+
+**變更類型：** 效能 ·  **狀態：完成**
+
+**動機：** user 反映 batch align「前搖很長」。每個 worker(各自 spawn 重建 reader)第一張圖要付:載 44995(~20s)+ placement
+prep gather(~15s,CPU 競爭)。M6 的 prep 只在記憶體、不跨 process/session。
+
+**實作：** prep 做成**獨立 sidecar**(`cellcache.save_prep/load_prep`,keyed by file+cell;prep 是 layer 無關的——placements
+不被 layer 過濾、reachable_bbox 用 sbbox——故跨任何 wanted_layers 重用)。`walk_roi` 對大 cell(N≥門檻)先 `load_prep`,
+未命中才 gather 並 `save_prep`。→ 每個 batch worker / 每 session 第一個 ROI **跳過 ~15s gather**(改讀磁碟陣列)。另把 `_feat`
+收集用 `DEBUG` 包住(非 debug 不掃 150 萬 placement)。`save`/`save_prep` 都有 `_fresh_entry` guard,避免多 worker 重複寫。
+
+**測試：** `test_prep_cache_round_trips`(prep 持久化、新 reader 走磁碟 prep、walk 結果一致)。`pytest tests/` 602 全綠。
+**影響檔案：** `glas/core/oasis_random.py`、`glas/core/cellcache.py`、`tests/test_cellcache.py`、`docs/plans/F16-B-cell-decode-cache.md`、`SESSION_LOG.md`。
+
+**建議:** 跑 batch 前先互動式載一個該檔 ROI(把 cell + prep sidecar 都建起來),batch 每個 worker 就只讀磁碟 → 暖機短很多。
+
+---
+
 ## [2026-06-04] [F16-B] 向量化 geometry extent 建構（每 session 第一個 ROI 加速）
 
 **變更類型：** 效能 ·  **狀態：完成**
