@@ -581,6 +581,20 @@ class TestWalkRoi:
         assert res["stats"].instances_visited == 3
         assert res["stats"].instances_pruned == 0
 
+    def test_placement_prep_cached_across_rois(self, tmp_path):
+        # F16-B M6: the placement gather is built once per cell and reused for
+        # later ROIs (same object), while still giving correct per-ROI results.
+        rar = self._reader(tmp_path, [(0, 0), (1000, 0), (2000, 0)])
+        r1 = orx.walk_roi(rar, 0, (900, -50, 1100, 50), 17, 0)
+        prep = rar.load_cell(0)._place_prep
+        assert prep is not None
+        assert r1["rects"].tolist() == [[1000, 0, 1010, 10]]
+        # A different ROI reuses the cached prep object and selects a different
+        # instance correctly.
+        r2 = orx.walk_roi(rar, 0, (1900, -50, 2100, 50), 17, 0)
+        assert rar.load_cell(0)._place_prep is prep        # reused, not rebuilt
+        assert r2["rects"].tolist() == [[2000, 0, 2010, 10]]
+
     def test_many_individual_placements_pruned_vectorized(self, tmp_path):
         # A cell with thousands of *individual* placements (no repetition) must
         # be pruned with a single batched apply_to_rects, not one numpy call per

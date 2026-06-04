@@ -113,6 +113,11 @@ class CellContent:
     #   _pcol[key] = (pts (Σn,2) int, off (P+1,) int64, rt (P,) int16, rr (P,) object)
     _rcol: dict = field(default_factory=dict, repr=False, compare=False)
     _pcol: dict = field(default_factory=dict, repr=False, compare=False)
+    # F16-B M6: cached placement-prune precompute (the ~20s gather over millions
+    # of child placements). Cell-local + reachable_bbox only => ROI/transform
+    # independent, so it is built once and reused across every ROI and layer of a
+    # session (the per-ROI walk then only does a vectorized transform + mask).
+    _place_prep: object = field(default=None, repr=False, compare=False)
 
     # ── columnar-or-tuple accessors used by the walk ──────────────────────────
     def rect_keys(self):
@@ -1285,60 +1290,70 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
         if not placements:
             return
         _ts_pl = time.perf_counter()
-        # Vectorized whole-array prune over ALL placements of this cell at once:
-        # build each placement's array-extent bbox (parent-local) and test them
-        # with a SINGLE apply_to_rects + ROI mask. A per-placement numpy call
-        # here is death by overhead on cells with millions of placements; the
-        # batched form turns it into a handful of array ops. Only the few
-        # survivors are expanded/clipped and recursed into.
         N = len(placements)
+        # Vectorized whole-array prune over ALL placements of this cell. The
+        # per-placement gather (matrices, child bboxes, repetition extents) is
+        # cell-local and reachable_bbox-only — ROI/transform independent — so it
+        # is built once and cached on the CellContent (F16-B M6). Subsequent ROIs
+        # and layers reuse it; only the apply_to_rects + ROI mask below is redone.
+        prep = content._place_prep
+        if prep is None:
+            base_M = np.zeros((N, 2, 2), dtype=np.float64)
+            base_t = np.zeros((N, 2), dtype=np.float64)
+            cb_arr = np.zeros((N, 4), dtype=np.float64)
+            ext = np.zeros((N, 4), dtype=np.float64)
+            rcount = np.ones(N, dtype=np.int64)
+            valid = np.zeros(N, dtype=bool)
+            arb_skip = 0
+            unk_skip = 0
+            for i, pl in enumerate(placements):
+                rt, rr = pl.repetition_type, pl.repetition_raw
+                rc = oas.repetition_count(rt, rr)
+                rcount[i] = rc
+                a = pl.angle % 360.0
+                q = int(round(a / 90.0))
+                if abs(a - q * 90.0) > 0.01:    # non-quarter-turn -> skip
+                    arb_skip += rc
+                    continue
+                cb = reachable_bbox(pl.target)
+                if cb is None:
+                    unk_skip += 1
+                    continue
+                m00, m01, m10, m11 = _D4_ROT[q % 4]
+                if pl.flip:                     # mirror after rotation (col 1)
+                    m01, m11 = -m01, -m11
+                mag = pl.magnification
+                if mag != 1.0:
+                    m00 *= mag; m01 *= mag; m10 *= mag; m11 *= mag
+                base_M[i, 0, 0] = m00; base_M[i, 0, 1] = m01
+                base_M[i, 1, 0] = m10; base_M[i, 1, 1] = m11
+                base_t[i, 0] = pl.x; base_t[i, 1] = pl.y
+                cb_arr[i] = cb
+                ex = oas.repetition_extent(rt, rr)
+                ext[i, 0] = ex[0]; ext[i, 1] = ex[1]
+                ext[i, 2] = ex[2]; ext[i, 3] = ex[3]
+                valid[i] = True
+            # placed bbox = base applied to child bbox (batched corner
+            # transform), then extended by the repetition extent.
+            corners = np.empty((N, 4, 2), dtype=np.float64)
+            corners[:, 0, 0] = cb_arr[:, 0]; corners[:, 0, 1] = cb_arr[:, 1]
+            corners[:, 1, 0] = cb_arr[:, 2]; corners[:, 1, 1] = cb_arr[:, 1]
+            corners[:, 2, 0] = cb_arr[:, 2]; corners[:, 2, 1] = cb_arr[:, 3]
+            corners[:, 3, 0] = cb_arr[:, 0]; corners[:, 3, 1] = cb_arr[:, 3]
+            tc = np.einsum('nij,nkj->nki', base_M, corners) + base_t[:, None, :]
+            px, py = tc[:, :, 0], tc[:, :, 1]
+            placed_all = np.empty((N, 4), dtype=np.float64)
+            placed_all[:, 0] = px.min(axis=1); placed_all[:, 1] = py.min(axis=1)
+            placed_all[:, 2] = px.max(axis=1); placed_all[:, 3] = py.max(axis=1)
+            arr_local = placed_all + ext
+            prep = (base_M, base_t, placed_all, arr_local, rcount, valid,
+                    arb_skip, unk_skip)
+            content._place_prep = prep
+        (base_M, base_t, placed_all, arr_local, rcount, valid,
+         arb_skip, unk_skip) = prep
         stats.placements_scanned += N
-        base_M = np.zeros((N, 2, 2), dtype=np.float64)
-        base_t = np.zeros((N, 2), dtype=np.float64)
-        cb_arr = np.zeros((N, 4), dtype=np.float64)
-        ext = np.zeros((N, 4), dtype=np.float64)
-        rcount = np.ones(N, dtype=np.int64)
-        valid = np.zeros(N, dtype=bool)
-        for i, pl in enumerate(placements):
-            rt, rr = pl.repetition_type, pl.repetition_raw
-            rc = oas.repetition_count(rt, rr)
-            rcount[i] = rc
-            a = pl.angle % 360.0
-            q = int(round(a / 90.0))
-            if abs(a - q * 90.0) > 0.01:        # non-quarter-turn -> skip
-                stats.arbitrary_angle_skipped += rc
-                continue
-            cb = reachable_bbox(pl.target)
-            if cb is None:
-                stats.unknown_target_skipped += 1
-                continue
-            m00, m01, m10, m11 = _D4_ROT[q % 4]
-            if pl.flip:                         # mirror after rotation (col 1)
-                m01, m11 = -m01, -m11
-            mag = pl.magnification
-            if mag != 1.0:
-                m00 *= mag; m01 *= mag; m10 *= mag; m11 *= mag
-            base_M[i, 0, 0] = m00; base_M[i, 0, 1] = m01
-            base_M[i, 1, 0] = m10; base_M[i, 1, 1] = m11
-            base_t[i, 0] = pl.x; base_t[i, 1] = pl.y
-            cb_arr[i] = cb
-            ex = oas.repetition_extent(rt, rr)
-            ext[i, 0] = ex[0]; ext[i, 1] = ex[1]
-            ext[i, 2] = ex[2]; ext[i, 3] = ex[3]
-            valid[i] = True
-        # placed bbox = base applied to child bbox (batched corner transform),
-        # then extended by the repetition extent -> array-extent bbox.
-        corners = np.empty((N, 4, 2), dtype=np.float64)
-        corners[:, 0, 0] = cb_arr[:, 0]; corners[:, 0, 1] = cb_arr[:, 1]
-        corners[:, 1, 0] = cb_arr[:, 2]; corners[:, 1, 1] = cb_arr[:, 1]
-        corners[:, 2, 0] = cb_arr[:, 2]; corners[:, 2, 1] = cb_arr[:, 3]
-        corners[:, 3, 0] = cb_arr[:, 0]; corners[:, 3, 1] = cb_arr[:, 3]
-        tc = np.einsum('nij,nkj->nki', base_M, corners) + base_t[:, None, :]
-        px, py = tc[:, :, 0], tc[:, :, 1]
-        placed_all = np.empty((N, 4), dtype=np.float64)
-        placed_all[:, 0] = px.min(axis=1); placed_all[:, 1] = py.min(axis=1)
-        placed_all[:, 2] = px.max(axis=1); placed_all[:, 3] = py.max(axis=1)
-        arr_local = placed_all + ext
+        stats.arbitrary_angle_skipped += arb_skip
+        stats.unknown_target_skipped += unk_skip
         keep = valid & _roi_overlap_mask(T.apply_to_rects(arr_local), roi)
         stats.instances_pruned += int(rcount[valid & ~keep].sum())
         stats.t_place += time.perf_counter() - _ts_pl   # gather+prune only

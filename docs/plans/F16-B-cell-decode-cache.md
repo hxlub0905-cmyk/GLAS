@@ -113,11 +113,17 @@ repetition descriptor（`rt`/`rr`）多數為 None，非 None 的存稀疏側表
 - [x] 測試：e2e「decode 寫 sidecar → 新 reader load_cell 走欄狀」walk_roi bit-identical；改檔→miss、不同 wanted_layers→不同條目、env 關閉。
 - [x] 驗證：`pytest tests/` 599 全綠。手動 LTV 待 user 量測（首次寫快取、重開 app 秒級）。
 
-### M5: ② ROI 過濾解碼（env 開關）  [status: planned]
+### M6: ① walk 的 placement gather per-cell 快取（換 ROI 加速）  [status: done]
 
-- [ ] `_decode_at` 接受可選的 local-ROI bbox；descend 到大 cell 時把 root-ROI 經 `T⁻¹` 映回 local 傳入，跳過 FOV 外幾何/placement 的「建物件」（仍循序 parse 維持 modal）。
-- [ ] 預設關（`GLAS_ROI_DECODE=1` 開）；開啟時該 cell 不寫整顆快取（內容不完整）。
-- [ ] 驗證：開/關下 `walk_roi` 對 ROI 結果 bit-identical；手動量測首解時間下降。
+- [x] 把 walk 的 placement prune「gather」（base_M/base_t/placed_all/arr_local/rcount/valid + arb/unk skip）抽成 ROI/T 無關的 per-cell 預計算，快取在 `CellContent._place_prep`，跨 ROI/layer 重用；每次 walk 只剩 `T.apply_to_rects(arr_local)` + mask + survivor。
+- [x] 測試：`test_placement_prep_cached_across_rois`（prep 同物件重用、不同 ROI 結果正確）。
+- [x] 驗證：`pytest tests/` 599 全綠。
+- 註：in-memory（跨 ROI 同 session）。geometry extent 早已由 `_ext_cache` 跨 ROI 快取。**故第二個 ROI 起秒級**；每 session 第一個 ROI 仍付 gather(~20s)+geom ext(~40s) 預計算。on-disk 持久化 prep/ext（連每 session 第一個 ROI 也快）列為日後選做。
+
+### M5: ② ROI 過濾解碼（env 開關）  [status: deferred — 待 user 測快取後決定]
+
+- 架構衝突：ROI 過濾結果是 ROI-specific，與「按 cell memo/快取」相斥；只省第一次解碼 ~2x。user 選「先測 ①/M6 再決定」。
+- [ ] （若要做）`_decode_at` 接 local-ROI、按 `(cell, roi)` memo、不寫整顆快取、env `GLAS_ROI_DECODE=1` 預設關。
 
 ---
 

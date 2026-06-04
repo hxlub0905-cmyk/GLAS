@@ -4,6 +4,24 @@
 
 ---
 
+## [2026-06-04] [F16-B M6] walk placement gather per-cell 快取（換 ROI 加速）
+
+**變更類型：** 效能 ·  **狀態：完成**
+
+**動機：** user 問「載一顆後換其他 ROI/defect 呢」。釐清：磁碟快取省掉 292s 解碼，但**每換一個 ROI**，walk 仍重跑 44995
+的 150 萬 placement「gather」（`t_place` ~20s/層 × 3 ≈ 60s）。看很多 defect 的工作流，這才是換 ROI 的主要成本。
+
+**洞察：** gather（base_M/base_t/placed_all/arr_local/rcount/valid）是 **cell-local + reachable_bbox only → ROI/transform
+無關**，可快取。**實作：** 抽成 per-cell 預計算存 `CellContent._place_prep`，跨 ROI/layer 重用；每次 walk 只剩
+`T.apply_to_rects(arr_local)` + ROI mask + survivor 展開（向量化、~秒）。arb/unk skip 計數存進 prep、每 walk 重加以維持統計一致。
+geometry extent 早已由 `_ext_cache` 跨 ROI 快取，故**第二個 ROI 起 placement+geometry 預計算都重用 → 秒級**（每 session 第一個
+ROI 仍付一次 gather+ext 建構）。
+
+**測試：** `test_placement_prep_cached_across_rois`（prep 同物件重用、不同 ROI 結果正確）。`pytest tests/` 599 全綠。
+**影響檔案：** `glas/core/oasis_random.py`、`tests/test_oasis_random.py`、`docs/plans/F16-B-cell-decode-cache.md`、`SESSION_LOG.md`。
+
+---
+
 ## [2026-06-04] [F16-B M2-M4] CellContent 欄狀雙後端 + 解碼 cell 磁碟快取（① + ③）
 
 **變更類型：** 功能（持久化快取）+ 重構 ·  **狀態：完成（M2/M3/M4；剩 M5 ROI 過濾）**
