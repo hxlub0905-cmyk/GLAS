@@ -6266,10 +6266,11 @@ class MainWindow(QMainWindow):
         chosen ROI layer(s). Default half-window is the FOV; ``half_w/half_h``
         override it (e.g. Goto GDS uses a larger window for comparison).
 
-        Runs in a background thread: the first load decodes every reachable
-        cell once to learn its size (the OASIS has no per-cell bbox), which
-        can take a while on a big chip — so the UI stays responsive with a
-        cancellable progress dialog. Subsequent loads reuse the cache."""
+        Runs in a background thread: with S_BOUNDING_BOX the per-cell bbox is
+        read from the name table so the prune is decode-free (F16); only files
+        lacking it fall back to decoding every reachable cell once to learn its
+        size, which can take a while on a big chip — so the UI stays responsive
+        with a cancellable progress dialog. Subsequent loads reuse the cache."""
         hw = half_w if half_w is not None else self._fov_w
         hh = half_h if half_h is not None else self._fov_h
         if hw <= 0 or hh <= 0:
@@ -6468,9 +6469,20 @@ class MainWindow(QMainWindow):
             return
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
+            import time as _t
+            _t0 = _t.perf_counter()
             rar = oasis_random.RandomAccessReader(
                 path, wanted_layers=set(layer_keys),
                 bbox_layer=oasis_random.DEFAULT_BBOX_LAYER)
+            # One-time build telemetry (F16): index size + whether each cell got
+            # an S_BOUNDING_BOX. n_sbbox ≈ cell count => ROI prune is decode-free;
+            # n_sbbox == 0 => fall back to bbox-by-decode (slow first load).
+            n_sbbox = len(rar._sbbox_by_refnum) + len(rar._sbbox_by_name)
+            print(f"[roi] reader built in {_t.perf_counter() - _t0:.1f}s · "
+                  f"{len(rar._by_refnum):,} cells indexed · S_BOUNDING_BOX on "
+                  f"{n_sbbox:,} cells "
+                  f"({'decode-free prune' if n_sbbox else 'NONE -> bbox-by-decode'})",
+                  flush=True)
         except Exception as exc:
             QApplication.restoreOverrideCursor()
             self._show_load_error("ROI open failed", str(exc))

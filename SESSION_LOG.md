@@ -21,6 +21,11 @@ S_BOUNDING_BOX map → 走免解幾何路徑）。`walk_roi` 收尾填入。app 
 **測試：** `TestSBoundingBoxPrune::test_walk_prunes_far_instance` 加驗 `sbbox_prune is True` 且 `cells_decoded==2`
 （只解 root+命中 child，遠端 instance 子樹未解）。`pytest tests/test_oasis_random.py` 30 passed。
 
+**追加：** 也在 reader 建立處（`_load_roi_around` 上游）印一次性建構遙測：
+`[roi] reader built in X.Xs · N cells indexed · S_BOUNDING_BOX on M cells (decode-free prune / NONE)`，
+把「建 reader（slurp+scan）」與「walk」兩段時間分開，並直接顯示 sbbox map 有沒有建起來（M≈cell 數 → F16 生效；
+M==0 → 退回 bbox-by-decode）。同步修正 `_load_roi_around` 過時 docstring（不再宣稱每次首載都全解每顆 cell）。
+
 **影響檔案：** `glas/core/oasis_random.py`、`glas/app/gds_align_tool.py`、`tests/test_oasis_random.py`、`SESSION_LOG.md`。
 **Branch：** `claude/friendly-franklin-9uZqU`
 
