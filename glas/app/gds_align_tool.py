@@ -823,7 +823,12 @@ class OpenOasisWizard(QWizard):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Open OASIS")
+        # ClassicStyle drops the empty Modern/Aero "banner" strip above the
+        # title — we don't ship a wizard pixmap, so the band reads as a stray
+        # white block (reported on PR #11 screenshot).
+        self.setWizardStyle(QWizard.WizardStyle.ClassicStyle)
         self.setOption(QWizard.WizardOption.NoBackButtonOnStartPage, True)
+        self.setOption(QWizard.WizardOption.HaveHelpButton, False)
         self.setMinimumSize(640, 520)
 
         self._file_page = _FilePickPage(self)
