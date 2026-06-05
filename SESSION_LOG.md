@@ -4,6 +4,48 @@
 
 ---
 
+## [2026-06-05] [UX round 2] S2/S7/S11/S12 Minimap toggle / δ gating / empty states
+
+**變更類型：** UX 後續批次（4 條 + 移除 welcome / catalog 文案內的 dev mode 入口洩漏） ·
+**狀態：完成**
+
+**動機：** U1–U12 完成後挑 4 條真正影響工作流的：(a) Minimap 互斥模式不順手；(b) δ 在
+沒 SEM 時顯示 actionable 卻無從 act；(c) 空 catalog 沒視覺辨識；(d) 中央 SEM viewer
+empty 狀態沒 CTA → 新手得在右欄找 Load SEM 按鈕。**外加 user 強調：dev mode 必須維持
+「隱性彩蛋」**，文案不能明說「click icon 5×」如何啟用。
+
+**改動：**
+- **S2** Minimap 拆成獨立 overlay toggle：`_VIEW_MODES` 縮為 `("sem", "gds")`；toolbar
+  新增 `_mini_btn`（QPushButton checkable，**不**進 `_view_group` exclusive group）；
+  新增 `_set_minimap_visible(on)` 方法；shortcut `M` 切 minimap、`G` 仍 cycle SEM↔GDS；
+  batch workspace 進出時保留 toggle 狀態。
+- **S7** AlignmentDeltaPanel 初始 `setEnabled(False)`；SemPanel.set_images 收到 images
+  時依 `bool(images)` 切 enable，沒 SEM 時整個 panel 灰化。
+- **S11** PartChipPanel 空 catalog 狀態升級為警告卡（橘框、`#fff0e0` 背景、`#9a6a2a`
+  字色），文案改成「⚠ No PART / CHIP data\nAsk an administrator to add entries.」—
+  **不洩漏 dev mode 入口**（原本「Help → About → click icon 5×」整段拿掉）。
+- **S12** 新增 `_SemViewerCTA(QPushButton)` 子元件 + `SemViewer.load_sem_requested`
+  signal；viewer 在空狀態下中央偏下 110 px 顯示橘色「Load SEM…」CTA；點下後
+  MainWindow `_on_cta_load_sem` 開右欄 Load SEM 按鈕的同一個 split menu（KLARF /
+  folder 二選一）；set_image 一旦有 pixmap 即 hide CTA。
+
+**Dev mode 文案清理（額外）：** WelcomeDialog slide 3「Need a CHIP that isn't listed?
+An administrator can add it in developer mode (Help → About, click the icon 5×, then
+use ⚙ Edit catalog…)」改成「…via the catalog editor.」—— 跟 S11 一致，正常 user
+看到的 surface 不洩漏 dev mode 入口存在性。
+
+**測試：** 全套件 **668 passed**（+1：`test_minimap_toggle_independent_of_view_mode`）。
+更新失效測試：`test_empty_catalog_disables_dropdowns`（文案）、`test_set_offset_button_
+emits_signal` / `test_clear_button_emits_signal` / `test_set_offset_via_alignment_
+delta_signal`（S7 gate，測試前 `setEnabled(True)`）、`test_modes_are_exclusive` 改測
+只剩 SEM/GDS 兩態、`test_cycle_wraps` 改測 binary cycle，並新增 minimap independence
+測試。
+
+**影響檔案：** `glas/app/gds_align_tool.py`、`tests/test_gds_align_f21.py`、
+`tests/test_gds_align_m7.py`、`SESSION_LOG.md`。 **PR：** #11
+
+---
+
 ## [2026-06-05] [UX polish round] U1–U12 右欄 / toolbar / 視覺整理（PR #11 follow-up）
 
 **變更類型：** UX 細節 batch（12 條一次做完） ·  **狀態：完成**

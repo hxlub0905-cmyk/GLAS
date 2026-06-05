@@ -2968,6 +2968,24 @@ def _nice_round(x: float) -> float:
     return base
 
 
+class _SemViewerCTA(QPushButton):
+    """S12: orange CTA button overlay shown on the empty SEM viewer so a
+    first-time user has a clear next action right where they're looking
+    (instead of hunting the right column). Hidden as soon as an image is
+    loaded."""
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setText("  Load SEM…  ")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setStyleSheet(
+            f"QPushButton {{ background:{_TK_ACCENT.name()}; "
+            f"color:#ffffff; border:1px solid {_TK_ACCENT_DK.name()}; "
+            f"border-radius:6px; padding:9px 22px; "
+            f"font-size:{_FS_LABEL + 1}px; font-weight:700; }}"
+            f"QPushButton:hover {{ background:{_TK_ACCENT_DK.name()}; }}")
+
+
 class SemViewer(QWidget):
     """Right pane: SEM image + draggable GDS overlay (plan M4a).
 
@@ -2985,6 +3003,7 @@ class SemViewer(QWidget):
 
     drag_changed = pyqtSignal()
     cursor_gds = pyqtSignal(object)   # F11 M1: (x_nm, y_nm) or None
+    load_sem_requested = pyqtSignal()  # S12: empty-state CTA click
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -3012,6 +3031,11 @@ class SemViewer(QWidget):
         self._cursor_screen: Optional[QPointF] = None
         self.setMouseTracking(True)   # live cursor readout without a button
         self._corner_overlay: Optional[QWidget] = None   # M7-ov #9 minimap
+        # S12: prominent CTA in the empty SEM area so the first action a new
+        # user sees in the centre of the screen is loading a SEM.
+        self._cta_btn = _SemViewerCTA(self)
+        self._cta_btn.clicked.connect(self.load_sem_requested)
+        self._cta_btn.show()
 
     def set_corner_overlay(self, w: Optional[QWidget]) -> None:
         """Host a small floating widget (the minimap) pinned bottom-right."""
@@ -3026,9 +3050,22 @@ class SemViewer(QWidget):
         w.move(max(0, self.width() - w.width() - m),
                max(0, self.height() - w.height() - m))
 
+    def _reposition_cta(self) -> None:
+        # Centre the CTA button slightly below the painted "No SEM image"
+        # caption (the caption sits at the widget centre, the CTA sits
+        # ~110 px below it).
+        if self._cta_btn is None:
+            return
+        self._cta_btn.adjustSize()
+        sz = self._cta_btn.size()
+        cx = (self.width() - sz.width()) // 2
+        cy = (self.height() - sz.height()) // 2 + 110
+        self._cta_btn.move(max(0, cx), max(0, cy))
+
     def resizeEvent(self, ev) -> None:  # type: ignore[override]
         super().resizeEvent(ev)
         self._reposition_overlay()
+        self._reposition_cta()
 
     def native_size(self) -> Optional[tuple]:
         if self._pixmap is None or self._pixmap.isNull():
@@ -3050,6 +3087,11 @@ class SemViewer(QWidget):
                 self._pixmap = pm
                 self._caption = img.filename
         self._drag_x = self._drag_y = 0.0   # temp drag never survives a new image
+        # S12: CTA shows only on the empty viewer; hide as soon as any
+        # pixmap (even an unreadable one) has been assigned for inspection.
+        self._cta_btn.setVisible(self._pixmap is None)
+        if self._cta_btn.isVisible():
+            self._reposition_cta()
         self.reset_view()
         self.update()
 
@@ -3196,7 +3238,7 @@ class SemViewer(QWidget):
         p.setFont(sub)
         p.setPen(QPen(_TK_TEXT_HINT))
         p.drawText(r.adjusted(0, 56, 0, 56), Qt.AlignmentFlag.AlignCenter,
-                   "Follow the steps above to get started")
+                   "Load a KLARF defect list or an image folder")
 
     def _draw_hud(self, p: QPainter) -> None:
         """Corner readout: zoom factor (top-right), cursor GDS coordinate
@@ -3630,21 +3672,32 @@ class PartChipPanel(QFrame):
             self._part_cb.setEnabled(False)
             self._chip_cb.setEnabled(False)
             self._custom_chk.setEnabled(True)
+            # S11: empty-catalog state used to be a muted hint that read
+            # as a regular tooltip; promote it to a card with a warning
+            # tint so it can't be mistaken for normal copy. The hint
+            # leaves the catalog-editor entry point intentionally vague
+            # (it's gated behind developer mode and shouldn't advertise
+            # how to unlock it).
             if self._load_error:
                 self._status_lbl.setText(
-                    f"⚠ catalog error: {self._load_error}\n"
-                    f"Fix glas/data/parts.json or use Edit catalog…")
+                    f"⚠ Catalog error: {self._load_error}\n"
+                    f"Fix glas/data/parts.json or use the catalog editor.")
             else:
                 self._status_lbl.setText(
-                    "No PART/CHIP data — enable developer mode "
-                    "(Help → About → click icon 5×) and use Edit catalog… "
-                    "to add entries.")
+                    "⚠ No PART / CHIP data\n"
+                    "Ask an administrator to add entries.")
+            self._status_lbl.setStyleSheet(
+                f"background:#fff0e0; color:#9a6a2a; "
+                f"border:1px solid #c8a080; border-radius:4px; "
+                f"padding:8px 10px; font-size:{_FS_CAPTION}px;")
         else:
             self._part_cb.setEnabled(True)
             self._chip_cb.setEnabled(True)
             for pid in sorted(self._catalog):
                 self._part_cb.addItem(pid)
             self._status_lbl.setText("")
+            self._status_lbl.setStyleSheet(
+                _hint_qss(_FS_MICRO, _TK_TEXT_HINT.name(), pad="4px 0 0 0"))
         self._suppress = False
         # Drive an initial CHIP/badge update once.
         self._on_part_changed(self._part_cb.currentText())
@@ -5175,6 +5228,11 @@ class SemPanel(QFrame):
         # Shortcuts for legacy call sites that wired Set/Clear to MainWindow.
         self.set_offset_btn = self.alignment_delta.set_btn
         self.clear_offset_btn = self.alignment_delta.clear_btn
+        # S7: δ has no operational meaning until a SEM image is loaded.
+        # Start disabled (greyed) so the controls don't read as actionable
+        # before there is something to align against. ``set_images``
+        # re-enables the panel as soon as a KLARF / image list arrives.
+        self.alignment_delta.setEnabled(False)
         v.addWidget(self.alignment_delta)
 
         # Image list — the primary defect-navigation control — gets the
@@ -5238,6 +5296,9 @@ class SemPanel(QFrame):
         self._images = list(images)
         self._scores = {}
         self.list.clear()
+        # S7: an alignment δ is only meaningful once there are SEM images
+        # to align. Enable / disable the panel to match.
+        self.alignment_delta.setEnabled(bool(self._images))
         if not self._images:
             self._show_list_placeholder()
             return
@@ -5334,8 +5395,7 @@ _WELCOME_SLIDES: list[tuple[str, str, str]] = [
         "default FOV, and the overlay scale — no need to type RFL "
         "numbers.</p>"
         "<p>Need a CHIP that isn't listed? An administrator can add it "
-        "in developer mode (<i>Help → About</i>, click the icon 5×, then "
-        "use <b>⚙ Edit catalog…</b>).</p>",
+        "via the catalog editor.</p>",
     ),
     (
         "target",
@@ -5918,6 +5978,9 @@ class MainWindow(QMainWindow):
         self.canvas.cursor_pos_nm.connect(self._on_cursor)
         self.canvas.defect_clicked.connect(self._on_defect_clicked)
         self.sem_viewer.cursor_gds.connect(self._on_coord)   # F11 M1
+        # S12: clicking the empty-viewer CTA pops the same split menu the
+        # right column's Load SEM… button shows.
+        self.sem_viewer.load_sem_requested.connect(self._on_cta_load_sem)
         self.sem_panel.load_klarf_requested.connect(self._on_load_klarf)
         self.sem_panel.load_folder_requested.connect(self._on_load_folder)
         self.sem_panel.load_roi_requested.connect(self._on_load_roi_clicked)
@@ -6107,7 +6170,10 @@ class MainWindow(QMainWindow):
 
         h.addWidget(_divider())
 
-        # ── View mode (segmented, exclusive) ──
+        # ── View mode (segmented, exclusive) + Minimap (overlay toggle) ──
+        # S2: SEM / GDS are mutually exclusive view modes; Minimap is now
+        # an independent corner-overlay that composes with both, instead
+        # of being a third exclusive mode.
         h.addWidget(_group("VIEW MODE"))
         self._view_group = QButtonGroup(self)
         self._view_group.setExclusive(True)
@@ -6123,12 +6189,21 @@ class MainWindow(QMainWindow):
             return b
 
         self._seg_sem = _seg("SEM", "image", "sem",
-                             "SEM + overlay only (full width).")
+                             "SEM + overlay only (full width). Shortcut: G")
         self._seg_gds = _seg("GDS", "layers", "gds",
-                             "SEM beside the whole-chip GDS overview (50/50).")
-        self._seg_mini = _seg("Minimap", "target", "minimap",
-                              "SEM full width with a defect minimap in the corner.")
+                             "SEM beside the whole-chip GDS overview (50/50). "
+                             "Shortcut: G")
         self._seg_sem.setChecked(True)
+
+        # Standalone Minimap toggle — checkable, not in the seg group.
+        self._mini_btn = QPushButton(_qicon("target"), " Minimap")
+        self._mini_btn.setCheckable(True)
+        self._mini_btn.setProperty("seg", "true")
+        self._mini_btn.setToolTip(
+            "Toggle a corner defect minimap on the SEM viewer. Works in "
+            "both SEM and GDS view modes. Shortcut: M")
+        self._mini_btn.toggled.connect(self._set_minimap_visible)
+        h.addWidget(self._mini_btn)
 
         h.addWidget(_divider())
         fit_btn = QPushButton(_qicon("maximize"), " Fit")
@@ -6215,6 +6290,8 @@ class MainWindow(QMainWindow):
         sc("Ctrl+=", lambda: self.sem_viewer.zoom_by(1.2))
         sc("Ctrl+-", lambda: self.sem_viewer.zoom_by(1.0 / 1.2))
         sc("G", self._cycle_view_mode)
+        # S2: M toggles the corner minimap independently of view mode.
+        sc("M", lambda: self._mini_btn.setChecked(not self._mini_btn.isChecked()))
         sc("Ctrl+Up", lambda: self._nudge_origin(0, self._NUDGE_NM))
         sc("Ctrl+Down", lambda: self._nudge_origin(0, -self._NUDGE_NM))
         sc("Ctrl+Left", lambda: self._nudge_origin(-self._NUDGE_NM, 0))
@@ -6232,40 +6309,52 @@ class MainWindow(QMainWindow):
             f"origin δ nudged to ({self._origin_dx:,.0f}, "
             f"{self._origin_dy:,.0f}) nm")
 
-    _VIEW_MODES = ("sem", "gds", "minimap")
+    # S2: only two mutually exclusive main views; Minimap is an overlay
+    # toggle that composes with either.
+    _VIEW_MODES = ("sem", "gds")
 
     def _set_view_mode(self, mode: str) -> None:
-        """Switch the centre view between SEM-only / GDS overview / minimap
-        (M7-ov view-mode selector). Mutually exclusive. Also leaves the batch
-        workspace, if active (F7)."""
+        """Switch the centre view between SEM-only and SEM + GDS overview.
+        Also leaves the batch workspace, if active (F7). Minimap visibility
+        is independent of view mode (see :meth:`_set_minimap_visible`)."""
         if mode not in self._VIEW_MODES:
             return
-        # Leaving the batch workspace (clicking any view button exits it).
         self._batch_active = False
         self.batch_panel.setVisible(False)
         self._view_mode = mode
-        # GDS overview pane visible only in 'gds'. Splitter widgets are
-        # [canvas, batch_panel, sem_viewer]; size all three explicitly.
         self.canvas.setVisible(mode == "gds")
         if mode == "gds":
             total = max(2, self._center_split.width())
             self._center_split.setSizes([total // 2, 0, total - total // 2])
-        # Corner minimap visible only in 'minimap'.
-        self.minimap.setVisible(mode == "minimap")
-        if mode == "minimap":
-            self.sem_viewer._reposition_overlay()
-            self.minimap.raise_()
-        # Reflect in the segmented buttons (block signals to avoid recursion).
-        btn = {"sem": self._seg_sem, "gds": self._seg_gds,
-               "minimap": self._seg_mini}[mode]
+        btn = {"sem": self._seg_sem, "gds": self._seg_gds}[mode]
         if not btn.isChecked():
             btn.blockSignals(True)
             btn.setChecked(True)
             btn.blockSignals(False)
 
+    def _set_minimap_visible(self, on: bool) -> None:
+        """S2: Minimap is now an independent corner-overlay toggle. Works
+        in both SEM and GDS view modes; batch workspace still suppresses it
+        to keep that focused layout clean."""
+        if self._batch_active:
+            return
+        self.minimap.setVisible(bool(on))
+        if on:
+            self.sem_viewer._reposition_overlay()
+            self.minimap.raise_()
+        # Keep the toolbar button in sync if a programmatic caller flipped
+        # the visibility without going through the button.
+        if self._mini_btn.isChecked() != bool(on):
+            self._mini_btn.blockSignals(True)
+            self._mini_btn.setChecked(bool(on))
+            self._mini_btn.blockSignals(False)
+
     def _enter_batch_workspace(self) -> None:
         """Show the batch workspace (left = results, right = SEM overlay),
-        remembering the current view mode so 'Back' can restore it (F7)."""
+        remembering the current view mode so 'Back' can restore it (F7).
+        Minimap is suppressed while in the batch workspace regardless of
+        its toggle state; the toggle's checked state is preserved so the
+        previous overlay returns when the user exits batch mode."""
         if not self._batch_active:
             self._prev_view_mode = self._view_mode
         self._batch_active = True
@@ -6277,8 +6366,11 @@ class MainWindow(QMainWindow):
         self._center_split.setSizes([0, left, total - left])
 
     def _exit_batch_workspace(self) -> None:
-        """Return from the batch workspace to the previous view mode (F7)."""
+        """Return from the batch workspace to the previous view mode (F7),
+        re-showing the minimap if its toggle was on."""
         self._set_view_mode(getattr(self, "_prev_view_mode", "sem"))
+        if self._mini_btn.isChecked():
+            self._set_minimap_visible(True)
 
     def _cycle_view_mode(self) -> None:
         i = self._VIEW_MODES.index(getattr(self, "_view_mode", "sem"))
@@ -6395,6 +6487,17 @@ class MainWindow(QMainWindow):
             self._on_sem_image_selected(img)
 
     # ── M3: SEM load + coordinate jump ──────────────────────────────────────
+    def _on_cta_load_sem(self) -> None:
+        """S12: empty-viewer CTA opens the same KLARF/folder menu the right
+        column's Load SEM… button uses, anchored under the button."""
+        btn = self.sem_panel.load_sem_btn
+        menu = btn.menu()
+        if menu is None:
+            # No menu wired (defensive); fall back to the KLARF picker.
+            self._on_load_klarf()
+            return
+        menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
+
     def _on_load_klarf(self) -> None:
         # KLARF result files are commonly named <lot>.000 / .001 / … (a
         # numeric "result number" extension), so accept any three-digit

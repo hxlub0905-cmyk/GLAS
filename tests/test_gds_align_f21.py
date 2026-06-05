@@ -125,7 +125,9 @@ class TestPartChipPanel:
         p = mw.sem_panel.coord_setup
         assert p._part_cb.isEnabled() is False
         assert p._chip_cb.isEnabled() is False
-        assert "No PART/CHIP" in p._status_lbl.text()
+        # S11: empty-catalog hint is rephrased and styled as a warning card
+        # ("No PART / CHIP data" + admin advice).
+        assert "No PART" in p._status_lbl.text()
 
     def test_changed_signal_emits_on_chip_select(self, mw):
         p = mw.sem_panel.coord_setup
@@ -148,6 +150,9 @@ class TestAlignmentDeltaPanel:
 
     def test_set_offset_button_emits_signal(self, mw):
         ad = mw.sem_panel.alignment_delta
+        # S7: panel starts disabled until SEM images load; enable so the
+        # signal-emission contract is testable independently of the gate.
+        ad.setEnabled(True)
         fired = {"n": 0}
         ad.set_requested.connect(lambda: fired.__setitem__("n", 1))
         ad.set_btn.click()
@@ -155,6 +160,7 @@ class TestAlignmentDeltaPanel:
 
     def test_clear_button_emits_signal(self, mw):
         ad = mw.sem_panel.alignment_delta
+        ad.setEnabled(True)
         fired = {"n": 0}
         ad.clear_requested.connect(lambda: fired.__setitem__("n", 1))
         ad.clear_btn.click()
@@ -281,6 +287,9 @@ class TestMainWindowIntegration:
         assert ad._dy == -90.0   # −50 − 40
 
     def test_set_offset_via_alignment_delta_signal(self, mw):
+        # S7: panel starts disabled until SEM images load; enable for this
+        # signal-routing test.
+        mw.sem_panel.alignment_delta.setEnabled(True)
         mw._origin_dx, mw._origin_dy = 0.0, 0.0
         mw.sem_viewer._anchor = (1000.0, 2000.0)
         mw.sem_viewer._nm_per_px = 1.0
