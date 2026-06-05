@@ -4,9 +4,9 @@
 
 ---
 
-## [2026-06-05] [F21 plan] PART/CHIP catalog 取代 Coordinate Setup + Origin δ UI 升級（plan-only）
+## [2026-06-05] [F21] PART/CHIP catalog 取代 Coordinate Setup + Origin δ UI 升級
 
-**變更類型：** plan 文件（尚未動程式碼） ·  **狀態：plan 完成，待 user 核准開工**
+**變更類型：** plan + M1 (catalog data model) ·  **狀態：M1 完成，M2–M6 待續**
 
 **動機：** 評估「真小白 + 無手冊」走完 GLAS 全流程的通關率 ≈ 0.4%，最大殺手是
 Coordinate Setup（Step 3 通過率僅 ~10%）—— RFL 術語、6 欄手填、無自動帶入、預設折疊。
@@ -31,8 +31,19 @@ delete + atomic save）→ M5 cache schema v1→v2 bump（加 part_id/chip_id、
 三 dialog 成單一 `QWizard`）+ [F22] First-run welcome dialog（5 縮圖 onboarding）
 列入 §8 Backlog；F21 完成後接續處理。
 
-**影響檔案：** `docs/plans/F21-part-chip-catalog.md`(新)、`CLAUDE.md` §8 新增 F21/
-F20/F22、`SESSION_LOG.md`。 **Branch：** claude/youthful-gates-WLNYJ
+**M1 完成（user 核准 A + 種子用範例）：** 新增 `glas/core/parts_catalog.py`（無 Qt
+core；`ChipSpec` / `PartSpec` dataclass + `to_dict/from_dict` round-trip、
+`chip_corner_nm()` 沿用舊公式 `(DieX − GDS_off) × 1000`、`load_catalog` 容忍未知欄位
+向前相容、`save_catalog` atomic tempfile + os.replace、`CatalogError` 區分壞檔/壞 schema、
+`DEFAULT_FOV_NM = 1500.0`、`CATALOG_SCHEMA = "glas-parts-v1"`）+ 種子
+`glas/data/parts.json`（EXAMPLE_PART / C1+C2 placeholder，description 引導 user 進 dev
+mode 編輯）+ `tests/test_parts_catalog.py` 26 項全綠（round-trip / partial / 未知欄位
+忽略 / 壞 JSON / schema 不符 / 非 dict root / atomic write 無 leftover / UTF-8 CJK /
+seed 載入）。
+
+**影響檔案：** `docs/plans/F21-part-chip-catalog.md`(新)、`glas/core/parts_catalog.py`(新)、
+`glas/data/parts.json`(新)、`tests/test_parts_catalog.py`(新)、`CLAUDE.md` §8 新增
+F21/F20/F22、`SESSION_LOG.md`。 **Branch：** claude/youthful-gates-WLNYJ
 
 ---
 

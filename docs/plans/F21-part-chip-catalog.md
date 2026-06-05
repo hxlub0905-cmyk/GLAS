@@ -99,24 +99,25 @@ override**。預設值 **1500 nm（W）× 1500 nm（H）**。
 
 > 每個 milestone 以「一個 session 可完成」為粒度切。
 
-### M1: Catalog data model + loader [status: planned]
+### M1: Catalog data model + loader [status: done 2026-06-05]
 
 定義 catalog schema、寫純函式 loader、給 catalog 寫一份種子資料。**core 無 Qt 依賴**。
 
-- [ ] 新增 `glas/data/parts.json`（schema v1，種子資料：至少 1 個 PART + 2 個 CHIP，
-      含註解說明欄位）
-- [ ] 新增 `glas/core/parts_catalog.py`：
+- [x] 新增 `glas/data/parts.json`（schema v1，種子資料 EXAMPLE_PART / C1+C2，
+      placeholder 數值並在 description 引導 user 進 dev mode 編輯）
+- [x] 新增 `glas/core/parts_catalog.py`：
   - `@dataclass ChipSpec`：`chip_x_um / chip_y_um / chip_w_um / chip_h_um /
     gds_off_x_um / gds_off_y_um / fov_w_nm / fov_h_nm / nm_per_px (Optional, None=auto) /
-    notes`
+    notes` + `chip_corner_nm()` helper（沿用舊 panel 公式）
   - `@dataclass PartSpec`：`description / chips: dict[str, ChipSpec]`
-  - `load_catalog(path) -> dict[str, PartSpec]`：讀 JSON、schema 驗證、缺欄補預設
-  - `save_catalog(path, parts)`：atomic write（tempfile + rename）
-  - `DEFAULT_FOV_NM = 1500`
-  - schema 常數 `CATALOG_SCHEMA = "glas-parts-v1"`
-- [ ] 新增 `tests/test_parts_catalog.py`：load round-trip、缺欄位、壞 JSON、
-      schema version mismatch、atomic write 中斷不會壞檔
-- [ ] 驗證：`pytest tests/test_parts_catalog.py -v` 全綠
+  - `load_catalog(path)`：讀 JSON、schema 驗證、容忍未知欄位、缺檔回空 dict
+  - `save_catalog(path, parts)`：atomic write（tempfile + os.replace + 清 leftover）
+  - `default_catalog_path()`、`DEFAULT_FOV_NM = 1500.0`、
+    `CATALOG_SCHEMA = "glas-parts-v1"`、`CatalogError`
+- [x] 新增 `tests/test_parts_catalog.py`：26 項涵蓋 round-trip / partial / 未知欄位忽略 /
+      壞 JSON / schema 不符 / 非 dict root / atomic write 無 leftover / UTF-8 CJK /
+      seed 載入
+- [x] 驗證：`pytest tests/test_parts_catalog.py -v` → **26 passed**
 
 ### M2: 右欄重構 — PART/CHIP 下拉 + FOV badge [status: planned]
 

@@ -1,0 +1,34 @@
+{
+  "schema": "glas-parts-v1",
+  "parts": {
+    "EXAMPLE_PART": {
+      "description": "Placeholder PART for first-launch demo. Replace with real data via developer-mode catalog editor (Help → About → click icon 5x → ⚙ Edit catalog…).",
+      "chips": {
+        "C1": {
+          "chip_x_um": 0.0,
+          "chip_y_um": 0.0,
+          "chip_w_um": 10000.0,
+          "chip_h_um": 10000.0,
+          "gds_off_x_um": 0.0,
+          "gds_off_y_um": 0.0,
+          "fov_w_nm": 1500.0,
+          "fov_h_nm": 1500.0,
+          "nm_per_px": null,
+          "notes": "Example chip — origin at die lower-left, no GDS offset."
+        },
+        "C2": {
+          "chip_x_um": 10500.0,
+          "chip_y_um": 0.0,
+          "chip_w_um": 10000.0,
+          "chip_h_um": 10000.0,
+          "gds_off_x_um": 0.0,
+          "gds_off_y_um": 0.0,
+          "fov_w_nm": 1500.0,
+          "fov_h_nm": 1500.0,
+          "nm_per_px": null,
+          "notes": "Second chip — offset 10.5 mm east of C1."
+        }
+      }
+    }
+  }
+}
