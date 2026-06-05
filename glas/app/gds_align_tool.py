@@ -7140,14 +7140,18 @@ def main() -> int:
     # Required on Windows so the child loader process re-imports this module
     # cleanly when it spawns. No-op on POSIX.
     mp.freeze_support()
-    # Silence one harmless, very chatty Qt warning (a pixel-sized font reports
-    # pointSize()==-1, which Qt's internals then complain about) while letting
-    # every other Qt message through.
+    # Filter two harmless, very chatty Qt warnings (a pixel-sized font reports
+    # pointSize()==-1; a dialog whose min-height nudges past the requested
+    # geometry triggers a setGeometry notice) while letting everything else
+    # through.
     try:
         from PyQt6.QtCore import qInstallMessageHandler
 
+        _QUIET = ("setPointSize: Point size <= 0",
+                  "QWindowsWindow::setGeometry: Unable to set geometry")
+
         def _qt_msg_filter(mode, ctx, message):
-            if "setPointSize: Point size <= 0" in message:
+            if any(q in message for q in _QUIET):
                 return
             print(message, file=sys.stderr, flush=True)
 

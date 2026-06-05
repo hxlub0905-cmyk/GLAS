@@ -4,6 +4,25 @@
 
 ---
 
+## [2026-06-04] [F16-B] 向量化 geometry extent 計算（每 session 第一個 ROI 的 geom 29s）+ 收 Qt 警告
+
+**變更類型：** 效能 + 雜訊 ·  **狀態：完成**
+
+**動機（實測）：** 重開 app（快取已建）後第一個 ROI 58s，其中 `geom 29s`（17/101）最大 —— 44995 在該層 ~870 萬矩形多為
+repetition（CMG），`rect_arrays` 建 extent 逐筆呼叫 `repetition_extent` ≈ 870 萬次。前次「只跳過無 repetition」沒幫到（多數有）。
+
+**實作（B）：** 新增 `_ext_from_columnar(base, rt, rr)`：規則型（1/2/3/8/9）按 type 分組、用 numpy 一次算 extent（min/max 與 0
+取正負向，等價 `repetition_extent` 的 `_box`/type-8 corners）；任意清單型（10/11，及罕見 4-7）逐筆 fallback。`rect_arrays`/
+`poly_arrays`（欄狀與 tuple 兩路）改建 `(base, rt, rr)` 後呼叫此 helper。預期 geom 29s → ~數秒。
+
+**收警告：** Qt message handler 多濾一條 `QWindowsWindow::setGeometry: Unable to set geometry`（多行進度框 min-height 觸發的無害通知），
+連同既有的 `setPointSize` 一起濾掉。
+
+**測試：** `TestExtVectorized`（每種 repetition type 對照 `repetition_extent` 逐值相等、含負 spacing / 斜向 type-8 / 空）。
+`pytest tests/` 606 全綠。**影響檔案：** `glas/core/oasis_random.py`、`glas/app/gds_align_tool.py`、`tests/test_oasis_random.py`、`SESSION_LOG.md`。
+
+---
+
 ## [2026-06-04] [F18] lazy placement 反序列化（cache 載入再砍 ~10s / batch 暖機）
 
 **變更類型：** 效能 + 重構 ·  **狀態：完成**

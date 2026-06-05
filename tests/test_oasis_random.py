@@ -715,3 +715,36 @@ class TestGridClip:
         skew = orx._clip_grid_offsets(8, (10, 10, (40, 5), (0, 40)), placed,
                                       T, roi)
         assert skew.shape[0] == 100
+
+
+class TestExtVectorized:
+    """F16-B 'B': _ext_from_columnar must match a per-spec repetition_extent for
+    every repetition type (the vectorized regular types + looped 10/11)."""
+
+    def test_matches_repetition_extent(self):
+        cases = [
+            (None, None), (0, None),
+            (1, (3, 4, 100, 200)), (1, (2, 2, -50, 30)),
+            (2, (5, 50)), (3, (5, 50)),
+            (8, (3, 3, (40, 0), (0, 40))), (8, (2, 4, (10, 5), (-3, 20))),
+            (9, (4, (7, 3))),
+            (10, ([(1, 2), (3, 4)],)), (11, (2, [(1, 1), (2, 2)])),
+        ]
+        M = len(cases)
+        base = np.arange(M * 4, dtype=np.float64).reshape(M, 4)
+        rt = np.fromiter(((-1 if c[0] is None else c[0]) for c in cases),
+                         dtype=np.int16, count=M)
+        rr = np.empty(M, dtype=object)
+        for i, c in enumerate(cases):
+            rr[i] = c[1]
+        ext = orx._ext_from_columnar(base, rt, rr)
+        for i, (t, raw) in enumerate(cases):
+            e = np.array(oas.repetition_extent(t, raw), dtype=np.float64)
+            assert np.array_equal(ext[i], base[i] + e), (t, raw, ext[i],
+                                                         base[i] + e)
+
+    def test_empty(self):
+        base = np.empty((0, 4), dtype=np.float64)
+        rt = np.empty(0, dtype=np.int16)
+        rr = np.empty(0, dtype=object)
+        assert orx._ext_from_columnar(base, rt, rr).shape == (0, 4)

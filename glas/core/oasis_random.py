@@ -265,25 +265,21 @@ class CellContent:
             if col is not None:
                 c, rt, rr = col
                 base = c.astype(np.float64)              # vectorized
-                ext = base.copy()
-                for i in np.flatnonzero(rt > 0):         # repeated rects only
-                    e0, e1, e2, e3 = oas.repetition_extent(int(rt[i]), rr[i])
-                    ext[i, 0] += e0; ext[i, 1] += e1
-                    ext[i, 2] += e2; ext[i, 3] += e3
             else:
                 specs = self.rect_specs.get(key) or ()
                 M = len(specs)
                 if M:
                     base = np.array([s[:4] for s in specs], dtype=np.float64)
+                    rt = np.fromiter(((-1 if s[4] is None else s[4])
+                                      for s in specs), dtype=np.int16, count=M)
+                    rr = np.empty(M, dtype=object)
+                    for i, s in enumerate(specs):
+                        rr[i] = s[5]
                 else:
                     base = np.empty((0, 4), dtype=np.float64)
-                ext = base.copy()
-                for i, s in enumerate(specs):
-                    if s[4]:                             # rtype not None / 0
-                        e0, e1, e2, e3 = oas.repetition_extent(s[4], s[5])
-                        ext[i, 0] += e0; ext[i, 1] += e1
-                        ext[i, 2] += e2; ext[i, 3] += e3
-            got = (base, ext)
+                    rt = np.empty(0, dtype=np.int16)
+                    rr = np.empty(0, dtype=object)
+            got = (base, _ext_from_columnar(base, rt, rr))
             self._ext_cache[ck] = got
         return got
 
@@ -308,24 +304,19 @@ class CellContent:
                     base[:, 3] = np.maximum.reduceat(pts[:, 1], seg)
                 else:
                     base = np.empty((0, 4), dtype=np.float64)
-                ext = base.copy()
-                for i in np.flatnonzero(rt > 0):
-                    e0, e1, e2, e3 = oas.repetition_extent(int(rt[i]), rr[i])
-                    ext[i, 0] += e0; ext[i, 1] += e1
-                    ext[i, 2] += e2; ext[i, 3] += e3
+                ext = _ext_from_columnar(base, rt, rr)
             else:
                 P = self.poly_count(key)
                 base = np.empty((P, 4), dtype=np.float64)
-                ext = np.empty((P, 4), dtype=np.float64)
+                rt = np.empty(P, dtype=np.int16)
+                rr = np.empty(P, dtype=object)
                 for i in range(P):
-                    b, rt, rr = self.poly_spec_at(key, i)
-                    bx0 = float(b[:, 0].min()); by0 = float(b[:, 1].min())
-                    bx1 = float(b[:, 0].max()); by1 = float(b[:, 1].max())
-                    base[i, 0] = bx0; base[i, 1] = by0
-                    base[i, 2] = bx1; base[i, 3] = by1
-                    e0, e1, e2, e3 = oas.repetition_extent(rt, rr)
-                    ext[i, 0] = bx0 + e0; ext[i, 1] = by0 + e1
-                    ext[i, 2] = bx1 + e2; ext[i, 3] = by1 + e3
+                    b, _rt, _rr = self.poly_spec_at(key, i)
+                    base[i, 0] = float(b[:, 0].min()); base[i, 1] = float(b[:, 1].min())
+                    base[i, 2] = float(b[:, 0].max()); base[i, 3] = float(b[:, 1].max())
+                    rt[i] = -1 if _rt is None else _rt
+                    rr[i] = _rr
+                ext = _ext_from_columnar(base, rt, rr)
             got = (base, ext)
             self._ext_cache[ck] = got
         return got
@@ -1101,6 +1092,64 @@ _KIND_CODES = {"refnum": 0, "name": 1, "modal": 2}
 
 _D4_ROT = ((1.0, 0.0, 0.0, 1.0), (0.0, -1.0, 1.0, 0.0),
            (-1.0, 0.0, 0.0, -1.0), (0.0, 1.0, -1.0, 0.0))
+
+
+def _ext_from_columnar(base: np.ndarray, rt: np.ndarray, rr) -> np.ndarray:
+    """``ext`` = ``base`` grown by each rect/poly's repetition extent, vectorized
+    (F16-B "B"). Regular types (1/2/3/8/9) are computed with grouped numpy ops;
+    arbitrary-list types (10/11, and any rare 4-7) fall back to a per-spec
+    :func:`repetition_extent`. Equivalent to looping ``repetition_extent`` over
+    every ``rt>0`` row — but ~6x+ faster on millions of regular CMG arrays
+    (whose per-call branching + tuple build dominated the per-session first ROI).
+    ``rt`` uses -1 for no repetition; ``rr`` is the per-row object array."""
+    ext = base.copy()
+    rep = np.flatnonzero(rt > 0)
+    if rep.size == 0:
+        return ext
+    rtv = rt[rep]
+
+    def _grow(idx, dx, dy):
+        z = np.zeros(idx.size, dtype=np.float64)
+        ext[idx, 0] += np.minimum(z, dx); ext[idx, 1] += np.minimum(z, dy)
+        ext[idx, 2] += np.maximum(z, dx); ext[idx, 3] += np.maximum(z, dy)
+
+    def _flat(idx):                       # (k, n) int array of flat tuples
+        return np.array(rr[idx].tolist(), dtype=np.float64)
+
+    s = rep[rtv == 1]                     # rr=(nx, ny, xs, ys)
+    if s.size:
+        p = _flat(s)
+        _grow(s, (p[:, 0] - 1) * p[:, 2], (p[:, 1] - 1) * p[:, 3])
+    s = rep[rtv == 2]                     # rr=(nx, xs)
+    if s.size:
+        p = _flat(s)
+        _grow(s, (p[:, 0] - 1) * p[:, 1], np.zeros(s.size))
+    s = rep[rtv == 3]                     # rr=(ny, ys)
+    if s.size:
+        p = _flat(s)
+        _grow(s, np.zeros(s.size), (p[:, 0] - 1) * p[:, 1])
+    s = rep[rtv == 9]                     # rr=(nd, (dx, dy))
+    if s.size:
+        nd = np.fromiter((rr[i][0] for i in s), np.float64, s.size)
+        dv = np.array([rr[i][1] for i in s], dtype=np.float64)
+        _grow(s, (nd - 1) * dv[:, 0], (nd - 1) * dv[:, 1])
+    s = rep[rtv == 8]                     # rr=(nn, mm, (nvx,nvy), (mvx,mvy))
+    if s.size:
+        nn = np.fromiter((rr[i][0] for i in s), np.float64, s.size)
+        mm = np.fromiter((rr[i][1] for i in s), np.float64, s.size)
+        nvec = np.array([rr[i][2] for i in s], dtype=np.float64)
+        mvec = np.array([rr[i][3] for i in s], dtype=np.float64)
+        ax = (nn - 1) * nvec[:, 0]; ay = (nn - 1) * nvec[:, 1]
+        bx = (mm - 1) * mvec[:, 0]; by = (mm - 1) * mvec[:, 1]
+        cx = np.stack([np.zeros_like(ax), ax, bx, ax + bx], axis=1)
+        cy = np.stack([np.zeros_like(ay), ay, by, ay + by], axis=1)
+        ext[s, 0] += cx.min(1); ext[s, 1] += cy.min(1)
+        ext[s, 2] += cx.max(1); ext[s, 3] += cy.max(1)
+    handled = ((rtv == 1) | (rtv == 2) | (rtv == 3) | (rtv == 8) | (rtv == 9))
+    for i in rep[~handled]:               # 10/11 arbitrary lists, rare 4-7
+        e0, e1, e2, e3 = oas.repetition_extent(int(rt[i]), rr[i])
+        ext[i, 0] += e0; ext[i, 1] += e1; ext[i, 2] += e2; ext[i, 3] += e3
+    return ext
 
 
 def _roi_to_local(T: "Transform", roi: Bbox) -> Bbox:
