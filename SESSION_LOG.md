@@ -4,6 +4,54 @@
 
 ---
 
+## [2026-06-05] [F20 + F22] Open OASIS Wizard 化 + First-run welcome dialog
+
+**變更類型：** UX 補完（取代三層 modal cascade + 首次啟動 onboarding） ·  **狀態：完成**
+
+**動機：** F21 把右欄改造完後，剩下兩個 onboarding 缺口：(1) Open OASIS 仍是三層
+modal 串接（LayerFilterDialog → LayerPickDialog → QInputDialog root cell，新手卡在
+「root cell」黑話）；(2) 第一次打開 app 完全沒人說明這 app 在做什麼。
+
+**F20 OpenOasisWizard（取代 3 dialog）：** 新增 `OpenOasisWizard(QWizard)` 三頁——
+`_FilePickPage`（檔案選擇 + 顯示檔名 / 大小 / S_CELL_OFFSET 索引狀態 inline check 用
+`oasis_streamer.scan_cell_offsets`）+ `_LayerPickPage`（Scan layers 按鈕 → 內嵌
+QListWidget 多選 + 手動輸入 fallback；sources scan result 給下一頁用）+
+`_RootCellPage`（QComboBox + 推薦預選含 `top`/`merge` 的名稱 + 解釋一行）。`isComplete()`
+控制 Next 按鈕。MainWindow `_on_open_roi` 大瘦身：跑 wizard → accept 後取 file_path /
+layer_keys / root_cell 三值，後面 RAR 建構 + has_offsets 檢查 + state 寫入照舊。**刪掉
+`LayerFilterDialog` + `LayerPickDialog`（共 ~277 行）**。Guidance Step 1 文案改成
+「a 3-page wizard guides you」。
+
+**F22 WelcomeDialog（首次啟動 5 slide）：** 新增 `WelcomeDialog(QDialog)` + 模組常數
+`_WELCOME_SLIDES`：5 張 slide 為 (icon, title, body html)，QStackedWidget 切換 +
+Prev / Next / `Got it ✓`（末頁）+ ● ○ 進度點 + `[ ] Don't show again`（預設 on）。
+Help menu 加 `Show welcome…` action（永遠 enabled，user 手動再叫出）。MainWindow
+`showEvent` 首次觸發時 `QSettings("welcome_shown_v1")` 未設 → `QTimer.singleShot(0,
+self._show_welcome_dialog)` 在主視窗繪製完後彈出。`accept()` 寫回 QSettings。
+
+**測試環境 hook（重要）：** `MainWindow.showEvent` 自動跳 welcome 用 `dlg.exec()`，在
+test 環境 `processEvents()` 一旦呼叫就死鎖。conftest.py 啟動時預先 `QSettings("GLAS",
+"GLAS").setValue("welcome_shown_v1", True)`，讓 test 表現得像「曾經看過」的 user；
+welcome 本身仍在 `test_gds_align_f22.py` 直接 instantiate 驗證。
+
+**測試：** 全套件 **665 passed**（baseline F21 後 643 → +22）。新增
+`tests/test_gds_align_f20.py` 11 項（FilePickPage isComplete 邊界、LayerPickPage 文字
+解析 / scan 結果渲染、RootCellPage 從 scan_result 取 by_name 並推薦含 top 的名稱、
+MainWindow `_on_open_roi` 取消 wizard 不動 state、舊 dialog 不存在於 module）+
+`tests/test_gds_align_f22.py` 11 項（5 slide 載入 / 起始 idx=0 / Prev 邊界 / Next 末
+頁變 Got it / accept 寫 QSettings / 不勾不寫 / Help menu 有 Show welcome / `_show_
+welcome_dialog` 存在）。
+
+**影響檔案：** `docs/plans/F20-open-oasis-wizard.md`(新)、`docs/plans/F22-first-run-
+welcome.md`(新)、`glas/app/gds_align_tool.py`（新增 OpenOasisWizard + 三 page 類 +
+WelcomeDialog + _WELCOME_SLIDES；刪 LayerFilterDialog + LayerPickDialog；
+`_on_open_roi` 重寫；showEvent 接 welcome hook；Help menu + `_show_welcome_dialog`）、
+`conftest.py`（QSettings welcome flag pre-set）、`tests/test_gds_align_f20.py`(新)、
+`tests/test_gds_align_f22.py`(新)、`README.md`（使用流程 wizard 3 頁）、`CLAUDE.md` §8
+（移除 F20 / F22）、`SESSION_LOG.md`。 **Branch：** claude/youthful-gates-WLNYJ
+
+---
+
 ## [2026-06-05] [F21] PART/CHIP catalog 取代 Coordinate Setup + Origin δ UI 升級
 
 **變更類型：** UX 重大改造（取代 right-column setup form + δ 升級為常駐區塊 + 移除 fine

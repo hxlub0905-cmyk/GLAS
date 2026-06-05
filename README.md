@@ -59,7 +59,8 @@ python main.py
 ## 使用流程
 
 ```
-Open OASIS (ROI) → Load SEM (KLARF) → 選 PART / CHIP（catalog 帶座標）→ 點選 image 自動跳位/載 ROI
+Open OASIS（3 頁 wizard：file → layers → root cell）→ Load SEM (KLARF) →
+選 PART / CHIP（catalog 帶座標）→ 點選 image 自動跳位/載 ROI
 → 拖動對齊 + Set Offset（或 Fine Align 自動 matchTemplate）→ Export Alignment
 ```
 

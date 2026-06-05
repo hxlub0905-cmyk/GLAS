@@ -74,9 +74,10 @@ from PyQt6.QtWidgets import (
     QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
     QPlainTextEdit, QPushButton,
-    QScrollArea, QSizePolicy, QSpinBox, QSplitter, QStatusBar, QStyle,
+    QScrollArea, QSizePolicy, QSpinBox, QSplitter, QStackedWidget, QStatusBar,
+    QStyle,
     QStyledItemDelegate, QTableWidget, QTableWidgetItem, QToolButton,
-    QVBoxLayout, QWidget,
+    QVBoxLayout, QWidget, QWizard, QWizardPage,
 )
 
 try:
@@ -494,245 +495,209 @@ def roi_document_from_reader(rar, root, layer_keys, roi_bbox, cancel_cb=None,
 # ── Threaded loader (keeps the GUI responsive on big OASIS files) ────────────
 
 
-class LayerPickDialog(QDialog):
-    """Multi-select list of layers, shown after a successful layer scan.
+# ── F20: Open OASIS Wizard ──────────────────────────────────────────────────
 
-    Each row is ``L<layer>/D<datatype>  (optional name)``. ``selected_pairs()``
-    returns the chosen ``(layer, datatype)`` tuples in stable display order."""
 
-    def __init__(self, parent: Optional[QWidget],
-                 layers: list[dict], *, note: str = "") -> None:
+class _FilePickPage(QWizardPage):
+    """Step 1 — pick the .oas file and surface its index status."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Pick layers to load")
-        self.setModal(True)
-        self.setMinimumSize(420, 460)
+        self.setTitle("Step 1 — Pick an OASIS file")
+        self.setSubTitle(
+            "Choose the layout (.oas) file to align against your SEM "
+            "images. Large files are fine — only ROI geometry is loaded "
+            "on demand.")
 
         v = QVBoxLayout(self)
-        v.setContentsMargins(20, 16, 20, 14)
-        v.setSpacing(10)
+        v.setSpacing(8)
 
-        v.addWidget(QLabel(
-            f"<b>{len(layers)} layer(s)</b> discovered in this file. "
-            "Ctrl/Shift-click for multi-select.", self,
-        ))
-        if note:
-            note_lbl = QLabel(note, self)
-            note_lbl.setWordWrap(True)
-            note_lbl.setStyleSheet("color: #9a6a00;")
-            v.addWidget(note_lbl)
+        row = QHBoxLayout()
+        self._edit = QLineEdit(self)
+        self._edit.setReadOnly(True)
+        self._edit.setPlaceholderText("(no file selected)")
+        self._browse = QPushButton(_qicon("folder-open"), " Browse…", self)
+        self._browse.clicked.connect(self._on_browse)
+        row.addWidget(self._edit, 1)
+        row.addWidget(self._browse)
+        v.addLayout(row)
 
-        self._list = QListWidget(self)
-        self._list.setSelectionMode(
-            QListWidget.SelectionMode.ExtendedSelection)
-        for entry in sorted(layers, key=lambda d: (d["layer"], d["datatype"])):
-            label = f"L{entry['layer']}/D{entry['datatype']}"
-            if entry.get("name"):
-                label += f"   ·  {entry['name']}"
-            item = QListWidgetItem(label, self._list)
-            item.setData(Qt.ItemDataRole.UserRole,
-                         (int(entry["layer"]), int(entry["datatype"])))
-        v.addWidget(self._list, 1)
+        self._info = QLabel("", self)
+        self._info.setWordWrap(True)
+        self._info.setStyleSheet(_hint_qss(_FS_LABEL, pad="6px 0"))
+        v.addWidget(self._info)
 
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok
-            | QDialogButtonBox.StandardButton.Cancel, self,
-        )
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Use these")
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        v.addWidget(buttons)
+        self._warning = QLabel("", self)
+        self._warning.setWordWrap(True)
+        self._warning.setStyleSheet(
+            f"color:{_TK_ACCENT_DK.name()}; font-size:{_FS_LABEL}px; "
+            f"padding:4px 0;")
+        v.addWidget(self._warning)
+        v.addStretch(1)
 
-    def selected_pairs(self) -> list[tuple[int, int]]:
-        out: list[tuple[int, int]] = []
-        for item in self._list.selectedItems():
-            data = item.data(Qt.ItemDataRole.UserRole)
-            if isinstance(data, tuple) and len(data) == 2:
-                out.append((int(data[0]), int(data[1])))
-        return out
+        # Expose the chosen path through the wizard field API so the next
+        # pages (and the caller) can pick it up via ``wizard.field("file")``.
+        self.registerField("file*", self._edit)
 
+        self._file_path: Optional[str] = None
+        self._has_offsets = False
 
-class LayerFilterDialog(QDialog):
-    """Ask the user which layers to actually load.
+    def _on_browse(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open OASIS", "",
+            "OASIS files (*.oas *.oasis);;All files (*)")
+        if not path:
+            return
+        self._edit.setText(path)
+        self._update_info(path)
+        self.completeChanged.emit()
 
-    A 300 MB OASIS expands to 1.5–6 GB in klayout's in-memory layout, and the
-    "tens of GB" future case is completely infeasible to load whole. The
-    alignment workflow only needs 1–2 layers (POI + maybe a reference), so we
-    let the user list those up front; ``layer_map`` + ``create_other_layers
-    = False`` makes klayout skip everything else during the read itself.
-
-    Result via ``filter_pairs()``: list of ``(layer, datatype)`` ints, or an
-    empty list meaning "no filter — load everything" (only sensible for
-    small files).
-    """
-
-    def __init__(self, parent: Optional[QWidget], file_size_mb: float,
-                 file_name: str, file_path: str, *,
-                 roi_mode: bool = False) -> None:
-        super().__init__(parent)
-        self._roi_mode = roi_mode
-        self.setWindowTitle("Pick ROI layers" if roi_mode else "Layer filter")
-        self.setModal(True)
-        self.setMinimumWidth(_capped_min_width(540))
-
-        v = QVBoxLayout(self)
-        v.setContentsMargins(20, 16, 20, 14)
-        v.setSpacing(10)
-
-        risk = "high" if file_size_mb > 200 else (
-            "medium" if file_size_mb > 50 else "low")
-        if roi_mode:
-            info = QLabel(
-                f"<b>{file_name}</b> &nbsp; · &nbsp; {file_size_mb:,.0f} MB"
-                "<br><br>"
-                "Pick the layer(s) to show in ROI mode. Only the geometry "
-                "around the clicked SEM image is loaded, so this is fast even "
-                "on huge files."
-                "<br><br>"
-                "Click <b>Scan layers in file</b> to discover what's "
-                "available, or type pairs directly: "
-                "<code>layer/datatype</code>, comma-separated "
-                "(e.g. <code>17/0, 6/101</code>)."
-            )
+    def _update_info(self, path: str) -> None:
+        try:
+            p = Path(path)
+            size_mb = p.stat().st_size / 1024 / 1024
+        except OSError as exc:
+            self._info.setText(f"⚠ cannot stat file: {exc}")
+            self._warning.setText("")
+            self._has_offsets = False
+            return
+        # Cheap index check — only reads the small name-table section.
+        try:
+            import oasis_streamer
+            scan = oasis_streamer.scan_cell_offsets(path)
+            n_cells = len(scan.get("by_refnum", {}))
+            n_named = len(scan.get("by_name", {}))
+            self._has_offsets = bool(n_cells or n_named)
+        except Exception:
+            self._has_offsets = False
+            scan = {}
+        index_msg = (
+            f"✓ S_CELL_OFFSET index found ({max(n_cells, n_named):,} cells)"
+            if self._has_offsets else
+            "⚠ no S_CELL_OFFSET index — ROI mode unavailable")
+        self._info.setText(
+            f"<b>{p.name}</b> · {size_mb:,.1f} MB<br>{index_msg}")
+        if not self._has_offsets:
+            self._warning.setText(
+                "Without an S_CELL_OFFSET index, GLAS can't load ROIs on "
+                "demand. Re-save the file with KLayout (File → Save As → "
+                "OASIS, strict mode) and try again.")
         else:
-            info = QLabel(
-                f"<b>{file_name}</b> &nbsp; · &nbsp; {file_size_mb:,.0f} MB "
-                f"(in-RAM risk: <b>{risk}</b>)<br><br>"
-                "Large OASIS / GDS layouts can blow past available RAM when "
-                "loaded in full. The alignment workflow only needs a couple "
-                "of layers — let the reader skip everything else during "
-                "streaming.<br><br>"
-                "Click <b>Scan layers in file</b> to discover what's "
-                "available, or type pairs directly: "
-                "<code>layer/datatype</code>, comma-separated "
-                "(e.g. <code>20/0, 30/0</code>)."
-            )
-        info.setWordWrap(True)
-        info.setTextFormat(Qt.TextFormat.RichText)
-        v.addWidget(info)
+            self._warning.setText("")
+        self._file_path = path
+
+    def isComplete(self) -> bool:
+        # Allow Next even without offsets so the user sees the rest of the
+        # wizard; the actual blocker is enforced after Finish.
+        return bool(self._file_path) and Path(self._file_path).exists()
+
+    def file_path(self) -> Optional[str]:
+        return self._file_path
+
+    def has_offsets(self) -> bool:
+        return self._has_offsets
+
+
+class _LayerPickPage(QWizardPage):
+    """Step 2 — scan the file and let the user multi-select layers."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setTitle("Step 2 — Pick layers to load")
+        self.setSubTitle(
+            "GLAS only loads the layers you need — picking 1–3 is the norm. "
+            "Click Scan to discover what's in the file, or type "
+            "<code>layer/datatype</code> pairs directly.")
+
+        v = QVBoxLayout(self)
+        v.setSpacing(8)
 
         scan_row = QHBoxLayout()
-        scan_row.setSpacing(8)
-        self._scan_btn = QPushButton("Scan layers in file", self)
-        self._scan_btn.setProperty("variant", "primary")
+        self._scan_btn = QPushButton(_qicon("layers"), " Scan layers", self)
         self._scan_btn.clicked.connect(self._on_scan)
         scan_row.addWidget(self._scan_btn)
         scan_row.addStretch(1)
         v.addLayout(scan_row)
 
+        self._list = QListWidget(self)
+        self._list.setSelectionMode(
+            QListWidget.SelectionMode.ExtendedSelection)
+        self._list.itemSelectionChanged.connect(self._on_list_changed)
+        v.addWidget(self._list, 1)
+
+        v.addWidget(QLabel("…or type pairs (e.g. <code>20/0, 30/0</code>):"))
         self._edit = QLineEdit(self)
-        self._edit.setPlaceholderText("e.g.  20/0, 30/0")
+        self._edit.setPlaceholderText("layer/datatype, comma-separated")
+        self._edit.textChanged.connect(lambda _t: self.completeChanged.emit())
         v.addWidget(self._edit)
 
+        self._status = QLabel("", self)
+        self._status.setWordWrap(True)
+        self._status.setStyleSheet(_hint_qss(_FS_LABEL, pad="4px 0"))
+        v.addWidget(self._status)
 
-        self._warning = QLabel("", self)
-        self._warning.setStyleSheet(_hint_qss(_FS_LABEL, _TK_ACCENT_DK.name()))
-        self._warning.setWordWrap(True)
-        v.addWidget(self._warning)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok
-            | QDialogButtonBox.StandardButton.Cancel, self,
-        )
-        buttons.accepted.connect(self._on_ok)
-        buttons.rejected.connect(self.reject)
-        v.addWidget(buttons)
-        self._ok_btn = buttons.button(QDialogButtonBox.StandardButton.Ok)
-        self._ok_btn.setText("Pick root cell…" if roi_mode else "Load")
-
-        self._file_size_mb = file_size_mb
-        self._file_path = file_path
-        self._pairs: list[tuple[int, int]] = []
-        # Scan-mode state (set during _on_scan).
+        # Scan-mode state.
         self._scan_thread: Optional[QThread] = None
         self._scan_worker: Optional[LayerScanWorker] = None
-        self._scan_progress: Optional[LoadProgressDialog] = None
+        self._scan_result: dict = {}
 
-    def filter_pairs(self) -> list[tuple[int, int]]:
-        return list(self._pairs)
+    def initializePage(self) -> None:
+        # Reset whenever the user revisits the page.
+        self._list.clear()
+        self._edit.clear()
+        self._status.setText("")
 
-    # ── Layer scan flow ────────────────────────────────────────────────────
     def _on_scan(self) -> None:
         if self._scan_thread is not None:
-            return  # already scanning
+            return
+        path = self.field("file")
+        if not path:
+            return
         self._scan_btn.setEnabled(False)
-        self._warning.setText("")
-
-        self._scan_progress = LoadProgressDialog(self)
-        self._scan_progress.set_text(
-            f"Scanning {Path(self._file_path).name} for available layers…\n"
-            "(this can be slow for big files; cancel to fall back to manual "
-            "entry)"
-        )
-
+        self._status.setText(f"Scanning {Path(path).name}…")
         self._scan_thread = QThread(self)
-        self._scan_worker = LayerScanWorker(self._file_path)
+        self._scan_worker = LayerScanWorker(str(path))
         self._scan_worker.moveToThread(self._scan_thread)
         self._scan_thread.started.connect(self._scan_worker.run)
-
-        self._scan_worker.progress.connect(self._scan_progress.set_text)
+        self._scan_worker.progress.connect(self._status.setText)
         self._scan_worker.finished.connect(self._on_scan_finished)
         self._scan_worker.failed.connect(self._on_scan_failed)
-        self._scan_worker.cancelled.connect(self._on_scan_cancelled)
-        self._scan_progress.cancel_requested.connect(self._scan_worker.cancel)
-
+        self._scan_worker.cancelled.connect(
+            lambda: self._status.setText("Scan cancelled."))
         for sig in (self._scan_worker.finished,
                     self._scan_worker.failed,
                     self._scan_worker.cancelled):
             sig.connect(self._scan_thread.quit)
         self._scan_thread.finished.connect(self._cleanup_scan)
-
-        self._scan_progress.show()
-        QApplication.processEvents()
         self._scan_thread.start()
 
     def _on_scan_finished(self, result: object) -> None:
-        # F12: result is {"layers": [...], "source": "layername"|"sampled"|
-        # "no-index"}. (A bare list is tolerated for safety.)
         if isinstance(result, dict):
             layers = result.get("layers") or []
-            source = result.get("source", "")
+            self._scan_result = result
         else:
-            layers = result if isinstance(result, list) else []
-            source = ""
-
+            layers = list(result) if isinstance(result, list) else []
+            self._scan_result = {"layers": layers}
         if not layers:
-            if source == "no-index":
-                self._warning.setText(
-                    "This file has no LAYERNAME table and no S_CELL_OFFSET "
-                    "index, so layers can't be enumerated.\nRe-save it with "
-                    "KLayout (open ▸ Save As ▸ .oas) to add the index tables, "
-                    "then scan again — or type pairs manually.")
-            else:
-                self._warning.setText(
-                    "Scan found no layers; type pairs manually.")
+            self._status.setText(
+                "Scan found no layers — type pairs manually below.")
             return
-
-        # A sampled (no-LAYERNAME) scan is not guaranteed exhaustive; tell the
-        # user they can still type a pair the sample missed.
-        note = ("Sampled from geometry (no LAYERNAME table) — a rarely-used "
-                "layer may be missing; type it manually if so."
-                if source == "sampled" else "")
-        pick = LayerPickDialog(self, layers, note=note)
-        if pick.exec() == QDialog.DialogCode.Accepted:
-            picks = pick.selected_pairs()
-            if picks:
-                self._edit.setText(
-                    ", ".join(f"{l}/{d}" for l, d in picks))
-                self._warning.setText("")
+        self._list.clear()
+        for entry in sorted(layers, key=lambda d: (d["layer"], d["datatype"])):
+            label = f"L{entry['layer']}/D{entry['datatype']}"
+            if entry.get("name"):
+                label += f"   ·  {entry['name']}"
+            it = QListWidgetItem(label, self._list)
+            it.setData(Qt.ItemDataRole.UserRole,
+                       (int(entry["layer"]), int(entry["datatype"])))
+        self._status.setText(
+            f"Found {len(layers)} layer(s) — select one or more above.")
 
     def _on_scan_failed(self, msg: str) -> None:
-        self._warning.setText(
-            f"Scan failed — fall back to manual entry.\n{msg.splitlines()[0]}")
-
-    def _on_scan_cancelled(self) -> None:
-        self._warning.setText("Scan cancelled.")
+        self._status.setText(
+            f"Scan failed: {msg.splitlines()[0]} — use manual entry below.")
 
     def _cleanup_scan(self) -> None:
-        if self._scan_progress is not None:
-            self._scan_progress.shutdown()
-            self._scan_progress.close()
-            self._scan_progress.deleteLater()
-            self._scan_progress = None
         if self._scan_worker is not None:
             self._scan_worker.deleteLater()
             self._scan_worker = None
@@ -741,34 +706,149 @@ class LayerFilterDialog(QDialog):
             self._scan_thread = None
         self._scan_btn.setEnabled(True)
 
-    def _on_ok(self) -> None:
-        text = self._edit.text().strip()
-        pairs: list[tuple[int, int]] = []
-        if text:
-            for chunk in text.split(","):
-                chunk = chunk.strip()
-                if not chunk:
-                    continue
+    def _on_list_changed(self) -> None:
+        self.completeChanged.emit()
+
+    def _parse_text(self) -> list[tuple[int, int]]:
+        out: list[tuple[int, int]] = []
+        for chunk in self._edit.text().split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            try:
                 if "/" in chunk:
                     l_s, d_s = chunk.split("/", 1)
                 else:
                     l_s, d_s = chunk, "0"
+                out.append((int(l_s), int(d_s)))
+            except ValueError:
+                return []   # any parse error invalidates the lot
+        return out
+
+    def isComplete(self) -> bool:
+        return bool(self.layer_keys())
+
+    def layer_keys(self) -> list[tuple[int, int]]:
+        # Selected items take precedence; fall back to text entry so a user
+        # can manually key a layer the scan didn't surface.
+        from_list: list[tuple[int, int]] = []
+        for item in self._list.selectedItems():
+            data = item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(data, tuple) and len(data) == 2:
+                from_list.append((int(data[0]), int(data[1])))
+        if from_list:
+            return from_list
+        return self._parse_text()
+
+    def scan_result(self) -> dict:
+        return self._scan_result
+
+
+class _RootCellPage(QWizardPage):
+    """Step 3 — pick the root (top) cell. We pre-select a name containing
+    ``top`` or ``merge``; users keep the default unless they know better."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setTitle("Step 3 — Pick the root cell")
+        self.setSubTitle(
+            "The root cell is the top of the layout hierarchy — usually the "
+            "whole chip. The recommended default is named ‘top’ or ‘merge’; "
+            "if your file uses a different convention, override below.")
+
+        v = QVBoxLayout(self)
+        v.setSpacing(8)
+        self._combo = QComboBox(self)
+        self._combo.setEditable(False)
+        self._combo.currentTextChanged.connect(
+            lambda _t: self.completeChanged.emit())
+        v.addWidget(self._combo)
+
+        self._status = QLabel("", self)
+        self._status.setWordWrap(True)
+        self._status.setStyleSheet(_hint_qss(_FS_LABEL, pad="4px 0"))
+        v.addWidget(self._status)
+        v.addStretch(1)
+
+    def initializePage(self) -> None:
+        # The names come from the file's S_CELL_OFFSET name table, which
+        # ``scan_cell_offsets`` already returned during Step 2. Falling back
+        # to a fresh scan keeps the page usable if the user typed pairs and
+        # skipped scanning.
+        wiz = self.wizard()
+        names: list[str] = []
+        scan = wiz.layer_page().scan_result() if wiz else {}
+        by_name = scan.get("by_name") if isinstance(scan, dict) else None
+        if by_name:
+            names = list(by_name.keys())
+        else:
+            path = self.field("file")
+            if path:
                 try:
-                    pairs.append((int(l_s), int(d_s)))
-                except ValueError:
-                    self._warning.setText(
-                        f"Can't parse '{chunk}' — expected layer/datatype "
-                        "(integers).")
-                    return
-        if not pairs and self._file_size_mb > 200:
-            # Empty filter on a likely-OOM file: force the user to confirm.
-            if self._warning.text() == "":
-                self._warning.setText(
-                    "No filter set on a large file — loading may exhaust "
-                    "memory. Click Load again to proceed anyway.")
-                return
-        self._pairs = pairs
-        self.accept()
+                    import oasis_streamer
+                    res = oasis_streamer.scan_cell_offsets(path)
+                    names = list(res.get("by_name", {}).keys())
+                except Exception:
+                    names = []
+        self._combo.clear()
+        if not names:
+            self._status.setText(
+                "⚠ no cell names found — file may lack a name table.")
+            self.completeChanged.emit()
+            return
+        self._combo.addItems(names)
+        default = next(
+            (n for n in names if "top" in n.lower() or "merge" in n.lower()),
+            names[-1])
+        idx = names.index(default)
+        self._combo.setCurrentIndex(idx)
+        self._status.setText(
+            f"Recommended: <b>{default}</b> "
+            f"(name looks like a top cell; out of {len(names):,} cells).")
+        self.completeChanged.emit()
+
+    def isComplete(self) -> bool:
+        return bool(self._combo.currentText())
+
+    def root_cell(self) -> str:
+        return self._combo.currentText()
+
+
+class OpenOasisWizard(QWizard):
+    """F20: replaces the LayerFilterDialog + LayerPickDialog + QInputDialog
+    root-cell cascade with a single three-page wizard. The caller reads the
+    chosen file / layers / root cell via :meth:`file_path` / :meth:`layer_keys`
+    / :meth:`root_cell` after :py:meth:`exec` returns ``Accepted``."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Open OASIS")
+        self.setOption(QWizard.WizardOption.NoBackButtonOnStartPage, True)
+        self.setMinimumSize(640, 520)
+
+        self._file_page = _FilePickPage(self)
+        self._layer_page = _LayerPickPage(self)
+        self._root_page = _RootCellPage(self)
+        self.addPage(self._file_page)
+        self.addPage(self._layer_page)
+        self.addPage(self._root_page)
+
+    # Public accessors (used by MainWindow._on_open_roi after exec()).
+
+    def file_path(self) -> Optional[str]:
+        return self._file_page.file_path()
+
+    def has_offsets(self) -> bool:
+        return self._file_page.has_offsets()
+
+    def layer_keys(self) -> list[tuple[int, int]]:
+        return self._layer_page.layer_keys()
+
+    def root_cell(self) -> str:
+        return self._root_page.root_cell()
+
+    def layer_page(self) -> "_LayerPickPage":
+        return self._layer_page
 
 
 class _AnimatedBar(QWidget):
@@ -5109,6 +5189,179 @@ class SemPanel(QFrame):
             self.image_selected.emit(img)
 
 
+# ── F22: First-run welcome ──────────────────────────────────────────────────
+
+
+# Five-slide onboarding: tuple of (icon_name, title, html_body). Kept as a
+# module-level constant so the layout pass is just data + a stacked widget.
+_WELCOME_SLIDES: list[tuple[str, str, str]] = [
+    (
+        "target",
+        "Welcome to GLAS",
+        "<p><b>GLAS</b> aligns <b>GDS / OASIS layouts</b> to <b>SEM "
+        "images</b> so downstream measurement tools can find the right "
+        "feature on every defect.</p>"
+        "<p>This 5-step tour walks you through the workflow — you can "
+        "re-open it any time from <b>Help → Show welcome…</b></p>",
+    ),
+    (
+        "folder-open",
+        "Step 1 — Open OASIS",
+        "<p>Click the orange <b>Open OASIS…</b> button on the toolbar. "
+        "A wizard guides you through three short steps:</p>"
+        "<ol>"
+        "<li>Pick the <code>.oas</code> file</li>"
+        "<li>Scan + pick the layer(s) you want to load</li>"
+        "<li>Confirm the root (top) cell (a recommendation is pre-selected)</li>"
+        "</ol>"
+        "<p>Big files are fine — GLAS only loads geometry around each "
+        "clicked defect.</p>",
+    ),
+    (
+        "layers",
+        "Step 2 — Pick PART / CHIP",
+        "<p>In the right column, pick <b>PART</b> then <b>CHIP</b> from "
+        "the dropdowns. The catalog supplies the chip-corner offset, the "
+        "default FOV, and the overlay scale — no need to type RFL "
+        "numbers.</p>"
+        "<p>Need a CHIP that isn't listed? An administrator can add it "
+        "in developer mode (<i>Help → About</i>, click the icon 5×, then "
+        "use <b>⚙ Edit catalog…</b>).</p>",
+    ),
+    (
+        "target",
+        "Step 3 — Click a defect, drag, Set Offset",
+        "<p>Load a KLARF (right column <b>Load SEM…</b>), then click a "
+        "defect in the list. GLAS auto-jumps and loads the GDS ROI.</p>"
+        "<p>The half-transparent GDS overlay drops on top of the SEM. "
+        "<b>Left-drag</b> it into alignment, then click <b>Set Offset</b> "
+        "in the ALIGNMENT δ block to lock it in. δ applies to every "
+        "defect afterwards.</p>"
+        "<p>Wheel zooms; middle / right-drag pans; <code>Ctrl + arrows</code> "
+        "nudge δ by 10 nm.</p>",
+    ),
+    (
+        "download",
+        "Step 4 — Fine align, then export",
+        "<p>Tick a layer's <b>POI</b> button on the left to mark it as a "
+        "template, expand the right-column <b>Fine Align</b> section, and "
+        "click <b>Run all</b>. Each defect gets a colour-coded score "
+        "badge in the image list (green / amber / red).</p>"
+        "<p>When you're happy, use the toolbar's <b>Export Alignment…</b> "
+        "to write CSV / JSON for the downstream measurement recipe.</p>"
+        "<p>That's the whole workflow. Have fun!</p>",
+    ),
+]
+
+
+class WelcomeDialog(QDialog):
+    """First-run onboarding (F22). 5 ASCII / icon-based slides with
+    Prev / Next navigation, persistent "Don't show again" preference."""
+
+    SETTING_KEY = "welcome_shown_v1"
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Welcome to GLAS")
+        self.setModal(True)
+        self.setMinimumSize(640, 420)
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(16, 16, 16, 12)
+        v.setSpacing(10)
+
+        self._stack = QStackedWidget(self)
+        for icon, title, body in _WELCOME_SLIDES:
+            self._stack.addWidget(self._build_slide(icon, title, body))
+        v.addWidget(self._stack, 1)
+
+        # Progress dots (● for visited / current, ○ for upcoming).
+        self._dots = QLabel("", self)
+        self._dots.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._dots.setStyleSheet(
+            f"color:{_TK_ACCENT_DK.name()}; font-size:{_FS_LABEL}px; "
+            f"letter-spacing:4px;")
+        v.addWidget(self._dots)
+
+        # Footer: Don't show again | Prev | Next/Got it
+        footer = QHBoxLayout()
+        self._dont_show = QCheckBox("Don't show this again", self)
+        self._dont_show.setChecked(True)
+        footer.addWidget(self._dont_show)
+        footer.addStretch(1)
+        self._prev_btn = QPushButton("◀  Prev", self)
+        self._prev_btn.clicked.connect(self._on_prev)
+        self._next_btn = QPushButton("Next  ▶", self)
+        self._next_btn.clicked.connect(self._on_next)
+        self._next_btn.setProperty("variant", "primary")
+        footer.addWidget(self._prev_btn)
+        footer.addWidget(self._next_btn)
+        v.addLayout(footer)
+
+        self._update_state()
+
+    @staticmethod
+    def _build_slide(icon_name: str, title: str, body_html: str) -> QWidget:
+        w = QWidget()
+        h = QHBoxLayout(w)
+        h.setContentsMargins(12, 18, 12, 12)
+        h.setSpacing(18)
+        # Icon column (big version of an existing toolbar icon).
+        ic = _qicon(icon_name)
+        icon_lbl = QLabel()
+        if not ic.isNull():
+            icon_lbl.setPixmap(ic.pixmap(96, 96))
+        icon_lbl.setAlignment(Qt.AlignmentFlag.AlignTop)
+        icon_lbl.setFixedWidth(112)
+        h.addWidget(icon_lbl)
+        # Text column.
+        text_col = QVBoxLayout()
+        text_col.setSpacing(8)
+        title_lbl = QLabel(title)
+        title_lbl.setStyleSheet(
+            f"color:{_TK_ACCENT_DK.name()}; "
+            f"font-size:{max(_FS_LABEL + 5, 18)}px; font-weight:700;")
+        text_col.addWidget(title_lbl)
+        body_lbl = QLabel(body_html)
+        body_lbl.setWordWrap(True)
+        body_lbl.setTextFormat(Qt.TextFormat.RichText)
+        body_lbl.setStyleSheet(
+            f"color:{_TK_TEXT_PRI.name()}; font-size:{_FS_LABEL}px; "
+            f"line-height:1.5;")
+        text_col.addWidget(body_lbl)
+        text_col.addStretch(1)
+        h.addLayout(text_col, 1)
+        return w
+
+    def _update_state(self) -> None:
+        idx = self._stack.currentIndex()
+        n = self._stack.count()
+        self._prev_btn.setEnabled(idx > 0)
+        is_last = idx == n - 1
+        self._next_btn.setText("Got it  ✓" if is_last else "Next  ▶")
+        self._dots.setText(
+            "  ".join("●" if i <= idx else "○" for i in range(n)))
+
+    def _on_prev(self) -> None:
+        i = self._stack.currentIndex()
+        if i > 0:
+            self._stack.setCurrentIndex(i - 1)
+            self._update_state()
+
+    def _on_next(self) -> None:
+        i = self._stack.currentIndex()
+        if i < self._stack.count() - 1:
+            self._stack.setCurrentIndex(i + 1)
+            self._update_state()
+        else:
+            self.accept()
+
+    def accept(self) -> None:  # type: ignore[override]
+        if self._dont_show.isChecked():
+            QSettings("GLAS", "GLAS").setValue(self.SETTING_KEY, True)
+        super().accept()
+
+
 class DebugReportDialog(QDialog):
     """F10: show a copyable plain-text diagnostic report; optionally note the
     sidecar file it was saved to."""
@@ -5664,6 +5917,17 @@ class MainWindow(QMainWindow):
         if not self._split_sized:
             self._split_sized = True
             QTimer.singleShot(0, self._fit_split_sizes)
+            # F22: first launch — defer welcome dialog one event loop tick so
+            # the main window is already painted underneath it.
+            settings = QSettings("GLAS", "GLAS")
+            if not settings.value(WelcomeDialog.SETTING_KEY, False, type=bool):
+                QTimer.singleShot(0, self._show_welcome_dialog)
+
+    def _show_welcome_dialog(self) -> None:
+        """Open the onboarding dialog. Triggered both by first-launch and the
+        Help → Show welcome… menu entry."""
+        dlg = WelcomeDialog(self)
+        dlg.exec()
 
     def _fit_split_sizes(self) -> None:
         w = self._main_split.width()
@@ -5938,7 +6202,7 @@ class MainWindow(QMainWindow):
     def _update_guidance(self) -> None:
         """Show the next workflow step; hide the strip once set up (M6.6)."""
         if self._rar is None and self._doc is None:
-            msg = "Step 1 — Open an OASIS: toolbar “Open OASIS…” (scan + pick layers / root cell)."
+            msg = "Step 1 — Open an OASIS: toolbar “Open OASIS…” — a 3-page wizard guides you (file → layers → root cell)."
         elif not self._sem_images:
             msg = "Step 2 — Load SEM: right panel “Load SEM…” (KLARF file or image folder)."
         elif self._fov_w <= 0 or self._fov_h <= 0:
@@ -5970,6 +6234,10 @@ class MainWindow(QMainWindow):
         menu.addAction(quit_action)
 
         help_menu = self.menuBar().addMenu("&Help")
+        welcome_action = QAction("Show &welcome…", self)
+        welcome_action.triggered.connect(self._show_welcome_dialog)
+        help_menu.addAction(welcome_action)
+        help_menu.addSeparator()
         about_action = QAction("&About", self)
         about_action.triggered.connect(self._show_about)
         help_menu.addAction(about_action)
@@ -7039,25 +7307,17 @@ class MainWindow(QMainWindow):
             self._roi_thread = None
 
     def _on_open_roi(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Open OASIS", "",
-            "OASIS files (*.oas *.oasis);;All files (*)")
-        if not path:
+        """F20: three-page wizard replaces the file-dialog + LayerFilter +
+        LayerPick + QInputDialog-root-cell cascade."""
+        wiz = OpenOasisWizard(self)
+        if wiz.exec() != QDialog.DialogCode.Accepted:
+            return
+        path = wiz.file_path()
+        layer_keys = wiz.layer_keys()
+        root = wiz.root_cell()
+        if not (path and layer_keys and root):
             return
         self._roi_load_path = path   # F10: remembered for debug-mode diagnostics
-        # Scan the file for available layers and let the user multi-select
-        # (same flow the old full-load entry used), instead of typing
-        # layer/datatype pairs by hand.
-        size_mb = Path(path).stat().st_size / 1024 / 1024
-        dlg = LayerFilterDialog(self, size_mb, Path(path).name, path,
-                                roi_mode=True)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
-        layer_keys = dlg.filter_pairs()
-        if not layer_keys:
-            QMessageBox.warning(self, "ROI layers",
-                                "Pick (or type) at least one layer to load.")
-            return
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             import time as _t
@@ -7065,9 +7325,6 @@ class MainWindow(QMainWindow):
             rar = oasis_random.RandomAccessReader(
                 path, wanted_layers=set(layer_keys),
                 bbox_layer=oasis_random.DEFAULT_BBOX_LAYER)
-            # One-time build telemetry (F16): index size + whether each cell got
-            # an S_BOUNDING_BOX. n_sbbox ≈ cell count => ROI prune is decode-free;
-            # n_sbbox == 0 => fall back to bbox-by-decode (slow first load).
             n_sbbox = len(rar._sbbox_by_refnum) + len(rar._sbbox_by_name)
             print(f"[roi] reader built in {_t.perf_counter() - _t0:.1f}s · "
                   f"{len(rar._by_refnum):,} cells indexed · S_BOUNDING_BOX on "
@@ -7086,30 +7343,16 @@ class MainWindow(QMainWindow):
                 "ROI load isn't possible. Re-export the layout with "
                 "per-cell offsets, or load a smaller file.")
             return
-        # Pick the root cell from the cellname list (default: a name that
-        # looks like a top cell, else the last-defined name).
-        names = list(rar._by_name.keys())
-        default = next((n for n in names
-                        if "top" in n.lower() or "merge" in n.lower()),
-                       names[-1] if names else "")
-        root, ok = QInputDialog.getItem(
-            self, "ROI root cell", "Root (top) cell:", names,
-            names.index(default) if default in names else 0, False)
-        if not ok or not root:
-            return
         self._rar = rar
         self._oas_path = path
         self._roi_root = root
         self._roi_layers = layer_keys
-        # New layout → drop any recipes from a previously-open file (recipes
-        # persist across ROI reloads of the SAME file, not across files).
+        # New layout → drop any recipes from a previously-open file.
         self._recipes = []
         lyr_txt = ", ".join(f"L{l}/D{d}" for l, d in layer_keys)
         self._status_doc.setText(
             f"ROI mode: {Path(path).name} · root '{root}' · {lyr_txt}"
             f" · {len(rar._by_refnum):,} cells indexed · click a SEM image")
-        # Frame all defect positions so the marker has a visible span to
-        # jump across; then jump to the current image (auto-loads its ROI).
         self._fit_view_to_defects()
         if self._current_sem is not None:
             self._jump_to_image(self._current_sem)
