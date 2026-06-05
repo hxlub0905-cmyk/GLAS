@@ -205,7 +205,9 @@ class TestRound2:
         assert mw.sem_panel.findChildren(QScrollArea)
 
     def test_right_panel_width(self, mw):
-        assert mw.sem_panel.width() == 300
+        # Widened in PR #11 follow-up so the vertical scrollbar can appear
+        # without clipping combobox / spinbox / button controls.
+        assert mw.sem_panel.width() == 320
 
 
 class TestOverviewMap:

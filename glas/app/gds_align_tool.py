@@ -3913,7 +3913,9 @@ class AlignmentDeltaPanel(QFrame):
         v.addWidget(self._x_lbl)
         v.addWidget(self._y_lbl)
 
-        # Set / Clear / Copy row.
+        # Set / Clear row (two equal stretching buttons — no third icon
+        # button so the row never overflows the 300-px-fixed right column
+        # when the vertical scrollbar appears).
         btn_row = QHBoxLayout()
         btn_row.setSpacing(6)
         self.set_btn = QPushButton("Set Offset")
@@ -3922,16 +3924,25 @@ class AlignmentDeltaPanel(QFrame):
             "Shortcut: arrow keys with Ctrl nudge δ by 10 nm.")
         self.clear_btn = QPushButton("Clear")
         self.clear_btn.setToolTip("Reset alignment δ and any pending drag.")
-        self._copy_btn = QPushButton("⧉")
-        self._copy_btn.setToolTip("Copy δ (X, Y nm) to the clipboard.")
-        self._copy_btn.setFixedWidth(32)
         self.set_btn.clicked.connect(self.set_requested)
         self.clear_btn.clicked.connect(self.clear_requested)
-        self._copy_btn.clicked.connect(self._on_copy)
         btn_row.addWidget(self.set_btn, 1)
         btn_row.addWidget(self.clear_btn, 1)
-        btn_row.addWidget(self._copy_btn)
         v.addLayout(btn_row)
+
+        # Copy δ — small flat link-style button on its own line so the
+        # button label is always readable (a ⧉ Unicode icon shrank into
+        # an unrecognisable square on some platforms).
+        self._copy_btn = QPushButton("Copy δ to clipboard", self)
+        self._copy_btn.setToolTip("Copy (dx, dy) nm to the system clipboard.")
+        self._copy_btn.setFlat(True)
+        self._copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._copy_btn.setStyleSheet(
+            f"QPushButton {{ color:{_TK_ACCENT_DK.name()}; "
+            f"font-size:{_FS_MICRO}px; text-align:left; padding:2px 0; }}"
+            f"QPushButton:hover {{ text-decoration: underline; }}")
+        self._copy_btn.clicked.connect(self._on_copy)
+        v.addWidget(self._copy_btn)
 
         hint = QLabel("Drag GDS overlay → Set. Ctrl+arrow keys nudge ±10 nm.")
         hint.setWordWrap(True)
@@ -5042,7 +5053,10 @@ class SemPanel(QFrame):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setObjectName("rightPanel")
-        self.setFixedWidth(300)          # M7 R8: a touch wider eases density
+        # 320 px reserves room for a vertical scrollbar (~16 px) plus the
+        # combo / spin / button widgets so their controls (▼, ↑↓, …) aren't
+        # clipped when the column scrolls (reported on PR #11 screenshot).
+        self.setFixedWidth(320)
         # M7 R4: scroll the whole column when both collapsibles + the list
         # exceed the window height, instead of clipping.
         outer = QVBoxLayout(self)
@@ -5966,7 +5980,7 @@ class MainWindow(QMainWindow):
         if w <= 0:
             return
         lw = self.layer_panel.width() or 260
-        rw = self.sem_panel.width() or 280
+        rw = self.sem_panel.width() or 320
         self._main_split.setSizes([lw, max(400, w - lw - rw), rw])
 
     # ── construction helpers ───────────────────────────────────────────────
