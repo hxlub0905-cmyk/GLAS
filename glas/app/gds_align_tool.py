@@ -3930,19 +3930,34 @@ class AlignmentDeltaPanel(QFrame):
         btn_row.addWidget(self.clear_btn, 1)
         v.addLayout(btn_row)
 
-        # Copy δ — small flat link-style button on its own line so the
-        # button label is always readable (a ⧉ Unicode icon shrank into
-        # an unrecognisable square on some platforms).
-        self._copy_btn = QPushButton("Copy δ to clipboard", self)
+        # Copy δ — full-width, icon + label, accent-bordered button on its
+        # own line. The earlier ⧉ Unicode glyph rendered as an
+        # unrecognisable square on some platforms; this version pairs the
+        # Lucide-style copy SVG with a clear label, and confirms with a
+        # transient label flip ("Copied ✓") so the click feels acknowledged.
+        self._copy_btn = QPushButton(_qicon("copy"), " Copy δ to clipboard",
+                                     self)
         self._copy_btn.setToolTip("Copy (dx, dy) nm to the system clipboard.")
-        self._copy_btn.setFlat(True)
         self._copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._copy_btn.setStyleSheet(
-            f"QPushButton {{ color:{_TK_ACCENT_DK.name()}; "
-            f"font-size:{_FS_MICRO}px; text-align:left; padding:2px 0; }}"
-            f"QPushButton:hover {{ text-decoration: underline; }}")
+            f"QPushButton {{ background:#fff5e8; "
+            f"color:{_TK_ACCENT_DK.name()}; "
+            f"border:1px solid {_TK_ACCENT_DK.name()}; "
+            f"border-radius:4px; padding:5px 10px; "
+            f"font-size:{_FS_CAPTION}px; font-weight:600; }}"
+            f"QPushButton:hover {{ background:{_TK_ACCENT.name()}; "
+            f"color:#ffffff; }}"
+            f"QPushButton:pressed {{ background:{_TK_ACCENT_DK.name()}; "
+            f"color:#ffffff; }}")
         self._copy_btn.clicked.connect(self._on_copy)
         v.addWidget(self._copy_btn)
+
+        # Snap-back timer for the post-copy confirmation label flip.
+        self._copy_revert_timer = QTimer(self)
+        self._copy_revert_timer.setSingleShot(True)
+        self._copy_revert_timer.setInterval(1200)
+        self._copy_revert_timer.timeout.connect(
+            lambda: self._copy_btn.setText(" Copy δ to clipboard"))
 
         hint = QLabel("Drag GDS overlay → Set. Ctrl+arrow keys nudge ±10 nm.")
         hint.setWordWrap(True)
@@ -3968,6 +3983,10 @@ class AlignmentDeltaPanel(QFrame):
         if app is None:
             return
         app.clipboard().setText(f"{self._dx:.0f}, {self._dy:.0f}")
+        # Transient confirmation so the click feels acknowledged; reverts
+        # back to the default label after ~1.2 s.
+        self._copy_btn.setText(" Copied ✓")
+        self._copy_revert_timer.start()
 
 
 class CatalogEditorDialog(QDialog):
