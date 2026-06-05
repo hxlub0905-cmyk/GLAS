@@ -208,6 +208,47 @@ class TestCacheV5:
         assert v["part_id"] == "TMVG10"
         assert v["chip_id"] == "C2"
 
+    def test_set_from_meta_preserves_custom_fov_override(self, mw):
+        # Codex PR #11 review: a cache exported with Custom FOV active
+        # stores the overridden FOV/scale in meta. The v5 restore path must
+        # re-enable Custom and load those values, not silently snap back to
+        # the catalog defaults (which would shift the alignment).
+        panel = mw.sem_panel.coord_setup
+        # The fixture catalog has TMVG10/C1 with fov_w_nm=1500 by default.
+        meta = gds_layer_cache.LayerCacheMeta(
+            source_oas="x.oas", source_mtime=0.0, source_size=0,
+            chip_corner_x=10_000.0, chip_corner_y=20_000.0,
+            chip_x_um=10.0, chip_y_um=20.0,
+            fov_w=3000.0, fov_h=2500.0,   # divergent from catalog
+            nm_per_px=1.75,                # also divergent
+            part_id="TMVG10", chip_id="C1")
+        panel.set_from_meta(meta)
+        v = panel.values()
+        assert v["part_id"] == "TMVG10"
+        assert v["chip_id"] == "C1"
+        # Custom override must be on and carry the cached values.
+        assert panel._customising is True
+        assert panel._custom_chk.isChecked() is True
+        assert v["fov_w"] == 3000.0
+        assert v["fov_h"] == 2500.0
+        assert v["nm_auto"] is False
+        assert v["nm_per_px_manual"] == pytest.approx(1.75)
+
+    def test_set_from_meta_matching_fov_skips_custom(self, mw):
+        # Counter-check: when cached FOV / scale equal the catalog defaults,
+        # Custom must NOT be enabled (it's only restored on divergence).
+        panel = mw.sem_panel.coord_setup
+        meta = gds_layer_cache.LayerCacheMeta(
+            source_oas="x.oas", source_mtime=0.0, source_size=0,
+            chip_corner_x=10_000.0, chip_corner_y=20_000.0,
+            chip_x_um=10.0, chip_y_um=20.0,
+            fov_w=1500.0, fov_h=1500.0,
+            nm_per_px=0.0,   # 0 => auto, matches chip C1 default (nm_per_px=None)
+            part_id="TMVG10", chip_id="C1")
+        panel.set_from_meta(meta)
+        assert panel._customising is False
+        assert panel._custom_chk.isChecked() is False
+
     def test_set_from_meta_legacy_v4(self, mw):
         # v4 cache: no part_id/chip_id → "legacy snapshot" mode shows the
         # stored coordinates and disables the dropdowns.

@@ -3792,9 +3792,12 @@ class PartChipPanel(QFrame):
         cid = getattr(meta, "chip_id", None)
         part = self._catalog.get(pid) if pid else None
         if part is not None and cid in part.chips:
-            # v5 round-trip: reselect catalog entry. The stored coordinates
-            # equal the catalog values by construction (Q3 = C snapshot +
-            # id), so we don't second-guess the catalog.
+            # v5 round-trip: reselect catalog entry. Chip-corner snapshots
+            # always equal the catalog values by construction (Q3) so they
+            # come straight from the catalog. FOV / nm-per-px may diverge if
+            # the cache was exported with Custom override active — restore
+            # that override transparently so the alignment doesn't silently
+            # shift back to catalog defaults on cache load.
             self._legacy_snapshot = False
             self._legacy_values = {}
             idx = self._part_cb.findText(pid)
@@ -3803,6 +3806,30 @@ class PartChipPanel(QFrame):
             idx = self._chip_cb.findText(cid)
             if idx >= 0:
                 self._chip_cb.setCurrentIndex(idx)
+            chip = part.chips[cid]
+            cached_fov_w = float(getattr(meta, "fov_w", 0.0) or 0.0)
+            cached_fov_h = float(getattr(meta, "fov_h", 0.0) or 0.0)
+            cached_npx = float(getattr(meta, "nm_per_px", 0.0) or 0.0)
+            fov_diff = (
+                cached_fov_w > 0
+                and (abs(cached_fov_w - chip.fov_w_nm) > 0.5
+                     or abs(cached_fov_h - chip.fov_h_nm) > 0.5))
+            chip_npx = chip.nm_per_px or 0.0
+            npx_diff = abs(cached_npx - chip_npx) > 1e-6
+            if fov_diff or npx_diff:
+                self._customising = True
+                self._custom_chk.setChecked(True)
+                self._custom_frame.setVisible(True)
+                if cached_fov_w > 0:
+                    self._fov_w.setValue(int(round(cached_fov_w)))
+                    self._fov_h.setValue(int(round(cached_fov_h)))
+                if cached_npx > 0:
+                    self._nm_auto.setChecked(False)
+                    self._nm_per_px.setEnabled(True)
+                    self._nm_per_px.setValue(cached_npx)
+                else:
+                    self._nm_auto.setChecked(True)
+                    self._nm_per_px.setEnabled(False)
             self._suppress = False
             self._refresh_badges()
             self.changed.emit()

@@ -4,6 +4,31 @@
 
 ---
 
+## [2026-06-05] [F21 fix] PartChipPanel.set_from_meta 保留 Custom override（PR #11 Codex review）
+
+**變更類型：** bug fix（cache restore silent data loss） ·  **狀態：完成**
+
+**現象（Codex review on PR #11, glas/app/gds_align_tool.py:3808）：** user 在 Custom
+override 開啟時（例如 FOV 改成 3000 nm）匯出 cache，`make_meta()` 把 override 後的
+FOV / scale 寫進 meta；但 v5 restore path 看到 part_id/chip_id 還在 catalog → 直接
+reselect 下拉、忽略 cached fov_w/h/nm_per_px → 對位 silently 回到 catalog 預設、
+overlay 跟 export 對位都偏掉。
+
+**修法（`PartChipPanel.set_from_meta` v5 catalog-match 分支）：** reselect 完 chip 後，
+比對 cached vs `chip.fov_w_nm/fov_h_nm/nm_per_px`；只要 FOV 差 >0.5 nm 或 nm_per_px
+差 >1e-6（保留 None=0 → auto 的等價）→ 自動勾 Custom override + 填入 cached values
++ 顯示 custom frame。完全相等就維持 catalog 預設、不勾 Custom。
+
+**測試：** 新增 `tests/test_gds_align_f21.py::TestCacheV5::test_set_from_meta_preserves_
+custom_fov_override`（cached fov 3000/2500 + nm_per_px 1.75 → Custom 自動打開，values()
+回傳 cached）+ `test_set_from_meta_matching_fov_skips_custom`（cached = catalog 預設
+→ Custom 不勾）。全套件 643+22 → **667 passed**。
+
+**影響檔案：** `glas/app/gds_align_tool.py`、`tests/test_gds_align_f21.py`、
+`SESSION_LOG.md`。 **Branch：** claude/youthful-gates-WLNYJ · **PR：** #11
+
+---
+
 ## [2026-06-05] [F20 + F22] Open OASIS Wizard 化 + First-run welcome dialog
 
 **變更類型：** UX 補完（取代三層 modal cascade + 首次啟動 onboarding） ·  **狀態：完成**
