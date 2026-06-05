@@ -6,7 +6,9 @@
 
 ## [2026-06-05] [F21] PART/CHIP catalog 取代 Coordinate Setup + Origin δ UI 升級
 
-**變更類型：** plan + M1 (catalog data model) ·  **狀態：M1 完成，M2–M6 待續**
+**變更類型：** UX 重大改造（取代 right-column setup form + δ 升級為常駐區塊 + 移除 fine
+tune dx/dy + dev-mode catalog editor + cache schema v4→v5） ·  **狀態：完成（M1–M6
+全部完工）**
 
 **動機：** 評估「真小白 + 無手冊」走完 GLAS 全流程的通關率 ≈ 0.4%，最大殺手是
 Coordinate Setup（Step 3 通過率僅 ~10%）—— RFL 術語、6 欄手填、無自動帶入、預設折疊。
@@ -31,19 +33,65 @@ delete + atomic save）→ M5 cache schema v1→v2 bump（加 part_id/chip_id、
 三 dialog 成單一 `QWizard`）+ [F22] First-run welcome dialog（5 縮圖 onboarding）
 列入 §8 Backlog；F21 完成後接續處理。
 
-**M1 完成（user 核准 A + 種子用範例）：** 新增 `glas/core/parts_catalog.py`（無 Qt
-core；`ChipSpec` / `PartSpec` dataclass + `to_dict/from_dict` round-trip、
-`chip_corner_nm()` 沿用舊公式 `(DieX − GDS_off) × 1000`、`load_catalog` 容忍未知欄位
-向前相容、`save_catalog` atomic tempfile + os.replace、`CatalogError` 區分壞檔/壞 schema、
-`DEFAULT_FOV_NM = 1500.0`、`CATALOG_SCHEMA = "glas-parts-v1"`）+ 種子
-`glas/data/parts.json`（EXAMPLE_PART / C1+C2 placeholder，description 引導 user 進 dev
-mode 編輯）+ `tests/test_parts_catalog.py` 26 項全綠（round-trip / partial / 未知欄位
-忽略 / 壞 JSON / schema 不符 / 非 dict root / atomic write 無 leftover / UTF-8 CJK /
-seed 載入）。
+**M1 — catalog data model + loader：** 新增 `glas/core/parts_catalog.py`（無 Qt core；
+`ChipSpec` / `PartSpec` dataclass + `to_dict/from_dict` round-trip、`chip_corner_nm()`
+沿用 `(DieX − GDS_off) × 1000`、`load_catalog` 容忍未知欄位、`save_catalog` atomic、
+`CatalogError`、`DEFAULT_FOV_NM = 1500.0`、`CATALOG_SCHEMA = "glas-parts-v1"`）+ 種子
+`glas/data/parts.json`（EXAMPLE_PART / C1+C2 placeholder）+ 26 項單元測試全綠。
+
+**M2 — 右欄重構為 PartChipPanel：** 移除舊 `CoordinateSetupPanel`（RFL 6 欄、FOV 2 欄、
+overlay scale、Fine tune 2 欄）整個 ~220 行。新增 `PartChipPanel`：PART/CHIP `QComboBox`
+下拉、即時 chip-corner / FOV badge、`Custom override` checkbox 展開 FOV/scale spinbox（勾
+掉回 catalog 預設）、`values()` 新 dict（加 `part_id` / `chip_id`，**移除 `fine_dx` /
+`fine_dy`**）。MainWindow 同步移除 `_fine_dx`/`_fine_dy` state + 8 處 `+ self._fine_dx +`
+加總（`_jump_to_image` / `_current_image_gds` / `_fit_view_to_defects` /
+`_refresh_overview_defects` / `_coarse_anchor` / `_coarse_gds` 等）。
+
+**M3 — AlignmentDeltaPanel 常駐區塊：** 新增獨立 `QFrame` widget，大字級 monospace X / Y
+顯示（sign-aligned 不抖動）、`Set Offset` / `Clear` / `⧉` copy-clipboard 按鈕、emit
+`set_requested` / `clear_requested` 給 MainWindow。完全常駐（不收合），取代原來藏在
+Coordinate Setup ④ 區塊的 read-only label。所有 `coord_setup.set_origin(...)` call site
+（_nudge_origin / _on_overlay_drag / _on_set_offset / _on_clear_offset /
+_on_apply_median_residual / cache load）一律改走 `alignment_delta.set_values(...)`。
+
+**M4 — Catalog editor（dev mode）：** 新增 `CatalogEditorDialog`：左 PART/CHIP 樹（含
+Add PART / Add CHIP / Remove 按鈕，命名重複擋下）+ 右 form（µm spinbox / nm spinbox /
+nm-per-px 0=auto / notes / description）+ atomic Save 寫回 `glas/data/parts.json`。
+PartChipPanel 加 `⚙ Edit catalog…` 按鈕（`set_dev_mode(on)` 控制顯示）+
+`reload_catalog()`；MainWindow `_set_dev_mode` 順手更新此按鈕；
+`_on_edit_catalog` 開 dialog → accept 後刷新下拉。
+
+**M5 — cache schema v4 → v5：** `LayerCacheMeta` 加 `part_id` / `chip_id`
+(`Optional[str] = None`)、`SCHEMA_VERSION = 5`、`_LOADABLE_SCHEMAS = {4, 5}`
+（v4 舊 cache 仍能載，欄位拿 None default）。`make_meta` / 匯出 cache call site 帶
+`v.get("part_id") / v.get("chip_id")`。`PartChipPanel.set_from_meta(meta)` 兩種路徑：
+v5+catalog 命中 → 直接 reselect 下拉；v4 / 不在 catalog → 進「legacy snapshot」模式，
+鎖住下拉 + 顯示 ⚠ 提示 + 仍用 stored chip_corner/FOV 還原。
+
+**M6 — 文件 / §8 / §7 不變式：** README 使用流程改「選 PART / CHIP（catalog 帶座標）」；
+CLAUDE.md §5.2 對位流程更新（PartChipPanel + AlignmentDeltaPanel）；§7 新增兩條不變式
+（`_LOADABLE_SCHEMAS` 必含「現+前」、Custom override 不可改 chip_corner）；§8 移除 [F21]
+（保留 F20 / F22）。Workflow guidance Step 3 文字改「Pick PART / CHIP」。
+
+**測試：** 全套件 **643 passed**（原 606 baseline + 37 新增/重寫）。新增
+`tests/test_gds_align_f21.py` 23 項涵蓋 PartChipPanel 下拉 / Custom override / 空 catalog
+disable / AlignmentDeltaPanel set/clear/copy / cache v5 round-trip / v4 legacy snapshot /
+MainWindow `_fine_dx` 已不存在 / overlay-drag-updates-δ / set-offset signal / coarse_gds
+無 fine_tune / dev-mode 切換顯示 catalog 編輯按鈕 / atomic save / Add PART 重複擋下。
+
+**廢棄測試重寫（無回退）：** `test_gds_align_m4a` 改驗 AlignmentDeltaPanel；
+`test_gds_align_m5` coarse_gds 改用 `_origin_dx/dy`；`test_gds_align_m6_6` 改用 catalog
+seed；`test_gds_align_m7` 刪除 `TestAutoCollapse::test_jump_collapses_coord_once`、
+`test_no_collapse_without_valid_fov`、`TestBatch1CoordBadge`（功能已移除）；
+`test_gds_layer_cache` v4 cache 仍能載入測試新增 + 「old schema rejected」改名為
+「future schema rejected」（_LOADABLE_SCHEMAS 是「現+前」而非單版）。
 
 **影響檔案：** `docs/plans/F21-part-chip-catalog.md`(新)、`glas/core/parts_catalog.py`(新)、
-`glas/data/parts.json`(新)、`tests/test_parts_catalog.py`(新)、`CLAUDE.md` §8 新增
-F21/F20/F22、`SESSION_LOG.md`。 **Branch：** claude/youthful-gates-WLNYJ
+`glas/core/gds_layer_cache.py`、`glas/data/parts.json`(新)、`glas/app/gds_align_tool.py`、
+`tests/test_parts_catalog.py`(新)、`tests/test_gds_align_f21.py`(新)、
+`tests/test_gds_align_m4a.py`、`tests/test_gds_align_m5.py`、`tests/test_gds_align_m6_6.py`、
+`tests/test_gds_align_m7.py`、`tests/test_gds_layer_cache.py`、`README.md`、`CLAUDE.md`、
+`SESSION_LOG.md`。 **Branch：** claude/youthful-gates-WLNYJ
 
 ---
 

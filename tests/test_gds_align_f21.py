@@ -1,0 +1,306 @@
+"""F21 UI tests: PartChipPanel / AlignmentDeltaPanel / CatalogEditorDialog
+and the MainWindow integration (no fine-tune, δ wired to AlignmentDeltaPanel,
+cache schema v5 round-trip, dev-mode catalog editor)."""
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+# conftest puts glas/core + glas/app on sys.path; importing flat works.
+_ROOT = Path(__file__).resolve().parents[1]
+for sub in ("glas/core", "glas/app"):
+    if str(_ROOT / sub) not in sys.path:
+        sys.path.insert(0, str(_ROOT / sub))
+
+try:
+    from PyQt6.QtWidgets import QApplication
+except Exception:  # pragma: no cover
+    pytest.skip("PyQt6 unavailable", allow_module_level=True)
+
+import gds_align_tool as gat
+import gds_layer_cache
+import parts_catalog
+import sem_loader
+from parts_catalog import ChipSpec, PartSpec
+
+
+@pytest.fixture(scope="module")
+def qapp():
+    app = QApplication.instance() or QApplication([])
+    yield app
+
+
+@pytest.fixture
+def mw(qapp, tmp_path, monkeypatch):
+    # Redirect the catalog default path to a tmp file so tests don't see /
+    # write the real seed catalog.
+    catalog_path = tmp_path / "parts.json"
+    parts_catalog.save_catalog(catalog_path, {
+        "TMVG10": PartSpec(
+            description="test product",
+            chips={
+                "C1": ChipSpec(chip_x_um=10.0, chip_y_um=20.0,
+                               chip_w_um=1000.0, chip_h_um=2000.0,
+                               fov_w_nm=1500.0, fov_h_nm=1500.0),
+                "C2": ChipSpec(chip_x_um=2010.0, chip_y_um=20.0,
+                               chip_w_um=1000.0, chip_h_um=2000.0,
+                               fov_w_nm=2000.0, fov_h_nm=2000.0,
+                               nm_per_px=1.25),
+            },
+        ),
+    })
+    monkeypatch.setattr(parts_catalog, "default_catalog_path",
+                        lambda: catalog_path)
+    monkeypatch.setattr(gat, "default_catalog_path",
+                        lambda: catalog_path)
+    w = gat.MainWindow()
+    yield w
+    w.close()
+
+
+# ── PartChipPanel ────────────────────────────────────────────────────────────
+
+class TestPartChipPanel:
+    def test_dropdowns_populated_from_catalog(self, mw):
+        p = mw.sem_panel.coord_setup
+        assert p._part_cb.count() == 1
+        assert p._part_cb.itemText(0) == "TMVG10"
+        assert p._chip_cb.count() == 2
+
+    def test_selecting_chip_sets_chip_corner_and_fov(self, mw):
+        p = mw.sem_panel.coord_setup
+        p._part_cb.setCurrentText("TMVG10")
+        p._chip_cb.setCurrentText("C1")
+        v = p.values()
+        assert v["part_id"] == "TMVG10"
+        assert v["chip_id"] == "C1"
+        assert v["chip_x_um"] == 10.0
+        # chip_corner = (DieX − GDS_off) × 1000
+        assert v["chip_corner_x"] == pytest.approx(10_000.0)
+        assert v["chip_corner_y"] == pytest.approx(20_000.0)
+        # FOV from catalog default.
+        assert v["fov_w"] == 1500.0
+        assert v["fov_h"] == 1500.0
+
+    def test_values_dict_has_no_fine_tune(self, mw):
+        v = mw.sem_panel.coord_setup.values()
+        assert "fine_dx" not in v
+        assert "fine_dy" not in v
+
+    def test_custom_fov_overrides_catalog(self, mw):
+        p = mw.sem_panel.coord_setup
+        p._part_cb.setCurrentText("TMVG10")
+        p._chip_cb.setCurrentText("C1")
+        p._custom_chk.setChecked(True)
+        p._fov_w.setValue(3000)
+        p._fov_h.setValue(2500)
+        v = p.values()
+        assert v["fov_w"] == 3000.0
+        assert v["fov_h"] == 2500.0
+        # Disabling Custom snaps back to catalog defaults.
+        p._custom_chk.setChecked(False)
+        v2 = p.values()
+        assert v2["fov_w"] == 1500.0
+
+    def test_custom_seeded_from_current_chip(self, mw):
+        p = mw.sem_panel.coord_setup
+        p._chip_cb.setCurrentText("C2")
+        p._custom_chk.setChecked(True)
+        # C2's default 2000 / 1.25 nm-per-px should pre-populate the
+        # override spinboxes so the user is editing from a reasonable start.
+        assert p._fov_w.value() == 2000
+        assert p._fov_h.value() == 2000
+        assert p._nm_auto.isChecked() is False
+        assert p._nm_per_px.value() == pytest.approx(1.25)
+
+    def test_empty_catalog_disables_dropdowns(self, mw, monkeypatch):
+        monkeypatch.setattr(parts_catalog, "load_catalog", lambda *_: {})
+        # Inject same shim into the namespace the app imported from.
+        monkeypatch.setattr(gat, "load_catalog", lambda *_: {})
+        mw.sem_panel.coord_setup.reload_catalog()
+        p = mw.sem_panel.coord_setup
+        assert p._part_cb.isEnabled() is False
+        assert p._chip_cb.isEnabled() is False
+        assert "No PART/CHIP" in p._status_lbl.text()
+
+    def test_changed_signal_emits_on_chip_select(self, mw):
+        p = mw.sem_panel.coord_setup
+        fired = {"n": 0}
+        p.changed.connect(lambda: fired.__setitem__("n", fired["n"] + 1))
+        p._chip_cb.setCurrentText("C2")
+        assert fired["n"] >= 1
+
+
+# ── AlignmentDeltaPanel ──────────────────────────────────────────────────────
+
+class TestAlignmentDeltaPanel:
+    def test_set_values_updates_big_labels(self, mw):
+        ad = mw.sem_panel.alignment_delta
+        ad.set_values(1234.0, -567.0)
+        assert "1,234" in ad._x_lbl.text()
+        assert "-567" in ad._y_lbl.text()
+        assert ad._dx == 1234.0
+        assert ad._dy == -567.0
+
+    def test_set_offset_button_emits_signal(self, mw):
+        ad = mw.sem_panel.alignment_delta
+        fired = {"n": 0}
+        ad.set_requested.connect(lambda: fired.__setitem__("n", 1))
+        ad.set_btn.click()
+        assert fired["n"] == 1
+
+    def test_clear_button_emits_signal(self, mw):
+        ad = mw.sem_panel.alignment_delta
+        fired = {"n": 0}
+        ad.clear_requested.connect(lambda: fired.__setitem__("n", 1))
+        ad.clear_btn.click()
+        assert fired["n"] == 1
+
+    def test_copy_to_clipboard(self, mw, qapp):
+        ad = mw.sem_panel.alignment_delta
+        ad.set_values(100.0, -50.0)
+        ad._on_copy()
+        assert qapp.clipboard().text() == "100, -50"
+
+    def test_panel_is_not_collapsible(self, mw):
+        # Plan Q7: AlignmentDeltaPanel must be always visible (no
+        # CollapsibleSection wrapping).
+        ad = mw.sem_panel.alignment_delta
+        assert ad.isVisibleTo(mw.sem_panel)
+
+
+# ── Cache schema v5 round-trip ───────────────────────────────────────────────
+
+class TestCacheV5:
+    def test_part_chip_round_trip(self, mw, tmp_path):
+        meta = gds_layer_cache.make_meta(
+            __file__,
+            chip_corner_x=10_000.0, chip_corner_y=20_000.0,
+            chip_x_um=10.0, chip_y_um=20.0,
+            fov_w=1500.0, fov_h=1500.0,
+            top_cell_name="TOP",
+            part_id="TMVG10", chip_id="C1")
+        layers = [(1, 0,
+                   [np.array([[0., 0.], [1., 0.], [1., 1.], [0., 1.]],
+                             dtype=np.float32)],
+                   np.array([[0., 0., 1., 1.]], dtype=np.float32))]
+        out = tmp_path / "cache.npz"
+        gds_layer_cache.cache_save(out, layers, meta)
+        loaded = gds_layer_cache.cache_load(out)
+        assert loaded is not None
+        assert loaded.meta.schema_version == 5
+        assert loaded.meta.part_id == "TMVG10"
+        assert loaded.meta.chip_id == "C1"
+
+    def test_set_from_meta_restores_dropdowns(self, mw):
+        meta = gds_layer_cache.LayerCacheMeta(
+            source_oas="x.oas", source_mtime=0.0, source_size=0,
+            chip_corner_x=10_000.0, chip_corner_y=20_000.0,
+            chip_x_um=10.0, chip_y_um=20.0,
+            fov_w=1500.0, fov_h=1500.0,
+            part_id="TMVG10", chip_id="C2")
+        mw.sem_panel.coord_setup.set_from_meta(meta)
+        v = mw.sem_panel.coord_setup.values()
+        assert v["part_id"] == "TMVG10"
+        assert v["chip_id"] == "C2"
+
+    def test_set_from_meta_legacy_v4(self, mw):
+        # v4 cache: no part_id/chip_id → "legacy snapshot" mode shows the
+        # stored coordinates and disables the dropdowns.
+        meta = gds_layer_cache.LayerCacheMeta(
+            source_oas="x.oas", source_mtime=0.0, source_size=0,
+            chip_corner_x=99_000.0, chip_corner_y=88_000.0,
+            fov_w=2500.0, fov_h=2000.0,
+            part_id=None, chip_id=None)
+        mw.sem_panel.coord_setup.set_from_meta(meta)
+        v = mw.sem_panel.coord_setup.values()
+        assert v["chip_corner_x"] == 99_000.0
+        assert v["chip_corner_y"] == 88_000.0
+        assert v["fov_w"] == 2500.0
+        assert mw.sem_panel.coord_setup._part_cb.isEnabled() is False
+
+
+# ── MainWindow integration ───────────────────────────────────────────────────
+
+class TestMainWindowIntegration:
+    def test_no_fine_tune_state(self, mw):
+        assert not hasattr(mw, "_fine_dx")
+        assert not hasattr(mw, "_fine_dy")
+
+    def test_overlay_drag_updates_alignment_delta_only(self, mw):
+        mw._origin_dx, mw._origin_dy = 100.0, -50.0
+        mw.sem_viewer._drag_x, mw.sem_viewer._drag_y = 30.0, 40.0
+        mw._on_overlay_drag()
+        ad = mw.sem_panel.alignment_delta
+        assert ad._dx == 70.0    # 100 − 30
+        assert ad._dy == -90.0   # −50 − 40
+
+    def test_set_offset_via_alignment_delta_signal(self, mw):
+        mw._origin_dx, mw._origin_dy = 0.0, 0.0
+        mw.sem_viewer._anchor = (1000.0, 2000.0)
+        mw.sem_viewer._nm_per_px = 1.0
+        mw.sem_viewer._drag_x, mw.sem_viewer._drag_y = 50.0, -25.0
+        mw._current_sem = None
+        mw.sem_panel.alignment_delta.set_btn.click()
+        # δ now carries the drag; viewer drag reset.
+        assert mw._origin_dx == -50.0
+        assert mw._origin_dy == 25.0
+        assert mw.sem_viewer._drag_x == 0.0
+
+    def test_coarse_gds_uses_only_origin(self, mw):
+        mw._chip_corner_x = mw._chip_corner_y = 0.0
+        mw._origin_dx, mw._origin_dy = 10.0, 20.0
+        img = sem_loader.SemImage(
+            image_id="D1", filename="a.png",
+            file_path=Path("a.png"), xrel=4000.0, yrel=5000.0)
+        cx, cy = mw._coarse_gds(img)
+        assert cx == pytest.approx(4010.0)
+        assert cy == pytest.approx(5020.0)
+
+    def test_dev_mode_off_hides_edit_catalog(self, mw):
+        mw._set_dev_mode(False)
+        assert mw.sem_panel.coord_setup._edit_btn.isVisible() is False
+
+    def test_dev_mode_on_shows_edit_catalog(self, mw):
+        mw._set_dev_mode(True)
+        # Visibility flag flips even if the widget isn't actually painted
+        # offscreen.
+        assert mw.sem_panel.coord_setup._edit_btn.isVisibleTo(
+            mw.sem_panel.coord_setup) is True
+        mw._set_dev_mode(False)
+
+
+# ── CatalogEditorDialog ──────────────────────────────────────────────────────
+
+class TestCatalogEditor:
+    def test_save_writes_atomic(self, mw, tmp_path, monkeypatch):
+        # Use a fresh per-test path so the dialog write doesn't clobber the
+        # session catalog seeded by the mw fixture.
+        target = tmp_path / "edited.json"
+        monkeypatch.setattr(parts_catalog, "default_catalog_path",
+                            lambda: target)
+        monkeypatch.setattr(gat, "default_catalog_path", lambda: target)
+        dlg = gat.CatalogEditorDialog(mw, {
+            "NEW_PART": PartSpec(description="x",
+                                 chips={"C9": ChipSpec(chip_x_um=42.0)}),
+        })
+        dlg._on_save()
+        loaded = parts_catalog.load_catalog(target)
+        assert "NEW_PART" in loaded
+        assert loaded["NEW_PART"].chips["C9"].chip_x_um == 42.0
+
+    def test_add_part_rejects_duplicates(self, mw, monkeypatch):
+        # Stub QInputDialog so we can drive Add PART without a modal.
+        from PyQt6.QtWidgets import QInputDialog, QMessageBox
+        monkeypatch.setattr(QInputDialog, "getText",
+                            staticmethod(lambda *a, **k: ("DUP", True)))
+        monkeypatch.setattr(QMessageBox, "warning",
+                            staticmethod(lambda *a, **k: None))
+        dlg = gat.CatalogEditorDialog(mw, {"DUP": PartSpec()})
+        dlg._on_add_part()
+        # Still exactly one DUP, no silent overwrite.
+        assert list(dlg._catalog) == ["DUP"]

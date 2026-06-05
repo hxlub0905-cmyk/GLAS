@@ -60,9 +60,9 @@ class TestCollapsibleRefs:
     @pytest.mark.skipif(gat.CollapsibleSection is None,
                         reason="CollapsibleSection unavailable")
     def test_initial_collapse_state(self, mw):
-        # Coordinate Setup now starts collapsed so it doesn't crowd the image
-        # list; Fine Align also starts collapsed.
-        assert mw.sem_panel._coord_section.is_collapsed() is True
+        # F21: Coordinate Setup is now the always-visible PartChipPanel
+        # (no collapse wrapper). Fine Align still starts collapsed until a
+        # POI is selected.
         assert mw.sem_panel._fine_section.is_collapsed() is True
 
 
@@ -75,28 +75,6 @@ class TestAutoCollapse:
         mw.layer_panel.set_document(_poi_doc())
         mw.layer_panel._rows[0].poi_btn.setChecked(True)
         assert mw.sem_panel._fine_section.is_collapsed() is False
-
-    def test_jump_collapses_coord_once(self, mw):
-        mw._fov_w = mw._fov_h = 2000.0
-        img = sem_loader.SemImage(image_id="D1", filename="a.png",
-                                  file_path=Path("a.png"), xrel=1.0, yrel=2.0)
-        mw._jump_to_image(img)
-        assert mw.sem_panel._coord_section.is_collapsed() is True
-        assert mw._coord_collapsed_once is True
-        # Re-expanding should stick — a second jump must NOT re-collapse it.
-        mw.sem_panel.set_coord_collapsed(False)
-        mw._jump_to_image(img)
-        assert mw.sem_panel._coord_section.is_collapsed() is False
-
-    def test_no_collapse_without_valid_fov(self, mw):
-        # Coordinate Setup now starts collapsed (flag defaults True), so a jump
-        # with an invalid FOV simply leaves the default collapsed state intact.
-        mw._fov_w = mw._fov_h = 0.0
-        img = sem_loader.SemImage(image_id="D1", filename="a.png",
-                                  file_path=Path("a.png"), xrel=1.0, yrel=2.0)
-        mw._jump_to_image(img)
-        assert mw._coord_collapsed_once is True
-        assert mw.sem_panel._coord_section.is_collapsed() is True
 
 
 # ── M7.2 token centralization ────────────────────────────────────────
@@ -186,12 +164,12 @@ class TestRefinements:
         assert {"FILE", "VIEW MODE", "EXPORT"} <= texts
 
     def test_coord_setup_single_column(self, mw):
-        # Single-column form: the grid has effectively one content column
-        # (everything added at column 0).
-        from PyQt6.QtWidgets import QGridLayout
+        # F21: PartChipPanel uses a top-level QVBoxLayout (dropdowns + badges
+        # + Custom override stacked vertically) — single column by
+        # construction.
+        from PyQt6.QtWidgets import QVBoxLayout
         lay = mw.sem_panel.coord_setup.layout()
-        assert isinstance(lay, QGridLayout)
-        assert lay.columnCount() == 1
+        assert isinstance(lay, QVBoxLayout)
 
 
 class TestRound2:
@@ -412,25 +390,6 @@ class TestBatch1LoadSemAccent:
     def test_load_sem_btn_has_accent_qss(self, mw):
         qss = mw.sem_panel.load_sem_btn.styleSheet()
         assert gat._TK_ACCENT.name() in qss
-
-
-@pytest.mark.skipif(gat.CollapsibleSection is None,
-                    reason="CollapsibleSection unavailable")
-class TestBatch1CoordBadge:
-
-    def test_coord_badge_not_set(self, mw):
-        mw.sem_panel.update_coord_badge({"fov_w_nm": 0, "fov_h_nm": 0})
-        assert mw.sem_panel._coord_section._badge.text() == "not set"
-
-    def test_coord_badge_set(self, mw):
-        mw.sem_panel.update_coord_badge(
-            {"fov_w_nm": 2000000, "fov_h_nm": 1500000})
-        assert mw.sem_panel._coord_section._badge.text() == "FOV 2000 × 1500"
-
-    def test_coord_badge_hidden_when_expanded(self, mw):
-        mw.sem_panel.update_coord_badge({"fov_w_nm": 0, "fov_h_nm": 0})
-        mw.sem_panel.set_coord_collapsed(False)
-        assert mw.sem_panel._coord_section._badge.isHidden()
 
 
 class TestBatch1ImageListBadges:
