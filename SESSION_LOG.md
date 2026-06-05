@@ -4,369 +4,44 @@
 
 ---
 
-## [2026-06-04] [F16-B] 向量化 geometry extent 計算（每 session 第一個 ROI 的 geom 29s）+ 收 Qt 警告
-
-**變更類型：** 效能 + 雜訊 ·  **狀態：完成**
-
-**動機（實測）：** 重開 app（快取已建）後第一個 ROI 58s，其中 `geom 29s`（17/101）最大 —— 44995 在該層 ~870 萬矩形多為
-repetition（CMG），`rect_arrays` 建 extent 逐筆呼叫 `repetition_extent` ≈ 870 萬次。前次「只跳過無 repetition」沒幫到（多數有）。
-
-**實作（B）：** 新增 `_ext_from_columnar(base, rt, rr)`：規則型（1/2/3/8/9）按 type 分組、用 numpy 一次算 extent（min/max 與 0
-取正負向，等價 `repetition_extent` 的 `_box`/type-8 corners）；任意清單型（10/11，及罕見 4-7）逐筆 fallback。`rect_arrays`/
-`poly_arrays`（欄狀與 tuple 兩路）改建 `(base, rt, rr)` 後呼叫此 helper。預期 geom 29s → ~數秒。
-
-**收警告：** Qt message handler 多濾一條 `QWindowsWindow::setGeometry: Unable to set geometry`（多行進度框 min-height 觸發的無害通知），
-連同既有的 `setPointSize` 一起濾掉。
-
-**測試：** `TestExtVectorized`（每種 repetition type 對照 `repetition_extent` 逐值相等、含負 spacing / 斜向 type-8 / 空）。
-`pytest tests/` 606 全綠。**影響檔案：** `glas/core/oasis_random.py`、`glas/app/gds_align_tool.py`、`tests/test_oasis_random.py`、`SESSION_LOG.md`。
-
----
-
-## [2026-06-04] [F18] lazy placement 反序列化（cache 載入再砍 ~10s / batch 暖機）
-
-**變更類型：** 效能 + 重構 ·  **狀態：完成**
-
-**動機：** cache 載回大 cell 時仍重建 ~150 萬個 Placement 物件（+ object 陣列 unpickle target/kind）≈ ~10s，且
-prep 已持久化後 prune 根本不需要 placement 清單（只有 survivor + --debug 的 _feat 會碰）。
-
-**實作：** `CellContent.placements` 改 **lazy property**：decoded cell 設 `_placements`（list）；cache 載入設 `_pl_soa`
-（SoA 陣列），清單**用到才建**。新增 `placement_count()` / `placement_at(i)`（從 SoA 建單顆）/ `_pl_from_soa`。cache 格式改
-（SCHEMA_VERSION→2）：`target` 存 int64（refnum；-1=name，name 字串存稀疏側表）、`kind` 存 int8 code，避免 object 陣列
-unpickle。walk 改用 `placement_count()` + survivor `placement_at(i)`；gather（prep miss 才跑）才 materialize 清單。
-→ prep 命中時（batch worker 暖機 / 每 session 第一個 ROI）**完全不建 150 萬 placement**，cache 載入 placement 段 ~10s→~0.3s。
-
-**測試：** `test_placements_lazy_from_cache`（SoA-backed、placement_at 不建全清單、name-target 經稀疏側表、property 才 materialize）；
-既有 round-trip 仍逐筆相等。`pytest tests/` 604 全綠。**影響檔案：** `glas/core/oasis_random.py`、`glas/core/cellcache.py`、`tests/test_cellcache.py`、`SESSION_LOG.md`。
-
----
-
-## [2026-06-04] [F19] cell/prep sidecar 快取 LRU 自動清理 + clear()
-
-**變更類型：** 功能（維護）·  **狀態：完成**
-
-**動機：** sidecar 快取（每大檔 cell ~300MB + prep ~180MB）無自動清理，看越多檔越占磁碟。
-
-**實作（`cellcache.py`）：** `_max_bytes()`（`GLAS_CELLCACHE_MAX_MB`，預設 8192MB；0=不限）；`_evict()` best-effort LRU
-（掃 cache dir、超過上限就刪最舊 .npz；被 reader 開啟中刪不掉就跳過，永不拋；誤刪只是下次重解）；`save`/`save_prep` 寫完
-呼叫 `_evict()`；`clear()` 清空回傳刪除數。
-
-**測試：** `test_evict_lru_and_clear`（超上限刪最舊、clear 清空）。`pytest tests/` 603 全綠。**影響檔案：** `glas/core/cellcache.py`、`tests/test_cellcache.py`、`SESSION_LOG.md`。
-
----
-
-## [2026-06-04] [F16-B] 收尾：命名正名 + §8/§4/§7 + plan 收成 done
-
-**變更類型：** 文件/housekeeping ·  **狀態：完成**
-
-**動機：** 「大 cell 解碼快取」這串沿用了 `F16-B` 標籤，與 §8 既有的 `[F16-B]`（無 sbbox 檔的 bbox sweep，方案 B）撞名。
-
-**處理：** 維持本串 = `F16-B`（已遍布 16 個 commit / SESSION_LOG / plan），把 §8 舊的 `[F16-B]` 改號為 `[F17]`（加註）。
-新增 backlog `[F18]`（lazy placement deser，砍 cache 載回重建 150 萬 Placement 的 ~10s）、`[F19]`（sidecar 無自動清理 → LRU/上限）。
-`CLAUDE.md` §4 加 `cellcache.py`；§7 加兩條快取不變式（cell key 含 wanted_layers、prep key 只含 file+cell、mtime/size 驗證、
-prep index 對齊 placements 順序）。`docs/plans/F16-B-cell-decode-cache.md` 收成 `done`（M5 撤案、後續登 F18/F19）。
-
-**影響檔案：** `CLAUDE.md`、`docs/plans/F16-B-cell-decode-cache.md`、`SESSION_LOG.md`。
-
----
-
-## [2026-06-04] [F16-B] debug 分層 + ROI 進度畫面精確化 + 收雜訊
-
-**變更類型：** 診斷/UX ·  **狀態：完成**
-
-**動機：** user 反映 GDS function 複雜、來回 commit 耗時，希望 `--debug` 直接給「每環節花多少時間、解碼遇到什麼問題」；
-且移動 ROI 的等待畫面要更準。
-
-**實作：**
-- **debug 分層：** `MMH_GDS_DEBUG=1`/`--debug`=**精簡**(每層一行摘要:`L/D in Xs | decode Ys (n cached, m decoded) | place Zs | geom Ws | out Rr Pp [| ⚠ N errors]`
-  + 整體 `── loaded in ...`)；`MMH_GDS_DEBUG=2`/`--trace`=**全 trace**(root/heartbeat/perf/scanned/features/violations/jump)。
-  `_dbg`(L1)/`_trace`(L2) 兩級;reader 加 `_n_cache_hits`、stats 加 `cells_cached`/`t_decode` → 摘要能顯示「快取命中 vs 解碼」。
-- **ROI 進度畫面：** `RoiWalkWorker` 加 `progress(idx,total,key)` signal、`roi_document_from_reader` 加 `progress_cb` 逐層回報；
-  `_tick_roi_progress` 改顯示「目前第幾層(L/D) + 已載入 cell 數 + 幾顆來自快取」，並在首載大 cell 時提示「第一次較久、之後重用快取」；
-  移除誤導的 `/44997 (pct%)`。
-- **收雜訊：** `[jump]` 每次跳點輸出降到 L2;`qInstallMessageHandler` 過濾掉無害的 `QFont::setPointSize: Point size <= 0` 警告
-  (pixel-size 字體 pointSize()==-1 的 Qt 內部抱怨)，其餘 Qt 訊息照常。
-
-**測試：** `pytest tests/` 602 全綠;L1/L2 輸出手動比對 OK。**影響檔案：** `glas/core/oasis_random.py`、`glas/app/gds_align_tool.py`、`SESSION_LOG.md`。
-
----
-
-## [2026-06-04] [F16-B M7] batch 暖機加速：persist placement prep + _feat gate
-
-**變更類型：** 效能 ·  **狀態：完成**
-
-**動機：** user 反映 batch align「前搖很長」。每個 worker(各自 spawn 重建 reader)第一張圖要付:載 44995(~20s)+ placement
-prep gather(~15s,CPU 競爭)。M6 的 prep 只在記憶體、不跨 process/session。
-
-**實作：** prep 做成**獨立 sidecar**(`cellcache.save_prep/load_prep`,keyed by file+cell;prep 是 layer 無關的——placements
-不被 layer 過濾、reachable_bbox 用 sbbox——故跨任何 wanted_layers 重用)。`walk_roi` 對大 cell(N≥門檻)先 `load_prep`,
-未命中才 gather 並 `save_prep`。→ 每個 batch worker / 每 session 第一個 ROI **跳過 ~15s gather**(改讀磁碟陣列)。另把 `_feat`
-收集用 `DEBUG` 包住(非 debug 不掃 150 萬 placement)。`save`/`save_prep` 都有 `_fresh_entry` guard,避免多 worker 重複寫。
-
-**測試：** `test_prep_cache_round_trips`(prep 持久化、新 reader 走磁碟 prep、walk 結果一致)。`pytest tests/` 602 全綠。
-**影響檔案：** `glas/core/oasis_random.py`、`glas/core/cellcache.py`、`tests/test_cellcache.py`、`docs/plans/F16-B-cell-decode-cache.md`、`SESSION_LOG.md`。
-
-**建議:** 跑 batch 前先互動式載一個該檔 ROI(把 cell + prep sidecar 都建起來),batch 每個 worker 就只讀磁碟 → 暖機短很多。
-
----
-
-## [2026-06-04] [F16-B] 向量化 geometry extent 建構（每 session 第一個 ROI 加速）
-
-**變更類型：** 效能 ·  **狀態：完成**
-
-**動機：** 快取載入後，每 session 第一個 ROI 仍需建 `_ext_cache`（rect_arrays/poly_arrays 的 base+extent），其中 17/101 那層
-870 萬矩形逐筆 Python 迴圈 ~35s。但多數矩形無 repetition → extent == base。
-
-**修復（向量化）：** `rect_arrays` 欄狀路徑：`base = coords.astype(float)`（向量化）、`ext = base.copy()`，只對 `rt>0`（有
-repetition 的少數）跑迴圈算 extent；tuple 路徑用 `np.array([s[:4] for s in specs])` 一次建 base、同樣只補 repeated。
-`poly_arrays` 欄狀路徑：用 `np.minimum/maximum.reduceat` 在 CSR point buffer 上一次算出每個多邊形 bbox，免逐筆 min/max；
-repeated 才補 extent。預期把第一個 ROI 的 ext 建構從 ~35s 降到 ~數秒（取決於 repeated 比例）。
-
-**測試：** 新增 `test_arrays_match_columnar_vs_tuple`（tuple vs 快取欄狀的 rect/poly arrays 逐值相等，含不等長多邊形驗 reduceat）。
-`pytest tests/` 600 全綠。**影響檔案：** `glas/core/oasis_random.py`、`tests/test_cellcache.py`、`SESSION_LOG.md`。
-
----
-
-## [2026-06-04] [F16-B] --debug 跳過有 sbbox 之 cell 的 CE 檢查（移除首載 ~53s）
-
-**變更類型：** 效能（診斷路徑）·  **狀態：完成**
-
-**動機：** user 實測（重開 app、快取已建）：換 ROI 已降到 9–12s（M6 生效，t_place 14.9s→0.7s）、44995 從磁碟載入 19.8s（vs 解碼
-292s）。但每 session 第一個 ROI 仍 128.8s，其中 ~53s 不在分段計時內 → 為 `--debug` 的 CE-violation 檢查對 44995 呼叫
-`load_cell_bbox`（解碼到深處的 CE 邊界矩形）。因本檔用 S_BOUNDING_BOX 剪枝、根本不靠 CE，此檢查多餘。
-
-**修復：** walk 的 DEBUG 一致性檢查改為：有 sbbox → 只驗 sbbox-violation（便宜）、**跳過 CE 檢查（不呼叫 load_cell_bbox）**；
-無 sbbox 才驗 CE（CE 是該情境的剪枝路徑）。非 --debug 本就整段跳過。移除大檔首載的 ~53s 診斷開銷。
-
-**測試：** `pytest tests/` 600 全綠（CE early-stop 測試用無 sbbox 的 cell，仍走 CE 檢查）。**影響檔案：** `glas/core/oasis_random.py`、`SESSION_LOG.md`。
-
----
-
-## [2026-06-04] [F16-B M6] walk placement gather per-cell 快取（換 ROI 加速）
-
-**變更類型：** 效能 ·  **狀態：完成**
-
-**動機：** user 問「載一顆後換其他 ROI/defect 呢」。釐清：磁碟快取省掉 292s 解碼，但**每換一個 ROI**，walk 仍重跑 44995
-的 150 萬 placement「gather」（`t_place` ~20s/層 × 3 ≈ 60s）。看很多 defect 的工作流，這才是換 ROI 的主要成本。
-
-**洞察：** gather（base_M/base_t/placed_all/arr_local/rcount/valid）是 **cell-local + reachable_bbox only → ROI/transform
-無關**，可快取。**實作：** 抽成 per-cell 預計算存 `CellContent._place_prep`，跨 ROI/layer 重用；每次 walk 只剩
-`T.apply_to_rects(arr_local)` + ROI mask + survivor 展開（向量化、~秒）。arb/unk skip 計數存進 prep、每 walk 重加以維持統計一致。
-geometry extent 早已由 `_ext_cache` 跨 ROI 快取，故**第二個 ROI 起 placement+geometry 預計算都重用 → 秒級**（每 session 第一個
-ROI 仍付一次 gather+ext 建構）。
-
-**測試：** `test_placement_prep_cached_across_rois`（prep 同物件重用、不同 ROI 結果正確）。`pytest tests/` 599 全綠。
-**影響檔案：** `glas/core/oasis_random.py`、`tests/test_oasis_random.py`、`docs/plans/F16-B-cell-decode-cache.md`、`SESSION_LOG.md`。
-
----
-
-## [2026-06-04] [F16-B M2-M4] CellContent 欄狀雙後端 + 解碼 cell 磁碟快取（① + ③）
-
-**變更類型：** 功能（持久化快取）+ 重構 ·  **狀態：完成（M2/M3/M4；剩 M5 ROI 過濾）**
-
-**動機：** 大 flat cell（44995，1080 萬筆）首解 292s，session 內已 memoized 但每個 session 第一次仍要等。做磁碟 sidecar
-快取讓「第二個 session 起」秒級。
-
-**M2（③ 欄狀儲存）：** `CellContent` 加 optional 欄狀後端 `_rcol[key]=(coords,rt,rr)` / `_pcol[key]=(pts,off,rt,rr)`
-（decode 仍產 tuple-list，cache 載入填欄狀）。新增 accessor（`rect_count/poly_count`、`rect_spec_at/poly_spec_at`、
-`all_rect_rtypes/all_poly_rtypes`、`total_rects/total_polys`、`rect_keys/poly_keys`）優先吃欄狀否則退回 tuple；
-`rect_arrays/poly_arrays/rects()/polys()/is_empty` 與 walk 的 _feat/survivor/count 全改走 accessor。decoded cell 行為不變。
-
-**M3（① 序列化）：** `CellContent.to_cache_arrays/from_cache_arrays`（欄狀 + 稀疏 rr：只存非 None 的 idx/val，避免 880 萬
-mostly-None object array 拖慢 pickle）；placement 走 SoA、載入時重建 list。新增 `glas/core/cellcache.py`（per-user cache dir、
-`SCHEMA_VERSION`、mtime/size/schema 驗證、原子寫、毀損/版本不符/檔變更當 miss、env：`GLAS_CELLCACHE`/`_DIR`/`_MIN_RECORDS`）。
-
-**M4（① 整合）：** `RandomAccessReader.load_cell` 先 `cellcache.load`（命中→欄狀直用、不重建 tuple），decode 後 record 數
-≥ 門檻（預設 10 萬）→ `cellcache.save`。numpy 物件陣列陷阱（等長 tuple 被當 2D）以逐元素填 object array 解掉。
-
-**測試：** 新增 `tests/test_cellcache.py`（各 repetition type round-trip 逐 spec 相等、walk decode-vs-cache bit-identical、
-e2e load_cell 快取、失效、env 關閉）。`pytest tests/` 599 全綠。**影響檔案：** `glas/core/oasis_random.py`、
-`glas/core/cellcache.py`、`tests/test_cellcache.py`、`docs/plans/F16-B-cell-decode-cache.md`、`SESSION_LOG.md`。
-
----
-
-## [2026-06-04] [F16-B M1] Placement→NamedTuple + decode 內圈微優化（③ parser 加速）
-
-**變更類型：** 效能 + 重構 ·  **狀態：完成（M1/5；user 選 1+2+3 全做）**
-
-**動機：** decode 計時定論：ROI walk 剩餘瓶頸是單一巨大 flat cell `44995`（880萬 rect + 150萬 placement + 48萬 poly
-≈ 1080萬筆）首解 ~292s。user 選定「①磁碟快取 + ②ROI 過濾解碼 + ③parser 加速」全做。plan 改寫為 5 個 milestone
-（`docs/plans/F16-B-cell-decode-cache.md`）：M1=③型別/內圈、M2=③幾何欄狀、M3/M4=①cellcache、M5=②ROI 過濾。
-
-**M1 實作：** `Placement` `@dataclass`→`NamedTuple`（不可變、無 `__dict__`、建構更快、150萬實例記憶體砍半；確認無 mutation、僅
-屬性存取）。`_decode_at` 內圈：last-key 快取避免每筆 record 的 `dict.setdefault(key, [])` throwaway `[]` 配置（flat cell 達
-880萬次）、幾何分支（RECT/POLY/PLACEMENT）排到 CELL/END 之前、`Placement` 改 positional 建構。
-
-**測試：** `pytest tests/` 592 全綠（行為不變）。**影響檔案：** `glas/core/oasis_store.py`、`glas/core/oasis_random.py`、
-`docs/plans/F16-B-cell-decode-cache.md`、`SESSION_LOG.md`。
-
----
-
-## [2026-06-04] [F16 後續] walk_roi 加 decode 計時（定位剩餘 345s）
-
-**變更類型：** 診斷 ·  **狀態：完成（待 user 數據定論）**
-
-**動機現象：** 分段計時顯示 walk 6/0 總 370s 但 placements+rects+polys 三段只佔 24.9s → **345s 不在 walk 邏輯**。
-且此 gap 只出現在第一層（`newly_decoded_cells=721`），後兩層（decode=0、重用快取）幾乎無 gap → 345s 在 `load_cell`
-**解碼**本身。加 `_decode_prof`（總 decode 時間 + 最慢單一 cell 與其 placement/rect/poly 數）印在 `[roi] decode:` 行，
-確認是否為單一巨大 cell（疑似 chip-spanning 的 44995，~1.5M placements）所致。
-
-**影響檔案：** `glas/core/oasis_random.py`、`SESSION_LOG.md`。
-
----
-
-## [2026-06-04] [F16 後續] walk_roi 幾何 extent 快取（per-cell）+ 分段計時
-
-**變更類型：** 效能修復 + 診斷 ·  **狀態：完成**
-
-**動機現象：** 向量化後 LTV 從 1313s→443s，但 walk 6/0 仍 366s（`poly_specs=477,590`），而 walk 17/101 掃 870 萬 rect 只 57s。
-poly 每 spec ~727µs，異常高。研判：幾何剪枝的「base bbox min/max + `repetition_extent`（type 10/11 會 `expand_repetition`）」
-在**每次 visit、每層**重算一遍（同一顆 cell 被造訪多次 → 同樣的 extent 重算多次）。
-
-**修復實作：** 在 `CellContent` 加 `_ext_cache`，新增 `rect_arrays(key)` / `poly_arrays(key)` 回傳 `(base_bbox, extent_bbox)`
-兩個 `(M,4)` ndarray，**首次計算後快取**（CellContent 在 reader 上 memoized，跨同一次 walk 的多次 visit 重用）。walk 的幾何
-剪枝改成讀快取陣列 → 一次 `apply_to_rects` 篩選、只展開 survivor。另加分段計時 `t_place/t_rect/t_poly`（`[roi] section time` 行）
-與 `placements/rect_specs/poly_specs` scan 計數，定位剩餘熱點。
-
-**測試：** `pytest tests/` → 592 passed（行為不變，僅把重算改為快取）。
-
-**影響檔案：** `glas/core/oasis_random.py`、`SESSION_LOG.md`。
-
----
-
-## [2026-06-04] [F16 後續] walk_roi 剪枝向量化（消除 per-record numpy 開銷）— 真正的慢點
-
-**變更類型：** 效能修復 + 測試 ·  **狀態：完成**
-
-**動機現象：** 裁剪做完後再測 LTV，`max_array_k=1525`、`instances_materialized≈110k`、`visited=1165`、`decoded=342`
-**全都很小**，但仍 ~513s/層；user 描述「進度條卡在 342/44997 二十分鐘然後瞬間跑完」＝解碼早完成，那 20 分鐘是**純計算**。
-定位：walk 的剪枝對**每一筆 placement / 每一個 rect spec 都單獨呼叫一次 `apply_to_rects`(單盒)+mask**，這些 numpy 呼叫
-有高固定開銷（allocate corners／matmul／min-max）。當 cell 帶數百萬筆 placement／個別矩形時，百萬次 × ~30µs ≈ 數百秒。
-`pruned=16M` 三層一致＝placement 迴圈與層無關（baseline），各層額外時間來自幾何迴圈，且與「掃描的 spec 數」相關（非輸出數）。
-
-**修復實作（向量化批次剪枝）：**
-- **placement 迴圈**：先用純 Python 迴圈把整顆 cell 的所有 placement 的 base 矩陣／child bbox／repetition extent 填進預配置
-  ndarray（用 `_D4_ROT` scalar 填矩陣，不再 per-item `Transform.from_placement`/`np.array`），再以**單次** einsum 算 placed bbox、
-  **單次** `apply_to_rects`＋單次 mask 完成整批 whole-array 剪枝；只有少數命中 ROI 的 survivor 才做 `_clip_grid_offsets` 展開＋遞迴。
-- **rect / poly 自身幾何**：同樣批次化 —— 一次 `apply_to_rects` 篩出命中的 spec，survivor 才展開；rect 最後再以單次 transform 收集發射。
-- 新增 `placements_scanned / rect_specs_scanned / poly_specs_scanned` 計數（`[roi]   scanned: ...` 行），直接顯示「掃了幾筆」。
-  語義與舊版逐筆迴圈完全等價（591→592 測試全綠，含 far-prune/clip/cycle/CE/sbbox）。
-
-**測試：** 新增 `test_many_individual_placements_pruned_vectorized`：2 萬筆個別 placement，tiny ROI 只命中 1 顆，
-`placements_scanned==20000`、`instances_visited==1`、`pruned==19999`。`pytest tests/` → 592 passed。
-
-**影響檔案：** `glas/core/oasis_random.py`、`tests/test_oasis_random.py`、`SESSION_LOG.md`。
-
----
-
-## [2026-06-04] [F16 後續] walk_roi 自身幾何（RECTANGLE/POLYGON）阵列也裁剪 + type-8 grid 支援
-
-**變更類型：** 效能修復 + 測試 ·  **狀態：完成**
-
-**動機現象：** 加了 placement 子網格裁剪後再測 LTV，placement 端已修好（`max_array_k=304`、
-`instances_materialized=111,355`、`visited=2802`、`decoded=713` 都很小），但仍 ~527s/層。關鍵線索：walk 2/3
-`newly_decoded_cells=0`（無解碼）卻 612s/174s，時間與**輸出矩形數**成正比（4664 rect→612s、1493→174s）。
-定位到 `walk()` 的「自身幾何發射」：`content.rects(key)` 把**每個 RECTANGLE/POLYGON 的 repetition 阵列全展開**
-（type 1/8 CMG 阵列可達數百萬），再 `apply_to_rects` 全 transform、最後只留 ROI 內幾千個——且**完全沒有剪枝**
-（連 miss ROI 的阵列也全展開）。
-
-**修復實作：**
-1. `walk()` 自身幾何改為逐 spec 處理：先做便宜的 whole-array extent 剪枝（miss ROI 直接 O(1) skip，
-   這是 `content.rects()` 路徑本來缺的），再用 `_clip_grid_offsets` 只 materialize ROI 附近子網格，才 transform+mask。
-   結果與全展開完全相同（clip 回傳真 survivor 的 superset，下游精確 mask 決定）。
-2. `_clip_grid_offsets` 重構為 `_grid_axes` 軸分解，**新增 type 8（2D lattice）支援**：向量軸對齊（一橫一縱）時可裁剪，
-   斜向 lattice 退回全展開。placement 與幾何兩路共用，故 type-8 placement 阵列現也裁。
-3. 幾何阵列 materialize 也計入 `arrays_materialized/instances_materialized/max_array_k`（perf 行含幾何）。
-
-**測試：** 新增 `test_walk_clips_huge_rect_array_to_roi`（1M rect 阵列 walk 只 emit ROI 內 1 顆、`max_array_k<=25`）、
-`TestGridClip.test_clip_type8_axis_aligned`（type-8 軸對齊裁剪為 superset、斜向退回全展開）。`pytest tests/` → 591 passed。
-
-**影響檔案：** `glas/core/oasis_random.py`、`tests/test_oasis_random.py`、`SESSION_LOG.md`。
-
-**追加（開頭階段計時）：** user 回報進度條一開始卡在 `1 / <44997` 很久（`_n_loaded` 卡在 1＝只載入 root、還沒往下遞迴）。
-在 `walk()` depth==0 加兩行 `_dbg`：`root ... loaded in Xs (placements=…, rect_specs=…, poly_specs=…)` 與
-`root own-geometry done at Xs (rects=…, polys=…); descending N placements…`，把「載 root / 發射 root 自身幾何 / 開始遞迴」
-三段分開,定位開頭停頓究竟在哪。最可能就是 root 自帶橫跨全 chip 的矩形阵列（已由本次幾何裁剪修掉）。
-
-**變更類型：** 效能修復 + 測試 ·  **狀態：完成**
-
-**動機現象：** LTV 一次 ROI（4×4µm）三層共等 ~17 分鐘（每層 528–593s），但 `newly_decoded_cells=271`、
-`pruned=16,263,752`、`sbbox_prune=ON`。即 **F16 sbbox 有生效、幾乎沒在解幾何**，時間全花在「把一個橫跨全 chip、
-~1600 萬 instance 的 repetition 阵列整個 materialize 出來，只為了留下小 FOV 內的幾顆」。`place_rtypes=['2','3','10','11']`
-（1D 阵列巢狀成 sea）。既有的「整阵列 extent 剪枝」對「阵列 extent 蓋住 ROI」的情形無效 → 退化成全展開。
-
-**修復實作：** 新增 `_clip_grid_offsets`（+ `_roi_to_local` / `_axis_index_range`）：對規則格點型（type 1/2/3）先把
-ROI 用 `T⁻¹` 映回阵列 local 座標，解析算出可能命中的 index 子範圍（每邊 pad 1 格做 rounding 安全餘裕），**只 materialize
-該子網格**；其餘 arbitrary-list 型（10/11，本就有界）維持全展開。下游仍跑原本的精確 root-space mask 決定 survivor，
-故結果與全展開**完全相同**（clip 只回傳真 survivor 的 superset）。`instances_pruned` 改用 `repetition_count` 全數計，統計不失真。
-新增遙測 `arrays_materialized / instances_materialized / max_array_k`（`[roi]   perf: ...` 行）。
-
-**測試：** `TestBigGridRepetition.test_roi_inside_picks_one` 加驗 1M 阵列 ROI-inside 時 `max_array_k<=25`（不再全展開）；
-新 `TestGridClip`：(1) 四種 D4 旋轉 ×flip 下 clip 結果 ⊇ 真 survivor 且確實縮小；(2) type 2/3 1D 阵列裁剪。
-`pytest tests/ -k "oasis or random or walk or layout or boolean"` → 367 passed。
-
-**影響檔案：** `glas/core/oasis_random.py`、`tests/test_oasis_random.py`、`SESSION_LOG.md`。
-
----
-
-## [2026-06-04] [F16 後續] ROI load 永遠顯示效能遙測（診斷「為何還是慢」）
-
-**變更類型：** 診斷遙測 + 測試 ·  **狀態：完成**
-
-**動機：** user 回報 LTV/R8 兩個大檔 Load GDS ROI 仍很慢，並發現 LTV「有 CE 層但 Scan layers 沒讀到」。釐清：
-(1) `bbox_layer` 是寫死的 `DEFAULT_BBOX_LAYER=(108,250)`，與 Scan layers 有無列出無關；(2) 三檔 L108/D250 都只有
-~4–6 個矩形（非 per-cell 邊界，cell 數卻上萬）→ CE early-stop 對這些檔幾乎不觸發，本來就慢；F16 的 S_BOUNDING_BOX
-才是正解。為了能不開 DEBUG 就看出「prune 到底有沒有生效、時間花在哪」，把 walk 的關鍵數字做成永遠顯示。
-
-**實作：** `RoiWalkStats` 新增 `cells_decoded`（本次真正全解的 cell 數）、`elapsed_s`、`sbbox_prune`（reader 是否有
-S_BOUNDING_BOX map → 走免解幾何路徑）。`walk_roi` 收尾填入。app `_on_roi_loaded` 永遠 print：
-`[roi] loaded in X.Xs · cells decoded=N · M instances pruned · S_BOUNDING_BOX prune=ON/off`。
-**判讀：** 小 FOV 卻 `cells decoded` 上千 → prune 沒咬住（多半 F16 未生效或幾何是 flat 大 cell）。
-
-**測試：** `TestSBoundingBoxPrune::test_walk_prunes_far_instance` 加驗 `sbbox_prune is True` 且 `cells_decoded==2`
-（只解 root+命中 child，遠端 instance 子樹未解）。`pytest tests/test_oasis_random.py` 30 passed。
-
-**追加：** 也在 reader 建立處（`_load_roi_around` 上游）印一次性建構遙測：
-`[roi] reader built in X.Xs · N cells indexed · S_BOUNDING_BOX on M cells (decode-free prune / NONE)`，
-把「建 reader（slurp+scan）」與「walk」兩段時間分開，並直接顯示 sbbox map 有沒有建起來（M≈cell 數 → F16 生效；
-M==0 → 退回 bbox-by-decode）。同步修正 `_load_roi_around` 過時 docstring（不再宣稱每次首載都全解每顆 cell）。
-
-**影響檔案：** `glas/core/oasis_random.py`、`glas/app/gds_align_tool.py`、`tests/test_oasis_random.py`、`SESSION_LOG.md`。
-**Branch：** `claude/friendly-franklin-9uZqU`
-
----
-
-## [2026-06-04] [F16] 用 name-table S_BOUNDING_BOX 免解幾何加速 Load GDS ROI
-
-**變更類型：** 功能（ROI 剪枝 fast path）+ 診斷 + 測試 ·  **狀態：完成** ·  **plan：** `docs/plans/F16-sbbox-roi-prune.md`
-
-**背景／現象：** user 回報「Load GDS ROI 常常開很久」。追查：`walk_roi` 靠 `reachable_bbox`→`load_cell_bbox`
-取每顆 cell bbox 做 ROI 剪枝；有 CE 邊界層 (L108/D250) 時每顆只讀 ~1 矩形即停（快），**KLayout 轉檔無此層 →
-`_decode_bbox_at` 退化成每顆 cell 全解，第一次 ROI load 的 reachable_bbox 全階層 sweep ≈ 全 chip 解碼 → 慢**
-（F12 撤案的根本卡點）。
-
-**診斷（M1）：** `scan_cell_offsets` 在掃 name table（含 strict 檔尾表）順帶偵測 `S_BOUNDING_BOX`（`_BBOX_PROP`）：
-`n_bbox_props` 計數 + `bbox_sample` 原始值取樣，顯示在 Diagnose 報告與 `[gds-scan]` 終端機。user 跑三個真實檔回報：
-**1.8 GB 的兩個慢檔每顆 cell 都帶 S_BOUNDING_BOX（其中 R8_OD 還剛好無 CE 層 = 最慢型）；唯一沒有的 E3B（345 MB）
-本就有 CE 層＋檔小**。→ 確定走方案 A（讀 name-table bbox），方案 B（自建 sidecar）三檔用不到、留 backlog。
-
-**解碼確認：** S_BOUNDING_BOX 五值 = `[flag, x左下, y左下, 寬, 高]`，cell-local grid/DBU；x/y 有號、寬高無號；
-bbox=`(x,y,x+寬,y+高)`。`flag==0` = 完整 bbox（含 placement，由檔1 top cell bbox≈整顆 chip 反證）。
-
-**實作（M2，方案 A）：**
-- `scan_cell_offsets` 建完整 `bbox_by_refnum`/`bbox_by_name`（**僅 flag==0**，存 `(x0,y0,x1,y1)` grid），隨 idx 回傳。
-- `RandomAccessReader` stash `_sbbox_by_refnum/_by_name` + 新 `sbbox_for(cell_id)`（解析 refnum/name，仿 `offset_for`）。
-- `reachable_bbox`（walk_roi closure + 獨立 `_reachable_bbox`）加 fast path：有 sbbox → **直接回傳、跳過
-  `load_cell_bbox` 與子遞迴**，memoize 進 `_reach_memo`。無 sbbox 完全走原 CE/解碼路（E3B 行為不變）。
-- DEBUG 守門：walk 內仿 CE-VIOLATION 加 `SBBOX-VIOLATION`——查表 bbox 必須包住每顆走訪 cell 的實際 bbox。
-
-**測試：** `TestSBoundingBoxPrune`（value 故意大於真實幾何以證明值來自 name table；flag!=0 → fallback 解碼；
-遠端 instance 免解幾何剪枝且 `_bbox_memo=={}`）+ `TestBoundingBoxProp`（偵測有/無）。`pytest tests/` **587 passed**。
-
-**影響檔案：** `glas/core/oasis_streamer.py`、`glas/core/oasis_random.py`、`glas/core/oasis_debug.py`、
-`glas/app/gds_align_tool.py`、`tests/test_oasis_random.py`、`tests/test_oasis_layer_scan.py`、
-`docs/plans/F16-sbbox-roi-prune.md`、`SESSION_LOG.md`。
-**Branch：** `claude/friendly-franklin-9uZqU`
+## [2026-06-04] [F16 + F16-B + F18/F19] Load GDS ROI 大檔加速：S_BOUNDING_BOX 剪枝 → 解碼快取 → 換 ROI 秒級
+
+**變更類型：** 重大效能（多 milestone，本日一連串來回，已合併）·  **狀態：完成**
+
+**問題：** LTV（1.75GB OASIS）載入單一 defect 的 ROI 要 ~7 分鐘。逐層定位瓶頸並修復（完整逐步診斷見 git history 與
+`docs/plans/F16-sbbox-roi-prune.md` / `F16-B-cell-decode-cache.md`）。
+
+**根因與修復（依發現順序）：**
+1. **無 per-cell bbox → ROI 首載需全 chip 解碼** → [F16] 用 name-table **S_BOUNDING_BOX**（per-cell 完整、含 placement 的 bbox）
+   做 `reachable_bbox`，免解幾何剪枝（`oasis_random.sbbox_for` + reader 建 sbbox map）。
+2. **巨大 repetition 阵列被全展開**（placement 1600 萬 instance / 幾何 CMG 阵列）→ **解析子網格裁剪** `_clip_grid_offsets`
+   （type 1/2/3/8 規則格點：把橫跨全 chip、ROI 落在內部的阵列只展開 ROI 附近幾顆；下游精確 mask，結果與全展開逐筆相等）。
+3. **per-record 逐筆 numpy 開銷**（百萬筆 × `apply_to_rects` 單盒）→ walk 剪枝**向量化**（placement gather 批次 einsum + 單次
+   `apply_to_rects`/mask；rect/poly 同理）。
+4. **真正大頭：單一橫跨全 chip 的 flat merge cell `44995`（880 萬 rect + 150 萬 placement + 48 萬 poly ≈ 1080 萬筆）首解 ~292s**
+   → **[F16-B] 解碼磁碟快取**（per-user sidecar）：
+   - **M1** `Placement`→NamedTuple + decode 內圈精簡；**M2** `CellContent` 欄狀雙後端（`_rcol`/`_pcol`）；
+     **M3/M4** 新模組 `cellcache.py`（欄狀 `.npz` + 稀疏 rr、mtime/size+schema 驗證、原子寫、毀損當 miss、env 開關/門檻）接進 `load_cell`。
+   - **M6** placement gather per-cell 快取（ROI/T 無關）→ **換 ROI 秒級**；**M7** gather 持久化成 prep sidecar + `_feat` DEBUG gate
+     → batch 每 worker / 每 session 第一個 ROI 跳過 gather。
+   - **[F18]** lazy placement（cache 存 SoA、int target/kind、用到 survivor 才建）→ cache 載入 placement 段 ~10s→~0.3s；
+     **[F19]** sidecar LRU 自動清理（`_evict`/`clear()`/`GLAS_CELLCACHE_MAX_MB`）。
+   - geometry extent 向量化（`_ext_from_columnar`，規則型 numpy 一次算、10/11 逐筆）；`_ext_cache` 跨 ROI 重用。
+5. **診斷/UX：** 永遠顯示遙測 → `--debug` 分層（L1 精簡每層摘要 / `--trace`=L2 深度 per-cell）；ROI 進度畫面精確化（逐層 +
+   已載/快取命中數）；有 sbbox 時跳過 --debug 的 CE 檢查（省首載 ~53s）；濾掉無害 Qt 警告（setPointSize / setGeometry）。
+
+**實測（5–7min → ）：** 換 ROI/defect **~9–12s**（原 ~2min）；重開 app 第一個 ROI **~42s**（decode 283→14s 走快取、
+place 14→0.8s 走 prep、geom 29→13s 向量化）；同檔換不同 ROI 全程秒級；batch 每 worker 暖機亦走快取。
+
+**撤案：** M5（ROI 過濾解碼）— 對「看多 defect」工作流更差 + 與 cell 快取相斥。**未做（CP 值不足）：** 結構化 repetition 參數
+（可再砍 geom build ~9s→~1s）。
+
+**測試：** ~218 → **606 項全綠**（新增 cellcache round-trip / walk decode-vs-cache bit-identical / 子網格裁剪 D4 superset /
+ext 向量化對照 repetition_extent / lazy placement / LRU eviction 等）。
+
+**影響檔案：** `glas/core/oasis_random.py`、`glas/core/cellcache.py`(新)、`glas/app/gds_align_tool.py`、
+`tests/test_oasis_random.py`、`tests/test_cellcache.py`(新)、`docs/plans/F16-sbbox-roi-prune.md`、
+`docs/plans/F16-B-cell-decode-cache.md`、`CLAUDE.md`、`SESSION_LOG.md`。**Branch：** claude/friendly-franklin-9uZqU。
 
 ---
 
