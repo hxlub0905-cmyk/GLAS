@@ -297,16 +297,15 @@ class TestOverviewMap:
 
 
 class TestViewModes:
-    """View-mode selector (SEM / GDS) + standalone Minimap overlay toggle
-    (S2: Minimap is no longer a third exclusive mode)."""
+    """View-mode selector (SEM / GDS). Minimap was removed entirely in a
+    later UX pass (it duplicated the GDS overview's defect map)."""
 
     def test_default_mode_sem(self, mw):
         assert mw._view_mode == "sem"
-        assert mw.canvas.isHidden() and mw.minimap.isHidden()
+        assert mw.canvas.isHidden()
         assert mw._seg_sem.isChecked()
 
     def test_modes_are_exclusive(self, mw):
-        # S2: only SEM and GDS are mutually exclusive view modes.
         mw._set_view_mode("gds")
         assert not mw.canvas.isHidden()
         assert mw._seg_gds.isChecked() and not mw._seg_sem.isChecked()
@@ -315,44 +314,15 @@ class TestViewModes:
         assert mw._seg_sem.isChecked() and not mw._seg_gds.isChecked()
 
     def test_cycle_wraps(self, mw):
-        # S2: cycle is now binary (sem <-> gds), no minimap third state.
         mw._set_view_mode("sem")
         mw._cycle_view_mode(); assert mw._view_mode == "gds"
         mw._cycle_view_mode(); assert mw._view_mode == "sem"
 
-    def test_minimap_toggle_independent_of_view_mode(self, mw):
-        # S2: Minimap visibility composes with any view mode.
-        mw._set_view_mode("sem")
-        mw._set_minimap_visible(True)
-        assert not mw.minimap.isHidden()
-        assert mw._mini_btn.isChecked() is True
-        # Switching SEM <-> GDS does not turn the minimap off.
-        mw._set_view_mode("gds")
-        assert not mw.minimap.isHidden()
-        mw._set_minimap_visible(False)
-        assert mw.minimap.isHidden()
-        assert mw._mini_btn.isChecked() is False
-
-    def test_minimap_receives_defects_and_click(self, mw):
-        mw._sem_images = [
-            sem_loader.SemImage(image_id="D1", filename="a", file_path=Path("a"),
-                                xrel=4000.0, yrel=5000.0),
-            sem_loader.SemImage(image_id="D2", filename="b", file_path=Path("b"),
-                                xrel=9000.0, yrel=2000.0),
-        ]
-        mw._chip_corner_x = mw._chip_corner_y = 0.0
-        mw._refresh_overview_defects()
-        assert len(mw.minimap._defects) == 2
-        mw.minimap.resize(212, 152)
-        bbox = mw.minimap._bbox()
-        sx, sy = mw.minimap._map(9000.0, 2000.0, bbox)   # D2 dot
-        from PyQt6.QtGui import QMouseEvent
-        from PyQt6.QtCore import QPointF, QEvent, Qt as _Qt
-        ev = QMouseEvent(QEvent.Type.MouseButtonPress, QPointF(sx, sy),
-                         _Qt.MouseButton.LeftButton, _Qt.MouseButton.LeftButton,
-                         _Qt.KeyboardModifier.NoModifier)
-        mw.minimap.mousePressEvent(ev)
-        assert mw._current_sem.image_id == "D2"
+    def test_minimap_gone(self, mw):
+        # Defensive check that the minimap UI was fully removed.
+        assert not hasattr(mw, "minimap")
+        assert not hasattr(mw, "_mini_btn")
+        assert not hasattr(mw, "_set_minimap_visible")
 
     def test_fit_action_not_a_mode(self, mw):
         # _on_fit_view fits the overview to defects (an action, not a mode);

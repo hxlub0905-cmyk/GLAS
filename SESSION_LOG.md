@@ -4,6 +4,34 @@
 
 ---
 
+## [2026-06-05] [UX cleanup] Minimap 功能整批移除
+
+**變更類型：** dead feature 清除 ·  **狀態：完成**
+
+**動機：** user 實機跑後表示 Minimap 沒什麼用，要求整批拿掉（含 UI + class +
+shortcut）。剛 round 2 把它從互斥 view mode 改成獨立 toggle，反而暴露了「沒用但
+又佔 toolbar 空間」的問題；GDS view mode 的 overview pane 已經能顯示所有 defect 位置
++ 當前 FOV，minimap 是重複資訊。
+
+**移除：**
+- `MiniMap(QWidget)` class 整個拿掉（~93 行）
+- toolbar `_mini_btn` 拿掉、`M` shortcut 拿掉
+- `MainWindow.minimap` instance、`MainWindow._set_minimap_visible` 拿掉
+- `MainWindow._enter_batch_workspace` / `_exit_batch_workspace` 內的 minimap 保留邏輯
+- `_refresh_overview_defects` 內 `self.minimap.set_data(...)` 呼叫
+- `SemViewer._corner_overlay` / `set_corner_overlay` / `_reposition_overlay` 機制
+  整套拿掉（minimap 是唯一 consumer）
+- `resizeEvent` 不再 reposition overlay
+
+**測試：** `tests/test_gds_align_m7.py::TestViewModes` 移除 minimap-related cases
+（`test_minimap_toggle_independent_of_view_mode` / `test_minimap_receives_defects_and_
+click`），新增 `test_minimap_gone` 防回退（確認 attr 都不存在）。全套件 **667 passed**。
+
+**影響檔案：** `glas/app/gds_align_tool.py`、`tests/test_gds_align_m7.py`、
+`SESSION_LOG.md`。 **PR：** #11
+
+---
+
 ## [2026-06-05] [UX round 2] S2/S7/S11/S12 Minimap toggle / δ gating / empty states
 
 **變更類型：** UX 後續批次（4 條 + 移除 welcome / catalog 文案內的 dev mode 入口洩漏） ·

@@ -3030,25 +3030,11 @@ class SemViewer(QWidget):
         self._MAX_ZOOM = 60.0
         self._cursor_screen: Optional[QPointF] = None
         self.setMouseTracking(True)   # live cursor readout without a button
-        self._corner_overlay: Optional[QWidget] = None   # M7-ov #9 minimap
         # S12: prominent CTA in the empty SEM area so the first action a new
         # user sees in the centre of the screen is loading a SEM.
         self._cta_btn = _SemViewerCTA(self)
         self._cta_btn.clicked.connect(self.load_sem_requested)
         self._cta_btn.show()
-
-    def set_corner_overlay(self, w: Optional[QWidget]) -> None:
-        """Host a small floating widget (the minimap) pinned bottom-right."""
-        self._corner_overlay = w
-        self._reposition_overlay()
-
-    def _reposition_overlay(self) -> None:
-        w = self._corner_overlay
-        if w is None:
-            return
-        m = 12
-        w.move(max(0, self.width() - w.width() - m),
-               max(0, self.height() - w.height() - m))
 
     def _reposition_cta(self) -> None:
         # Centre the CTA button slightly below the painted "No SEM image"
@@ -3064,7 +3050,6 @@ class SemViewer(QWidget):
 
     def resizeEvent(self, ev) -> None:  # type: ignore[override]
         super().resizeEvent(ev)
-        self._reposition_overlay()
         self._reposition_cta()
 
     def native_size(self) -> Optional[tuple]:
@@ -3360,99 +3345,6 @@ class SemViewer(QWidget):
         self._pan_x = (mx - ix * s2) - (self.width() - nw * s2) / 2.0
         self._pan_y = (my - iy * s2) - (self.height() - nh * s2) / 2.0
         self.update()
-
-
-class MiniMap(QWidget):
-    """A small picture-in-picture defect map (M7-ov #9), floated over the SEM
-    view. Draws all defect dots (colour = score) + the current FOV centre,
-    auto-fit to the defect bounds. Click a dot to select that image. Renders
-    only dots/markers — no OASIS geometry — so it stays cheap."""
-
-    defect_clicked = pyqtSignal(str)
-
-    def __init__(self, parent: Optional[QWidget] = None) -> None:
-        super().__init__(parent)
-        self.setFixedSize(212, 152)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._defects: list = []
-        self._current: Optional[str] = None
-        self._fov: Optional[tuple] = None     # (cx, cy) nm
-
-    def set_data(self, defects: list, current_id: Optional[str],
-                 fov_center: Optional[tuple]) -> None:
-        self._defects = list(defects)
-        self._current = current_id
-        self._fov = fov_center
-        self.update()
-
-    def _bbox(self):
-        pts = [(d[1], d[2]) for d in self._defects]
-        if self._fov is not None:
-            pts.append(self._fov)
-        if not pts:
-            return None
-        xs = [p[0] for p in pts]
-        ys = [p[1] for p in pts]
-        x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
-        px = max((x1 - x0) * 0.12, 500.0)
-        py = max((y1 - y0) * 0.12, 500.0)
-        return (x0 - px, y0 - py, x1 + px, y1 + py)
-
-    def _map(self, gx, gy, bbox):
-        x0, y0, x1, y1 = bbox
-        iw, ih = self.width() - 16, self.height() - 26
-        s = min(iw / max(1.0, x1 - x0), ih / max(1.0, y1 - y0))
-        cx, cy = 8 + iw / 2.0, 20 + ih / 2.0
-        wx, wy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
-        return cx + (gx - wx) * s, cy - (gy - wy) * s
-
-    def paintEvent(self, ev) -> None:  # type: ignore[override]
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        bg = QColor("#fbf8f3")
-        bg.setAlpha(238)
-        p.setBrush(QBrush(bg))
-        p.setPen(QPen(_TK_BORDER_DK, 1))
-        p.drawRoundedRect(QRectF(0.5, 0.5, self.width() - 1, self.height() - 1), 6, 6)
-        p.setPen(QPen(_TK_TEXT_HINT))
-        p.drawText(QRectF(8, 4, self.width() - 16, 14),
-                   Qt.AlignmentFlag.AlignLeft, "Defect map")
-        bbox = self._bbox()
-        if bbox is None:
-            p.setPen(QPen(_TK_TEXT_HINT))
-            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "no defects")
-            p.end()
-            return
-        for image_id, gx, gy, score in self._defects:
-            sx, sy = self._map(gx, gy, bbox)
-            p.setPen(QPen(QColor("#ffffff"), 0.8))
-            p.setBrush(QBrush(GdsCanvas._score_color(score)))
-            p.drawEllipse(QPointF(sx, sy), 3.2, 3.2)
-            if image_id == self._current:
-                p.setPen(QPen(_TK_ACCENT_DK, 1.4))
-                p.setBrush(Qt.BrushStyle.NoBrush)
-                p.drawEllipse(QPointF(sx, sy), 6.0, 6.0)
-        if self._fov is not None:
-            fx, fy = self._map(self._fov[0], self._fov[1], bbox)
-            p.setPen(QPen(_TK_ACCENT_DK, 1.4))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawLine(QPointF(fx - 5, fy), QPointF(fx + 5, fy))
-            p.drawLine(QPointF(fx, fy - 5), QPointF(fx, fy + 5))
-        p.end()
-
-    def mousePressEvent(self, ev: QMouseEvent) -> None:  # type: ignore[override]
-        bbox = self._bbox()
-        if bbox is None:
-            return
-        px, py = ev.position().x(), ev.position().y()
-        best, best_d2 = None, 12.0 ** 2
-        for image_id, gx, gy, _s in self._defects:
-            sx, sy = self._map(gx, gy, bbox)
-            d2 = (sx - px) ** 2 + (sy - py) ** 2
-            if d2 <= best_d2:
-                best, best_d2 = image_id, d2
-        if best is not None:
-            self.defect_clicked.emit(best)
 
 
 class PartChipPanel(QFrame):
@@ -5915,7 +5807,7 @@ class MainWindow(QMainWindow):
         self._center_split.setStretchFactor(2, 1)
         center_layout.addWidget(self._center_split, 1)
         # Single-view UX (M6.3): show SEM+overlay big by default; the GDS
-        # overview / minimap are opt-in view modes.
+        # overview is an opt-in view mode.
         self.canvas.setVisible(False)
         self.batch_panel.setVisible(False)
         self._view_mode = "sem"
@@ -5927,12 +5819,8 @@ class MainWindow(QMainWindow):
         self.batch_panel.back_requested.connect(self._exit_batch_workspace)
         self.batch_panel.cancel_requested.connect(self._on_fa_cancel_clicked)
         self.batch_panel.rerun_requested.connect(self._on_rerun_requested)
-        # M7-ov #9: corner minimap floated over the SEM view (hidden unless in
-        # 'minimap' mode).
-        self.minimap = MiniMap(self.sem_viewer)
-        self.minimap.hide()
-        self.minimap.defect_clicked.connect(self._on_defect_clicked)
-        self.sem_viewer.set_corner_overlay(self.minimap)
+        # M7-ov #9 corner minimap removed (no longer useful in practice — the
+        # GDS view-mode overview pane already shows defect positions).
 
         self.sem_panel = SemPanel(splitter)
         # F21 M3: Set/Clear Offset are wired through the AlignmentDeltaPanel
@@ -6195,19 +6083,9 @@ class MainWindow(QMainWindow):
                              "Shortcut: G")
         self._seg_sem.setChecked(True)
 
-        # Standalone Minimap toggle — checkable, not in the seg group.
-        self._mini_btn = QPushButton(_qicon("target"), " Minimap")
-        self._mini_btn.setCheckable(True)
-        self._mini_btn.setProperty("seg", "true")
-        self._mini_btn.setToolTip(
-            "Toggle a corner defect minimap on the SEM viewer. Works in "
-            "both SEM and GDS view modes. Shortcut: M")
-        self._mini_btn.toggled.connect(self._set_minimap_visible)
-        h.addWidget(self._mini_btn)
-
         h.addWidget(_divider())
         fit_btn = QPushButton(_qicon("maximize"), " Fit")
-        fit_btn.setToolTip("Fit the GDS overview / minimap to all defects.")
+        fit_btn.setToolTip("Fit the GDS overview to all defects.")
         fit_btn.clicked.connect(self._on_fit_view)
         h.addWidget(fit_btn)
 
@@ -6290,8 +6168,6 @@ class MainWindow(QMainWindow):
         sc("Ctrl+=", lambda: self.sem_viewer.zoom_by(1.2))
         sc("Ctrl+-", lambda: self.sem_viewer.zoom_by(1.0 / 1.2))
         sc("G", self._cycle_view_mode)
-        # S2: M toggles the corner minimap independently of view mode.
-        sc("M", lambda: self._mini_btn.setChecked(not self._mini_btn.isChecked()))
         sc("Ctrl+Up", lambda: self._nudge_origin(0, self._NUDGE_NM))
         sc("Ctrl+Down", lambda: self._nudge_origin(0, -self._NUDGE_NM))
         sc("Ctrl+Left", lambda: self._nudge_origin(-self._NUDGE_NM, 0))
@@ -6315,8 +6191,7 @@ class MainWindow(QMainWindow):
 
     def _set_view_mode(self, mode: str) -> None:
         """Switch the centre view between SEM-only and SEM + GDS overview.
-        Also leaves the batch workspace, if active (F7). Minimap visibility
-        is independent of view mode (see :meth:`_set_minimap_visible`)."""
+        Also leaves the batch workspace, if active (F7)."""
         if mode not in self._VIEW_MODES:
             return
         self._batch_active = False
@@ -6332,52 +6207,28 @@ class MainWindow(QMainWindow):
             btn.setChecked(True)
             btn.blockSignals(False)
 
-    def _set_minimap_visible(self, on: bool) -> None:
-        """S2: Minimap is now an independent corner-overlay toggle. Works
-        in both SEM and GDS view modes; batch workspace still suppresses it
-        to keep that focused layout clean."""
-        if self._batch_active:
-            return
-        self.minimap.setVisible(bool(on))
-        if on:
-            self.sem_viewer._reposition_overlay()
-            self.minimap.raise_()
-        # Keep the toolbar button in sync if a programmatic caller flipped
-        # the visibility without going through the button.
-        if self._mini_btn.isChecked() != bool(on):
-            self._mini_btn.blockSignals(True)
-            self._mini_btn.setChecked(bool(on))
-            self._mini_btn.blockSignals(False)
-
     def _enter_batch_workspace(self) -> None:
         """Show the batch workspace (left = results, right = SEM overlay),
-        remembering the current view mode so 'Back' can restore it (F7).
-        Minimap is suppressed while in the batch workspace regardless of
-        its toggle state; the toggle's checked state is preserved so the
-        previous overlay returns when the user exits batch mode."""
+        remembering the current view mode so 'Back' can restore it (F7)."""
         if not self._batch_active:
             self._prev_view_mode = self._view_mode
         self._batch_active = True
         self.canvas.setVisible(False)
-        self.minimap.setVisible(False)
         self.batch_panel.setVisible(True)
         total = max(2, self._center_split.width())
         left = int(total * 0.55)
         self._center_split.setSizes([0, left, total - left])
 
     def _exit_batch_workspace(self) -> None:
-        """Return from the batch workspace to the previous view mode (F7),
-        re-showing the minimap if its toggle was on."""
+        """Return from the batch workspace to the previous view mode (F7)."""
         self._set_view_mode(getattr(self, "_prev_view_mode", "sem"))
-        if self._mini_btn.isChecked():
-            self._set_minimap_visible(True)
 
     def _cycle_view_mode(self) -> None:
         i = self._VIEW_MODES.index(getattr(self, "_view_mode", "sem"))
         self._set_view_mode(self._VIEW_MODES[(i + 1) % len(self._VIEW_MODES)])
 
     def _on_fit_view(self) -> None:
-        """Fit the active overview/minimap to all defects (Fit action)."""
+        """Fit the GDS overview to all defects (Fit action)."""
         self.canvas.fit_to_defects()
 
     def _on_toggle_overview(self, on: bool) -> None:
@@ -6475,8 +6326,6 @@ class MainWindow(QMainWindow):
             defects.append((im.image_id, gx, gy, ref[2] if ref else None))
         cur = self._current_sem.image_id if self._current_sem else None
         self.canvas.set_defects(defects, cur)
-        fov = self._current_image_gds()       # current FOV centre (or None)
-        self.minimap.set_data(defects, cur, fov)
 
     def _on_defect_clicked(self, image_id: str) -> None:
         """Clicking a dot in the overview selects that image (same on-demand
