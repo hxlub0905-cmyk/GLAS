@@ -1933,15 +1933,35 @@ class LayerPanel(QFrame):
             "Compose a synthetic layer from a Boolean expression, e.g.\n"
             "[(A > W:5) & B] < H:5")
         self._expr_btn.clicked.connect(self.add_expression_requested)
+        # U2: Boolean expressions can only bind to raw layers — keep the
+        # button greyed out until a document is loaded.
+        self._expr_btn.setEnabled(False)
+        # U8: a discreet "?" badge replaces the always-visible hint strip
+        # ("checkbox / POI / swatch") — same wording in the tooltip,
+        # without permanently using ~32 px of vertical space.
+        self._row_help_btn = QToolButton(self)
+        self._row_help_btn.setText("?")
+        self._row_help_btn.setAutoRaise(True)
+        self._row_help_btn.setCursor(Qt.CursorShape.WhatsThisCursor)
+        self._row_help_btn.setStyleSheet(
+            f"QToolButton {{ color:{_TK_TEXT_HINT.name()}; "
+            f"font-size:{_FS_LABEL}px; font-weight:700; "
+            f"border:1px solid {_TK_BORDER.name()}; border-radius:9px; "
+            f"min-width:18px; max-width:18px; min-height:18px; max-height:18px; "
+            f"padding:0; }}"
+            f"QToolButton:hover {{ background:{_TK_BG_PANEL.name()}; "
+            f"color:{_TK_ACCENT_DK.name()}; }}")
+        self._row_help_btn.setToolTip(
+            "Row controls:\n"
+            "• checkbox — show / hide this layer in the overlay\n"
+            "• POI — use this layer as the fine-align template\n"
+            "• coloured swatch — click to recolour the layer")
         btn_row = QHBoxLayout()
-        btn_row.setContentsMargins(8, 6, 8, 0)
-        btn_row.addWidget(self._expr_btn)
+        btn_row.setContentsMargins(8, 6, 8, 6)
+        btn_row.setSpacing(6)
+        btn_row.addWidget(self._expr_btn, 1)
+        btn_row.addWidget(self._row_help_btn)
         layout.addLayout(btn_row)
-
-        hint = QLabel("checkbox: show/hide  ·  POI: fine-align template  ·  swatch: colour")
-        hint.setStyleSheet(_hint_qss(_FS_MICRO, pad="6px 10px"))
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
 
         self._doc: Optional[GdsDocument] = None
         self._rows: list[_LayerRow] = []
@@ -1986,6 +2006,8 @@ class LayerPanel(QFrame):
         self.list.clear()
         self._rows = []
         self._poi_entries = []
+        # U2: + Expression… only makes sense once raw layers exist to bind.
+        self._expr_btn.setEnabled(doc is not None and bool(doc.entries))
         if doc is None or not doc.entries:
             self._show_empty_hint()
             self.pois_changed.emit([])
@@ -3490,10 +3512,9 @@ class PartChipPanel(QFrame):
             "for this session.")
         v.addWidget(self._fov_lbl)
 
-        self._notes_lbl = QLabel("")
-        self._notes_lbl.setWordWrap(True)
-        self._notes_lbl.setStyleSheet(_hint_qss(_FS_MICRO, pad="0 0 2px 0"))
-        v.addWidget(self._notes_lbl)
+        # U5: catalog notes used to live as a dedicated italic label that
+        # competed visually with the FOV "(custom)" italic tag. Move it
+        # into the chip-corner badge's tooltip — same info, no extra row.
 
         # ── Custom override toggle + hidden frame ────────────────────────
         self._custom_chk = QCheckBox("Custom override (FOV / scale)", self)
@@ -3530,12 +3551,23 @@ class PartChipPanel(QFrame):
         self._nm_per_px.setSingleStep(0.5)
         self._nm_per_px.setGroupSeparatorShown(True)
         self._nm_per_px.setSuffix(" nm/px")
+        # U4: a disabled QSpinBox still shows "0.0000" prominently and reads
+        # as "scale is zero" to first-time users. Show "auto" instead while
+        # the auto checkbox is on, so the value the panel will actually use
+        # (FOV ÷ image px) is what the user sees.
+        self._nm_per_px.setSpecialValueText("auto (FOV ÷ image px)")
         self._nm_per_px.setEnabled(False)
         self._nm_per_px.valueChanged.connect(self._on_custom_value_changed)
         self._nm_auto = QCheckBox("auto = FOV ÷ image px", self._custom_frame)
         self._nm_auto.setChecked(True)
-        self._nm_auto.toggled.connect(
-            lambda on: self._nm_per_px.setEnabled(not on))
+
+        def _sync_npx_enabled(on: bool) -> None:
+            self._nm_per_px.setEnabled(not on)
+            # The special-value text only appears at the spinbox minimum;
+            # snap to 0 while auto is on so "auto" stays visible.
+            if on:
+                self._nm_per_px.setValue(0.0)
+        self._nm_auto.toggled.connect(_sync_npx_enabled)
         self._nm_auto.toggled.connect(self._on_custom_value_changed)
 
         def _add(row: int, text: str, w: QWidget) -> None:
@@ -3726,12 +3758,16 @@ class PartChipPanel(QFrame):
         self._fov_lbl.setText(
             f"→ FOV: {fw:,.0f} × {fh:,.0f} nm  "
             f"({fw / 1e3:,.3f} × {fh / 1e3:,.3f} µm){tag}")
+        # U5: surface chip notes in the chip-corner tooltip instead of as a
+        # third italic line that crowded the right column.
         chip = self._current_chip()
+        base_corner_tip = (
+            "Chip lower-left corner relative to die corner (nm), computed "
+            "as (chip_x − gds_off_x) × 1000 — fed to klarf_to_gds().")
         if chip is not None and chip.notes:
-            self._notes_lbl.setText(f"<i>{chip.notes}</i>")
-            self._notes_lbl.setTextFormat(Qt.TextFormat.RichText)
+            self._corner_lbl.setToolTip(f"{base_corner_tip}\n\n{chip.notes}")
         else:
-            self._notes_lbl.setText("")
+            self._corner_lbl.setToolTip(base_corner_tip)
 
     # ── Public API for MainWindow ───────────────────────────────────────
 
@@ -4297,7 +4333,7 @@ class FineAlignPanel(QGroupBox):
         grid.setHorizontalSpacing(6)
         grid.setVerticalSpacing(4)
 
-        self._poi_lbl = QLabel("POI: (none — toggle 'POI' on a layer)")
+        self._poi_lbl = QLabel("POI: (none — click the POI button on a layer in the LAYERS column)")
         self._poi_lbl.setWordWrap(True)
         self._poi_lbl.setStyleSheet(_hint_qss(_FS_CAPTION))
         self._poi_set = False
@@ -4436,7 +4472,7 @@ class FineAlignPanel(QGroupBox):
         n = len(items)
         self._poi_lbl.setText(
             f"POI: {n} layer{'s' if n != 1 else ''} → composite template"
-            if self._poi_set else "POI: (none — toggle 'POI' on a layer)")
+            if self._poi_set else "POI: (none — click the POI button on a layer in the LAYERS column)")
         self._update_enabled()
 
     def set_fgs(self, fgs: dict) -> None:
@@ -5097,9 +5133,8 @@ class SemPanel(QFrame):
         v.setContentsMargins(10, 12, 10, 12)
         v.setSpacing(11)
 
-        title = QLabel("SEM")
-        title.setObjectName("panelTitle")
-        v.addWidget(title)
+        # U6: the "SEM" panel-title label was redundant with the prominent
+        # Load SEM… button immediately below it — removed.
 
         btn_row = QHBoxLayout()
         self.load_sem_btn = QPushButton("Load SEM…")
@@ -5124,6 +5159,15 @@ class SemPanel(QFrame):
         # name so existing signal wiring keeps working.
         self.coord_setup = PartChipPanel(self)
         v.addWidget(self.coord_setup)
+
+        # U7: thin separator between the PART/CHIP block and the Alignment δ
+        # block so the right column's four concerns read as four distinct
+        # sections instead of one undifferentiated wall of text.
+        sep1 = QFrame(self)
+        sep1.setFrameShape(QFrame.Shape.HLine)
+        sep1.setStyleSheet(f"color:{_TK_BORDER.name()};")
+        sep1.setFixedHeight(1)
+        v.addWidget(sep1)
 
         # F21 M3: Alignment δ readout, always visible directly below the
         # PART/CHIP block. The numeric value is owned by MainWindow.
@@ -5970,7 +6014,7 @@ class MainWindow(QMainWindow):
         self._klarf_path: str = ""
         self._oas_path: str = ""
 
-        self._status_doc.setText("ready · OASIS streamer (built-in)")
+        self._status_doc.setText("ready — open an OASIS to begin")
 
         self._update_guidance()
 
@@ -6058,18 +6102,8 @@ class MainWindow(QMainWindow):
             "Needs an S_CELL_OFFSET index.")
         open_btn.clicked.connect(self._on_open_roi)
         h.addWidget(open_btn)
-
-        load_btn = QPushButton(_qicon("folder"), " Load Cache…")
-        load_btn.setToolTip("Restore layers + settings from a .npz cache.")
-        load_btn.clicked.connect(self._on_load_cache)
-        h.addWidget(load_btn)
-
-        export_btn = QPushButton(_qicon("save"), " Export Cache…")
-        export_btn.setToolTip(
-            "Save the loaded layers + alignment settings to a .npz cache "
-            "so the next launch opens instantly (M2.1).")
-        export_btn.clicked.connect(self._on_export_cache)
-        h.addWidget(export_btn)
+        # U3: Load Cache / Export Cache live in File menu now — they're
+        # advanced actions that don't deserve permanent toolbar real estate.
 
         h.addWidget(_divider())
 
@@ -6106,7 +6140,7 @@ class MainWindow(QMainWindow):
         # same-coordinate layout comparison. Loads a ~50µm ROI there.
         h.addWidget(QLabel("Goto µm:"))
         self._goto_edit = QLineEdit()
-        self._goto_edit.setPlaceholderText("x, y")
+        self._goto_edit.setPlaceholderText("e.g. 12345, 6789")
         self._goto_edit.setMaximumWidth(120)
         self._goto_edit.setToolTip(
             "Enter a GDS coordinate (x, y µm) to jump there and load nearby "
@@ -6286,6 +6320,15 @@ class MainWindow(QMainWindow):
         open_action.setShortcut("Ctrl+O")
         open_action.triggered.connect(self._on_open_roi)
         menu.addAction(open_action)
+        menu.addSeparator()
+        # U3: cache I/O moved from the toolbar to the File menu — used once
+        # per session at most, doesn't deserve permanent toolbar space.
+        load_cache_action = QAction("&Load cache…", self)
+        load_cache_action.triggered.connect(self._on_load_cache)
+        menu.addAction(load_cache_action)
+        export_cache_action = QAction("&Export cache…", self)
+        export_cache_action.triggered.connect(self._on_export_cache)
+        menu.addAction(export_cache_action)
         menu.addSeparator()
         # F10: developer-only OASIS diagnostics. Hidden unless dev mode is on.
         self._diagnose_action = QAction("&Diagnose OASIS file…", self)
@@ -7375,7 +7418,14 @@ class MainWindow(QMainWindow):
         """F20: three-page wizard replaces the file-dialog + LayerFilter +
         LayerPick + QInputDialog-root-cell cascade."""
         wiz = OpenOasisWizard(self)
-        if wiz.exec() != QDialog.DialogCode.Accepted:
+        # U1: hide the redundant guidance bar while the wizard is the user's
+        # focus; restore on close (regardless of accept / reject).
+        self._guidance.setVisible(False)
+        try:
+            result = wiz.exec()
+        finally:
+            self._update_guidance()
+        if result != QDialog.DialogCode.Accepted:
             return
         path = wiz.file_path()
         layer_keys = wiz.layer_keys()
@@ -7418,6 +7468,9 @@ class MainWindow(QMainWindow):
         self._status_doc.setText(
             f"ROI mode: {Path(path).name} · root '{root}' · {lyr_txt}"
             f" · {len(rar._by_refnum):,} cells indexed · click a SEM image")
+        # U9: surface the active OASIS in the title bar so a user with
+        # several windows open can tell them apart at a glance.
+        self.setWindowTitle(f"GLAS — {Path(path).name}")
         self._fit_view_to_defects()
         if self._current_sem is not None:
             self._jump_to_image(self._current_sem)
@@ -7872,7 +7925,7 @@ class MainWindow(QMainWindow):
         self._load_path = path
         self.layer_panel.set_document(doc)
         self.canvas.set_document(doc)
-        self.setWindowTitle(f"GDS Align Tool — {Path(path).name} (cache)")
+        self.setWindowTitle(f"GLAS — {Path(path).name} (cache)")
         self._status_doc.setText(
             f"{Path(path).name} (cache)  ·  {doc.summary()}")
         self._restore_expr_sidecar(path)

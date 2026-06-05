@@ -4,6 +4,44 @@
 
 ---
 
+## [2026-06-05] [UX polish round] U1–U12 右欄 / toolbar / 視覺整理（PR #11 follow-up）
+
+**變更類型：** UX 細節 batch（12 條一次做完） ·  **狀態：完成**
+
+**動機：** user 實機跑後回報右欄 spinbox / combo / Copy 按鈕被裁切（已先在
+`33f7726` / `17531db` 修），以及一系列「待改善」list 共 12 條。一次解決。
+
+**改動清單：**
+- **U1**：wizard 開啟時 guidance 條暫時隱藏（`_on_open_roi` 用 try/finally
+  套住 `wiz.exec()`），避免「toolbar Open OASIS…」黃條跟 wizard 重複。
+- **U2**：`+ Expression…` 按鈕在 LayerPanel 沒 doc 時 `setEnabled(False)`；
+  `set_document` 收到 doc + entries 才啟用。
+- **U3**：toolbar 移除 Load Cache / Export Cache 兩顆按鈕，改進 File menu。
+- **U4**：nm/px spinbox 在 auto 勾起時用 `setSpecialValueText("auto (FOV ÷
+  image px)")` 加 snap-to-0；視覺從「0.0000 nm/px」變「auto …」。
+- **U5**：chip notes 不再單獨一行（撞到 FOV `(custom)` 的 italic）；改塞進
+  chip-corner badge 的 tooltip，下方 `_notes_lbl` 整個拿掉。
+- **U6**：SemPanel 頂端「SEM」panelTitle 拿掉（跟下方 Load SEM… 按鈕重複）。
+- **U7**：PART/CHIP block 與 AlignmentDeltaPanel 之間加 1 px `_TK_BORDER`
+  horizontal line，視覺切分四個區塊。
+- **U8**：LayerPanel 底「checkbox / POI / swatch」hint label 拿掉；改成
+  `+ Expression…` 右側的 18×18 `?` QToolButton（pill borderp，hover tooltip
+  原文）。
+- **U9**：載完 OASIS 後 setWindowTitle 為 `GLAS — <filename>`；cache 路徑也
+  改名為 `GLAS — <file> (cache)`（之前是 `GDS Align Tool — …`，名字過時）。
+- **U10**：status bar 啟動文案 `ready · OASIS streamer (built-in)` →
+  `ready — open an OASIS to begin`（「(built-in)」對使用者沒意義）。
+- **U11**：Fine Align POI placeholder `"POI: (none — toggle 'POI' on a
+  layer)"` → `"…click the POI button on a layer in the LAYERS column"`。
+- **U12**：Goto µm placeholder `x, y` → `e.g. 12345, 6789`。
+
+**測試：** 全套件 **667 passed**（與前次相同，無 regression）。
+
+**影響檔案：** `glas/app/gds_align_tool.py`、`SESSION_LOG.md`。
+**Branch：** claude/youthful-gates-WLNYJ · **PR：** #11
+
+---
+
 ## [2026-06-05] [F21 fix] PartChipPanel.set_from_meta 保留 Custom override（PR #11 Codex review）
 
 **變更類型：** bug fix（cache restore silent data loss） ·  **狀態：完成**
