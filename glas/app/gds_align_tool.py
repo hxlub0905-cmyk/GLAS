@@ -6488,15 +6488,16 @@ class MainWindow(QMainWindow):
 
     # ── M3: SEM load + coordinate jump ──────────────────────────────────────
     def _on_cta_load_sem(self) -> None:
-        """S12: empty-viewer CTA opens the same KLARF/folder menu the right
-        column's Load SEM… button uses, anchored under the button."""
-        btn = self.sem_panel.load_sem_btn
-        menu = btn.menu()
+        """S12: empty-viewer CTA opens the same KLARF / image-folder split
+        menu the right-column Load SEM… button uses, but anchored beneath
+        the CTA itself so the dropdown reads as belonging to the button the
+        user actually clicked (and not the one in the corner)."""
+        menu = self.sem_panel.load_sem_btn.menu()
         if menu is None:
-            # No menu wired (defensive); fall back to the KLARF picker.
             self._on_load_klarf()
             return
-        menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
+        cta = self.sem_viewer._cta_btn
+        menu.exec(cta.mapToGlobal(cta.rect().bottomLeft()))
 
     def _on_load_klarf(self) -> None:
         # KLARF result files are commonly named <lot>.000 / .001 / … (a
