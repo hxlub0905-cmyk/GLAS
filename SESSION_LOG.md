@@ -4,6 +4,38 @@
 
 ---
 
+## [2026-06-05] [F21 plan] PART/CHIP catalog 取代 Coordinate Setup + Origin δ UI 升級（plan-only）
+
+**變更類型：** plan 文件（尚未動程式碼） ·  **狀態：plan 完成，待 user 核准開工**
+
+**動機：** 評估「真小白 + 無手冊」走完 GLAS 全流程的通關率 ≈ 0.4%，最大殺手是
+Coordinate Setup（Step 3 通過率僅 ~10%）—— RFL 術語、6 欄手填、無自動帶入、預設折疊。
+user 提出：fab 工程師熟悉「PART 碼 + CHIP」心智模型（同 PART/CHIP 座標永遠相同），
+應該預先 key 進 catalog → user 只下拉選擇。同步發現 Origin δ vs Fine tune dx/dy
+是同件事兩個表現，要簡化。
+
+**Q&A 收斂（共 7 題）：** catalog 存 `glas/data/parts.json` 隨 repo 出貨（Q1）；
+OASIS 與 PART/CHIP 解耦、user 自挑 .oas（Q2）；cache 兩者都存、快照為主+id 追溯（Q3）；
+未知 CHIP 完全擋住（Q4）；FOV catalog 預設 + UI Custom override，預設 1500 nm（Q5）；
+**Fine tune dx/dy 完全移除**——UI + state + 加總邏輯全清（Q6）；Origin δ 升級為
+**永久可見的常駐區塊**、大字級 X/Y + Set/Clear/copy（Q7）。
+
+**Plan 結構（6 milestones）：** M1 catalog data model + loader（無 Qt core，
+含種子 JSON / `parts_catalog.py` / 單元測試）→ M2 右欄重構為 PartChipPanel（下拉 +
+badge + Custom FOV + 移 fine tune ~10 處 reference）→ M3 AlignmentDeltaPanel 常駐 +
+copy clipboard + Ctrl+方向鍵 nudge →  M4 dev-mode CatalogEditorDialog（add/edit/
+delete + atomic save）→ M5 cache schema v1→v2 bump（加 part_id/chip_id、移 fine_dx/dy、
+舊 v1 容忍）→ M6 收尾文件（README / CLAUDE §5.2/§7、SESSION_LOG）。
+
+**順帶排程：** [F20] Open OASIS Wizard 化（合併 LayerFilter / LayerPick / Root cell
+三 dialog 成單一 `QWizard`）+ [F22] First-run welcome dialog（5 縮圖 onboarding）
+列入 §8 Backlog；F21 完成後接續處理。
+
+**影響檔案：** `docs/plans/F21-part-chip-catalog.md`(新)、`CLAUDE.md` §8 新增 F21/
+F20/F22、`SESSION_LOG.md`。 **Branch：** claude/youthful-gates-WLNYJ
+
+---
+
 ## [2026-06-04] [F16 + F16-B + F18/F19] Load GDS ROI 大檔加速：S_BOUNDING_BOX 剪枝 → 解碼快取 → 換 ROI 秒級
 
 **變更類型：** 重大效能（多 milestone，本日一連串來回，已合併）·  **狀態：完成**

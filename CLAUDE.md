@@ -195,10 +195,15 @@ HMI 風格表達式 → 遞迴下降 parser → AST → shapely 運算。運算�
 
 ### 進行中 (In Progress)
 
-- （目前無）
+- [F21] PART/CHIP catalog 取代 Coordinate Setup + Origin δ UI 升級
+  （`docs/plans/F21-part-chip-catalog.md`，6 milestone，**待 user 核准開工**）
 
 ### 待辦 (Backlog)
 
+- [F20] Open OASIS Wizard 化：合併 LayerFilter / LayerPick / Root cell 三 dialog
+  成單一 `QWizard` 三頁。F21 完成後排程，可順手把 PART/CHIP 選擇併入 Page 0 快捷。
+- [F22] First-run welcome dialog：5 張縮圖式 onboarding + 「Don't show again」+
+  Help menu 重開入口。依賴 F20/F21 完工後 UI 才能拍最終縮圖。
 - [F17] （原 `[F16-B]`，改號避免與「大 cell 解碼快取」F16-B 撞名）S_BOUNDING_BOX 的後續：給「大檔 + 無
   S_BOUNDING_BOX + 無 CE 層」型做一次性 bbox sweep + sidecar 快取。**目前已知三個測試檔都用不到**（會慢的大檔
   都帶 S_BOUNDING_BOX）→ 低優先。F16 方案 A 已完成（`docs/plans/F16-sbbox-roi-prune.md`）。
