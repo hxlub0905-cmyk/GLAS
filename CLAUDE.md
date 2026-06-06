@@ -133,9 +133,11 @@ oasis_random    name-table S_CELL_OFFSET → 隨機存取單 cell + top-down ROI
 ### 5.2 對位流程（glas/app）
 
 ```
-sem_loader 載 KLARF（die-corner XREL/YREL）→ gds_fov.klarf_to_gds 換算 → 點 SEM image
+sem_loader 載 KLARF（die-corner XREL/YREL）→ 選 PART/CHIP（PartChipPanel 從 catalog
+帶 chip_corner / FOV / nm-per-px）→ gds_fov.klarf_to_gds 換算 → 點 SEM image
 → oasis_random ROI walk 載入該處 geometry → SemViewer 半透明 overlay
-→ 手動拖動（Set Offset δ）或 FineAlignPanel cv2.matchTemplate 自動 refine
+→ 手動拖動（AlignmentDeltaPanel · Set Offset 折進 δ）或 FineAlignPanel
+  cv2.matchTemplate 自動 refine
 → 匯出 per-image offset CSV/JSON（schema mmh-gds-alignment-v1，image_id join key）
   + 影像匯出：模擬 GLV 灰階圖 `<id>_gray.png` + ROI label map `<id>_label.png`（F15，
   同一組 per-layer 幾何 rasterize、gray 套 blur / label 不 blur、像素網格一致，下游
@@ -183,6 +185,8 @@ HMI 風格表達式 → 遞迴下降 parser → AST → shapely 運算。運算�
 | layer cache `.npz` 原子寫入 + SCHEMA_VERSION 遷移 | 跨版本舊 cache 必須能開 |
 | `cellcache` cell key 含 `wanted_layers`（幾何過濾）；prep key 只含 (file, cell)（placement 不被 layer 過濾、reachable_bbox 用 sbbox → layer 無關） | 鍵錯會回傳不完整/不對的幾何或對不到的 prep |
 | `cellcache` 一律 mtime+size 驗證、毀損/版本不符當 miss、原子寫；`_place_prep` 的 index 必須對齊 `content.placements` 順序 | cache 永不可破壞正確性；prep survivor 用 index 取 placement |
+| `gds_layer_cache` `_LOADABLE_SCHEMAS` 必須能讀「現在 + 前一版」schema（v4+v5） | F21 加 part_id/chip_id 時，舊 v4 cache 仍須能載入（轉「legacy snapshot」UI 模式） |
+| `parts_catalog`：catalog 沒有的 PART/CHIP 不可進下拉、Custom override 只能改 FOV / nm-per-px，不能改 chip_corner | Q4 嚴格清單；chip_corner 來自 catalog 是「不會 key 錯」設計的核心 |
 
 完整演進與每個決策理由見 `docs/plans/F2-gds-align-tool.md`（design history）。
 

@@ -60,9 +60,9 @@ class TestCollapsibleRefs:
     @pytest.mark.skipif(gat.CollapsibleSection is None,
                         reason="CollapsibleSection unavailable")
     def test_initial_collapse_state(self, mw):
-        # Coordinate Setup now starts collapsed so it doesn't crowd the image
-        # list; Fine Align also starts collapsed.
-        assert mw.sem_panel._coord_section.is_collapsed() is True
+        # F21: Coordinate Setup is now the always-visible PartChipPanel
+        # (no collapse wrapper). Fine Align still starts collapsed until a
+        # POI is selected.
         assert mw.sem_panel._fine_section.is_collapsed() is True
 
 
@@ -75,28 +75,6 @@ class TestAutoCollapse:
         mw.layer_panel.set_document(_poi_doc())
         mw.layer_panel._rows[0].poi_btn.setChecked(True)
         assert mw.sem_panel._fine_section.is_collapsed() is False
-
-    def test_jump_collapses_coord_once(self, mw):
-        mw._fov_w = mw._fov_h = 2000.0
-        img = sem_loader.SemImage(image_id="D1", filename="a.png",
-                                  file_path=Path("a.png"), xrel=1.0, yrel=2.0)
-        mw._jump_to_image(img)
-        assert mw.sem_panel._coord_section.is_collapsed() is True
-        assert mw._coord_collapsed_once is True
-        # Re-expanding should stick — a second jump must NOT re-collapse it.
-        mw.sem_panel.set_coord_collapsed(False)
-        mw._jump_to_image(img)
-        assert mw.sem_panel._coord_section.is_collapsed() is False
-
-    def test_no_collapse_without_valid_fov(self, mw):
-        # Coordinate Setup now starts collapsed (flag defaults True), so a jump
-        # with an invalid FOV simply leaves the default collapsed state intact.
-        mw._fov_w = mw._fov_h = 0.0
-        img = sem_loader.SemImage(image_id="D1", filename="a.png",
-                                  file_path=Path("a.png"), xrel=1.0, yrel=2.0)
-        mw._jump_to_image(img)
-        assert mw._coord_collapsed_once is True
-        assert mw.sem_panel._coord_section.is_collapsed() is True
 
 
 # ── M7.2 token centralization ────────────────────────────────────────
@@ -165,11 +143,12 @@ class TestRefinements:
     """M7 visual refinements (single-column setup, empty hints, weights)."""
 
     def test_layers_empty_hint(self, mw):
-        # No document -> a non-selectable LAYERS onboarding hint (icon + title
-        # + sub-hint).
+        # No document -> non-selectable LAYERS onboarding hint (icon + title
+        # + "toolbar → Open OASIS…" + "or  File → Load cache…").
         lst = mw.layer_panel.list
-        assert lst.count() == 3
+        assert lst.count() == 4
         assert "Open an OASIS" in lst.item(1).text()
+        assert "Load cache" in lst.item(3).text()
         from PyQt6.QtCore import Qt
         for i in range(lst.count()):
             assert lst.item(i).flags() == Qt.ItemFlag.NoItemFlags
@@ -186,12 +165,12 @@ class TestRefinements:
         assert {"FILE", "VIEW MODE", "EXPORT"} <= texts
 
     def test_coord_setup_single_column(self, mw):
-        # Single-column form: the grid has effectively one content column
-        # (everything added at column 0).
-        from PyQt6.QtWidgets import QGridLayout
+        # F21: PartChipPanel uses a top-level QVBoxLayout (dropdowns + badges
+        # + Custom override stacked vertically) — single column by
+        # construction.
+        from PyQt6.QtWidgets import QVBoxLayout
         lay = mw.sem_panel.coord_setup.layout()
-        assert isinstance(lay, QGridLayout)
-        assert lay.columnCount() == 1
+        assert isinstance(lay, QVBoxLayout)
 
 
 class TestRound2:
@@ -227,7 +206,9 @@ class TestRound2:
         assert mw.sem_panel.findChildren(QScrollArea)
 
     def test_right_panel_width(self, mw):
-        assert mw.sem_panel.width() == 300
+        # Widened in PR #11 follow-up so the vertical scrollbar can appear
+        # without clipping combobox / spinbox / button controls.
+        assert mw.sem_panel.width() == 320
 
 
 class TestOverviewMap:
@@ -317,49 +298,32 @@ class TestOverviewMap:
 
 
 class TestViewModes:
-    """View-mode selector (SEM / GDS / Minimap) + corner minimap (#9)."""
+    """View-mode selector (SEM / GDS). Minimap was removed entirely in a
+    later UX pass (it duplicated the GDS overview's defect map)."""
 
     def test_default_mode_sem(self, mw):
         assert mw._view_mode == "sem"
-        assert mw.canvas.isHidden() and mw.minimap.isHidden()
+        assert mw.canvas.isHidden()
         assert mw._seg_sem.isChecked()
 
     def test_modes_are_exclusive(self, mw):
         mw._set_view_mode("gds")
-        assert (not mw.canvas.isHidden()) and mw.minimap.isHidden()
+        assert not mw.canvas.isHidden()
         assert mw._seg_gds.isChecked() and not mw._seg_sem.isChecked()
-        mw._set_view_mode("minimap")
-        assert mw.canvas.isHidden() and (not mw.minimap.isHidden())
-        assert mw._seg_mini.isChecked() and not mw._seg_gds.isChecked()
         mw._set_view_mode("sem")
-        assert mw.canvas.isHidden() and mw.minimap.isHidden()
+        assert mw.canvas.isHidden()
+        assert mw._seg_sem.isChecked() and not mw._seg_gds.isChecked()
 
     def test_cycle_wraps(self, mw):
         mw._set_view_mode("sem")
         mw._cycle_view_mode(); assert mw._view_mode == "gds"
-        mw._cycle_view_mode(); assert mw._view_mode == "minimap"
         mw._cycle_view_mode(); assert mw._view_mode == "sem"
 
-    def test_minimap_receives_defects_and_click(self, mw):
-        mw._sem_images = [
-            sem_loader.SemImage(image_id="D1", filename="a", file_path=Path("a"),
-                                xrel=4000.0, yrel=5000.0),
-            sem_loader.SemImage(image_id="D2", filename="b", file_path=Path("b"),
-                                xrel=9000.0, yrel=2000.0),
-        ]
-        mw._chip_corner_x = mw._chip_corner_y = 0.0
-        mw._refresh_overview_defects()
-        assert len(mw.minimap._defects) == 2
-        mw.minimap.resize(212, 152)
-        bbox = mw.minimap._bbox()
-        sx, sy = mw.minimap._map(9000.0, 2000.0, bbox)   # D2 dot
-        from PyQt6.QtGui import QMouseEvent
-        from PyQt6.QtCore import QPointF, QEvent, Qt as _Qt
-        ev = QMouseEvent(QEvent.Type.MouseButtonPress, QPointF(sx, sy),
-                         _Qt.MouseButton.LeftButton, _Qt.MouseButton.LeftButton,
-                         _Qt.KeyboardModifier.NoModifier)
-        mw.minimap.mousePressEvent(ev)
-        assert mw._current_sem.image_id == "D2"
+    def test_minimap_gone(self, mw):
+        # Defensive check that the minimap UI was fully removed.
+        assert not hasattr(mw, "minimap")
+        assert not hasattr(mw, "_mini_btn")
+        assert not hasattr(mw, "_set_minimap_visible")
 
     def test_fit_action_not_a_mode(self, mw):
         # _on_fit_view fits the overview to defects (an action, not a mode);
@@ -412,25 +376,6 @@ class TestBatch1LoadSemAccent:
     def test_load_sem_btn_has_accent_qss(self, mw):
         qss = mw.sem_panel.load_sem_btn.styleSheet()
         assert gat._TK_ACCENT.name() in qss
-
-
-@pytest.mark.skipif(gat.CollapsibleSection is None,
-                    reason="CollapsibleSection unavailable")
-class TestBatch1CoordBadge:
-
-    def test_coord_badge_not_set(self, mw):
-        mw.sem_panel.update_coord_badge({"fov_w_nm": 0, "fov_h_nm": 0})
-        assert mw.sem_panel._coord_section._badge.text() == "not set"
-
-    def test_coord_badge_set(self, mw):
-        mw.sem_panel.update_coord_badge(
-            {"fov_w_nm": 2000000, "fov_h_nm": 1500000})
-        assert mw.sem_panel._coord_section._badge.text() == "FOV 2000 × 1500"
-
-    def test_coord_badge_hidden_when_expanded(self, mw):
-        mw.sem_panel.update_coord_badge({"fov_w_nm": 0, "fov_h_nm": 0})
-        mw.sem_panel.set_coord_collapsed(False)
-        assert mw.sem_panel._coord_section._badge.isHidden()
 
 
 class TestBatch1ImageListBadges:

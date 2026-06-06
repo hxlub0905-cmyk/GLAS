@@ -228,10 +228,13 @@ class TestOriginOffsetFold:
         mw._origin_dx, mw._origin_dy = 100.0, -50.0
         mw.sem_viewer._drag_x, mw.sem_viewer._drag_y = 30.0, 40.0
         mw._on_overlay_drag()
-        # The Coordinate Setup panel previews the effective δ (origin − drag)
-        # live via its read-only label.
-        label = mw.sem_panel.coord_setup._origin_lbl.text()
-        assert "70" in label and "-90" in label   # 100−30, −50−40
+        # F21 M3: the AlignmentDeltaPanel previews the effective δ
+        # (origin − drag) live via its big X/Y labels.
+        ad = mw.sem_panel.alignment_delta
+        assert ad._dx == 70.0    # 100 − 30
+        assert ad._dy == -90.0   # −50 − 40
+        assert "70" in ad._x_lbl.text()
+        assert "-90" in ad._y_lbl.text()
 
     def test_set_offset_preserves_visual_anchor(self, mw):
         """Folding drag into origin must reproduce the dragged eff_anchor

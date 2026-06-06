@@ -4,6 +4,210 @@
 
 ---
 
+## [2026-06-05] [PR #11 UX polish] 實機回饋驅動的 30+ 條細節整理（U/S/T 三輪 + Minimap 移除 + Codex review fix）
+
+**變更類型：** UX 細節 batch（多輪 user 實機回饋累積、本日連續推進，已合併）·
+**狀態：完成 · PR #11 累計 16 commits**
+
+**背景：** F21（PART/CHIP catalog）+ F20（Wizard）+ F22（Welcome）三大改造完成後，user
+實機跑 + 截圖回饋出一系列細節問題。30+ 條全部處理掉。下列依**主題**分組（非時序）。
+
+### Round 1 — U1-U12（右欄 / toolbar / 視覺整理）
+
+- **U1** Wizard 開啟時暫時隱藏 guidance 條，避免「toolbar Open OASIS…」黃條跟 wizard
+  重複（`_on_open_roi` try/finally）。
+- **U2** `+ Expression…` 按鈕在 LayerPanel 沒 doc 時 `setEnabled(False)`。
+- **U3** Toolbar 移除 Load Cache / Export Cache，改進 File menu。
+- **U4** nm/px spinbox 在 auto 勾起時 `setSpecialValueText("auto (FOV ÷ image px)")`
+  ，視覺從「0.0000 nm/px」變「auto …」。
+- **U5** Chip notes 不再單獨一行（撞到 FOV `(custom)` italic）；改塞進 chip-corner
+  badge tooltip。
+- **U6** SemPanel 頂端「SEM」panelTitle 拿掉（重複 Load SEM… 按鈕）。
+- **U7** PART/CHIP block 與 AlignmentDeltaPanel 之間加 1 px 分隔線。
+- **U8** LayerPanel 底 hint 拿掉；改 18×18 `?` QToolButton + hover tooltip。
+- **U9** 載完 OASIS 後 `setWindowTitle("GLAS — <file>")`；cache 路徑同步。
+- **U10** Status bar 啟動文案 `ready · OASIS streamer (built-in)` →
+  `ready — open an OASIS to begin`。
+- **U11** Fine Align POI placeholder 改成明確指引「click the POI button on a layer
+  in the LAYERS column」。
+- **U12** Goto µm placeholder `x, y` → `e.g. 12345, 6789`。
+
+**順帶兩個前置 bug fix：**
+- `33f7726` 右欄寬度 300 → 320 px：fix scrollbar 把 spinbox/combo ↑↓ ▼ 按鈕裁掉
+- `17531db` Copy δ 按鈕改為 Lucide icon + accent border + 「Copied ✓」transient label
+  flip（取代之前看不懂的 ⧉ unicode 神祕方塊）
+
+### Round 2 — S2/S7/S11/S12（工作流順手度 + dev mode 隱性）
+
+- **S2** Minimap 從互斥 view mode 拆成獨立 overlay toggle：`_VIEW_MODES` 縮為
+  `("sem", "gds")`，toolbar 新增 `_mini_btn` 不進 view group，shortcut `M` 切 minimap、
+  `G` 仍 cycle SEM↔GDS。
+- **S7** AlignmentDeltaPanel 初始 `setEnabled(False)`；`set_images` 收到 images
+  才啟用，沒 SEM 時整個 panel 灰化。
+- **S11** PartChipPanel 空 catalog 改成警告卡（橘框 / 米底 / 棕字），文案
+  **不洩漏 dev mode 入口**。
+- **S12** 新增 `_SemViewerCTA` + `SemViewer.load_sem_requested` signal；viewer 空狀態
+  下中央顯示橘色「Load SEM…」CTA；點下開右欄 Load SEM 同一 split menu。
+  - 同步 fix `a1c040f`：menu 改錨在 CTA 按鈕底下（之前錨在右欄按鈕，下拉跑去右上）。
+
+**Dev mode 文案清理：** WelcomeDialog slide 3 + PartChipPanel 空狀態都不再提
+「Help → About, click icon 5×」—— user 強調 dev mode 必須保持隱性彩蛋。
+
+### Round 2.5 — Minimap 整批移除（dead feature）
+
+S2 拆出獨立 toggle 後，user 表示 Minimap 在實機**根本沒用**（GDS view mode 已能顯示
+所有 defect 位置）。整批清除：
+- `MiniMap` class（~93 行）、toolbar `_mini_btn`、`M` shortcut、
+  `MainWindow.minimap` / `_set_minimap_visible`、batch workspace 保留邏輯、
+  `_refresh_overview_defects` 內 `minimap.set_data(...)` 呼叫、
+  `SemViewer._corner_overlay` / `set_corner_overlay` / `_reposition_overlay`
+  整套（minimap 是唯一 consumer）。淨減 153 行。
+- 新增 `test_minimap_gone` defensive guard 防誤回退。
+
+### Round 3 — T1-T8（toolbar gating + 狀態列 + Wizard polish）
+
+- **T1 按鈕 gating：** 新增 `MainWindow._refresh_action_states()`，從 `_update_guidance`
+  尾巴呼叫。Toolbar `VIEW MODE GDS` / `Fit` / `Goto µm + Goto` / `Export Alignment` /
+  `Export OASIS` + 右欄 `Load GDS ROI here` 按條件 enable/disable。
+- **T2 狀態列 transient revert：** 新增 `_status_state(msg)` / `_status_transient(msg,
+  ms=4500)` helper。state 訊息存 `_status_state_msg`、transient 訊息 4.5 秒後自動 revert。
+  - **State**（永久）：KLARF / Folder / ROI / cache 載入
+  - **Transient**（自動清）：origin δ set/cleared/nudged、cache / OASIS / alignment
+    exported、catalog saved、deleted expression
+- **T3 LAYERS hint：** 空狀態加第二行「or  File → Load cache…」（U3 移走 Load Cache 後
+  的補救）。
+- **T4 GLAS wordmark 搬家：** Toolbar 左側 wordmark 移除（與 window title 重複），改在
+  status bar 左下角顯示「GLAS v1.0.0」橘色橫排。新增 `GLAS_VERSION = "1.0.0"` 常數，
+  About dialog 共用。
+- **T5 Wizard 記目錄：** `_FilePickPage._on_browse` 用 `QSettings("GLAS","GLAS")` key
+  `"wizard/last_oas_dir"` 存上次目錄。
+- **T6 Wizard subtitle 對比：** 新增 helper `_wizard_subtitle(html)` 把 subtitle 包進
+  `<span style="color:{_TK_TEXT_PRI}; font-size:12px;">`，3 頁都套；Qt 預設灰得幾乎看
+  不見的問題解決。
+- **T7 Load GDS ROI 文案：** 已載過 ROI（`_doc.entries` 非空 + `_current_sem`）後按鈕
+  文字改成「Reload GDS ROI ▶」；未載入維持「Load GDS ROI here ▶」。
+- **T8 Wizard Next/Finish accent：** `OpenOasisWizard.__init__` 末尾抓 `button(NextButton)`
+  / `button(FinishButton)` 套 accent QSS（橘底白字 / hover 深橘 / disabled 淡米 +
+  灰字），視覺權重 Next >> Cancel。
+
+### PR #11 Codex review fix（review 留言）
+
+`PartChipPanel.set_from_meta` v5 catalog-match 分支：reselect 完 chip 後比對 cached
+vs `chip.fov_w_nm/fov_h_nm/nm_per_px`；若 FOV 差 >0.5 nm 或 nm_per_px 差 >1e-6 →
+自動勾 Custom override + 填入 cached values。修正「Custom override 開啟下匯出的 cache
+重載後 silently 回到 catalog 預設、對位偏掉」的 bug。
+
+**Wizard 視覺 fix（`264b529`）：** QWizard 預設 `ModernStyle` 有空白 banner 區，改成
+`ClassicStyle` 去掉「stray white block」。
+
+**測試演進：** 606 baseline → 643（F21）→ 665（F20+F22）→ 667（U/S/Minimap）→ 668
+（S2 minimap independence）→ 672（T1-T3）→ 677（T5-T8）。期間根據 UI 改動同步重寫
+~10 個既有測試（廢棄 Coord Setup / Minimap / FOV badge 等）。
+
+**影響檔案：** `glas/app/gds_align_tool.py`（主戰場，~1500 行淨變動）、
+`glas/app/icons/copy.svg`(新)、`glas/app/icons/glas_wordmark.svg`(廢棄 — 仍保留)、
+`tests/test_gds_align_f20.py` / `f21.py` / `f22.py` / `m4a.py` / `m5.py` / `m6.py` /
+`m6_6.py` / `m7.py`（廣泛更新）、`conftest.py`（welcome QSettings pre-set 防 deadlock）、
+`README.md`、`CLAUDE.md`、`SESSION_LOG.md`。 **Branch：** claude/youthful-gates-WLNYJ ·
+**PR：** #11 · **Commits：** `33f7726` `17531db` `a139107` `37e6b0d` `a1c040f`
+`e7ff174` `45e450a` `9ca60f4` `ca63b4c` 等 16 commits（含 F21 fix + Codex review fix）
+
+---
+
+## [2026-06-05] [F20 + F22] Open OASIS Wizard 化 + First-run welcome dialog
+
+**變更類型：** UX 補完（取代三層 modal cascade + 首次啟動 onboarding） ·  **狀態：完成**
+
+**動機：** F21 把右欄改造完後，剩下兩個 onboarding 缺口：(1) Open OASIS 仍是三層
+modal 串接（LayerFilterDialog → LayerPickDialog → QInputDialog root cell，新手卡在
+「root cell」黑話）；(2) 第一次打開 app 完全沒人說明這 app 在做什麼。
+
+**F20 OpenOasisWizard（取代 3 dialog）：** 新增 `OpenOasisWizard(QWizard)` 三頁——
+`_FilePickPage`（檔案選擇 + 顯示檔名 / 大小 / S_CELL_OFFSET 索引狀態 inline check 用
+`oasis_streamer.scan_cell_offsets`）+ `_LayerPickPage`（Scan layers 按鈕 → 內嵌
+QListWidget 多選 + 手動輸入 fallback）+ `_RootCellPage`（QComboBox + 推薦預選含
+`top`/`merge` 的名稱 + 解釋一行）。`isComplete()` 控制 Next 按鈕。MainWindow
+`_on_open_roi` 大瘦身：跑 wizard → accept 後取 file_path / layer_keys / root_cell。
+**刪掉 `LayerFilterDialog` + `LayerPickDialog`（共 ~277 行）**。
+
+**F22 WelcomeDialog（首次啟動 5 slide）：** 新增 `WelcomeDialog(QDialog)` + 模組常數
+`_WELCOME_SLIDES`：QStackedWidget 切換 + Prev / Next / `Got it ✓` + ● ○ 進度點 +
+`[ ] Don't show again`（預設 on）。Help menu 加 `Show welcome…` action。MainWindow
+`showEvent` 首次觸發時 `QSettings("welcome_shown_v1")` 未設 → `QTimer.singleShot(0,
+self._show_welcome_dialog)` 在主視窗繪製完後彈出。
+
+**測試環境 hook（重要）：** `MainWindow.showEvent` 自動跳 welcome 用 `dlg.exec()`，在
+test 環境 `processEvents()` 一旦呼叫就死鎖。conftest.py 啟動時預先 `QSettings("GLAS",
+"GLAS").setValue("welcome_shown_v1", True)` 讓 test 表現得像「曾經看過」的 user；
+welcome 本身在 `test_gds_align_f22.py` 直接 instantiate 驗證。
+
+**測試：** 643 → **665 passed**（+22）。新增 `tests/test_gds_align_f20.py` 11 項 +
+`tests/test_gds_align_f22.py` 11 項。
+
+**影響檔案：** `docs/plans/F20-open-oasis-wizard.md`(新)、`docs/plans/F22-first-run-
+welcome.md`(新)、`glas/app/gds_align_tool.py`、`conftest.py`、
+`tests/test_gds_align_f20.py`(新)、`tests/test_gds_align_f22.py`(新)、`README.md`、
+`CLAUDE.md` §8（移除 F20 / F22）、`SESSION_LOG.md`。
+
+---
+
+## [2026-06-05] [F21] PART/CHIP catalog 取代 Coordinate Setup + Origin δ UI 升級
+
+**變更類型：** UX 重大改造（取代 right-column setup form + δ 升級為常駐區塊 + 移除 fine
+tune dx/dy + dev-mode catalog editor + cache schema v4→v5） ·  **狀態：完成（M1–M6
+全部完工）**
+
+**動機：** 評估「真小白 + 無手冊」走完 GLAS 全流程的通關率 ≈ 0.4%，最大殺手是
+Coordinate Setup（Step 3 通過率僅 ~10%）—— RFL 術語、6 欄手填、無自動帶入、預設折疊。
+user 提出：fab 工程師熟悉「PART 碼 + CHIP」心智模型（同 PART/CHIP 座標永遠相同），
+應該預先 key 進 catalog → user 只下拉選擇。同步發現 Origin δ vs Fine tune dx/dy
+是同件事兩個表現，要簡化。
+
+**Q&A 收斂（共 7 題）：** catalog 存 `glas/data/parts.json` 隨 repo 出貨（Q1）；
+OASIS 與 PART/CHIP 解耦、user 自挑 .oas（Q2）；cache 兩者都存、快照為主+id 追溯（Q3）；
+未知 CHIP 完全擋住（Q4）；FOV catalog 預設 + UI Custom override，預設 1500 nm（Q5）；
+**Fine tune dx/dy 完全移除**——UI + state + 加總邏輯全清（Q6）；Origin δ 升級為
+**永久可見的常駐區塊**、大字級 X/Y + Set/Clear/copy（Q7）。
+
+**6 milestones：**
+- **M1** catalog data model：新增 `glas/core/parts_catalog.py`（無 Qt；`ChipSpec` /
+  `PartSpec` dataclass + `to_dict/from_dict` round-trip、`chip_corner_nm()` 沿用
+  `(DieX − GDS_off) × 1000`、`load/save_catalog` atomic、`DEFAULT_FOV_NM = 1500.0`、
+  `CATALOG_SCHEMA = "glas-parts-v1"`、`CatalogError`）+ 種子 `glas/data/parts.json`
+  （EXAMPLE_PART / C1+C2 placeholder）+ 26 項單元測試全綠。
+- **M2** 右欄重構為 PartChipPanel：移除舊 `CoordinateSetupPanel`（~220 行）；新
+  `PartChipPanel` PART/CHIP `QComboBox` 下拉、即時 chip-corner / FOV badge、
+  `Custom override` checkbox 展開 FOV/scale spinbox、`values()` 新 dict 加
+  `part_id` / `chip_id` 移除 `fine_dx` / `fine_dy`。MainWindow 同步移除
+  `_fine_dx`/`_fine_dy` state + 8 處 `+ self._fine_dx +` 加總。
+- **M3** AlignmentDeltaPanel 常駐：新獨立 `QFrame`，大字級 monospace X / Y、
+  `Set Offset` / `Clear` / 後改 `Copy δ to clipboard` 按鈕，emit
+  `set_requested` / `clear_requested`。所有 `coord_setup.set_origin(...)` call site
+  改走 `alignment_delta.set_values(...)`。
+- **M4** dev-mode CatalogEditorDialog：左 PART/CHIP 樹（Add/Remove，命名重複擋下）+
+  右 form + atomic Save 寫回 `glas/data/parts.json`。PartChipPanel 加 `⚙ Edit catalog…`
+  按鈕（`set_dev_mode(on)` 控制顯示）。
+- **M5** cache schema v4 → v5：`LayerCacheMeta` 加 `part_id` / `chip_id`
+  (`Optional[str] = None`)、`SCHEMA_VERSION = 5`、`_LOADABLE_SCHEMAS = {4, 5}` 容忍 v4。
+  v5+catalog 命中 → 直接 reselect 下拉；v4 / 不在 catalog → 進「legacy snapshot」模式。
+- **M6** 文件收尾：README / CLAUDE §5.2 / §7 新增不變式 / §8 移除 [F21]。
+
+**測試：** ~606 baseline → **643 passed**（+37）。新增 `tests/test_gds_align_f21.py`
+23 項 + `tests/test_parts_catalog.py` 26 項。重寫廢棄測試：`test_gds_align_m4a` 改驗
+AlignmentDeltaPanel、`test_gds_align_m5` coarse_gds 改用 `_origin_dx/dy`、
+`test_gds_align_m6_6` 改用 catalog seed、`test_gds_align_m7` 刪除 minimap 相關 +
+TestBatch1CoordBadge（功能已移除）、`test_gds_layer_cache` v4 仍能載入 + future schema
+rejected。
+
+**影響檔案：** `docs/plans/F21-part-chip-catalog.md`(新)、`glas/core/parts_catalog.py`(新)、
+`glas/core/gds_layer_cache.py`、`glas/data/parts.json`(新)、`glas/app/gds_align_tool.py`、
+`tests/test_parts_catalog.py`(新)、`tests/test_gds_align_f21.py`(新)、
+`tests/test_gds_align_m4a.py` / `m5.py` / `m6_6.py` / `m7.py`、
+`tests/test_gds_layer_cache.py`、`README.md`、`CLAUDE.md`、`SESSION_LOG.md`。
+**Branch：** claude/youthful-gates-WLNYJ
+
+---
+
 ## [2026-06-04] [F16 + F16-B + F18/F19] Load GDS ROI 大檔加速：S_BOUNDING_BOX 剪枝 → 解碼快取 → 換 ROI 秒級
 
 **變更類型：** 重大效能（多 milestone，本日一連串來回，已合併）·  **狀態：完成**

@@ -27,7 +27,10 @@ from typing import Optional
 
 import numpy as np
 
-SCHEMA_VERSION = 4   # v4: RFL Chip-offset params (chip corner/size/GDS off, um)
+SCHEMA_VERSION = 5   # v5 (F21): + part_id / chip_id audit trail
+# Schemas this loader can still read. v4 lacks part_id/chip_id (defaults to
+# None) and re-saves migrate forward (plan F21 M5 "舊 cache 仍能載入").
+_LOADABLE_SCHEMAS = {4, 5}
 
 # Layer tuple shape:
 #   (layer:int, datatype:int, polys:list[ndarray(n,2) f32], bboxes:ndarray(P,4) f32)
@@ -70,6 +73,10 @@ class LayerCacheMeta:
     nm_per_px: float = 0.0
     top_cell_name: str = ""
     nm_units: float = 1.0
+    # F21 M5: audit trail back to the catalog the cache was built from.
+    # v4 caches simply have these as None.
+    part_id: Optional[str] = None
+    chip_id: Optional[str] = None
     created_at: float = field(default_factory=time.time)
     schema_version: int = SCHEMA_VERSION
 
@@ -193,7 +200,7 @@ def cache_load(path: str | Path) -> Optional[LayerCacheData]:
     try:
         with np.load(p, allow_pickle=False) as npz:
             manifest = json.loads(bytes(npz["meta"]).decode("utf-8"))
-            if int(manifest.get("schema_version", -1)) != SCHEMA_VERSION:
+            if int(manifest.get("schema_version", -1)) not in _LOADABLE_SCHEMAS:
                 return None
             layer_index = manifest.pop("layer_index", [])
             layers: list = []
@@ -231,7 +238,9 @@ def make_meta(source_path: str | Path,
               origin_dy: float = 0.0,
               nm_per_px: float = 0.0,
               top_cell_name: str = "",
-              nm_units: float = 1.0) -> LayerCacheMeta:
+              nm_units: float = 1.0,
+              part_id: Optional[str] = None,
+              chip_id: Optional[str] = None) -> LayerCacheMeta:
     """Build a :class:`LayerCacheMeta` from the source file + the
     current alignment settings. Convenience for the GUI's Export
     Cache handler."""
@@ -256,4 +265,6 @@ def make_meta(source_path: str | Path,
         nm_per_px=nm_per_px,
         top_cell_name=top_cell_name,
         nm_units=nm_units,
+        part_id=part_id,
+        chip_id=chip_id,
     )

@@ -181,7 +181,14 @@ class TestNudgeOrigin:
 class TestCoordPreview:
 
     def test_corner_label_shows_um(self, mw):
+        # F21: chip-corner is derived from the catalog ChipSpec, not directly
+        # editable. Seed a CHIP and select it so the badge picks it up.
+        from parts_catalog import ChipSpec, PartSpec
         panel = mw.sem_panel.coord_setup
-        panel._chip_x.setValue(100.0)
+        panel._catalog = {
+            "P1": PartSpec(chips={"C1": ChipSpec(chip_x_um=100.0)}),
+        }
+        panel._populate_parts()
         txt = panel._corner_lbl.text()
         assert "nm" in txt and "µm" in txt
+        assert "100,000" in txt   # 100 µm = 100,000 nm

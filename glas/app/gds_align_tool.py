@@ -74,9 +74,10 @@ from PyQt6.QtWidgets import (
     QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
     QPlainTextEdit, QPushButton,
-    QScrollArea, QSizePolicy, QSpinBox, QSplitter, QStatusBar, QStyle,
+    QScrollArea, QSizePolicy, QSpinBox, QSplitter, QStackedWidget, QStatusBar,
+    QStyle,
     QStyledItemDelegate, QTableWidget, QTableWidgetItem, QToolButton,
-    QVBoxLayout, QWidget,
+    QVBoxLayout, QWidget, QWizard, QWizardPage,
 )
 
 try:
@@ -145,6 +146,12 @@ import overlay_export     # noqa: E402
 from overlay_export import (  # noqa: E402,F401
     overlay_outlines_on_sem, _safe_name, _draw_polyline_np,
 )
+# F21: PART/CHIP catalog replaces the hand-keyed Coordinate Setup form.
+import parts_catalog     # noqa: E402
+from parts_catalog import (  # noqa: E402
+    CATALOG_SCHEMA, DEFAULT_FOV_NM, CatalogError, ChipSpec, PartSpec,
+    default_catalog_path, load_catalog, save_catalog,
+)
 
 # Design-system styling / widgets / icons (glas/app). Soft-imported so the tool
 # still launches if the GUI helpers are unavailable.
@@ -163,6 +170,11 @@ except Exception:  # pragma: no cover
     def _qicon(_name):
         from PyQt6.QtGui import QIcon
         return QIcon()
+
+
+# App version. Surfaced in the status-bar brand chip (left edge) and the
+# About dialog so a user reporting a bug can quote it at a glance.
+GLAS_VERSION = "1.0.0"
 
 
 _TK_BG_PAGE   = QColor("#f7f4ef")
@@ -488,245 +500,228 @@ def roi_document_from_reader(rar, root, layer_keys, roi_bbox, cancel_cb=None,
 # ── Threaded loader (keeps the GUI responsive on big OASIS files) ────────────
 
 
-class LayerPickDialog(QDialog):
-    """Multi-select list of layers, shown after a successful layer scan.
+# ── F20: Open OASIS Wizard ──────────────────────────────────────────────────
 
-    Each row is ``L<layer>/D<datatype>  (optional name)``. ``selected_pairs()``
-    returns the chosen ``(layer, datatype)`` tuples in stable display order."""
 
-    def __init__(self, parent: Optional[QWidget],
-                 layers: list[dict], *, note: str = "") -> None:
+def _wizard_subtitle(html: str) -> str:
+    """T6: Qt's default subtitle colour is so washed out the text is hard
+    to read on the wizard's cream background. Wrap in an explicit primary
+    text colour + slightly larger size so subtitles are first-class copy."""
+    return (f'<span style="color:{_TK_TEXT_PRI.name()}; font-size:12px;">'
+            f'{html}</span>')
+
+
+class _FilePickPage(QWizardPage):
+    """Step 1 — pick the .oas file and surface its index status."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Pick layers to load")
-        self.setModal(True)
-        self.setMinimumSize(420, 460)
+        self.setTitle("Step 1 — Pick an OASIS file")
+        # T6: wizard subtitles use Qt's default washed-out grey; wrap in an
+        # explicit colour span so the text actually reads against the
+        # warm-cream wizard background.
+        self.setSubTitle(_wizard_subtitle(
+            "Choose the layout (.oas) file to align against your SEM "
+            "images. Large files are fine — only ROI geometry is loaded "
+            "on demand."))
 
         v = QVBoxLayout(self)
-        v.setContentsMargins(20, 16, 20, 14)
-        v.setSpacing(10)
+        v.setSpacing(8)
 
-        v.addWidget(QLabel(
-            f"<b>{len(layers)} layer(s)</b> discovered in this file. "
-            "Ctrl/Shift-click for multi-select.", self,
-        ))
-        if note:
-            note_lbl = QLabel(note, self)
-            note_lbl.setWordWrap(True)
-            note_lbl.setStyleSheet("color: #9a6a00;")
-            v.addWidget(note_lbl)
+        row = QHBoxLayout()
+        self._edit = QLineEdit(self)
+        self._edit.setReadOnly(True)
+        self._edit.setPlaceholderText("(no file selected)")
+        self._browse = QPushButton(_qicon("folder-open"), " Browse…", self)
+        self._browse.clicked.connect(self._on_browse)
+        row.addWidget(self._edit, 1)
+        row.addWidget(self._browse)
+        v.addLayout(row)
 
-        self._list = QListWidget(self)
-        self._list.setSelectionMode(
-            QListWidget.SelectionMode.ExtendedSelection)
-        for entry in sorted(layers, key=lambda d: (d["layer"], d["datatype"])):
-            label = f"L{entry['layer']}/D{entry['datatype']}"
-            if entry.get("name"):
-                label += f"   ·  {entry['name']}"
-            item = QListWidgetItem(label, self._list)
-            item.setData(Qt.ItemDataRole.UserRole,
-                         (int(entry["layer"]), int(entry["datatype"])))
-        v.addWidget(self._list, 1)
+        self._info = QLabel("", self)
+        self._info.setWordWrap(True)
+        self._info.setStyleSheet(_hint_qss(_FS_LABEL, pad="6px 0"))
+        v.addWidget(self._info)
 
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok
-            | QDialogButtonBox.StandardButton.Cancel, self,
-        )
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Use these")
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        v.addWidget(buttons)
+        self._warning = QLabel("", self)
+        self._warning.setWordWrap(True)
+        self._warning.setStyleSheet(
+            f"color:{_TK_ACCENT_DK.name()}; font-size:{_FS_LABEL}px; "
+            f"padding:4px 0;")
+        v.addWidget(self._warning)
+        v.addStretch(1)
 
-    def selected_pairs(self) -> list[tuple[int, int]]:
-        out: list[tuple[int, int]] = []
-        for item in self._list.selectedItems():
-            data = item.data(Qt.ItemDataRole.UserRole)
-            if isinstance(data, tuple) and len(data) == 2:
-                out.append((int(data[0]), int(data[1])))
-        return out
+        # Expose the chosen path through the wizard field API so the next
+        # pages (and the caller) can pick it up via ``wizard.field("file")``.
+        self.registerField("file*", self._edit)
 
+        self._file_path: Optional[str] = None
+        self._has_offsets = False
 
-class LayerFilterDialog(QDialog):
-    """Ask the user which layers to actually load.
+    _SETTINGS_LAST_DIR = "wizard/last_oas_dir"
 
-    A 300 MB OASIS expands to 1.5–6 GB in klayout's in-memory layout, and the
-    "tens of GB" future case is completely infeasible to load whole. The
-    alignment workflow only needs 1–2 layers (POI + maybe a reference), so we
-    let the user list those up front; ``layer_map`` + ``create_other_layers
-    = False`` makes klayout skip everything else during the read itself.
+    def _on_browse(self) -> None:
+        # T5: remember the last directory the user picked from, so the next
+        # time they Open OASIS the dialog opens in the right place. Files
+        # are routinely big and live in one or two project folders.
+        settings = QSettings("GLAS", "GLAS")
+        start = str(settings.value(self._SETTINGS_LAST_DIR, "", type=str) or "")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open OASIS", start,
+            "OASIS files (*.oas *.oasis);;All files (*)")
+        if not path:
+            return
+        settings.setValue(self._SETTINGS_LAST_DIR, str(Path(path).parent))
+        self._edit.setText(path)
+        self._update_info(path)
+        self.completeChanged.emit()
 
-    Result via ``filter_pairs()``: list of ``(layer, datatype)`` ints, or an
-    empty list meaning "no filter — load everything" (only sensible for
-    small files).
-    """
-
-    def __init__(self, parent: Optional[QWidget], file_size_mb: float,
-                 file_name: str, file_path: str, *,
-                 roi_mode: bool = False) -> None:
-        super().__init__(parent)
-        self._roi_mode = roi_mode
-        self.setWindowTitle("Pick ROI layers" if roi_mode else "Layer filter")
-        self.setModal(True)
-        self.setMinimumWidth(_capped_min_width(540))
-
-        v = QVBoxLayout(self)
-        v.setContentsMargins(20, 16, 20, 14)
-        v.setSpacing(10)
-
-        risk = "high" if file_size_mb > 200 else (
-            "medium" if file_size_mb > 50 else "low")
-        if roi_mode:
-            info = QLabel(
-                f"<b>{file_name}</b> &nbsp; · &nbsp; {file_size_mb:,.0f} MB"
-                "<br><br>"
-                "Pick the layer(s) to show in ROI mode. Only the geometry "
-                "around the clicked SEM image is loaded, so this is fast even "
-                "on huge files."
-                "<br><br>"
-                "Click <b>Scan layers in file</b> to discover what's "
-                "available, or type pairs directly: "
-                "<code>layer/datatype</code>, comma-separated "
-                "(e.g. <code>17/0, 6/101</code>)."
-            )
+    def _update_info(self, path: str) -> None:
+        try:
+            p = Path(path)
+            size_mb = p.stat().st_size / 1024 / 1024
+        except OSError as exc:
+            self._info.setText(f"⚠ cannot stat file: {exc}")
+            self._warning.setText("")
+            self._has_offsets = False
+            return
+        # Cheap index check — only reads the small name-table section.
+        try:
+            import oasis_streamer
+            scan = oasis_streamer.scan_cell_offsets(path)
+            n_cells = len(scan.get("by_refnum", {}))
+            n_named = len(scan.get("by_name", {}))
+            self._has_offsets = bool(n_cells or n_named)
+        except Exception:
+            self._has_offsets = False
+            scan = {}
+        index_msg = (
+            f"✓ S_CELL_OFFSET index found ({max(n_cells, n_named):,} cells)"
+            if self._has_offsets else
+            "⚠ no S_CELL_OFFSET index — ROI mode unavailable")
+        self._info.setText(
+            f"<b>{p.name}</b> · {size_mb:,.1f} MB<br>{index_msg}")
+        if not self._has_offsets:
+            self._warning.setText(
+                "Without an S_CELL_OFFSET index, GLAS can't load ROIs on "
+                "demand. Re-save the file with KLayout (File → Save As → "
+                "OASIS, strict mode) and try again.")
         else:
-            info = QLabel(
-                f"<b>{file_name}</b> &nbsp; · &nbsp; {file_size_mb:,.0f} MB "
-                f"(in-RAM risk: <b>{risk}</b>)<br><br>"
-                "Large OASIS / GDS layouts can blow past available RAM when "
-                "loaded in full. The alignment workflow only needs a couple "
-                "of layers — let the reader skip everything else during "
-                "streaming.<br><br>"
-                "Click <b>Scan layers in file</b> to discover what's "
-                "available, or type pairs directly: "
-                "<code>layer/datatype</code>, comma-separated "
-                "(e.g. <code>20/0, 30/0</code>)."
-            )
-        info.setWordWrap(True)
-        info.setTextFormat(Qt.TextFormat.RichText)
-        v.addWidget(info)
+            self._warning.setText("")
+        self._file_path = path
+
+    def isComplete(self) -> bool:
+        # Allow Next even without offsets so the user sees the rest of the
+        # wizard; the actual blocker is enforced after Finish.
+        return bool(self._file_path) and Path(self._file_path).exists()
+
+    def file_path(self) -> Optional[str]:
+        return self._file_path
+
+    def has_offsets(self) -> bool:
+        return self._has_offsets
+
+
+class _LayerPickPage(QWizardPage):
+    """Step 2 — scan the file and let the user multi-select layers."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setTitle("Step 2 — Pick layers to load")
+        self.setSubTitle(_wizard_subtitle(
+            "GLAS only loads the layers you need — picking 1–3 is the norm. "
+            "Click Scan to discover what's in the file, or type "
+            "<code>layer/datatype</code> pairs directly."))
+
+        v = QVBoxLayout(self)
+        v.setSpacing(8)
 
         scan_row = QHBoxLayout()
-        scan_row.setSpacing(8)
-        self._scan_btn = QPushButton("Scan layers in file", self)
-        self._scan_btn.setProperty("variant", "primary")
+        self._scan_btn = QPushButton(_qicon("layers"), " Scan layers", self)
         self._scan_btn.clicked.connect(self._on_scan)
         scan_row.addWidget(self._scan_btn)
         scan_row.addStretch(1)
         v.addLayout(scan_row)
 
+        self._list = QListWidget(self)
+        self._list.setSelectionMode(
+            QListWidget.SelectionMode.ExtendedSelection)
+        self._list.itemSelectionChanged.connect(self._on_list_changed)
+        v.addWidget(self._list, 1)
+
+        v.addWidget(QLabel("…or type pairs (e.g. <code>20/0, 30/0</code>):"))
         self._edit = QLineEdit(self)
-        self._edit.setPlaceholderText("e.g.  20/0, 30/0")
+        self._edit.setPlaceholderText("layer/datatype, comma-separated")
+        self._edit.textChanged.connect(lambda _t: self.completeChanged.emit())
         v.addWidget(self._edit)
 
+        self._status = QLabel("", self)
+        self._status.setWordWrap(True)
+        self._status.setStyleSheet(_hint_qss(_FS_LABEL, pad="4px 0"))
+        v.addWidget(self._status)
 
-        self._warning = QLabel("", self)
-        self._warning.setStyleSheet(_hint_qss(_FS_LABEL, _TK_ACCENT_DK.name()))
-        self._warning.setWordWrap(True)
-        v.addWidget(self._warning)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok
-            | QDialogButtonBox.StandardButton.Cancel, self,
-        )
-        buttons.accepted.connect(self._on_ok)
-        buttons.rejected.connect(self.reject)
-        v.addWidget(buttons)
-        self._ok_btn = buttons.button(QDialogButtonBox.StandardButton.Ok)
-        self._ok_btn.setText("Pick root cell…" if roi_mode else "Load")
-
-        self._file_size_mb = file_size_mb
-        self._file_path = file_path
-        self._pairs: list[tuple[int, int]] = []
-        # Scan-mode state (set during _on_scan).
+        # Scan-mode state.
         self._scan_thread: Optional[QThread] = None
         self._scan_worker: Optional[LayerScanWorker] = None
-        self._scan_progress: Optional[LoadProgressDialog] = None
+        self._scan_result: dict = {}
 
-    def filter_pairs(self) -> list[tuple[int, int]]:
-        return list(self._pairs)
+    def initializePage(self) -> None:
+        # Reset whenever the user revisits the page.
+        self._list.clear()
+        self._edit.clear()
+        self._status.setText("")
 
-    # ── Layer scan flow ────────────────────────────────────────────────────
     def _on_scan(self) -> None:
         if self._scan_thread is not None:
-            return  # already scanning
+            return
+        path = self.field("file")
+        if not path:
+            return
         self._scan_btn.setEnabled(False)
-        self._warning.setText("")
-
-        self._scan_progress = LoadProgressDialog(self)
-        self._scan_progress.set_text(
-            f"Scanning {Path(self._file_path).name} for available layers…\n"
-            "(this can be slow for big files; cancel to fall back to manual "
-            "entry)"
-        )
-
+        self._status.setText(f"Scanning {Path(path).name}…")
         self._scan_thread = QThread(self)
-        self._scan_worker = LayerScanWorker(self._file_path)
+        self._scan_worker = LayerScanWorker(str(path))
         self._scan_worker.moveToThread(self._scan_thread)
         self._scan_thread.started.connect(self._scan_worker.run)
-
-        self._scan_worker.progress.connect(self._scan_progress.set_text)
+        self._scan_worker.progress.connect(self._status.setText)
         self._scan_worker.finished.connect(self._on_scan_finished)
         self._scan_worker.failed.connect(self._on_scan_failed)
-        self._scan_worker.cancelled.connect(self._on_scan_cancelled)
-        self._scan_progress.cancel_requested.connect(self._scan_worker.cancel)
-
+        self._scan_worker.cancelled.connect(
+            lambda: self._status.setText("Scan cancelled."))
         for sig in (self._scan_worker.finished,
                     self._scan_worker.failed,
                     self._scan_worker.cancelled):
             sig.connect(self._scan_thread.quit)
         self._scan_thread.finished.connect(self._cleanup_scan)
-
-        self._scan_progress.show()
-        QApplication.processEvents()
         self._scan_thread.start()
 
     def _on_scan_finished(self, result: object) -> None:
-        # F12: result is {"layers": [...], "source": "layername"|"sampled"|
-        # "no-index"}. (A bare list is tolerated for safety.)
         if isinstance(result, dict):
             layers = result.get("layers") or []
-            source = result.get("source", "")
+            self._scan_result = result
         else:
-            layers = result if isinstance(result, list) else []
-            source = ""
-
+            layers = list(result) if isinstance(result, list) else []
+            self._scan_result = {"layers": layers}
         if not layers:
-            if source == "no-index":
-                self._warning.setText(
-                    "This file has no LAYERNAME table and no S_CELL_OFFSET "
-                    "index, so layers can't be enumerated.\nRe-save it with "
-                    "KLayout (open ▸ Save As ▸ .oas) to add the index tables, "
-                    "then scan again — or type pairs manually.")
-            else:
-                self._warning.setText(
-                    "Scan found no layers; type pairs manually.")
+            self._status.setText(
+                "Scan found no layers — type pairs manually below.")
             return
-
-        # A sampled (no-LAYERNAME) scan is not guaranteed exhaustive; tell the
-        # user they can still type a pair the sample missed.
-        note = ("Sampled from geometry (no LAYERNAME table) — a rarely-used "
-                "layer may be missing; type it manually if so."
-                if source == "sampled" else "")
-        pick = LayerPickDialog(self, layers, note=note)
-        if pick.exec() == QDialog.DialogCode.Accepted:
-            picks = pick.selected_pairs()
-            if picks:
-                self._edit.setText(
-                    ", ".join(f"{l}/{d}" for l, d in picks))
-                self._warning.setText("")
+        self._list.clear()
+        for entry in sorted(layers, key=lambda d: (d["layer"], d["datatype"])):
+            label = f"L{entry['layer']}/D{entry['datatype']}"
+            if entry.get("name"):
+                label += f"   ·  {entry['name']}"
+            it = QListWidgetItem(label, self._list)
+            it.setData(Qt.ItemDataRole.UserRole,
+                       (int(entry["layer"]), int(entry["datatype"])))
+        self._status.setText(
+            f"Found {len(layers)} layer(s) — select one or more above.")
 
     def _on_scan_failed(self, msg: str) -> None:
-        self._warning.setText(
-            f"Scan failed — fall back to manual entry.\n{msg.splitlines()[0]}")
-
-    def _on_scan_cancelled(self) -> None:
-        self._warning.setText("Scan cancelled.")
+        self._status.setText(
+            f"Scan failed: {msg.splitlines()[0]} — use manual entry below.")
 
     def _cleanup_scan(self) -> None:
-        if self._scan_progress is not None:
-            self._scan_progress.shutdown()
-            self._scan_progress.close()
-            self._scan_progress.deleteLater()
-            self._scan_progress = None
         if self._scan_worker is not None:
             self._scan_worker.deleteLater()
             self._scan_worker = None
@@ -735,34 +730,172 @@ class LayerFilterDialog(QDialog):
             self._scan_thread = None
         self._scan_btn.setEnabled(True)
 
-    def _on_ok(self) -> None:
-        text = self._edit.text().strip()
-        pairs: list[tuple[int, int]] = []
-        if text:
-            for chunk in text.split(","):
-                chunk = chunk.strip()
-                if not chunk:
-                    continue
+    def _on_list_changed(self) -> None:
+        self.completeChanged.emit()
+
+    def _parse_text(self) -> list[tuple[int, int]]:
+        out: list[tuple[int, int]] = []
+        for chunk in self._edit.text().split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            try:
                 if "/" in chunk:
                     l_s, d_s = chunk.split("/", 1)
                 else:
                     l_s, d_s = chunk, "0"
+                out.append((int(l_s), int(d_s)))
+            except ValueError:
+                return []   # any parse error invalidates the lot
+        return out
+
+    def isComplete(self) -> bool:
+        return bool(self.layer_keys())
+
+    def layer_keys(self) -> list[tuple[int, int]]:
+        # Selected items take precedence; fall back to text entry so a user
+        # can manually key a layer the scan didn't surface.
+        from_list: list[tuple[int, int]] = []
+        for item in self._list.selectedItems():
+            data = item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(data, tuple) and len(data) == 2:
+                from_list.append((int(data[0]), int(data[1])))
+        if from_list:
+            return from_list
+        return self._parse_text()
+
+    def scan_result(self) -> dict:
+        return self._scan_result
+
+
+class _RootCellPage(QWizardPage):
+    """Step 3 — pick the root (top) cell. We pre-select a name containing
+    ``top`` or ``merge``; users keep the default unless they know better."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setTitle("Step 3 — Pick the root cell")
+        self.setSubTitle(_wizard_subtitle(
+            "The root cell is the top of the layout hierarchy — usually the "
+            "whole chip. The recommended default is named ‘top’ or ‘merge’; "
+            "if your file uses a different convention, override below."))
+
+        v = QVBoxLayout(self)
+        v.setSpacing(8)
+        self._combo = QComboBox(self)
+        self._combo.setEditable(False)
+        self._combo.currentTextChanged.connect(
+            lambda _t: self.completeChanged.emit())
+        v.addWidget(self._combo)
+
+        self._status = QLabel("", self)
+        self._status.setWordWrap(True)
+        self._status.setStyleSheet(_hint_qss(_FS_LABEL, pad="4px 0"))
+        v.addWidget(self._status)
+        v.addStretch(1)
+
+    def initializePage(self) -> None:
+        # The names come from the file's S_CELL_OFFSET name table, which
+        # ``scan_cell_offsets`` already returned during Step 2. Falling back
+        # to a fresh scan keeps the page usable if the user typed pairs and
+        # skipped scanning.
+        wiz = self.wizard()
+        names: list[str] = []
+        scan = wiz.layer_page().scan_result() if wiz else {}
+        by_name = scan.get("by_name") if isinstance(scan, dict) else None
+        if by_name:
+            names = list(by_name.keys())
+        else:
+            path = self.field("file")
+            if path:
                 try:
-                    pairs.append((int(l_s), int(d_s)))
-                except ValueError:
-                    self._warning.setText(
-                        f"Can't parse '{chunk}' — expected layer/datatype "
-                        "(integers).")
-                    return
-        if not pairs and self._file_size_mb > 200:
-            # Empty filter on a likely-OOM file: force the user to confirm.
-            if self._warning.text() == "":
-                self._warning.setText(
-                    "No filter set on a large file — loading may exhaust "
-                    "memory. Click Load again to proceed anyway.")
-                return
-        self._pairs = pairs
-        self.accept()
+                    import oasis_streamer
+                    res = oasis_streamer.scan_cell_offsets(path)
+                    names = list(res.get("by_name", {}).keys())
+                except Exception:
+                    names = []
+        self._combo.clear()
+        if not names:
+            self._status.setText(
+                "⚠ no cell names found — file may lack a name table.")
+            self.completeChanged.emit()
+            return
+        self._combo.addItems(names)
+        default = next(
+            (n for n in names if "top" in n.lower() or "merge" in n.lower()),
+            names[-1])
+        idx = names.index(default)
+        self._combo.setCurrentIndex(idx)
+        self._status.setText(
+            f"Recommended: <b>{default}</b> "
+            f"(name looks like a top cell; out of {len(names):,} cells).")
+        self.completeChanged.emit()
+
+    def isComplete(self) -> bool:
+        return bool(self._combo.currentText())
+
+    def root_cell(self) -> str:
+        return self._combo.currentText()
+
+
+class OpenOasisWizard(QWizard):
+    """F20: replaces the LayerFilterDialog + LayerPickDialog + QInputDialog
+    root-cell cascade with a single three-page wizard. The caller reads the
+    chosen file / layers / root cell via :meth:`file_path` / :meth:`layer_keys`
+    / :meth:`root_cell` after :py:meth:`exec` returns ``Accepted``."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Open OASIS")
+        # ClassicStyle drops the empty Modern/Aero "banner" strip above the
+        # title — we don't ship a wizard pixmap, so the band reads as a stray
+        # white block (reported on PR #11 screenshot).
+        self.setWizardStyle(QWizard.WizardStyle.ClassicStyle)
+        self.setOption(QWizard.WizardOption.NoBackButtonOnStartPage, True)
+        self.setOption(QWizard.WizardOption.HaveHelpButton, False)
+        self.setMinimumSize(640, 520)
+
+        self._file_page = _FilePickPage(self)
+        self._layer_page = _LayerPickPage(self)
+        self._root_page = _RootCellPage(self)
+        self.addPage(self._file_page)
+        self.addPage(self._layer_page)
+        self.addPage(self._root_page)
+
+        # T8: keep the Next / Finish button accent-orange so the eye is
+        # pulled to the forward action — Qt's default leaves it visually
+        # tied with Cancel. Disabled state still reads as muted.
+        accent = _TK_ACCENT.name()
+        accent_dk = _TK_ACCENT_DK.name()
+        next_qss = (
+            f"QPushButton {{ background:{accent}; color:#ffffff; "
+            f"border:1px solid {accent_dk}; border-radius:4px; "
+            f"padding:5px 16px; font-weight:700; }}"
+            f"QPushButton:hover {{ background:{accent_dk}; }}"
+            f"QPushButton:disabled {{ background:#f6e5cf; "
+            f"color:#cdb89b; border:1px solid #e6d2b0; }}")
+        for which in (QWizard.WizardButton.NextButton,
+                      QWizard.WizardButton.FinishButton):
+            btn = self.button(which)
+            if btn is not None:
+                btn.setStyleSheet(next_qss)
+
+    # Public accessors (used by MainWindow._on_open_roi after exec()).
+
+    def file_path(self) -> Optional[str]:
+        return self._file_page.file_path()
+
+    def has_offsets(self) -> bool:
+        return self._file_page.has_offsets()
+
+    def layer_keys(self) -> list[tuple[int, int]]:
+        return self._layer_page.layer_keys()
+
+    def root_cell(self) -> str:
+        return self._root_page.root_cell()
+
+    def layer_page(self) -> "_LayerPickPage":
+        return self._layer_page
 
 
 class _AnimatedBar(QWidget):
@@ -1842,15 +1975,35 @@ class LayerPanel(QFrame):
             "Compose a synthetic layer from a Boolean expression, e.g.\n"
             "[(A > W:5) & B] < H:5")
         self._expr_btn.clicked.connect(self.add_expression_requested)
+        # U2: Boolean expressions can only bind to raw layers — keep the
+        # button greyed out until a document is loaded.
+        self._expr_btn.setEnabled(False)
+        # U8: a discreet "?" badge replaces the always-visible hint strip
+        # ("checkbox / POI / swatch") — same wording in the tooltip,
+        # without permanently using ~32 px of vertical space.
+        self._row_help_btn = QToolButton(self)
+        self._row_help_btn.setText("?")
+        self._row_help_btn.setAutoRaise(True)
+        self._row_help_btn.setCursor(Qt.CursorShape.WhatsThisCursor)
+        self._row_help_btn.setStyleSheet(
+            f"QToolButton {{ color:{_TK_TEXT_HINT.name()}; "
+            f"font-size:{_FS_LABEL}px; font-weight:700; "
+            f"border:1px solid {_TK_BORDER.name()}; border-radius:9px; "
+            f"min-width:18px; max-width:18px; min-height:18px; max-height:18px; "
+            f"padding:0; }}"
+            f"QToolButton:hover {{ background:{_TK_BG_PANEL.name()}; "
+            f"color:{_TK_ACCENT_DK.name()}; }}")
+        self._row_help_btn.setToolTip(
+            "Row controls:\n"
+            "• checkbox — show / hide this layer in the overlay\n"
+            "• POI — use this layer as the fine-align template\n"
+            "• coloured swatch — click to recolour the layer")
         btn_row = QHBoxLayout()
-        btn_row.setContentsMargins(8, 6, 8, 0)
-        btn_row.addWidget(self._expr_btn)
+        btn_row.setContentsMargins(8, 6, 8, 6)
+        btn_row.setSpacing(6)
+        btn_row.addWidget(self._expr_btn, 1)
+        btn_row.addWidget(self._row_help_btn)
         layout.addLayout(btn_row)
-
-        hint = QLabel("checkbox: show/hide  ·  POI: fine-align template  ·  swatch: colour")
-        hint.setStyleSheet(_hint_qss(_FS_MICRO, pad="6px 10px"))
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
 
         self._doc: Optional[GdsDocument] = None
         self._rows: list[_LayerRow] = []
@@ -1880,21 +2033,27 @@ class LayerPanel(QFrame):
         title_item.setFont(font)
         self.list.addItem(title_item)
 
-        # 次文
-        hint_item = QListWidgetItem("toolbar → Open OASIS…")
-        hint_item.setFlags(Qt.ItemFlag.NoItemFlags)
-        hint_item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
-        hint_item.setForeground(QColor(_TK_TEXT_HINT))
-        font2 = hint_item.font()
-        font2.setPixelSize(_FS_CAPTION)
-        hint_item.setFont(font2)
-        self.list.addItem(hint_item)
+        # 次文 — primary path + alternative cache restore (T3: surface
+        # that File menu also has Load cache… so users who saved one
+        # before don't think they have to re-open the OASIS).
+        for sub in ("toolbar → Open OASIS…",
+                    "or  File → Load cache…"):
+            hint_item = QListWidgetItem(sub)
+            hint_item.setFlags(Qt.ItemFlag.NoItemFlags)
+            hint_item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
+            hint_item.setForeground(QColor(_TK_TEXT_HINT))
+            font2 = hint_item.font()
+            font2.setPixelSize(_FS_CAPTION)
+            hint_item.setFont(font2)
+            self.list.addItem(hint_item)
 
     def set_document(self, doc: Optional[GdsDocument]) -> None:
         self._doc = doc
         self.list.clear()
         self._rows = []
         self._poi_entries = []
+        # U2: + Expression… only makes sense once raw layers exist to bind.
+        self._expr_btn.setEnabled(doc is not None and bool(doc.entries))
         if doc is None or not doc.entries:
             self._show_empty_hint()
             self.pois_changed.emit([])
@@ -2855,6 +3014,24 @@ def _nice_round(x: float) -> float:
     return base
 
 
+class _SemViewerCTA(QPushButton):
+    """S12: orange CTA button overlay shown on the empty SEM viewer so a
+    first-time user has a clear next action right where they're looking
+    (instead of hunting the right column). Hidden as soon as an image is
+    loaded."""
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setText("  Load SEM…  ")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setStyleSheet(
+            f"QPushButton {{ background:{_TK_ACCENT.name()}; "
+            f"color:#ffffff; border:1px solid {_TK_ACCENT_DK.name()}; "
+            f"border-radius:6px; padding:9px 22px; "
+            f"font-size:{_FS_LABEL + 1}px; font-weight:700; }}"
+            f"QPushButton:hover {{ background:{_TK_ACCENT_DK.name()}; }}")
+
+
 class SemViewer(QWidget):
     """Right pane: SEM image + draggable GDS overlay (plan M4a).
 
@@ -2872,6 +3049,7 @@ class SemViewer(QWidget):
 
     drag_changed = pyqtSignal()
     cursor_gds = pyqtSignal(object)   # F11 M1: (x_nm, y_nm) or None
+    load_sem_requested = pyqtSignal()  # S12: empty-state CTA click
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -2898,24 +3076,27 @@ class SemViewer(QWidget):
         self._MAX_ZOOM = 60.0
         self._cursor_screen: Optional[QPointF] = None
         self.setMouseTracking(True)   # live cursor readout without a button
-        self._corner_overlay: Optional[QWidget] = None   # M7-ov #9 minimap
+        # S12: prominent CTA in the empty SEM area so the first action a new
+        # user sees in the centre of the screen is loading a SEM.
+        self._cta_btn = _SemViewerCTA(self)
+        self._cta_btn.clicked.connect(self.load_sem_requested)
+        self._cta_btn.show()
 
-    def set_corner_overlay(self, w: Optional[QWidget]) -> None:
-        """Host a small floating widget (the minimap) pinned bottom-right."""
-        self._corner_overlay = w
-        self._reposition_overlay()
-
-    def _reposition_overlay(self) -> None:
-        w = self._corner_overlay
-        if w is None:
+    def _reposition_cta(self) -> None:
+        # Centre the CTA button slightly below the painted "No SEM image"
+        # caption (the caption sits at the widget centre, the CTA sits
+        # ~110 px below it).
+        if self._cta_btn is None:
             return
-        m = 12
-        w.move(max(0, self.width() - w.width() - m),
-               max(0, self.height() - w.height() - m))
+        self._cta_btn.adjustSize()
+        sz = self._cta_btn.size()
+        cx = (self.width() - sz.width()) // 2
+        cy = (self.height() - sz.height()) // 2 + 110
+        self._cta_btn.move(max(0, cx), max(0, cy))
 
     def resizeEvent(self, ev) -> None:  # type: ignore[override]
         super().resizeEvent(ev)
-        self._reposition_overlay()
+        self._reposition_cta()
 
     def native_size(self) -> Optional[tuple]:
         if self._pixmap is None or self._pixmap.isNull():
@@ -2937,6 +3118,11 @@ class SemViewer(QWidget):
                 self._pixmap = pm
                 self._caption = img.filename
         self._drag_x = self._drag_y = 0.0   # temp drag never survives a new image
+        # S12: CTA shows only on the empty viewer; hide as soon as any
+        # pixmap (even an unreadable one) has been assigned for inspection.
+        self._cta_btn.setVisible(self._pixmap is None)
+        if self._cta_btn.isVisible():
+            self._reposition_cta()
         self.reset_view()
         self.update()
 
@@ -3083,7 +3269,7 @@ class SemViewer(QWidget):
         p.setFont(sub)
         p.setPen(QPen(_TK_TEXT_HINT))
         p.drawText(r.adjusted(0, 56, 0, 56), Qt.AlignmentFlag.AlignCenter,
-                   "Follow the steps above to get started")
+                   "Load a KLARF defect list or an image folder")
 
     def _draw_hud(self, p: QPainter) -> None:
         """Corner readout: zoom factor (top-right), cursor GDS coordinate
@@ -3207,318 +3393,914 @@ class SemViewer(QWidget):
         self.update()
 
 
-class MiniMap(QWidget):
-    """A small picture-in-picture defect map (M7-ov #9), floated over the SEM
-    view. Draws all defect dots (colour = score) + the current FOV centre,
-    auto-fit to the defect bounds. Click a dot to select that image. Renders
-    only dots/markers — no OASIS geometry — so it stays cheap."""
+class PartChipPanel(QFrame):
+    """PART/CHIP dropdowns + Custom FOV override (F21 M2).
 
-    defect_clicked = pyqtSignal(str)
+    Replaces the legacy CoordinateSetupPanel: instead of asking the user to
+    copy 6 RFL columns by hand, the panel loads a repo-shipped catalog
+    (``glas/data/parts.json``) and lets the user pick PART → CHIP from
+    dropdowns. The selected ChipSpec drives ``chip_corner_*`` / FOV /
+    nm-per-px. An optional "Custom override" group lets the user deviate
+    from the catalog FOV / scale per session without writing the catalog
+    (Q5 = B). Adding new PART/CHIP is a developer-mode action handled by
+    :class:`CatalogEditorDialog` (M4).
+
+    Backward-compat with the existing ``coord_setup`` wiring:
+
+    * ``changed`` signal — emitted whenever the effective values move
+    * ``values()`` — same numeric keys MainWindow already consumes, plus
+      ``part_id`` / ``chip_id`` (Optional[str]); ``fine_dx`` / ``fine_dy``
+      are intentionally absent (the manual fine-tune was removed in F21).
+    * ``set_from_meta(meta)`` — restores PART/CHIP when the cache stored
+      them (v5+); falls back to a "legacy" mode showing the snapshot
+      values when only the v4 coordinate fields are present.
+
+    The right column treats the panel as always-visible (no collapsible
+    wrapping) — see :class:`SemPanel`.
+    """
+
+    changed = pyqtSignal()
+    edit_catalog_requested = pyqtSignal()    # M4: developer-mode entry point
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self.setFixedSize(212, 152)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._defects: list = []
-        self._current: Optional[str] = None
-        self._fov: Optional[tuple] = None     # (cx, cy) nm
+        self.setFrameShape(QFrame.Shape.NoFrame)
 
-    def set_data(self, defects: list, current_id: Optional[str],
-                 fov_center: Optional[tuple]) -> None:
-        self._defects = list(defects)
-        self._current = current_id
-        self._fov = fov_center
-        self.update()
+        self._catalog: dict[str, PartSpec] = {}
+        self._load_error: Optional[str] = None
+        # When True, the panel is showing a v4-era cache snapshot and the
+        # PART/CHIP dropdowns are inert (the cache pre-dates the catalog).
+        self._legacy_snapshot = False
+        self._legacy_values: dict = {}
+        # Block ``changed`` emissions during programmatic widget updates so a
+        # PART/CHIP refresh doesn't trigger a cascade.
+        self._suppress = False
+        # Per-session Custom override (FOV / nm-per-px). Populated from the
+        # current chip the first time Custom is enabled.
+        self._customising = False
 
-    def _bbox(self):
-        pts = [(d[1], d[2]) for d in self._defects]
-        if self._fov is not None:
-            pts.append(self._fov)
-        if not pts:
-            return None
-        xs = [p[0] for p in pts]
-        ys = [p[1] for p in pts]
-        x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
-        px = max((x1 - x0) * 0.12, 500.0)
-        py = max((y1 - y0) * 0.12, 500.0)
-        return (x0 - px, y0 - py, x1 + px, y1 + py)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(8, 8, 8, 8)
+        v.setSpacing(6)
 
-    def _map(self, gx, gy, bbox):
-        x0, y0, x1, y1 = bbox
-        iw, ih = self.width() - 16, self.height() - 26
-        s = min(iw / max(1.0, x1 - x0), ih / max(1.0, y1 - y0))
-        cx, cy = 8 + iw / 2.0, 20 + ih / 2.0
-        wx, wy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
-        return cx + (gx - wx) * s, cy - (gy - wy) * s
+        # ── PART / CHIP dropdowns ────────────────────────────────────────
+        form = QGridLayout()
+        form.setHorizontalSpacing(8)
+        form.setVerticalSpacing(4)
+        form.setColumnStretch(1, 1)
 
-    def paintEvent(self, ev) -> None:  # type: ignore[override]
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        bg = QColor("#fbf8f3")
-        bg.setAlpha(238)
-        p.setBrush(QBrush(bg))
-        p.setPen(QPen(_TK_BORDER_DK, 1))
-        p.drawRoundedRect(QRectF(0.5, 0.5, self.width() - 1, self.height() - 1), 6, 6)
-        p.setPen(QPen(_TK_TEXT_HINT))
-        p.drawText(QRectF(8, 4, self.width() - 16, 14),
-                   Qt.AlignmentFlag.AlignLeft, "Defect map")
-        bbox = self._bbox()
-        if bbox is None:
-            p.setPen(QPen(_TK_TEXT_HINT))
-            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "no defects")
-            p.end()
-            return
-        for image_id, gx, gy, score in self._defects:
-            sx, sy = self._map(gx, gy, bbox)
-            p.setPen(QPen(QColor("#ffffff"), 0.8))
-            p.setBrush(QBrush(GdsCanvas._score_color(score)))
-            p.drawEllipse(QPointF(sx, sy), 3.2, 3.2)
-            if image_id == self._current:
-                p.setPen(QPen(_TK_ACCENT_DK, 1.4))
-                p.setBrush(Qt.BrushStyle.NoBrush)
-                p.drawEllipse(QPointF(sx, sy), 6.0, 6.0)
-        if self._fov is not None:
-            fx, fy = self._map(self._fov[0], self._fov[1], bbox)
-            p.setPen(QPen(_TK_ACCENT_DK, 1.4))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawLine(QPointF(fx - 5, fy), QPointF(fx + 5, fy))
-            p.drawLine(QPointF(fx, fy - 5), QPointF(fx, fy + 5))
-        p.end()
+        part_lbl = QLabel("PART:")
+        part_lbl.setStyleSheet(
+            f"font-weight:700; color:{_TK_ACCENT_DK.name()}; "
+            f"font-size:{_FS_CAPTION}px;")
+        chip_lbl = QLabel("CHIP:")
+        chip_lbl.setStyleSheet(part_lbl.styleSheet())
 
-    def mousePressEvent(self, ev: QMouseEvent) -> None:  # type: ignore[override]
-        bbox = self._bbox()
-        if bbox is None:
-            return
-        px, py = ev.position().x(), ev.position().y()
-        best, best_d2 = None, 12.0 ** 2
-        for image_id, gx, gy, _s in self._defects:
-            sx, sy = self._map(gx, gy, bbox)
-            d2 = (sx - px) ** 2 + (sy - py) ** 2
-            if d2 <= best_d2:
-                best, best_d2 = image_id, d2
-        if best is not None:
-            self.defect_clicked.emit(best)
+        self._part_cb = QComboBox(self)
+        self._part_cb.setToolTip(
+            "Select the fab PART (product code). Catalog ships with the app — "
+            "use Edit catalog… (developer mode) to add a missing PART.")
+        self._part_cb.currentTextChanged.connect(self._on_part_changed)
 
+        self._chip_cb = QComboBox(self)
+        self._chip_cb.setToolTip(
+            "Select the CHIP within the chosen PART. Each CHIP carries its "
+            "chip-corner offset, default FOV, and overlay scale.")
+        self._chip_cb.currentTextChanged.connect(self._on_chip_changed)
 
-class CoordinateSetupPanel(QGroupBox):
-    """Coordinate setup (RFL Chip-offset table) + FOV + overlay scale +
-    origin δ + fine-tune (plan M3 / M4a).
+        form.addWidget(part_lbl, 0, 0)
+        form.addWidget(self._part_cb, 0, 1)
+        form.addWidget(chip_lbl, 1, 0)
+        form.addWidget(self._chip_cb, 1, 1)
+        v.addLayout(form)
 
-    The user copies the RFL "Chip offset" row directly, all in **µm**
-    (lower-left origins): chip corner (DieX/DieY) relative to the die
-    corner, chip size (SizeW/SizeH), and the GDS default origin offset.
-    The chip-corner offset (nm) the jump logic needs is
-    ``(DieX − GDS_off) × 1000``. These + FOV + nm/px + origin δ are
-    persisted in the layer cache; fine-tune is per-session. Emits
-    ``changed`` so the canvas can re-jump when any value moves."""
+        # ── Effective-values badges ──────────────────────────────────────
+        self._corner_lbl = QLabel("→ chip corner: —")
+        self._corner_lbl.setWordWrap(True)
+        self._corner_lbl.setStyleSheet(_hint_qss(_FS_CAPTION, pad="2px 0"))
+        self._corner_lbl.setToolTip(
+            "Chip lower-left corner relative to die corner (nm), computed as "
+            "(chip_x − gds_off_x) × 1000 — fed to klarf_to_gds().")
+        v.addWidget(self._corner_lbl)
 
-    changed = pyqtSignal()
+        self._fov_lbl = QLabel("→ FOV: —")
+        self._fov_lbl.setWordWrap(True)
+        self._fov_lbl.setStyleSheet(_hint_qss(_FS_CAPTION, pad="2px 0"))
+        self._fov_lbl.setToolTip(
+            "SEM image field-of-view used for the GDS ROI box. Per-CHIP "
+            "default from the catalog; tick Custom override to change it "
+            "for this session.")
+        v.addWidget(self._fov_lbl)
 
-    def __init__(self, parent: Optional[QWidget] = None) -> None:
-        super().__init__("Coordinate Setup", parent)
-        grid = QGridLayout(self)
-        grid.setContentsMargins(8, 8, 8, 8)
-        grid.setHorizontalSpacing(6)
-        grid.setVerticalSpacing(4)
+        # U5: catalog notes used to live as a dedicated italic label that
+        # competed visually with the FOV "(custom)" italic tag. Move it
+        # into the chip-corner badge's tooltip — same info, no extra row.
 
-        def _um(lo: float = -100_000_000.0,
-                hi: float = 100_000_000.0) -> QDoubleSpinBox:
-            s = QDoubleSpinBox(self)
-            s.setDecimals(5)               # RFL gives ~5 dp in um
-            s.setRange(lo, hi)
-            s.setSingleStep(1.0)
-            s.setGroupSeparatorShown(True)
-            s.valueChanged.connect(self._on_changed)
-            return s
+        # ── Custom override toggle + hidden frame ────────────────────────
+        self._custom_chk = QCheckBox("Custom override (FOV / scale)", self)
+        self._custom_chk.setToolTip(
+            "Override the catalog defaults for FOV and overlay scale this "
+            "session. Untick to revert to the CHIP's catalog values.")
+        self._custom_chk.toggled.connect(self._on_custom_toggled)
+        v.addWidget(self._custom_chk)
 
-        def _nm(lo: int, hi: int, step: int = 100) -> QSpinBox:
-            s = QSpinBox(self)
-            s.setRange(lo, hi)
+        self._custom_frame = QFrame(self)
+        self._custom_frame.setFrameShape(QFrame.Shape.NoFrame)
+        cf = QGridLayout(self._custom_frame)
+        cf.setContentsMargins(12, 2, 4, 2)
+        cf.setHorizontalSpacing(6)
+        cf.setVerticalSpacing(2)
+
+        def _nm(step: int = 100) -> QSpinBox:
+            s = QSpinBox(self._custom_frame)
+            s.setRange(1, 100_000_000)
             s.setSingleStep(step)
             s.setGroupSeparatorShown(True)
-            s.valueChanged.connect(self._on_changed)
+            s.setSuffix(" nm")
+            s.valueChanged.connect(self._on_custom_value_changed)
             return s
 
-        # RFL "Chip offset" table (all um, lower-left origins): chip corner
-        # (DieX/DieY) rel die corner, chip size (SizeW/SizeH), and the GDS
-        # default origin offset. chip_corner = (DieX − GDS_off) → nm.
-        self._chip_x = _um(0.0)
-        self._chip_y = _um(0.0)
-        self._chip_w = _um(0.0)
-        self._chip_h = _um(0.0)
-        self._gds_off_x = _um()
-        self._gds_off_y = _um()
-        # FOV + fine-tune stay in nm (canvas works in nm).
-        self._fov_w = _nm(0, 100_000_000)
-        self._fov_h = _nm(0, 100_000_000)
-        self._fine_dx = _nm(0, 0, step=10)   # range set when FOV changes
-        self._fine_dy = _nm(0, 0, step=10)
-        # Overlay scale (nm per native image pixel).
-        self._nm_per_px = QDoubleSpinBox(self)
+        self._fov_w = _nm()
+        self._fov_h = _nm()
+        self._fov_w.setToolTip("Custom FOV width (nm).")
+        self._fov_h.setToolTip("Custom FOV height (nm).")
+
+        self._nm_per_px = QDoubleSpinBox(self._custom_frame)
         self._nm_per_px.setDecimals(4)
         self._nm_per_px.setRange(0.0, 1_000_000.0)
         self._nm_per_px.setSingleStep(0.5)
         self._nm_per_px.setGroupSeparatorShown(True)
-        self._nm_per_px.setEnabled(False)   # auto by default
-        self._nm_per_px.valueChanged.connect(self._on_changed)
-        self._nm_auto = QCheckBox("auto = FOV ÷ image px", self)
+        self._nm_per_px.setSuffix(" nm/px")
+        # U4: a disabled QSpinBox still shows "0.0000" prominently and reads
+        # as "scale is zero" to first-time users. Show "auto" instead while
+        # the auto checkbox is on, so the value the panel will actually use
+        # (FOV ÷ image px) is what the user sees.
+        self._nm_per_px.setSpecialValueText("auto (FOV ÷ image px)")
+        self._nm_per_px.setEnabled(False)
+        self._nm_per_px.valueChanged.connect(self._on_custom_value_changed)
+        self._nm_auto = QCheckBox("auto = FOV ÷ image px", self._custom_frame)
         self._nm_auto.setChecked(True)
-        self._nm_auto.toggled.connect(
-            lambda on: self._nm_per_px.setEnabled(not on))
-        self._nm_auto.toggled.connect(self._on_changed)
 
-        self._chip_x.setToolTip("RFL Chip-offset DieX: chip lower-left X relative to die lower-left (µm).")
-        self._chip_y.setToolTip("RFL Chip-offset DieY: chip lower-left Y relative to die lower-left (µm).")
-        self._chip_w.setToolTip("RFL Chip-offset SizeW: chip width (µm).")
-        self._chip_h.setToolTip("RFL Chip-offset SizeH: chip height (µm).")
-        self._gds_off_x.setToolTip("RFL GDS default offset X (µm; usually sub-micron, negligible).")
-        self._gds_off_y.setToolTip("RFL GDS default offset Y (µm).")
-        self._fov_w.setToolTip("SEM image field-of-view width (nm). Sets the FOV box size and the GDS ROI load extent.")
-        self._fov_h.setToolTip("SEM image field-of-view height (nm).")
-        self._fine_dx.setToolTip("Manual fine-tune X (nm) for the < 1 FOV residual; range ±FOV.")
-        self._fine_dy.setToolTip("Manual fine-tune Y (nm) for the < 1 FOV residual; range ±FOV.")
+        def _sync_npx_enabled(on: bool) -> None:
+            self._nm_per_px.setEnabled(not on)
+            # The special-value text only appears at the spinbox minimum;
+            # snap to 0 while auto is on so "auto" stays visible.
+            if on:
+                self._nm_per_px.setValue(0.0)
+        self._nm_auto.toggled.connect(_sync_npx_enabled)
+        self._nm_auto.toggled.connect(self._on_custom_value_changed)
 
-        self._corner_lbl = QLabel("→ chip corner: 0, 0 nm")
-        self._corner_lbl.setWordWrap(True)
-        self._corner_lbl.setStyleSheet(_hint_qss(_FS_LABEL, pad="2px 0"))
-        self._corner_lbl.setToolTip(
-            "chip_corner = (DieX − GDS_off) × 1000 (µm→nm); "
-            "fed to klarf_to_gds() for coordinate conversion.")
-        self._nm_per_px.setToolTip(
-            "GDS-to-SEM scale (nm per pixel). auto = FOV width ÷ image pixel width.")
-        self._origin_lbl = QLabel("origin δ: 0, 0 nm")
-        self._origin_lbl.setWordWrap(True)
-        self._origin_lbl.setStyleSheet(_hint_qss(_FS_LABEL, pad="2px 0"))
-        self._origin_lbl.setToolTip(
-            "Constant KLARF→GDS origin correction δ. Drag the GDS over the SEM "
-            "to align, then press Set Offset to fill it.")
+        def _add(row: int, text: str, w: QWidget) -> None:
+            cap = QLabel(text)
+            cap.setStyleSheet(_hint_qss(_FS_CAPTION))
+            cf.addWidget(cap, row, 0)
+            cf.addWidget(w, row, 1)
 
-        intro = QLabel("One-time setup per OASIS — saved with the cache. "
-                       "Copy ①/② from the RFL; ④ comes from dragging.")
-        intro.setWordWrap(True)
-        intro.setStyleSheet(_hint_qss(_FS_CAPTION, pad="0 0 4px 0"))
+        _add(0, "FOV W", self._fov_w)
+        _add(1, "FOV H", self._fov_h)
+        _add(2, "nm/px", self._nm_per_px)
+        cf.addWidget(self._nm_auto, 3, 0, 1, 2)
+        self._custom_frame.setVisible(False)
+        v.addWidget(self._custom_frame)
 
-        # (kind, label, widget) — "head" rows are bold section dividers.
-        layout: list[tuple[str, str, object]] = [
-            ("span", "", intro),
-            ("head", "① RFL Chip offset — µm (origin: lower-left)", None),
-            ("row", "Chip corner X (DieX)", self._chip_x),
-            ("row", "Chip corner Y (DieY)", self._chip_y),
-            ("row", "Chip width (SizeW)", self._chip_w),
-            ("row", "Chip height (SizeH)", self._chip_h),
-            ("row", "GDS offset X", self._gds_off_x),
-            ("row", "GDS offset Y", self._gds_off_y),
-            ("corner", "", None),
-            ("head", "② FOV — nm", None),
-            ("row", "FOV width", self._fov_w),
-            ("row", "FOV height", self._fov_h),
-            ("head", "③ Overlay scale — nm/px", None),
-            ("row", "nm per pixel", self._nm_per_px),
-            ("span", "", self._nm_auto),
-            ("head", "④ Origin offset δ — nm (drag + Set Offset)", None),
-            ("origin", "", None),
-            ("head", "⑤ Fine tune — nm (±FOV)", None),
-            ("row", "dx", self._fine_dx),
-            ("row", "dy", self._fine_dy),
-        ]
-        # Single-column form (label above input): the 280px panel can't fit
-        # "label : input" side-by-side without truncating these labels (M7).
-        r = 0
+        # ── Catalog status + Edit button (M4, dev-mode only) ─────────────
+        self._status_lbl = QLabel("")
+        self._status_lbl.setWordWrap(True)
+        self._status_lbl.setStyleSheet(
+            _hint_qss(_FS_MICRO, _TK_TEXT_HINT.name(), pad="4px 0 0 0"))
+        v.addWidget(self._status_lbl)
 
-        def _add(w):
-            nonlocal r
-            grid.addWidget(w, r, 0)
-            r += 1
+        self._edit_btn = QPushButton("⚙ Edit catalog…", self)
+        self._edit_btn.setToolTip(
+            "Developer mode: add or edit PART/CHIP entries in the catalog.")
+        self._edit_btn.clicked.connect(self.edit_catalog_requested)
+        self._edit_btn.setVisible(False)
+        v.addWidget(self._edit_btn)
 
-        for kind, label, widget in layout:
-            if kind == "head":
-                hdr = QLabel(label)
-                hdr.setWordWrap(True)
-                hdr.setStyleSheet(
-                    f"font-weight:700; color:{_TK_ACCENT_DK.name()}; "
-                    f"font-size:{_FS_CAPTION}px; margin-top:8px;")
-                _add(hdr)
-            elif kind == "corner":
-                _add(self._corner_lbl)
-            elif kind == "origin":
-                _add(self._origin_lbl)
-            elif kind == "span":
-                _add(widget)
+        # Pull in the catalog now so the dropdowns are populated before
+        # MainWindow connects the signal (an empty catalog leaves the
+        # widgets disabled with a status-line hint).
+        self.reload_catalog()
+
+    # ── Catalog I/O ─────────────────────────────────────────────────────
+
+    def reload_catalog(self) -> None:
+        """Re-read ``glas/data/parts.json`` and rebuild the dropdowns. The
+        catalog editor (M4) calls this after saving."""
+        self._load_error = None
+        try:
+            self._catalog = load_catalog()
+        except CatalogError as exc:
+            self._catalog = {}
+            self._load_error = str(exc)
+        self._legacy_snapshot = False
+        self._legacy_values = {}
+        self._populate_parts()
+
+    def set_dev_mode(self, on: bool) -> None:
+        """Show / hide the Edit catalog button (toggled by MainWindow when
+        developer mode is enabled or restored from QSettings)."""
+        self._edit_btn.setVisible(bool(on))
+
+    def _populate_parts(self) -> None:
+        self._suppress = True
+        self._part_cb.clear()
+        self._chip_cb.clear()
+        if not self._catalog:
+            self._part_cb.setEnabled(False)
+            self._chip_cb.setEnabled(False)
+            self._custom_chk.setEnabled(True)
+            # S11: empty-catalog state used to be a muted hint that read
+            # as a regular tooltip; promote it to a card with a warning
+            # tint so it can't be mistaken for normal copy. The hint
+            # leaves the catalog-editor entry point intentionally vague
+            # (it's gated behind developer mode and shouldn't advertise
+            # how to unlock it).
+            if self._load_error:
+                self._status_lbl.setText(
+                    f"⚠ Catalog error: {self._load_error}\n"
+                    f"Fix glas/data/parts.json or use the catalog editor.")
             else:
-                cap = QLabel(label)
-                cap.setStyleSheet(_hint_qss(_FS_CAPTION))
-                _add(cap)
-                _add(widget)
-
-        self._fov_w.valueChanged.connect(self._sync_fine_range)
-        self._fov_h.valueChanged.connect(self._sync_fine_range)
+                self._status_lbl.setText(
+                    "⚠ No PART / CHIP data\n"
+                    "Ask an administrator to add entries.")
+            self._status_lbl.setStyleSheet(
+                f"background:#fff0e0; color:#9a6a2a; "
+                f"border:1px solid #c8a080; border-radius:4px; "
+                f"padding:8px 10px; font-size:{_FS_CAPTION}px;")
+        else:
+            self._part_cb.setEnabled(True)
+            self._chip_cb.setEnabled(True)
+            for pid in sorted(self._catalog):
+                self._part_cb.addItem(pid)
+            self._status_lbl.setText("")
+            self._status_lbl.setStyleSheet(
+                _hint_qss(_FS_MICRO, _TK_TEXT_HINT.name(), pad="4px 0 0 0"))
         self._suppress = False
+        # Drive an initial CHIP/badge update once.
+        self._on_part_changed(self._part_cb.currentText())
 
-    def _on_changed(self) -> None:
-        cx, cy = self._chip_corner_nm()
-        self._corner_lbl.setText(
-            f"→ chip corner: {cx:,.0f}, {cy:,.0f} nm  "
-            f"({cx / 1e3:,.3f}, {cy / 1e3:,.3f} µm)")
+    # ── Selection callbacks ─────────────────────────────────────────────
+
+    def _on_part_changed(self, pid: str) -> None:
+        # Refresh CHIP dropdown to the chosen PART's chips.
+        self._suppress = True
+        self._chip_cb.clear()
+        part = self._catalog.get(pid)
+        if part is not None:
+            for cid in sorted(part.chips):
+                self._chip_cb.addItem(cid)
+        self._suppress = False
+        self._on_chip_changed(self._chip_cb.currentText())
+
+    def _on_chip_changed(self, _cid: str) -> None:
+        # A real chip selection cancels any pending legacy-snapshot mode.
+        if self._current_chip() is not None:
+            self._legacy_snapshot = False
+            self._legacy_values = {}
+        # Custom override re-seeded with the new CHIP's catalog defaults
+        # so toggling Custom shows reasonable starting values.
+        chip = self._current_chip()
+        if chip is not None and not self._custom_chk.isChecked():
+            self._seed_custom_from_chip(chip)
+        self._refresh_badges()
         if not self._suppress:
             self.changed.emit()
 
-    def _sync_fine_range(self) -> None:
-        """Fine-tune is bounded to ±FOV (plan: corrects < 1 FOV residual)."""
-        rx = int(self._fov_w.value())
-        ry = int(self._fov_h.value())
-        self._fine_dx.setRange(-rx, rx)
-        self._fine_dy.setRange(-ry, ry)
+    def _on_custom_toggled(self, on: bool) -> None:
+        self._customising = bool(on)
+        self._custom_frame.setVisible(bool(on))
+        chip = self._current_chip()
+        if on and chip is not None:
+            # Seed spinboxes from the current chip so the override starts
+            # at the catalog defaults rather than an empty / zero state.
+            self._seed_custom_from_chip(chip)
+        self._refresh_badges()
+        if not self._suppress:
+            self.changed.emit()
 
-    def _chip_corner_nm(self) -> tuple[float, float]:
-        # chip corner (rel die corner) = DieX − GDS_offset, in nm.
-        return ((self._chip_x.value() - self._gds_off_x.value()) * 1e3,
-                (self._chip_y.value() - self._gds_off_y.value()) * 1e3)
+    def _on_custom_value_changed(self) -> None:
+        self._refresh_badges()
+        if not self._suppress and self._customising:
+            self.changed.emit()
 
-    # ── value access ─────────────────────────────────────────────────────────
+    # ── Helpers ─────────────────────────────────────────────────────────
+
+    def _current_chip(self) -> Optional[ChipSpec]:
+        if self._legacy_snapshot:
+            return None
+        pid = self._part_cb.currentText()
+        cid = self._chip_cb.currentText()
+        part = self._catalog.get(pid)
+        if part is None:
+            return None
+        return part.chips.get(cid)
+
+    def _seed_custom_from_chip(self, chip: ChipSpec) -> None:
+        self._suppress = True
+        self._fov_w.setValue(int(chip.fov_w_nm))
+        self._fov_h.setValue(int(chip.fov_h_nm))
+        if chip.nm_per_px is not None:
+            self._nm_auto.setChecked(False)
+            self._nm_per_px.setValue(float(chip.nm_per_px))
+        else:
+            self._nm_auto.setChecked(True)
+            self._nm_per_px.setValue(0.0)
+        self._suppress = False
+
+    def _effective_fov(self) -> tuple[float, float]:
+        if self._legacy_snapshot:
+            return (float(self._legacy_values.get("fov_w", 0.0)),
+                    float(self._legacy_values.get("fov_h", 0.0)))
+        if self._customising:
+            return float(self._fov_w.value()), float(self._fov_h.value())
+        chip = self._current_chip()
+        if chip is None:
+            return DEFAULT_FOV_NM, DEFAULT_FOV_NM
+        return float(chip.fov_w_nm), float(chip.fov_h_nm)
+
+    def _effective_scale(self) -> tuple[float, bool]:
+        """(nm_per_px_manual, nm_auto). ``manual`` is ignored when ``auto``
+        is True; consumer uses FOV ÷ image px instead."""
+        if self._legacy_snapshot:
+            return (float(self._legacy_values.get("nm_per_px_manual", 0.0)),
+                    bool(self._legacy_values.get("nm_auto", True)))
+        if self._customising:
+            return (float(self._nm_per_px.value()),
+                    bool(self._nm_auto.isChecked()))
+        chip = self._current_chip()
+        if chip is None or chip.nm_per_px is None:
+            return 0.0, True
+        return float(chip.nm_per_px), False
+
+    def _refresh_badges(self) -> None:
+        if self._legacy_snapshot:
+            cx = float(self._legacy_values.get("chip_corner_x", 0.0))
+            cy = float(self._legacy_values.get("chip_corner_y", 0.0))
+        else:
+            chip = self._current_chip()
+            cx, cy = (chip.chip_corner_nm() if chip is not None else (0.0, 0.0))
+        self._corner_lbl.setText(
+            f"→ chip corner: {cx:,.0f}, {cy:,.0f} nm  "
+            f"({cx / 1e3:,.3f}, {cy / 1e3:,.3f} µm)")
+        fw, fh = self._effective_fov()
+        tag = " (custom)" if self._customising else (
+            " (legacy)" if self._legacy_snapshot else "")
+        self._fov_lbl.setText(
+            f"→ FOV: {fw:,.0f} × {fh:,.0f} nm  "
+            f"({fw / 1e3:,.3f} × {fh / 1e3:,.3f} µm){tag}")
+        # U5: surface chip notes in the chip-corner tooltip instead of as a
+        # third italic line that crowded the right column.
+        chip = self._current_chip()
+        base_corner_tip = (
+            "Chip lower-left corner relative to die corner (nm), computed "
+            "as (chip_x − gds_off_x) × 1000 — fed to klarf_to_gds().")
+        if chip is not None and chip.notes:
+            self._corner_lbl.setToolTip(f"{base_corner_tip}\n\n{chip.notes}")
+        else:
+            self._corner_lbl.setToolTip(base_corner_tip)
+
+    # ── Public API for MainWindow ───────────────────────────────────────
+
     def values(self) -> dict:
-        cc_x, cc_y = self._chip_corner_nm()
+        """Snapshot of the effective alignment values. Keys mirror the legacy
+        Coordinate Setup dict (so existing consumers keep working) with two
+        additions: ``part_id`` / ``chip_id`` (Optional[str]). ``fine_dx`` /
+        ``fine_dy`` are intentionally absent (removed in F21 Q6)."""
+        if self._legacy_snapshot:
+            d = dict(self._legacy_values)
+            d.setdefault("part_id", None)
+            d.setdefault("chip_id", None)
+            return d
+        chip = self._current_chip()
+        if chip is None:
+            return {
+                "chip_corner_x": 0.0, "chip_corner_y": 0.0,
+                "chip_x_um": 0.0, "chip_y_um": 0.0,
+                "chip_w_um": 0.0, "chip_h_um": 0.0,
+                "gds_off_x_um": 0.0, "gds_off_y_um": 0.0,
+                "fov_w": DEFAULT_FOV_NM if not self._customising
+                        else float(self._fov_w.value()),
+                "fov_h": DEFAULT_FOV_NM if not self._customising
+                        else float(self._fov_h.value()),
+                "nm_per_px_manual": (float(self._nm_per_px.value())
+                                     if self._customising else 0.0),
+                "nm_auto": (bool(self._nm_auto.isChecked())
+                            if self._customising else True),
+                "part_id": None,
+                "chip_id": None,
+            }
+        cx, cy = chip.chip_corner_nm()
+        fw, fh = self._effective_fov()
+        npx_manual, npx_auto = self._effective_scale()
         return {
-            "chip_corner_x": cc_x,
-            "chip_corner_y": cc_y,
-            "chip_x_um": float(self._chip_x.value()),
-            "chip_y_um": float(self._chip_y.value()),
-            "chip_w_um": float(self._chip_w.value()),
-            "chip_h_um": float(self._chip_h.value()),
-            "gds_off_x_um": float(self._gds_off_x.value()),
-            "gds_off_y_um": float(self._gds_off_y.value()),
-            "fov_w": float(self._fov_w.value()),
-            "fov_h": float(self._fov_h.value()),
-            "fine_dx": float(self._fine_dx.value()),
-            "fine_dy": float(self._fine_dy.value()),
-            "nm_per_px_manual": float(self._nm_per_px.value()),
-            "nm_auto": bool(self._nm_auto.isChecked()),
+            "chip_corner_x": cx,
+            "chip_corner_y": cy,
+            "chip_x_um": chip.chip_x_um,
+            "chip_y_um": chip.chip_y_um,
+            "chip_w_um": chip.chip_w_um,
+            "chip_h_um": chip.chip_h_um,
+            "gds_off_x_um": chip.gds_off_x_um,
+            "gds_off_y_um": chip.gds_off_y_um,
+            "fov_w": fw,
+            "fov_h": fh,
+            "nm_per_px_manual": npx_manual,
+            "nm_auto": npx_auto,
+            "part_id": self._part_cb.currentText() or None,
+            "chip_id": self._chip_cb.currentText() or None,
         }
 
-    def set_origin(self, dx: float, dy: float) -> None:
-        """Update the read-only origin-δ label (the value lives in
-        MainWindow; this just reflects it)."""
-        self._origin_lbl.setText(f"origin δ: {dx:,.0f}, {dy:,.0f} nm")
-
     def set_from_meta(self, meta) -> None:
-        """Auto-fill the RFL Chip-offset params + FOV from a loaded cache's
-        metadata, firing ``changed`` once at the end."""
+        """Restore PART/CHIP from a loaded cache. v5+ caches carry the IDs
+        and we re-select the dropdowns; v4 (or unknown PART/CHIP) drops the
+        panel into a "legacy snapshot" mode that exposes the stored
+        coordinates without offering a re-selection."""
         self._suppress = True
-        self._chip_x.setValue(getattr(meta, "chip_x_um", 0.0))
-        self._chip_y.setValue(getattr(meta, "chip_y_um", 0.0))
-        self._chip_w.setValue(getattr(meta, "chip_w_um", 0.0))
-        self._chip_h.setValue(getattr(meta, "chip_h_um", 0.0))
-        self._gds_off_x.setValue(getattr(meta, "gds_off_x_um", 0.0))
-        self._gds_off_y.setValue(getattr(meta, "gds_off_y_um", 0.0))
-        self._fov_w.setValue(int(getattr(meta, "fov_w", 0.0)))
-        self._fov_h.setValue(int(getattr(meta, "fov_h", 0.0)))
-        npx = float(getattr(meta, "nm_per_px", 0.0))
-        if npx > 0:
-            self._nm_per_px.setValue(npx)
-            self._nm_auto.setChecked(False)
-            self._nm_per_px.setEnabled(True)
-        self._sync_fine_range()
+        self._custom_chk.setChecked(False)
+        self._customising = False
+        self._custom_frame.setVisible(False)
+
+        pid = getattr(meta, "part_id", None)
+        cid = getattr(meta, "chip_id", None)
+        part = self._catalog.get(pid) if pid else None
+        if part is not None and cid in part.chips:
+            # v5 round-trip: reselect catalog entry. Chip-corner snapshots
+            # always equal the catalog values by construction (Q3) so they
+            # come straight from the catalog. FOV / nm-per-px may diverge if
+            # the cache was exported with Custom override active — restore
+            # that override transparently so the alignment doesn't silently
+            # shift back to catalog defaults on cache load.
+            self._legacy_snapshot = False
+            self._legacy_values = {}
+            idx = self._part_cb.findText(pid)
+            if idx >= 0:
+                self._part_cb.setCurrentIndex(idx)
+            idx = self._chip_cb.findText(cid)
+            if idx >= 0:
+                self._chip_cb.setCurrentIndex(idx)
+            chip = part.chips[cid]
+            cached_fov_w = float(getattr(meta, "fov_w", 0.0) or 0.0)
+            cached_fov_h = float(getattr(meta, "fov_h", 0.0) or 0.0)
+            cached_npx = float(getattr(meta, "nm_per_px", 0.0) or 0.0)
+            fov_diff = (
+                cached_fov_w > 0
+                and (abs(cached_fov_w - chip.fov_w_nm) > 0.5
+                     or abs(cached_fov_h - chip.fov_h_nm) > 0.5))
+            chip_npx = chip.nm_per_px or 0.0
+            npx_diff = abs(cached_npx - chip_npx) > 1e-6
+            if fov_diff or npx_diff:
+                self._customising = True
+                self._custom_chk.setChecked(True)
+                self._custom_frame.setVisible(True)
+                if cached_fov_w > 0:
+                    self._fov_w.setValue(int(round(cached_fov_w)))
+                    self._fov_h.setValue(int(round(cached_fov_h)))
+                if cached_npx > 0:
+                    self._nm_auto.setChecked(False)
+                    self._nm_per_px.setEnabled(True)
+                    self._nm_per_px.setValue(cached_npx)
+                else:
+                    self._nm_auto.setChecked(True)
+                    self._nm_per_px.setEnabled(False)
+            self._suppress = False
+            self._refresh_badges()
+            self.changed.emit()
+            return
+
+        # v4 cache (or PART/CHIP no longer in catalog): show the snapshot.
+        self._legacy_snapshot = True
+        self._legacy_values = {
+            "chip_corner_x": float(getattr(meta, "chip_corner_x", 0.0)),
+            "chip_corner_y": float(getattr(meta, "chip_corner_y", 0.0)),
+            "chip_x_um": float(getattr(meta, "chip_x_um", 0.0)),
+            "chip_y_um": float(getattr(meta, "chip_y_um", 0.0)),
+            "chip_w_um": float(getattr(meta, "chip_w_um", 0.0)),
+            "chip_h_um": float(getattr(meta, "chip_h_um", 0.0)),
+            "gds_off_x_um": float(getattr(meta, "gds_off_x_um", 0.0)),
+            "gds_off_y_um": float(getattr(meta, "gds_off_y_um", 0.0)),
+            "fov_w": float(getattr(meta, "fov_w", 0.0)),
+            "fov_h": float(getattr(meta, "fov_h", 0.0)),
+            "nm_per_px_manual": float(getattr(meta, "nm_per_px", 0.0)),
+            "nm_auto": float(getattr(meta, "nm_per_px", 0.0)) <= 0.0,
+        }
+        # Block dropdowns — the catalog can't represent this cache.
+        self._part_cb.setEnabled(False)
+        self._chip_cb.setEnabled(False)
+        if pid or cid:
+            self._status_lbl.setText(
+                f"⚠ cache from PART {pid or '?'} / CHIP {cid or '?'} not in "
+                f"current catalog — showing snapshot values only.")
+        else:
+            self._status_lbl.setText(
+                "⚠ legacy cache (no PART/CHIP) — showing snapshot values "
+                "only. Re-export from a current PART/CHIP to upgrade.")
         self._suppress = False
-        self._on_changed()
+        self._refresh_badges()
+        self.changed.emit()
+
+
+class AlignmentDeltaPanel(QFrame):
+    """Always-visible Origin δ readout + Set/Clear/Copy controls (F21 M3).
+
+    Replaces the small read-only ``origin δ`` label that used to live at the
+    bottom of CoordinateSetupPanel: the value the user is steering toward
+    deserves a prominent, persistent display next to the SEM list.
+    The numeric value is owned by MainWindow (``_origin_dx`` / ``_origin_dy``);
+    this widget just renders and provides the buttons.
+    """
+
+    set_requested = pyqtSignal()
+    clear_requested = pyqtSignal()
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("alignDeltaPanel")
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setStyleSheet(
+            f"QFrame#alignDeltaPanel {{ background: {_TK_BG_PANEL.name()}; "
+            f"border: 1px solid {_TK_BORDER.name()}; border-radius: 4px; }}")
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(10, 8, 10, 10)
+        v.setSpacing(6)
+
+        title = QLabel("ALIGNMENT δ")
+        title.setStyleSheet(
+            f"color:{_TK_ACCENT_DK.name()}; font-size:{_FS_MICRO}px; "
+            f"font-weight:700; letter-spacing:1px;")
+        v.addWidget(title)
+
+        self._x_lbl = QLabel("X:    0 nm")
+        self._y_lbl = QLabel("Y:    0 nm")
+        big_qss = (f"color:{_TK_TEXT_PRI.name()}; "
+                   f"font-size:{max(_FS_LABEL + 3, 16)}px; "
+                   f"font-weight:700; font-family: monospace;")
+        self._x_lbl.setStyleSheet(big_qss)
+        self._y_lbl.setStyleSheet(big_qss)
+        v.addWidget(self._x_lbl)
+        v.addWidget(self._y_lbl)
+
+        # Set / Clear row (two equal stretching buttons — no third icon
+        # button so the row never overflows the 300-px-fixed right column
+        # when the vertical scrollbar appears).
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+        self.set_btn = QPushButton("Set Offset")
+        self.set_btn.setToolTip(
+            "Lock in the current GDS overlay drag as the alignment δ. "
+            "Shortcut: arrow keys with Ctrl nudge δ by 10 nm.")
+        self.clear_btn = QPushButton("Clear")
+        self.clear_btn.setToolTip("Reset alignment δ and any pending drag.")
+        self.set_btn.clicked.connect(self.set_requested)
+        self.clear_btn.clicked.connect(self.clear_requested)
+        btn_row.addWidget(self.set_btn, 1)
+        btn_row.addWidget(self.clear_btn, 1)
+        v.addLayout(btn_row)
+
+        # Copy δ — full-width, icon + label, accent-bordered button on its
+        # own line. The earlier ⧉ Unicode glyph rendered as an
+        # unrecognisable square on some platforms; this version pairs the
+        # Lucide-style copy SVG with a clear label, and confirms with a
+        # transient label flip ("Copied ✓") so the click feels acknowledged.
+        self._copy_btn = QPushButton(_qicon("copy"), " Copy δ to clipboard",
+                                     self)
+        self._copy_btn.setToolTip("Copy (dx, dy) nm to the system clipboard.")
+        self._copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._copy_btn.setStyleSheet(
+            f"QPushButton {{ background:#fff5e8; "
+            f"color:{_TK_ACCENT_DK.name()}; "
+            f"border:1px solid {_TK_ACCENT_DK.name()}; "
+            f"border-radius:4px; padding:5px 10px; "
+            f"font-size:{_FS_CAPTION}px; font-weight:600; }}"
+            f"QPushButton:hover {{ background:{_TK_ACCENT.name()}; "
+            f"color:#ffffff; }}"
+            f"QPushButton:pressed {{ background:{_TK_ACCENT_DK.name()}; "
+            f"color:#ffffff; }}")
+        self._copy_btn.clicked.connect(self._on_copy)
+        v.addWidget(self._copy_btn)
+
+        # Snap-back timer for the post-copy confirmation label flip.
+        self._copy_revert_timer = QTimer(self)
+        self._copy_revert_timer.setSingleShot(True)
+        self._copy_revert_timer.setInterval(1200)
+        self._copy_revert_timer.timeout.connect(
+            lambda: self._copy_btn.setText(" Copy δ to clipboard"))
+
+        hint = QLabel("Drag GDS overlay → Set. Ctrl+arrow keys nudge ±10 nm.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(_hint_qss(_FS_MICRO, pad="2px 0 0 0"))
+        v.addWidget(hint)
+
+        self._dx = 0.0
+        self._dy = 0.0
+
+    def set_values(self, dx: float, dy: float) -> None:
+        """Update the displayed δ (called by MainWindow whenever
+        ``_origin_dx`` / ``_origin_dy`` changes, including live overlay
+        drag previews)."""
+        self._dx = float(dx)
+        self._dy = float(dy)
+        # Sign-aware aligned formatting so positive/negative numbers don't
+        # jiggle the column width every other update.
+        self._x_lbl.setText(f"X: {self._dx:>+10,.0f} nm")
+        self._y_lbl.setText(f"Y: {self._dy:>+10,.0f} nm")
+
+    def _on_copy(self) -> None:
+        app = QApplication.instance()
+        if app is None:
+            return
+        app.clipboard().setText(f"{self._dx:.0f}, {self._dy:.0f}")
+        # Transient confirmation so the click feels acknowledged; reverts
+        # back to the default label after ~1.2 s.
+        self._copy_btn.setText(" Copied ✓")
+        self._copy_revert_timer.start()
+
+
+class CatalogEditorDialog(QDialog):
+    """Developer-mode catalog editor (F21 M4).
+
+    Two-pane layout: a tree of PART → CHIP on the left + an add/remove
+    toolbar; a form for the selected CHIP's coordinate fields on the right.
+    ``Save`` atomically rewrites ``glas/data/parts.json``; the caller
+    refreshes its PartChipPanel on accept.
+
+    The dialog operates on an in-memory copy of the catalog so a
+    ``Cancel`` (or window-close) discards edits cleanly.
+    """
+
+    def __init__(self, parent: Optional[QWidget],
+                 catalog: dict[str, PartSpec]) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Edit PART / CHIP catalog")
+        self.setModal(True)
+        self.setMinimumSize(640, 480)
+
+        # Deep-copy so Cancel reverts cleanly.
+        self._catalog: dict[str, PartSpec] = {
+            pid: PartSpec.from_dict(p.to_dict())
+            for pid, p in catalog.items()
+        }
+
+        root = QHBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        # ── Left: PART/CHIP tree + add/remove ────────────────────────────
+        left = QVBoxLayout()
+        self._tree = QListWidget(self)
+        self._tree.itemSelectionChanged.connect(self._on_tree_select)
+        left.addWidget(self._tree, 1)
+
+        btn_row = QHBoxLayout()
+        self._add_part_btn = QPushButton("+ PART")
+        self._add_chip_btn = QPushButton("+ CHIP")
+        self._del_btn = QPushButton("− Remove")
+        self._add_part_btn.clicked.connect(self._on_add_part)
+        self._add_chip_btn.clicked.connect(self._on_add_chip)
+        self._del_btn.clicked.connect(self._on_del)
+        btn_row.addWidget(self._add_part_btn)
+        btn_row.addWidget(self._add_chip_btn)
+        btn_row.addWidget(self._del_btn)
+        left.addLayout(btn_row)
+
+        left_w = QWidget(self)
+        left_w.setLayout(left)
+        left_w.setMinimumWidth(220)
+        root.addWidget(left_w)
+
+        # ── Right: CHIP / PART form ──────────────────────────────────────
+        right = QVBoxLayout()
+        self._form_box = QGroupBox("(select an entry on the left)")
+        form = QGridLayout(self._form_box)
+        form.setVerticalSpacing(4)
+
+        self._desc = QLineEdit(self._form_box)
+        self._desc.setPlaceholderText(
+            "PART description (only used when a PART row is selected)")
+        self._desc.textChanged.connect(self._on_form_changed)
+
+        def _um(lo: float = -100_000_000.0,
+                hi: float = 100_000_000.0) -> QDoubleSpinBox:
+            s = QDoubleSpinBox(self._form_box)
+            s.setDecimals(5)
+            s.setRange(lo, hi)
+            s.setSuffix(" µm")
+            s.setGroupSeparatorShown(True)
+            s.valueChanged.connect(self._on_form_changed)
+            return s
+
+        def _nm() -> QSpinBox:
+            s = QSpinBox(self._form_box)
+            s.setRange(1, 100_000_000)
+            s.setSuffix(" nm")
+            s.setGroupSeparatorShown(True)
+            s.valueChanged.connect(self._on_form_changed)
+            return s
+
+        self._cx = _um(0.0)
+        self._cy = _um(0.0)
+        self._cw = _um(0.0)
+        self._ch = _um(0.0)
+        self._gx = _um()
+        self._gy = _um()
+        self._fw = _nm()
+        self._fh = _nm()
+        self._nmpx = QDoubleSpinBox(self._form_box)
+        self._nmpx.setDecimals(4)
+        self._nmpx.setRange(0.0, 1_000_000.0)
+        self._nmpx.setSuffix(" nm/px (0 = auto)")
+        self._nmpx.valueChanged.connect(self._on_form_changed)
+        self._notes = QLineEdit(self._form_box)
+        self._notes.setPlaceholderText("Notes (optional)")
+        self._notes.textChanged.connect(self._on_form_changed)
+
+        fields = [
+            ("Description", self._desc),
+            ("Chip X (DieX, µm)", self._cx),
+            ("Chip Y (DieY, µm)", self._cy),
+            ("Chip W (SizeW, µm)", self._cw),
+            ("Chip H (SizeH, µm)", self._ch),
+            ("GDS offset X (µm)", self._gx),
+            ("GDS offset Y (µm)", self._gy),
+            ("FOV W (nm)", self._fw),
+            ("FOV H (nm)", self._fh),
+            ("nm/px", self._nmpx),
+            ("Notes", self._notes),
+        ]
+        for i, (lbl, w) in enumerate(fields):
+            form.addWidget(QLabel(lbl), i, 0)
+            form.addWidget(w, i, 1)
+
+        right.addWidget(self._form_box, 1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel, self)
+        buttons.accepted.connect(self._on_save)
+        buttons.rejected.connect(self.reject)
+        right.addWidget(buttons)
+        root.addLayout(right, 1)
+
+        self._suppress = False
+        self._refresh_tree()
+        self._set_form_enabled(False)
+
+    # ── Helpers ─────────────────────────────────────────────────────────
+
+    def _refresh_tree(self, select: Optional[tuple[str, Optional[str]]] = None
+                      ) -> None:
+        self._tree.blockSignals(True)
+        self._tree.clear()
+        for pid in sorted(self._catalog):
+            top = QListWidgetItem(f"📦 {pid}")
+            top.setData(Qt.ItemDataRole.UserRole, ("part", pid, None))
+            self._tree.addItem(top)
+            for cid in sorted(self._catalog[pid].chips):
+                row = QListWidgetItem(f"     ↳ {cid}")
+                row.setData(Qt.ItemDataRole.UserRole, ("chip", pid, cid))
+                self._tree.addItem(row)
+        self._tree.blockSignals(False)
+        if select is not None:
+            self._select(*select)
+
+    def _select(self, pid: str, cid: Optional[str]) -> None:
+        for i in range(self._tree.count()):
+            data = self._tree.item(i).data(Qt.ItemDataRole.UserRole)
+            if cid is None and data == ("part", pid, None):
+                self._tree.setCurrentRow(i)
+                return
+            if cid is not None and data == ("chip", pid, cid):
+                self._tree.setCurrentRow(i)
+                return
+
+    def _current(self) -> Optional[tuple[str, str, Optional[str]]]:
+        it = self._tree.currentItem()
+        if it is None:
+            return None
+        return it.data(Qt.ItemDataRole.UserRole)
+
+    def _set_form_enabled(self, on: bool) -> None:
+        for w in (self._desc, self._cx, self._cy, self._cw, self._ch,
+                  self._gx, self._gy, self._fw, self._fh, self._nmpx,
+                  self._notes):
+            w.setEnabled(on)
+
+    def _on_tree_select(self) -> None:
+        cur = self._current()
+        if cur is None:
+            self._set_form_enabled(False)
+            self._form_box.setTitle("(select an entry on the left)")
+            return
+        kind, pid, cid = cur
+        self._suppress = True
+        if kind == "part":
+            part = self._catalog[pid]
+            self._form_box.setTitle(f"PART · {pid}")
+            self._desc.setText(part.description)
+            # Numeric fields don't apply to PART — disable them.
+            for w in (self._cx, self._cy, self._cw, self._ch, self._gx,
+                      self._gy, self._fw, self._fh, self._nmpx, self._notes):
+                w.setEnabled(False)
+            self._desc.setEnabled(True)
+        else:
+            chip = self._catalog[pid].chips[cid]
+            self._form_box.setTitle(f"CHIP · {pid} / {cid}")
+            self._set_form_enabled(True)
+            self._desc.setEnabled(False)
+            self._desc.setText("")
+            self._cx.setValue(chip.chip_x_um)
+            self._cy.setValue(chip.chip_y_um)
+            self._cw.setValue(chip.chip_w_um)
+            self._ch.setValue(chip.chip_h_um)
+            self._gx.setValue(chip.gds_off_x_um)
+            self._gy.setValue(chip.gds_off_y_um)
+            self._fw.setValue(int(chip.fov_w_nm))
+            self._fh.setValue(int(chip.fov_h_nm))
+            self._nmpx.setValue(float(chip.nm_per_px or 0.0))
+            self._notes.setText(chip.notes)
+        self._suppress = False
+
+    def _on_form_changed(self) -> None:
+        if self._suppress:
+            return
+        cur = self._current()
+        if cur is None:
+            return
+        kind, pid, cid = cur
+        if kind == "part":
+            self._catalog[pid].description = self._desc.text()
+            return
+        chip = self._catalog[pid].chips[cid]
+        chip.chip_x_um = float(self._cx.value())
+        chip.chip_y_um = float(self._cy.value())
+        chip.chip_w_um = float(self._cw.value())
+        chip.chip_h_um = float(self._ch.value())
+        chip.gds_off_x_um = float(self._gx.value())
+        chip.gds_off_y_um = float(self._gy.value())
+        chip.fov_w_nm = float(self._fw.value())
+        chip.fov_h_nm = float(self._fh.value())
+        npx = float(self._nmpx.value())
+        chip.nm_per_px = npx if npx > 0 else None
+        chip.notes = self._notes.text()
+
+    def _on_add_part(self) -> None:
+        pid, ok = QInputDialog.getText(
+            self, "Add PART", "New PART code (e.g. TMVG10):")
+        if not ok or not pid.strip():
+            return
+        pid = pid.strip()
+        if pid in self._catalog:
+            QMessageBox.warning(self, "PART exists",
+                                f"PART {pid!r} already exists.")
+            return
+        self._catalog[pid] = PartSpec()
+        self._refresh_tree(select=(pid, None))
+
+    def _on_add_chip(self) -> None:
+        cur = self._current()
+        if cur is None:
+            QMessageBox.information(self, "Pick a PART",
+                                    "Select a PART (or one of its CHIPs) first.")
+            return
+        _, pid, _ = cur
+        cid, ok = QInputDialog.getText(
+            self, "Add CHIP", f"New CHIP id within {pid}:")
+        if not ok or not cid.strip():
+            return
+        cid = cid.strip()
+        part = self._catalog[pid]
+        if cid in part.chips:
+            QMessageBox.warning(self, "CHIP exists",
+                                f"CHIP {cid!r} already exists in {pid}.")
+            return
+        part.chips[cid] = ChipSpec()
+        self._refresh_tree(select=(pid, cid))
+
+    def _on_del(self) -> None:
+        cur = self._current()
+        if cur is None:
+            return
+        kind, pid, cid = cur
+        target = f"CHIP {pid}/{cid}" if cid else f"PART {pid} (and all CHIPs)"
+        if QMessageBox.question(
+                self, "Remove?", f"Remove {target}?") != \
+                QMessageBox.StandardButton.Yes:
+            return
+        if cid is None:
+            del self._catalog[pid]
+            self._refresh_tree()
+        else:
+            del self._catalog[pid].chips[cid]
+            self._refresh_tree(select=(pid, None))
+
+    def _on_save(self) -> None:
+        try:
+            save_catalog(default_catalog_path(), self._catalog)
+        except OSError as exc:
+            QMessageBox.critical(self, "Save failed",
+                                 f"Could not write catalog: {exc}")
+            return
+        self.accept()
 
 
 class FineAlignPanel(QGroupBox):
@@ -3542,7 +4324,7 @@ class FineAlignPanel(QGroupBox):
         grid.setHorizontalSpacing(6)
         grid.setVerticalSpacing(4)
 
-        self._poi_lbl = QLabel("POI: (none — toggle 'POI' on a layer)")
+        self._poi_lbl = QLabel("POI: (none — click the POI button on a layer in the LAYERS column)")
         self._poi_lbl.setWordWrap(True)
         self._poi_lbl.setStyleSheet(_hint_qss(_FS_CAPTION))
         self._poi_set = False
@@ -3681,7 +4463,7 @@ class FineAlignPanel(QGroupBox):
         n = len(items)
         self._poi_lbl.setText(
             f"POI: {n} layer{'s' if n != 1 else ''} → composite template"
-            if self._poi_set else "POI: (none — toggle 'POI' on a layer)")
+            if self._poi_set else "POI: (none — click the POI button on a layer in the LAYERS column)")
         self._update_enabled()
 
     def set_fgs(self, fgs: dict) -> None:
@@ -4305,9 +5087,9 @@ class _ImageListDelegate(QStyledItemDelegate):
 
 class SemPanel(QFrame):
     """Right column: a single 'Load SEM…' button (KLARF / image folder via a
-    drop-down) + Coordinate Setup + the image list. Owns no file I/O — it
-    asks MainWindow to open dialogs and is handed the resulting
-    :class:`sem_loader.SemImage` list."""
+    drop-down) + PART/CHIP catalog (F21) + always-visible Alignment δ panel
+    + the image list. Owns no file I/O — it asks MainWindow to open dialogs
+    and is handed the resulting :class:`sem_loader.SemImage` list."""
 
     load_klarf_requested = pyqtSignal()
     load_folder_requested = pyqtSignal()
@@ -4317,7 +5099,10 @@ class SemPanel(QFrame):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setObjectName("rightPanel")
-        self.setFixedWidth(300)          # M7 R8: a touch wider eases density
+        # 320 px reserves room for a vertical scrollbar (~16 px) plus the
+        # combo / spin / button widgets so their controls (▼, ↑↓, …) aren't
+        # clipped when the column scrolls (reported on PR #11 screenshot).
+        self.setFixedWidth(320)
         # M7 R4: scroll the whole column when both collapsibles + the list
         # exceed the window height, instead of clipping.
         outer = QVBoxLayout(self)
@@ -4339,9 +5124,8 @@ class SemPanel(QFrame):
         v.setContentsMargins(10, 12, 10, 12)
         v.setSpacing(11)
 
-        title = QLabel("SEM")
-        title.setObjectName("panelTitle")
-        v.addWidget(title)
+        # U6: the "SEM" panel-title label was redundant with the prominent
+        # Load SEM… button immediately below it — removed.
 
         btn_row = QHBoxLayout()
         self.load_sem_btn = QPushButton("Load SEM…")
@@ -4360,15 +5144,34 @@ class SemPanel(QFrame):
         btn_row.addStretch(1)
         v.addLayout(btn_row)
 
-        # Coordinate Setup is a one-time setup — keep it in a collapsible
-        # section so it doesn't permanently crowd the image list (M7.1).
-        # It starts expanded; MainWindow collapses it after cache load / first
-        # successful jump. self.coord_setup / self.fine_align keep pointing at
-        # the inner panels (tests + signal wiring rely on those refs).
-        self.coord_setup = CoordinateSetupPanel(self)
-        self._coord_section = self._wrap_section(
-            "Coordinate Setup", self.coord_setup, collapsed=True)
-        v.addWidget(self._coord_section)
+        # F21 M2: PART/CHIP dropdowns replace the legacy Coordinate Setup
+        # form. Always visible (no collapse) — selecting CHIP is the primary
+        # setup step. ``self.coord_setup`` is preserved as the attribute
+        # name so existing signal wiring keeps working.
+        self.coord_setup = PartChipPanel(self)
+        v.addWidget(self.coord_setup)
+
+        # U7: thin separator between the PART/CHIP block and the Alignment δ
+        # block so the right column's four concerns read as four distinct
+        # sections instead of one undifferentiated wall of text.
+        sep1 = QFrame(self)
+        sep1.setFrameShape(QFrame.Shape.HLine)
+        sep1.setStyleSheet(f"color:{_TK_BORDER.name()};")
+        sep1.setFixedHeight(1)
+        v.addWidget(sep1)
+
+        # F21 M3: Alignment δ readout, always visible directly below the
+        # PART/CHIP block. The numeric value is owned by MainWindow.
+        self.alignment_delta = AlignmentDeltaPanel(self)
+        # Shortcuts for legacy call sites that wired Set/Clear to MainWindow.
+        self.set_offset_btn = self.alignment_delta.set_btn
+        self.clear_offset_btn = self.alignment_delta.clear_btn
+        # S7: δ has no operational meaning until a SEM image is loaded.
+        # Start disabled (greyed) so the controls don't read as actionable
+        # before there is something to align against. ``set_images``
+        # re-enables the panel as soon as a KLARF / image list arrives.
+        self.alignment_delta.setEnabled(False)
+        v.addWidget(self.alignment_delta)
 
         # Image list — the primary defect-navigation control — gets the
         # stretch space so it's the prominent element in the column.
@@ -4387,21 +5190,8 @@ class SemPanel(QFrame):
         self.load_roi_btn.setToolTip(
             "Random-access load of the GDS around the selected image "
             "(needs 'Open OASIS (ROI)…' first). Re-click after changing "
-            "FOV / fine-tune to reload.")
+            "FOV / Custom override to reload.")
         self.load_roi_btn.clicked.connect(self.load_roi_requested)
-
-        # Set / Clear Offset — 屬於 SEM 對位流程，放在 image list 下方
-        offset_row = QHBoxLayout()
-        offset_row.setSpacing(6)
-        self.set_offset_btn = QPushButton("Set Offset")
-        self.set_offset_btn.setToolTip(
-            "Fold the current GDS drag into the global origin correction δ.")
-        self.clear_offset_btn = QPushButton("Clear Offset")
-        self.clear_offset_btn.setToolTip("Reset the global δ and drag to zero.")
-        offset_row.addWidget(self.set_offset_btn)
-        offset_row.addWidget(self.clear_offset_btn)
-        v.addLayout(offset_row)
-
         v.addWidget(self.load_roi_btn)
 
         # Fine Align is only needed while aligning — start collapsed; expands
@@ -4414,25 +5204,6 @@ class SemPanel(QFrame):
         self._images: list = []
         self._scores: dict = {}
         self._show_list_placeholder()
-        # Seed the collapsed-state FOV badge so it's present from the start.
-        self.update_coord_badge({})
-
-    def update_coord_badge(self, values: dict) -> None:
-        """Reflect the Coordinate Setup FOV state in the section header badge
-        (shown while the section is collapsed): green ``FOV W × H`` (µm) when
-        set, muted amber ``not set`` otherwise."""
-        if CollapsibleSection is None:
-            return
-        fov_w = float(values.get("fov_w_nm", values.get("fov_w", 0)) or 0)
-        fov_h = float(values.get("fov_h_nm", values.get("fov_h", 0)) or 0)
-        if fov_w > 0 and fov_h > 0:
-            w_um = int(round(fov_w / 1000))
-            h_um = int(round(fov_h / 1000))
-            self._coord_section.set_badge(
-                f"FOV {w_um} × {h_um}", fg="#3e7f5d", bg="#ebf7f0")
-        else:
-            self._coord_section.set_badge(
-                "not set", fg="#c8a080", bg="#fff0e0")
 
     def _show_list_placeholder(self) -> None:
         """Fill the empty image list with a muted hint so it doesn't read as a
@@ -4454,10 +5225,6 @@ class SemPanel(QFrame):
         sec.add_widget(panel)
         return sec
 
-    def set_coord_collapsed(self, val: bool) -> None:
-        if CollapsibleSection is not None:
-            self._coord_section.set_collapsed(val)
-
     def set_fine_collapsed(self, val: bool) -> None:
         if CollapsibleSection is not None:
             self._fine_section.set_collapsed(val)
@@ -4467,6 +5234,9 @@ class SemPanel(QFrame):
         self._images = list(images)
         self._scores = {}
         self.list.clear()
+        # S7: an alignment δ is only meaningful once there are SEM images
+        # to align. Enable / disable the panel to match.
+        self.alignment_delta.setEnabled(bool(self._images))
         if not self._images:
             self._show_list_placeholder()
             return
@@ -4525,6 +5295,178 @@ class SemPanel(QFrame):
         img = item.data(Qt.ItemDataRole.UserRole)
         if img is not None:
             self.image_selected.emit(img)
+
+
+# ── F22: First-run welcome ──────────────────────────────────────────────────
+
+
+# Five-slide onboarding: tuple of (icon_name, title, html_body). Kept as a
+# module-level constant so the layout pass is just data + a stacked widget.
+_WELCOME_SLIDES: list[tuple[str, str, str]] = [
+    (
+        "target",
+        "Welcome to GLAS",
+        "<p><b>GLAS</b> aligns <b>GDS / OASIS layouts</b> to <b>SEM "
+        "images</b> so downstream measurement tools can find the right "
+        "feature on every defect.</p>"
+        "<p>This 5-step tour walks you through the workflow — you can "
+        "re-open it any time from <b>Help → Show welcome…</b></p>",
+    ),
+    (
+        "folder-open",
+        "Step 1 — Open OASIS",
+        "<p>Click the orange <b>Open OASIS…</b> button on the toolbar. "
+        "A wizard guides you through three short steps:</p>"
+        "<ol>"
+        "<li>Pick the <code>.oas</code> file</li>"
+        "<li>Scan + pick the layer(s) you want to load</li>"
+        "<li>Confirm the root (top) cell (a recommendation is pre-selected)</li>"
+        "</ol>"
+        "<p>Big files are fine — GLAS only loads geometry around each "
+        "clicked defect.</p>",
+    ),
+    (
+        "layers",
+        "Step 2 — Pick PART / CHIP",
+        "<p>In the right column, pick <b>PART</b> then <b>CHIP</b> from "
+        "the dropdowns. The catalog supplies the chip-corner offset, the "
+        "default FOV, and the overlay scale — no need to type RFL "
+        "numbers.</p>"
+        "<p>Need a CHIP that isn't listed? An administrator can add it "
+        "via the catalog editor.</p>",
+    ),
+    (
+        "target",
+        "Step 3 — Click a defect, drag, Set Offset",
+        "<p>Load a KLARF (right column <b>Load SEM…</b>), then click a "
+        "defect in the list. GLAS auto-jumps and loads the GDS ROI.</p>"
+        "<p>The half-transparent GDS overlay drops on top of the SEM. "
+        "<b>Left-drag</b> it into alignment, then click <b>Set Offset</b> "
+        "in the ALIGNMENT δ block to lock it in. δ applies to every "
+        "defect afterwards.</p>"
+        "<p>Wheel zooms; middle / right-drag pans; <code>Ctrl + arrows</code> "
+        "nudge δ by 10 nm.</p>",
+    ),
+    (
+        "download",
+        "Step 4 — Fine align, then export",
+        "<p>Tick a layer's <b>POI</b> button on the left to mark it as a "
+        "template, expand the right-column <b>Fine Align</b> section, and "
+        "click <b>Run all</b>. Each defect gets a colour-coded score "
+        "badge in the image list (green / amber / red).</p>"
+        "<p>When you're happy, use the toolbar's <b>Export Alignment…</b> "
+        "to write CSV / JSON for the downstream measurement recipe.</p>"
+        "<p>That's the whole workflow. Have fun!</p>",
+    ),
+]
+
+
+class WelcomeDialog(QDialog):
+    """First-run onboarding (F22). 5 ASCII / icon-based slides with
+    Prev / Next navigation, persistent "Don't show again" preference."""
+
+    SETTING_KEY = "welcome_shown_v1"
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Welcome to GLAS")
+        self.setModal(True)
+        self.setMinimumSize(640, 420)
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(16, 16, 16, 12)
+        v.setSpacing(10)
+
+        self._stack = QStackedWidget(self)
+        for icon, title, body in _WELCOME_SLIDES:
+            self._stack.addWidget(self._build_slide(icon, title, body))
+        v.addWidget(self._stack, 1)
+
+        # Progress dots (● for visited / current, ○ for upcoming).
+        self._dots = QLabel("", self)
+        self._dots.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._dots.setStyleSheet(
+            f"color:{_TK_ACCENT_DK.name()}; font-size:{_FS_LABEL}px; "
+            f"letter-spacing:4px;")
+        v.addWidget(self._dots)
+
+        # Footer: Don't show again | Prev | Next/Got it
+        footer = QHBoxLayout()
+        self._dont_show = QCheckBox("Don't show this again", self)
+        self._dont_show.setChecked(True)
+        footer.addWidget(self._dont_show)
+        footer.addStretch(1)
+        self._prev_btn = QPushButton("◀  Prev", self)
+        self._prev_btn.clicked.connect(self._on_prev)
+        self._next_btn = QPushButton("Next  ▶", self)
+        self._next_btn.clicked.connect(self._on_next)
+        self._next_btn.setProperty("variant", "primary")
+        footer.addWidget(self._prev_btn)
+        footer.addWidget(self._next_btn)
+        v.addLayout(footer)
+
+        self._update_state()
+
+    @staticmethod
+    def _build_slide(icon_name: str, title: str, body_html: str) -> QWidget:
+        w = QWidget()
+        h = QHBoxLayout(w)
+        h.setContentsMargins(12, 18, 12, 12)
+        h.setSpacing(18)
+        # Icon column (big version of an existing toolbar icon).
+        ic = _qicon(icon_name)
+        icon_lbl = QLabel()
+        if not ic.isNull():
+            icon_lbl.setPixmap(ic.pixmap(96, 96))
+        icon_lbl.setAlignment(Qt.AlignmentFlag.AlignTop)
+        icon_lbl.setFixedWidth(112)
+        h.addWidget(icon_lbl)
+        # Text column.
+        text_col = QVBoxLayout()
+        text_col.setSpacing(8)
+        title_lbl = QLabel(title)
+        title_lbl.setStyleSheet(
+            f"color:{_TK_ACCENT_DK.name()}; "
+            f"font-size:{max(_FS_LABEL + 5, 18)}px; font-weight:700;")
+        text_col.addWidget(title_lbl)
+        body_lbl = QLabel(body_html)
+        body_lbl.setWordWrap(True)
+        body_lbl.setTextFormat(Qt.TextFormat.RichText)
+        body_lbl.setStyleSheet(
+            f"color:{_TK_TEXT_PRI.name()}; font-size:{_FS_LABEL}px; "
+            f"line-height:1.5;")
+        text_col.addWidget(body_lbl)
+        text_col.addStretch(1)
+        h.addLayout(text_col, 1)
+        return w
+
+    def _update_state(self) -> None:
+        idx = self._stack.currentIndex()
+        n = self._stack.count()
+        self._prev_btn.setEnabled(idx > 0)
+        is_last = idx == n - 1
+        self._next_btn.setText("Got it  ✓" if is_last else "Next  ▶")
+        self._dots.setText(
+            "  ".join("●" if i <= idx else "○" for i in range(n)))
+
+    def _on_prev(self) -> None:
+        i = self._stack.currentIndex()
+        if i > 0:
+            self._stack.setCurrentIndex(i - 1)
+            self._update_state()
+
+    def _on_next(self) -> None:
+        i = self._stack.currentIndex()
+        if i < self._stack.count() - 1:
+            self._stack.setCurrentIndex(i + 1)
+            self._update_state()
+        else:
+            self.accept()
+
+    def accept(self) -> None:  # type: ignore[override]
+        if self._dont_show.isChecked():
+            QSettings("GLAS", "GLAS").setValue(self.SETTING_KEY, True)
+        super().accept()
 
 
 class DebugReportDialog(QDialog):
@@ -4865,9 +5807,6 @@ class MainWindow(QMainWindow):
         # the screen so small displays still open.
         _avw, _avh = _screen_avail()
         self.setMinimumSize(min(940, _avw), min(600, _avh))
-        # Coordinate Setup starts collapsed (see SemPanel); don't auto-collapse
-        # again so a user re-expanding it sticks.
-        self._coord_collapsed_once = True
 
         # F9: developer mode gates advanced features (OASIS export). Off by
         # default; enabled by clicking the About-dialog icon 5 times. Persisted
@@ -4914,7 +5853,7 @@ class MainWindow(QMainWindow):
         self._center_split.setStretchFactor(2, 1)
         center_layout.addWidget(self._center_split, 1)
         # Single-view UX (M6.3): show SEM+overlay big by default; the GDS
-        # overview / minimap are opt-in view modes.
+        # overview is an opt-in view mode.
         self.canvas.setVisible(False)
         self.batch_panel.setVisible(False)
         self._view_mode = "sem"
@@ -4926,18 +5865,13 @@ class MainWindow(QMainWindow):
         self.batch_panel.back_requested.connect(self._exit_batch_workspace)
         self.batch_panel.cancel_requested.connect(self._on_fa_cancel_clicked)
         self.batch_panel.rerun_requested.connect(self._on_rerun_requested)
-        # M7-ov #9: corner minimap floated over the SEM view (hidden unless in
-        # 'minimap' mode).
-        self.minimap = MiniMap(self.sem_viewer)
-        self.minimap.hide()
-        self.minimap.defect_clicked.connect(self._on_defect_clicked)
-        self.sem_viewer.set_corner_overlay(self.minimap)
+        # M7-ov #9 corner minimap removed (no longer useful in practice — the
+        # GDS view-mode overview pane already shows defect positions).
 
         self.sem_panel = SemPanel(splitter)
-        # Origin-offset (δ) controls live in the SEM panel (below the image
-        # list); they operate on the current SEM-overlay drag.
-        self.sem_panel.set_offset_btn.clicked.connect(self._on_set_offset)
-        self.sem_panel.clear_offset_btn.clicked.connect(self._on_clear_offset)
+        # F21 M3: Set/Clear Offset are wired through the AlignmentDeltaPanel
+        # signals (see below); the duplicate-direct wiring on the legacy
+        # set_offset_btn / clear_offset_btn attributes is intentionally gone.
 
         splitter.addWidget(self.layer_panel)
         splitter.addWidget(center)
@@ -4951,6 +5885,17 @@ class MainWindow(QMainWindow):
 
         self._status_bar = QStatusBar(self)
         self.setStatusBar(self._status_bar)
+        # Status-bar brand chip (left edge): "GLAS v1.0.0", muted accent
+        # colour. Lives here instead of the toolbar so the toolbar is
+        # action-only, and the version is always visible for bug reports.
+        self._status_brand = QLabel(f"GLAS v{GLAS_VERSION}")
+        self._status_brand.setStyleSheet(
+            f"color:{_TK_ACCENT_DK.name()}; "
+            f"font-size:{_FS_MICRO}px; font-weight:700; "
+            f"letter-spacing:1.5px; padding:0 10px;")
+        self._status_brand.setToolTip(
+            f"GLAS — GDS-Layout Alignment for SEM · version {GLAS_VERSION}")
+        self._status_bar.addWidget(self._status_brand)
         self._status_doc = QLabel("no GDS loaded")
         self._status_cursor = QLabel("")
         # F11 M1: dedicated, always-visible GDS cursor coordinate readout (both
@@ -4978,11 +5923,19 @@ class MainWindow(QMainWindow):
         self.canvas.cursor_pos_nm.connect(self._on_cursor)
         self.canvas.defect_clicked.connect(self._on_defect_clicked)
         self.sem_viewer.cursor_gds.connect(self._on_coord)   # F11 M1
+        # S12: clicking the empty-viewer CTA pops the same split menu the
+        # right column's Load SEM… button shows.
+        self.sem_viewer.load_sem_requested.connect(self._on_cta_load_sem)
         self.sem_panel.load_klarf_requested.connect(self._on_load_klarf)
         self.sem_panel.load_folder_requested.connect(self._on_load_folder)
         self.sem_panel.load_roi_requested.connect(self._on_load_roi_clicked)
         self.sem_panel.image_selected.connect(self._on_sem_image_selected)
         self.sem_panel.coord_setup.changed.connect(self._on_coord_changed)
+        self.sem_panel.coord_setup.edit_catalog_requested.connect(
+            self._on_edit_catalog)
+        self.sem_panel.coord_setup.set_dev_mode(self._dev_mode)
+        self.sem_panel.alignment_delta.set_requested.connect(self._on_set_offset)
+        self.sem_panel.alignment_delta.clear_requested.connect(self._on_clear_offset)
         self.sem_panel.fine_align.run_requested.connect(self._on_run_fine_align)
         self.sem_panel.fine_align.run_all_requested.connect(self._on_run_fine_align_all)
         self.sem_panel.fine_align.preview_requested.connect(self._on_preview_template)
@@ -4992,16 +5945,14 @@ class MainWindow(QMainWindow):
         self._doc: Optional[GdsDocument] = None
         self._load_path: Optional[str] = None
 
-        # Alignment settings (M3 Coordinate Setup panel is the source of
-        # truth; these mirror it via _on_coord_changed). chip + FOV are
-        # persisted in / restored from the layer cache; fine-tune is
-        # per-session.
+        # Alignment settings (F21 PartChipPanel is the source of truth;
+        # these mirror it via _on_coord_changed). chip + FOV are persisted
+        # in / restored from the layer cache. Fine-tune dx/dy were removed
+        # (F21 Q6) — all per-FOV correction now goes through origin δ.
         self._chip_corner_x: float = 0.0
         self._chip_corner_y: float = 0.0
         self._fov_w: float = 0.0
         self._fov_h: float = 0.0
-        self._fine_dx: float = 0.0
-        self._fine_dy: float = 0.0
         # Constant KLARF->GDS origin correction δ (nm), found by dragging the
         # SEM/GDS overlay (M4a). Applied to every defect; persisted in cache.
         self._origin_dx: float = 0.0
@@ -5071,7 +6022,11 @@ class MainWindow(QMainWindow):
         self._klarf_path: str = ""
         self._oas_path: str = ""
 
-        self._status_doc.setText("ready · OASIS streamer (built-in)")
+        # T2: initial state — _status_state also stores the message so a
+        # subsequent transient flash can revert back to it.
+        self._status_state_msg = "ready — open an OASIS to begin"
+        self._status_revert_timer: Optional[QTimer] = None
+        self._status_doc.setText(self._status_state_msg)
 
         self._update_guidance()
 
@@ -5083,13 +6038,24 @@ class MainWindow(QMainWindow):
         if not self._split_sized:
             self._split_sized = True
             QTimer.singleShot(0, self._fit_split_sizes)
+            # F22: first launch — defer welcome dialog one event loop tick so
+            # the main window is already painted underneath it.
+            settings = QSettings("GLAS", "GLAS")
+            if not settings.value(WelcomeDialog.SETTING_KEY, False, type=bool):
+                QTimer.singleShot(0, self._show_welcome_dialog)
+
+    def _show_welcome_dialog(self) -> None:
+        """Open the onboarding dialog. Triggered both by first-launch and the
+        Help → Show welcome… menu entry."""
+        dlg = WelcomeDialog(self)
+        dlg.exec()
 
     def _fit_split_sizes(self) -> None:
         w = self._main_split.width()
         if w <= 0:
             return
         lw = self.layer_panel.width() or 260
-        rw = self.sem_panel.width() or 280
+        rw = self.sem_panel.width() or 320
         self._main_split.setSizes([lw, max(400, w - lw - rw), rw])
 
     # ── construction helpers ───────────────────────────────────────────────
@@ -5124,17 +6090,8 @@ class MainWindow(QMainWindow):
                 f"font-weight:700; letter-spacing:1px; padding: 0 4px;")
             return lbl
 
-        # GLAS wordmark（toolbar 最左側）
-        _wm_path = Path(__file__).resolve().parent / "icons" / "glas_wordmark.svg"
-        if _wm_path.exists():
-            wm_label = QLabel(bar)
-            wm_pixmap = QPixmap(str(_wm_path))
-            wm_label.setPixmap(
-                wm_pixmap.scaledToHeight(28, Qt.TransformationMode.SmoothTransformation)
-            )
-            wm_label.setContentsMargins(4, 0, 8, 0)
-            h.addWidget(wm_label)
-            h.addWidget(_divider())
+        # Brand wordmark moved to the status bar (left edge) so the toolbar
+        # only carries actions. See ``_status_brand`` in __init__.
 
         # ── File group ──
         h.addSpacing(4)
@@ -5148,22 +6105,15 @@ class MainWindow(QMainWindow):
             "Needs an S_CELL_OFFSET index.")
         open_btn.clicked.connect(self._on_open_roi)
         h.addWidget(open_btn)
-
-        load_btn = QPushButton(_qicon("folder"), " Load Cache…")
-        load_btn.setToolTip("Restore layers + settings from a .npz cache.")
-        load_btn.clicked.connect(self._on_load_cache)
-        h.addWidget(load_btn)
-
-        export_btn = QPushButton(_qicon("save"), " Export Cache…")
-        export_btn.setToolTip(
-            "Save the loaded layers + alignment settings to a .npz cache "
-            "so the next launch opens instantly (M2.1).")
-        export_btn.clicked.connect(self._on_export_cache)
-        h.addWidget(export_btn)
+        # U3: Load Cache / Export Cache live in File menu now — they're
+        # advanced actions that don't deserve permanent toolbar real estate.
 
         h.addWidget(_divider())
 
-        # ── View mode (segmented, exclusive) ──
+        # ── View mode (segmented, exclusive) + Minimap (overlay toggle) ──
+        # S2: SEM / GDS are mutually exclusive view modes; Minimap is now
+        # an independent corner-overlay that composes with both, instead
+        # of being a third exclusive mode.
         h.addWidget(_group("VIEW MODE"))
         self._view_group = QButtonGroup(self)
         self._view_group.setExclusive(True)
@@ -5179,45 +6129,47 @@ class MainWindow(QMainWindow):
             return b
 
         self._seg_sem = _seg("SEM", "image", "sem",
-                             "SEM + overlay only (full width).")
+                             "SEM + overlay only (full width). Shortcut: G")
         self._seg_gds = _seg("GDS", "layers", "gds",
-                             "SEM beside the whole-chip GDS overview (50/50).")
-        self._seg_mini = _seg("Minimap", "target", "minimap",
-                              "SEM full width with a defect minimap in the corner.")
+                             "SEM beside the whole-chip GDS overview (50/50). "
+                             "Shortcut: G")
         self._seg_sem.setChecked(True)
 
         h.addWidget(_divider())
-        fit_btn = QPushButton(_qicon("maximize"), " Fit")
-        fit_btn.setToolTip("Fit the GDS overview / minimap to all defects.")
-        fit_btn.clicked.connect(self._on_fit_view)
-        h.addWidget(fit_btn)
+        # T1: keep references on self so _refresh_action_states can gate
+        # buttons whose meaning depends on what's already loaded.
+        self._fit_btn = QPushButton(_qicon("maximize"), " Fit")
+        self._fit_btn.setToolTip("Fit the GDS overview to all defects.")
+        self._fit_btn.clicked.connect(self._on_fit_view)
+        h.addWidget(self._fit_btn)
 
         # Goto GDS coordinate (µm) — same as klayout Ctrl+G, for direct
         # same-coordinate layout comparison. Loads a ~50µm ROI there.
-        h.addWidget(QLabel("Goto µm:"))
+        self._goto_lbl = QLabel("Goto µm:")
+        h.addWidget(self._goto_lbl)
         self._goto_edit = QLineEdit()
-        self._goto_edit.setPlaceholderText("x, y")
+        self._goto_edit.setPlaceholderText("e.g. 12345, 6789")
         self._goto_edit.setMaximumWidth(120)
         self._goto_edit.setToolTip(
             "Enter a GDS coordinate (x, y µm) to jump there and load nearby "
             "geometry — same coordinate as klayout's Ctrl+G for layout comparison.")
         self._goto_edit.returnPressed.connect(self._on_goto_gds)
         h.addWidget(self._goto_edit)
-        goto_btn = QPushButton(_qicon("target"), " Goto")
-        goto_btn.setToolTip("Goto the typed GDS coordinate (loads a ~50µm ROI there).")
-        goto_btn.clicked.connect(self._on_goto_gds)
-        h.addWidget(goto_btn)
+        self._goto_btn = QPushButton(_qicon("target"), " Goto")
+        self._goto_btn.setToolTip("Goto the typed GDS coordinate (loads a ~50µm ROI there).")
+        self._goto_btn.clicked.connect(self._on_goto_gds)
+        h.addWidget(self._goto_btn)
 
         h.addWidget(_divider())
 
         # ── Export group ──
         h.addWidget(_group("EXPORT"))
-        align_btn = QPushButton(_qicon("download"), " Export Alignment…")
-        align_btn.setToolTip(
+        self._align_btn = QPushButton(_qicon("download"), " Export Alignment…")
+        self._align_btn.setToolTip(
             "Export per-image alignment offsets (coarse + fine + score) to "
             "CSV / JSON for a future Recipe to anchor its ROI (M5).")
-        align_btn.clicked.connect(self._on_export_alignment)
-        h.addWidget(align_btn)
+        self._align_btn.clicked.connect(self._on_export_alignment)
+        h.addWidget(self._align_btn)
 
         # F9: OASIS export — advanced, hidden unless developer mode is on.
         self._export_oasis_btn = QPushButton(_qicon("save"), " Export OASIS…")
@@ -5280,40 +6232,31 @@ class MainWindow(QMainWindow):
         """Shift the global origin δ by (dx, dy) nm and re-jump (M6.6)."""
         self._origin_dx += dx
         self._origin_dy += dy
-        self.sem_panel.coord_setup.set_origin(self._origin_dx, self._origin_dy)
+        self.sem_panel.alignment_delta.set_values(self._origin_dx, self._origin_dy)
         if self._current_sem is not None:
             self._jump_to_image(self._current_sem)
         self._fit_view_to_defects()
-        self._status_doc.setText(
+        self._status_transient(
             f"origin δ nudged to ({self._origin_dx:,.0f}, "
             f"{self._origin_dy:,.0f}) nm")
 
-    _VIEW_MODES = ("sem", "gds", "minimap")
+    # S2: only two mutually exclusive main views; Minimap is an overlay
+    # toggle that composes with either.
+    _VIEW_MODES = ("sem", "gds")
 
     def _set_view_mode(self, mode: str) -> None:
-        """Switch the centre view between SEM-only / GDS overview / minimap
-        (M7-ov view-mode selector). Mutually exclusive. Also leaves the batch
-        workspace, if active (F7)."""
+        """Switch the centre view between SEM-only and SEM + GDS overview.
+        Also leaves the batch workspace, if active (F7)."""
         if mode not in self._VIEW_MODES:
             return
-        # Leaving the batch workspace (clicking any view button exits it).
         self._batch_active = False
         self.batch_panel.setVisible(False)
         self._view_mode = mode
-        # GDS overview pane visible only in 'gds'. Splitter widgets are
-        # [canvas, batch_panel, sem_viewer]; size all three explicitly.
         self.canvas.setVisible(mode == "gds")
         if mode == "gds":
             total = max(2, self._center_split.width())
             self._center_split.setSizes([total // 2, 0, total - total // 2])
-        # Corner minimap visible only in 'minimap'.
-        self.minimap.setVisible(mode == "minimap")
-        if mode == "minimap":
-            self.sem_viewer._reposition_overlay()
-            self.minimap.raise_()
-        # Reflect in the segmented buttons (block signals to avoid recursion).
-        btn = {"sem": self._seg_sem, "gds": self._seg_gds,
-               "minimap": self._seg_mini}[mode]
+        btn = {"sem": self._seg_sem, "gds": self._seg_gds}[mode]
         if not btn.isChecked():
             btn.blockSignals(True)
             btn.setChecked(True)
@@ -5326,7 +6269,6 @@ class MainWindow(QMainWindow):
             self._prev_view_mode = self._view_mode
         self._batch_active = True
         self.canvas.setVisible(False)
-        self.minimap.setVisible(False)
         self.batch_panel.setVisible(True)
         total = max(2, self._center_split.width())
         left = int(total * 0.55)
@@ -5341,7 +6283,7 @@ class MainWindow(QMainWindow):
         self._set_view_mode(self._VIEW_MODES[(i + 1) % len(self._VIEW_MODES)])
 
     def _on_fit_view(self) -> None:
-        """Fit the active overview/minimap to all defects (Fit action)."""
+        """Fit the GDS overview to all defects (Fit action)."""
         self.canvas.fit_to_defects()
 
     def _on_toggle_overview(self, on: bool) -> None:
@@ -5357,11 +6299,11 @@ class MainWindow(QMainWindow):
     def _update_guidance(self) -> None:
         """Show the next workflow step; hide the strip once set up (M6.6)."""
         if self._rar is None and self._doc is None:
-            msg = "Step 1 — Open an OASIS: toolbar “Open OASIS…” (scan + pick layers / root cell)."
+            msg = "Step 1 — Open an OASIS: toolbar “Open OASIS…” — a 3-page wizard guides you (file → layers → root cell)."
         elif not self._sem_images:
             msg = "Step 2 — Load SEM: right panel “Load SEM…” (KLARF file or image folder)."
         elif self._fov_w <= 0 or self._fov_h <= 0:
-            msg = "Step 3 — Coordinate Setup (right panel): fill the RFL Chip-offset row + FOV width/height."
+            msg = "Step 3 — Pick PART / CHIP (right panel): the catalog supplies chip-corner + FOV automatically."
         elif self._current_sem is None:
             msg = "Step 4 — Click a defect image in the list to jump and load its GDS ROI."
         else:
@@ -5369,6 +6311,86 @@ class MainWindow(QMainWindow):
                    "then press Set Offset. Wheel zooms; middle/right-drag pans.")
         self._guidance.setText(msg)
         self._guidance.setVisible(True)
+        # T1: every guidance update also refreshes which actions are enabled
+        # so the toolbar reflects the current prerequisites.
+        self._refresh_action_states()
+
+    def _refresh_action_states(self) -> None:
+        """T1: enable/disable toolbar + right-column actions to match the
+        current state. Driven by what's loaded; a button is enabled only
+        when invoking it would actually do something.
+
+        Defensive ``getattr`` checks let this run even before some widgets
+        exist (it's called from ``_update_guidance`` and that fires once
+        from ``__init__`` before the menu and toolbar are fully built)."""
+        has_doc = self._doc is not None or self._rar is not None
+        has_sem = bool(self._sem_images)
+        has_defects = has_sem and any(
+            getattr(im, "has_coords", False) for im in self._sem_images)
+        # GDS overview is only meaningful when there's geometry to draw.
+        seg_gds = getattr(self, "_seg_gds", None)
+        if seg_gds is not None:
+            seg_gds.setEnabled(has_doc)
+        # Fit / Goto operate on the overview pane and need a layout.
+        for name in ("_fit_btn", "_goto_btn", "_goto_edit", "_goto_lbl"):
+            w = getattr(self, name, None)
+            if w is not None:
+                w.setEnabled(has_doc)
+        # Export Alignment needs at least an image list to enumerate rows.
+        align = getattr(self, "_align_btn", None)
+        if align is not None:
+            align.setEnabled(has_sem)
+        # Export OASIS (dev) needs geometry; visibility is still gated by
+        # dev mode in _refresh_dev_ui.
+        oasis = getattr(self, "_export_oasis_btn", None)
+        if oasis is not None:
+            oasis.setEnabled(has_doc)
+        # Right column: Load GDS ROI here needs both a reader and a SEM
+        # image to centre on. Disabling it stops the "OASIS not loaded"
+        # MessageBox firing on a misclick. T7: once geometry has been
+        # loaded for the current image, the action is actually a re-load
+        # (after FOV / chip change) — flip the label so it doesn't read
+        # as "I haven't loaded anything yet" once a defect is open.
+        sem_panel = getattr(self, "sem_panel", None)
+        if sem_panel is not None:
+            roi_btn = getattr(sem_panel, "load_roi_btn", None)
+            if roi_btn is not None:
+                roi_btn.setEnabled(self._rar is not None and has_defects)
+                already_loaded = (
+                    self._doc is not None and bool(self._doc.entries)
+                    and self._current_sem is not None)
+                roi_btn.setText("Reload GDS ROI  ▶" if already_loaded
+                                else "Load GDS ROI here  ▶")
+
+    # ── T2: transient status-bar messages auto-revert ────────────────────────
+
+    def _status_state(self, msg: str) -> None:
+        """Set the status-bar's persistent state message. Use for changes
+        that reflect the current loaded state (KLARF loaded, ROI opened, ...).
+        Cancels any pending transient revert."""
+        self._status_state_msg = msg
+        timer = getattr(self, "_status_revert_timer", None)
+        if timer is not None:
+            timer.stop()
+        self._status_doc.setText(msg)
+
+    def _status_transient(self, msg: str, ms: int = 4500) -> None:
+        """Flash a short confirmation in the status bar then revert to the
+        most recent state message. Use for "X complete" style feedback so
+        the bar doesn't pile up stale notifications."""
+        self._status_doc.setText(msg)
+        timer = getattr(self, "_status_revert_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._status_revert_now)
+            self._status_revert_timer = timer
+        timer.start(ms)
+
+    def _status_revert_now(self) -> None:
+        self._status_doc.setText(
+            getattr(self, "_status_state_msg",
+                    "ready — open an OASIS to begin"))
 
     def _build_menu(self) -> None:
         menu = self.menuBar().addMenu("&File")
@@ -5376,6 +6398,15 @@ class MainWindow(QMainWindow):
         open_action.setShortcut("Ctrl+O")
         open_action.triggered.connect(self._on_open_roi)
         menu.addAction(open_action)
+        menu.addSeparator()
+        # U3: cache I/O moved from the toolbar to the File menu — used once
+        # per session at most, doesn't deserve permanent toolbar space.
+        load_cache_action = QAction("&Load cache…", self)
+        load_cache_action.triggered.connect(self._on_load_cache)
+        menu.addAction(load_cache_action)
+        export_cache_action = QAction("&Export cache…", self)
+        export_cache_action.triggered.connect(self._on_export_cache)
+        menu.addAction(export_cache_action)
         menu.addSeparator()
         # F10: developer-only OASIS diagnostics. Hidden unless dev mode is on.
         self._diagnose_action = QAction("&Diagnose OASIS file…", self)
@@ -5389,6 +6420,10 @@ class MainWindow(QMainWindow):
         menu.addAction(quit_action)
 
         help_menu = self.menuBar().addMenu("&Help")
+        welcome_action = QAction("Show &welcome…", self)
+        welcome_action.triggered.connect(self._show_welcome_dialog)
+        help_menu.addAction(welcome_action)
+        help_menu.addSeparator()
         about_action = QAction("&About", self)
         about_action.triggered.connect(self._show_about)
         help_menu.addAction(about_action)
@@ -5420,14 +6455,12 @@ class MainWindow(QMainWindow):
             gx, gy = gds_fov.klarf_to_gds(
                 im.xrel, im.yrel, self._chip_corner_x, self._chip_corner_y)
             rdx, rdy = self._refined_offset(im)
-            gx += self._fine_dx + self._origin_dx + rdx
-            gy += self._fine_dy + self._origin_dy + rdy
+            gx += self._origin_dx + rdx
+            gy += self._origin_dy + rdy
             ref = self._refined.get(im.image_id)
             defects.append((im.image_id, gx, gy, ref[2] if ref else None))
         cur = self._current_sem.image_id if self._current_sem else None
         self.canvas.set_defects(defects, cur)
-        fov = self._current_image_gds()       # current FOV centre (or None)
-        self.minimap.set_data(defects, cur, fov)
 
     def _on_defect_clicked(self, image_id: str) -> None:
         """Clicking a dot in the overview selects that image (same on-demand
@@ -5438,6 +6471,18 @@ class MainWindow(QMainWindow):
             self._on_sem_image_selected(img)
 
     # ── M3: SEM load + coordinate jump ──────────────────────────────────────
+    def _on_cta_load_sem(self) -> None:
+        """S12: empty-viewer CTA opens the same KLARF / image-folder split
+        menu the right-column Load SEM… button uses, but anchored beneath
+        the CTA itself so the dropdown reads as belonging to the button the
+        user actually clicked (and not the one in the corner)."""
+        menu = self.sem_panel.load_sem_btn.menu()
+        if menu is None:
+            self._on_load_klarf()
+            return
+        cta = self.sem_viewer._cta_btn
+        menu.exec(cta.mapToGlobal(cta.rect().bottomLeft()))
+
     def _on_load_klarf(self) -> None:
         # KLARF result files are commonly named <lot>.000 / .001 / … (a
         # numeric "result number" extension), so accept any three-digit
@@ -5457,7 +6502,7 @@ class MainWindow(QMainWindow):
         self._klarf_path = path
         self.sem_panel.set_images(images)
         with_coords = sum(1 for i in images if i.has_coords)
-        self._status_doc.setText(
+        self._status_state(
             f"KLARF: {len(images)} images ({with_coords} with coords) · "
             f"{Path(path).name}")
         # Overview: frame all defect positions so the FOV marker visibly
@@ -5472,7 +6517,7 @@ class MainWindow(QMainWindow):
         images = sem_loader.load_folder(path)
         self._sem_images = images
         self.sem_panel.set_images(images)
-        self._status_doc.setText(
+        self._status_state(
             f"Folder: {len(images)} images · {Path(path).name}")
         self._update_guidance()
 
@@ -5493,20 +6538,18 @@ class MainWindow(QMainWindow):
                 self._load_roi_around(*pos)
 
     def _on_coord_changed(self) -> None:
+        # F21: PartChipPanel is the source of truth for chip / FOV / scale.
+        # Fine-tune dx/dy were removed (Q6) — δ alone carries the residual.
         v = self.sem_panel.coord_setup.values()
-        self.sem_panel.update_coord_badge(v)
         self._chip_corner_x = v["chip_corner_x"]
         self._chip_corner_y = v["chip_corner_y"]
         self._fov_w = v["fov_w"]
         self._fov_h = v["fov_h"]
-        self._fine_dx = v["fine_dx"]
-        self._fine_dy = v["fine_dy"]
         self._nm_per_px_manual = v["nm_per_px_manual"]
         self._nm_auto = v["nm_auto"]
-        # Re-jump so chip-corner / FOV / fine-tune edits move the box live.
         if self._current_sem is not None:
             self._jump_to_image(self._current_sem)
-        self._refresh_overview_defects()      # positions shift with the offsets
+        self._refresh_overview_defects()
         self._update_guidance()
 
     def _effective_nm_per_px(self) -> float:
@@ -5542,8 +6585,8 @@ class MainWindow(QMainWindow):
         gx, gy = gds_fov.klarf_to_gds(
             img.xrel, img.yrel, self._chip_corner_x, self._chip_corner_y)
         rdx, rdy = self._refined_offset(img)
-        gx += self._fine_dx + self._origin_dx + rdx
-        gy += self._fine_dy + self._origin_dy + rdy
+        gx += self._origin_dx + rdx
+        gy += self._origin_dy + rdy
         # Keep the current (overview) zoom and just move the FOV box, so the
         # marker visibly travels across the chip instead of every image being
         # re-centred + re-zoomed (which made it look like nothing moved).
@@ -5557,31 +6600,21 @@ class MainWindow(QMainWindow):
             print(f"[jump] DID={img.image_id}  XREL={img.xrel} YREL={img.yrel}  "
                   f"chip_corner=({self._chip_corner_x:,.0f}, "
                   f"{self._chip_corner_y:,.0f}) nm  "
-                  f"fine+origin=({self._fine_dx + self._origin_dx:,.0f}, "
-                  f"{self._fine_dy + self._origin_dy:,.0f})  "
+                  f"origin=({self._origin_dx:,.0f}, "
+                  f"{self._origin_dy:,.0f})  "
                   f"-> gds=({gx/1e3:,.2f}, {gy/1e3:,.2f}) µm", flush=True)
         self._update_overlay()
-        self._maybe_collapse_coord_setup()
-
-    def _maybe_collapse_coord_setup(self) -> None:
-        """Auto-collapse the one-time Coordinate Setup once it's been used with
-        a valid setup — but only once, so re-expanding it sticks (M7.1)."""
-        if getattr(self, "_coord_collapsed_once", False):
-            return
-        if self._fov_w > 0 and self._fov_h > 0:
-            self._coord_collapsed_once = True
-            self.sem_panel.set_coord_collapsed(True)
 
     def _current_image_gds(self):
-        """GDS (x, y) of the selected image incl. fine-tune + refined, or None."""
+        """GDS (x, y) of the selected image incl. origin δ + refined, or None."""
         img = self._current_sem
         if img is None or not img.has_coords:
             return None
         gx, gy = gds_fov.klarf_to_gds(
             img.xrel, img.yrel, self._chip_corner_x, self._chip_corner_y)
         rdx, rdy = self._refined_offset(img)
-        return (gx + self._fine_dx + self._origin_dx + rdx,
-                gy + self._fine_dy + self._origin_dy + rdy)
+        return (gx + self._origin_dx + rdx,
+                gy + self._origin_dy + rdy)
 
     def _refined_offset(self, img) -> tuple:
         """Per-image fine-align correction (nm), or (0, 0) if not run (M4b)."""
@@ -5603,8 +6636,8 @@ class MainWindow(QMainWindow):
         for im in imgs:
             gx, gy = gds_fov.klarf_to_gds(
                 im.xrel, im.yrel, self._chip_corner_x, self._chip_corner_y)
-            xs.append(gx + self._fine_dx + self._origin_dx)
-            ys.append(gy + self._fine_dy + self._origin_dy)
+            xs.append(gx + self._origin_dx)
+            ys.append(gy + self._origin_dy)
         x0, x1 = min(xs), max(xs)
         y0, y1 = min(ys), max(ys)
         # Pad so edge markers aren't flush against the viewport; at least one
@@ -5618,7 +6651,7 @@ class MainWindow(QMainWindow):
     def _on_overlay_drag(self) -> None:
         """Live preview of the effective δ while dragging the overlay."""
         dx, dy = self.sem_viewer.drag_offset_nm()
-        self.sem_panel.coord_setup.set_origin(
+        self.sem_panel.alignment_delta.set_values(
             self._origin_dx - dx, self._origin_dy - dy)
 
     def _on_set_offset(self) -> None:
@@ -5632,22 +6665,22 @@ class MainWindow(QMainWindow):
         self._origin_dx -= dx
         self._origin_dy -= dy
         self.sem_viewer.reset_drag()
-        self.sem_panel.coord_setup.set_origin(self._origin_dx, self._origin_dy)
+        self.sem_panel.alignment_delta.set_values(self._origin_dx, self._origin_dy)
         if self._current_sem is not None:
             self._jump_to_image(self._current_sem)
         self._fit_view_to_defects()
-        self._status_doc.setText(
+        self._status_transient(
             f"origin δ set to ({self._origin_dx:,.0f}, {self._origin_dy:,.0f}) nm")
 
     def _on_clear_offset(self) -> None:
         self._origin_dx = 0.0
         self._origin_dy = 0.0
         self.sem_viewer.reset_drag()
-        self.sem_panel.coord_setup.set_origin(0.0, 0.0)
+        self.sem_panel.alignment_delta.set_values(0.0, 0.0)
         if self._current_sem is not None:
             self._jump_to_image(self._current_sem)
         self._fit_view_to_defects()
-        self._status_doc.setText("origin δ cleared")
+        self._status_transient("origin δ cleared")
 
     # ── F3: multi-POI template + auto fine alignment ─────────────────────────
     def _on_pois_changed(self, entries) -> None:
@@ -5716,12 +6749,11 @@ class MainWindow(QMainWindow):
             cfg["bg_glv"], cfg["blur_sigma_px"])
 
     def _coarse_anchor(self, img):
-        """Coarse FOV-centre GDS anchor for ``img`` (klarf→gds + fine + δ),
+        """Coarse FOV-centre GDS anchor for ``img`` (klarf→gds + δ),
         excluding any refined offset so the search starts from coarse."""
         gx, gy = gds_fov.klarf_to_gds(
             img.xrel, img.yrel, self._chip_corner_x, self._chip_corner_y)
-        return (gx + self._fine_dx + self._origin_dx,
-                gy + self._fine_dy + self._origin_dy)
+        return (gx + self._origin_dx, gy + self._origin_dy)
 
     def _on_run_fine_align(self) -> None:
         """Refine the current image's alignment via composite POI-template
@@ -6041,7 +7073,7 @@ class MainWindow(QMainWindow):
         self._origin_dx += mx
         self._origin_dy += my
         self.sem_viewer.reset_drag()
-        self.sem_panel.coord_setup.set_origin(self._origin_dx, self._origin_dy)
+        self.sem_panel.alignment_delta.set_values(self._origin_dx, self._origin_dy)
         if self._current_sem is not None:
             self._jump_to_image(self._current_sem)
         self._fit_view_to_defects()
@@ -6065,8 +7097,7 @@ class MainWindow(QMainWindow):
             return None
         gx, gy = gds_fov.klarf_to_gds(
             img.xrel, img.yrel, self._chip_corner_x, self._chip_corner_y)
-        return (gx + self._fine_dx + self._origin_dx,
-                gy + self._fine_dy + self._origin_dy)
+        return (gx + self._origin_dx, gy + self._origin_dy)
 
     # ── M5: per-image alignment export ───────────────────────────────────────
     def _on_export_alignment(self) -> None:
@@ -6104,7 +7135,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Export failed", str(exc))
             return
-        self._status_doc.setText(
+        self._status_transient(
             f"exported {len(rows)} image(s) → {Path(path).name}")
         if exp_raw or exp_overlay or exp_gray or exp_label:
             self._export_overlay_images(images, exp_raw, exp_overlay,
@@ -6472,25 +7503,24 @@ class MainWindow(QMainWindow):
             self._roi_thread = None
 
     def _on_open_roi(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Open OASIS", "",
-            "OASIS files (*.oas *.oasis);;All files (*)")
-        if not path:
+        """F20: three-page wizard replaces the file-dialog + LayerFilter +
+        LayerPick + QInputDialog-root-cell cascade."""
+        wiz = OpenOasisWizard(self)
+        # U1: hide the redundant guidance bar while the wizard is the user's
+        # focus; restore on close (regardless of accept / reject).
+        self._guidance.setVisible(False)
+        try:
+            result = wiz.exec()
+        finally:
+            self._update_guidance()
+        if result != QDialog.DialogCode.Accepted:
+            return
+        path = wiz.file_path()
+        layer_keys = wiz.layer_keys()
+        root = wiz.root_cell()
+        if not (path and layer_keys and root):
             return
         self._roi_load_path = path   # F10: remembered for debug-mode diagnostics
-        # Scan the file for available layers and let the user multi-select
-        # (same flow the old full-load entry used), instead of typing
-        # layer/datatype pairs by hand.
-        size_mb = Path(path).stat().st_size / 1024 / 1024
-        dlg = LayerFilterDialog(self, size_mb, Path(path).name, path,
-                                roi_mode=True)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
-        layer_keys = dlg.filter_pairs()
-        if not layer_keys:
-            QMessageBox.warning(self, "ROI layers",
-                                "Pick (or type) at least one layer to load.")
-            return
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             import time as _t
@@ -6498,9 +7528,6 @@ class MainWindow(QMainWindow):
             rar = oasis_random.RandomAccessReader(
                 path, wanted_layers=set(layer_keys),
                 bbox_layer=oasis_random.DEFAULT_BBOX_LAYER)
-            # One-time build telemetry (F16): index size + whether each cell got
-            # an S_BOUNDING_BOX. n_sbbox ≈ cell count => ROI prune is decode-free;
-            # n_sbbox == 0 => fall back to bbox-by-decode (slow first load).
             n_sbbox = len(rar._sbbox_by_refnum) + len(rar._sbbox_by_name)
             print(f"[roi] reader built in {_t.perf_counter() - _t0:.1f}s · "
                   f"{len(rar._by_refnum):,} cells indexed · S_BOUNDING_BOX on "
@@ -6519,30 +7546,19 @@ class MainWindow(QMainWindow):
                 "ROI load isn't possible. Re-export the layout with "
                 "per-cell offsets, or load a smaller file.")
             return
-        # Pick the root cell from the cellname list (default: a name that
-        # looks like a top cell, else the last-defined name).
-        names = list(rar._by_name.keys())
-        default = next((n for n in names
-                        if "top" in n.lower() or "merge" in n.lower()),
-                       names[-1] if names else "")
-        root, ok = QInputDialog.getItem(
-            self, "ROI root cell", "Root (top) cell:", names,
-            names.index(default) if default in names else 0, False)
-        if not ok or not root:
-            return
         self._rar = rar
         self._oas_path = path
         self._roi_root = root
         self._roi_layers = layer_keys
-        # New layout → drop any recipes from a previously-open file (recipes
-        # persist across ROI reloads of the SAME file, not across files).
+        # New layout → drop any recipes from a previously-open file.
         self._recipes = []
         lyr_txt = ", ".join(f"L{l}/D{d}" for l, d in layer_keys)
-        self._status_doc.setText(
+        self._status_state(
             f"ROI mode: {Path(path).name} · root '{root}' · {lyr_txt}"
             f" · {len(rar._by_refnum):,} cells indexed · click a SEM image")
-        # Frame all defect positions so the marker has a visible span to
-        # jump across; then jump to the current image (auto-loads its ROI).
+        # U9: surface the active OASIS in the title bar so a user with
+        # several windows open can tell them apart at a glance.
+        self.setWindowTitle(f"GLAS — {Path(path).name}")
         self._fit_view_to_defects()
         if self._current_sem is not None:
             self._jump_to_image(self._current_sem)
@@ -6764,7 +7780,7 @@ class MainWindow(QMainWindow):
             return
         self._recipes.remove(rec)
         self._recompute_recipes()
-        self._status_doc.setText(f"deleted expression layer '{name}'")
+        self._status_transient(f"deleted expression layer '{name}'")
 
     # ── M2.1: layer cache export / import ───────────────────────────────────
     def _on_export_cache(self) -> None:
@@ -6796,13 +7812,14 @@ class MainWindow(QMainWindow):
                 fov_w=v["fov_w"], fov_h=v["fov_h"],
                 origin_dx=self._origin_dx, origin_dy=self._origin_dy,
                 nm_per_px=self._effective_nm_per_px(),
-                top_cell_name=self._doc.top_cell_name)
+                top_cell_name=self._doc.top_cell_name,
+                part_id=v.get("part_id"), chip_id=v.get("chip_id"))
             gds_layer_cache.cache_save(path, layers, meta)
             self._save_expr_sidecar(path)
         except Exception as exc:
             QMessageBox.critical(self, "Cache export failed", str(exc))
             return
-        self._status_doc.setText(f"cache exported · {Path(path).name}")
+        self._status_transient(f"cache exported · {Path(path).name}")
 
     def _on_export_oasis(self) -> None:
         """F9 M3: export selected raw / Boolean layers to OASIS, optionally
@@ -6844,7 +7861,7 @@ class MainWindow(QMainWindow):
                 self, "Nothing exported",
                 "No geometry fell inside the crop region.")
             return
-        self._status_doc.setText(
+        self._status_transient(
             f"OASIS exported · {Path(path).name} ({n} layer{'s' if n != 1 else ''})")
         if report is not None:
             sidecar = path + ".debug.txt"
@@ -6982,25 +7999,24 @@ class MainWindow(QMainWindow):
                 bboxes=np.asarray(bbs, dtype=np.float32)))
         doc._recompute_bbox()
 
-        # Restore the RFL params + FOV into the Coordinate Setup panel; its
-        # ``changed`` signal mirrors them back into self._chip_corner_* etc.
+        # F21: restore PART/CHIP (v5) or legacy-snapshot coords (v4) into the
+        # PartChipPanel; its ``changed`` signal mirrors them back into
+        # self._chip_corner_* etc.
         self.sem_panel.coord_setup.set_from_meta(data.meta)
         # Restore the origin δ (M4a).
         self._origin_dx = float(getattr(data.meta, "origin_dx", 0.0))
         self._origin_dy = float(getattr(data.meta, "origin_dy", 0.0))
-        self.sem_panel.coord_setup.set_origin(self._origin_dx, self._origin_dy)
+        self.sem_panel.alignment_delta.set_values(
+            self._origin_dx, self._origin_dy)
 
         self._doc = doc
         self._load_path = path
         self.layer_panel.set_document(doc)
         self.canvas.set_document(doc)
-        self.setWindowTitle(f"GDS Align Tool — {Path(path).name} (cache)")
-        self._status_doc.setText(
+        self.setWindowTitle(f"GLAS — {Path(path).name} (cache)")
+        self._status_state(
             f"{Path(path).name} (cache)  ·  {doc.summary()}")
         self._restore_expr_sidecar(path)
-        # Settings came from the cache — collapse the one-time setup section.
-        self._coord_collapsed_once = True
-        self.sem_panel.set_coord_collapsed(True)
 
     def _restore_expr_sidecar(self, npz_path: str) -> None:
         """Recreate expression-layer recipes from ``<stem>_expr.json`` and
@@ -7058,6 +8074,20 @@ class MainWindow(QMainWindow):
         act = getattr(self, "_diagnose_action", None)
         if act is not None:
             act.setVisible(self._dev_mode)
+        # F21 M4: catalog editor button on the PART/CHIP panel.
+        if self.sem_panel is not None:
+            self.sem_panel.coord_setup.set_dev_mode(self._dev_mode)
+
+    def _on_edit_catalog(self) -> None:
+        """Open the PART/CHIP catalog editor (developer-mode only).
+        After Save, refresh the PartChipPanel so the dropdowns pick up new
+        entries immediately."""
+        panel = self.sem_panel.coord_setup
+        dlg = CatalogEditorDialog(self, panel._catalog)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            panel.reload_catalog()
+            self._status_transient(
+                "catalog saved · PART / CHIP dropdowns refreshed")
 
     def _on_diagnose_oasis(self) -> None:
         """F10: scan a chosen .oas and show a copyable diagnostic report
@@ -7115,7 +8145,7 @@ class MainWindow(QMainWindow):
 
         v.addSpacing(16)
 
-        ver_lbl = QLabel("Version 1.0.0", dlg)
+        ver_lbl = QLabel(f"Version {GLAS_VERSION}", dlg)
         ver_lbl.setStyleSheet("font-size: 12px; color: #9a8878;")
         ver_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         v.addWidget(ver_lbl)

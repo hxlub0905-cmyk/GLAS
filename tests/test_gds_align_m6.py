@@ -113,13 +113,14 @@ class TestLayerPanel:
         panel = gat.LayerPanel()
         panel.set_document(gat.GdsDocument())
         panel.set_document(None)
-        # Empty doc shows a non-selectable onboarding hint (icon + title +
-        # sub-hint) instead of a blank list.
-        assert panel.list.count() == 3
+        # T3: empty hint is now 4 non-selectable rows: icon + title
+        # + "toolbar → Open OASIS…" + "or  File → Load cache…".
+        assert panel.list.count() == 4
         from PyQt6.QtCore import Qt
         for i in range(panel.list.count()):
             assert panel.list.item(i).flags() == Qt.ItemFlag.NoItemFlags
         assert "Open an OASIS" in panel.list.item(1).text()
+        assert "Load cache" in panel.list.item(3).text()
 
 
 # ── MainWindow single-view UX ────────────────────────────────────────

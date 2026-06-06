@@ -150,15 +150,14 @@ class TestExportDialog:
 class TestMainWindowExport:
 
     def test_coarse_gds_excludes_refined(self):
+        # F21 Q6: manual fine tune dx/dy was removed; coarse = klarf_to_gds +
+        # origin δ. refined must NOT leak in even if present.
         mw = gat.MainWindow()
         try:
             mw._chip_corner_x = mw._chip_corner_y = 0.0
-            mw._fine_dx = 10.0
-            mw._fine_dy = 20.0
-            mw._origin_dx = mw._origin_dy = 0.0
+            mw._origin_dx = 10.0
+            mw._origin_dy = 20.0
             img = _img("D1", 4000.0, 5000.0)
-            # coarse = klarf_to_gds(4000,5000,0,0) + fine; refined must NOT
-            # leak in even if present.
             mw._refined = {"D1": (-999.0, -999.0, 0.5)}
             cx, cy = mw._coarse_gds(img)
             assert cx == pytest.approx(4010.0)

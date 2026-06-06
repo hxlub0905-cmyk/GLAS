@@ -150,13 +150,43 @@ class TestRoundTrip:
 
 class TestSchema:
 
-    def test_old_schema_rejected(self, tmp_path, monkeypatch):
+    def test_future_schema_rejected(self, tmp_path, monkeypatch):
+        # F21 M5: the loader accepts a known set (v4 + v5); a hypothetical
+        # future schema the current loader doesn't know about is still
+        # rejected.
         src = _src(tmp_path)
         out = tmp_path / "proj.npz"
         cache_save(out, _layers(), _meta(src))
         assert cache_load(out) is not None
-        monkeypatch.setattr(glc, "SCHEMA_VERSION", SCHEMA_VERSION + 1)
+        monkeypatch.setattr(glc, "_LOADABLE_SCHEMAS", {SCHEMA_VERSION + 1})
         assert cache_load(out) is None
+
+    def test_v4_cache_still_loads(self, tmp_path):
+        # F21 M5: v4 caches (pre-PART/CHIP) must keep loading with
+        # part_id / chip_id defaulting to None — the panel falls into
+        # "legacy snapshot" mode using the stored coordinates.
+        src = _src(tmp_path)
+        out = tmp_path / "proj.npz"
+        meta = _meta(src)
+        cache_save(out, _layers(), meta)
+        # Surgically downgrade the on-disk manifest version to 4 by
+        # round-tripping through json so we don't depend on real v4 files.
+        import io, json as _json
+        with np.load(out, allow_pickle=False) as npz:
+            data = {k: np.asarray(npz[k]) for k in npz.files}
+        manifest = _json.loads(bytes(data["meta"]).decode("utf-8"))
+        manifest["schema_version"] = 4
+        manifest.pop("part_id", None)
+        manifest.pop("chip_id", None)
+        data["meta"] = np.frombuffer(
+            _json.dumps(manifest).encode("utf-8"), dtype=np.uint8)
+        with open(out, "wb") as fh:
+            np.savez_compressed(fh, **data)
+        loaded = cache_load(out)
+        assert loaded is not None
+        assert loaded.meta.part_id is None
+        assert loaded.meta.chip_id is None
+        assert loaded.meta.chip_corner_x == 1000
 
 
 # ── Staleness check ──────────────────────────────────────────────────
