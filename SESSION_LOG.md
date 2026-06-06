@@ -4,6 +4,27 @@
 
 ---
 
+## [2026-06-05] [UX] T4 — 把 GLAS wordmark 從 toolbar 搬到 status bar 並帶版本號
+
+**變更類型：** UX 微調（toolbar 減重 + 版本辨識） ·  **狀態：完成**
+
+**動機：** Toolbar 最左側的 `glas_wordmark.svg`（~80–100 px）與 window title bar 的
+「GLAS」資訊重複；同時 user 沒有任何地方能一眼看到版本號（回報 bug 不方便）。
+
+**改動：**
+- 新增 module-level 常數 `GLAS_VERSION = "1.0.0"` 集中版本，並把 About dialog 的硬寫
+  「Version 1.0.0」改為 `f"Version {GLAS_VERSION}"`。
+- `_build_toolbar`：移除 GLAS wordmark QLabel + divider，toolbar 真正只承載 actions。
+- MainWindow `_status_bar`：左側新增 `self._status_brand = QLabel("GLAS v1.0.0")`，
+  橘色 `_TK_ACCENT_DK` + `_FS_MICRO` + letter-spacing 1.5px + padding 0 10px，hover
+  tooltip 「GDS-Layout Alignment for SEM · version 1.0.0」。
+
+**測試：** 全套件 **667 passed**（無 regression）。
+
+**影響檔案：** `glas/app/gds_align_tool.py`、`SESSION_LOG.md`。  **PR：** #11
+
+---
+
 ## [2026-06-05] [UX cleanup] Minimap 功能整批移除
 
 **變更類型：** dead feature 清除 ·  **狀態：完成**

@@ -172,6 +172,11 @@ except Exception:  # pragma: no cover
         return QIcon()
 
 
+# App version. Surfaced in the status-bar brand chip (left edge) and the
+# About dialog so a user reporting a bug can quote it at a glance.
+GLAS_VERSION = "1.0.0"
+
+
 _TK_BG_PAGE   = QColor("#f7f4ef")
 _TK_BG_PANEL  = QColor("#fff8f2")
 _TK_BG_INPUT  = QColor("#ffffff")
@@ -5839,6 +5844,17 @@ class MainWindow(QMainWindow):
 
         self._status_bar = QStatusBar(self)
         self.setStatusBar(self._status_bar)
+        # Status-bar brand chip (left edge): "GLAS v1.0.0", muted accent
+        # colour. Lives here instead of the toolbar so the toolbar is
+        # action-only, and the version is always visible for bug reports.
+        self._status_brand = QLabel(f"GLAS v{GLAS_VERSION}")
+        self._status_brand.setStyleSheet(
+            f"color:{_TK_ACCENT_DK.name()}; "
+            f"font-size:{_FS_MICRO}px; font-weight:700; "
+            f"letter-spacing:1.5px; padding:0 10px;")
+        self._status_brand.setToolTip(
+            f"GLAS — GDS-Layout Alignment for SEM · version {GLAS_VERSION}")
+        self._status_bar.addWidget(self._status_brand)
         self._status_doc = QLabel("no GDS loaded")
         self._status_cursor = QLabel("")
         # F11 M1: dedicated, always-visible GDS cursor coordinate readout (both
@@ -6029,17 +6045,8 @@ class MainWindow(QMainWindow):
                 f"font-weight:700; letter-spacing:1px; padding: 0 4px;")
             return lbl
 
-        # GLAS wordmark（toolbar 最左側）
-        _wm_path = Path(__file__).resolve().parent / "icons" / "glas_wordmark.svg"
-        if _wm_path.exists():
-            wm_label = QLabel(bar)
-            wm_pixmap = QPixmap(str(_wm_path))
-            wm_label.setPixmap(
-                wm_pixmap.scaledToHeight(28, Qt.TransformationMode.SmoothTransformation)
-            )
-            wm_label.setContentsMargins(4, 0, 8, 0)
-            h.addWidget(wm_label)
-            h.addWidget(_divider())
+        # Brand wordmark moved to the status bar (left edge) so the toolbar
+        # only carries actions. See ``_status_brand`` in __init__.
 
         # ── File group ──
         h.addSpacing(4)
@@ -8010,7 +8017,7 @@ class MainWindow(QMainWindow):
 
         v.addSpacing(16)
 
-        ver_lbl = QLabel("Version 1.0.0", dlg)
+        ver_lbl = QLabel(f"Version {GLAS_VERSION}", dlg)
         ver_lbl.setStyleSheet("font-size: 12px; color: #9a8878;")
         ver_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         v.addWidget(ver_lbl)
