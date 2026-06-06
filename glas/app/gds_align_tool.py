@@ -126,6 +126,7 @@ import gds_boolean      # noqa: E402
 import gds_layer_cache  # noqa: E402
 import sem_loader       # noqa: E402
 import oasis_random     # noqa: E402
+import devlog            # noqa: E402  (dev-mode coloured console tags)
 import layout_export     # noqa: E402  (F9: OASIS export — shapely guarded inside)
 import oasis_debug        # noqa: E402  (F10: OASIS diagnostics — Qt-free)
 # F8: the Qt-free fine-align compute lives in glas/core/fine_align.py so a
@@ -1508,18 +1509,23 @@ class FineAlignAllWorker(QObject):
         completion and their results are still kept."""
         n = len(self._jobs)
         rar = self._rar
-        # Reader params (not the live reader, which owns an unpicklable mmap):
-        # each worker rebuilds an identical reader from these.
-        initargs = (str(rar._path), rar._init_wanted, rar._dtype,
-                    rar._bbox_layer, self._root, self._poi_specs, self._cfg)
-        ctx = mp.get_context("spawn")
-        ex = ProcessPoolExecutor(max_workers=workers, mp_context=ctx,
-                                 initializer=fine_align._pool_init,
-                                 initargs=initargs)
+        # F23 M2: reuse a session-persistent, pre-warmable pool keyed on the
+        # reader identity + worker count, instead of spawning + tearing one down
+        # every Run all. The per-batch context (root / POI specs / cfg) rides
+        # each task (F23 M2 refactor) so a POI / search-radius change still hits
+        # the warm pool. F23 M1: the already-built name-table index is shipped
+        # via the pool initializer so each worker skips its own rescan (plain
+        # dict/list/int data, pickles cleanly into the spawn workers).
         done = 0
         dropped = False
-        try:
-            futures = [ex.submit(fine_align._pool_task, job)
+        # lease() holds the pool busy for the whole run so its idle-timeout
+        # auto-release can't fire mid-batch; on exit the idle timer re-arms.
+        # The pool persists across batches (F23 M2) — no per-batch shutdown.
+        with fine_align.batch_pool.lease(
+                str(rar._path), rar._init_wanted, rar._dtype, rar._bbox_layer,
+                rar.index_snapshot(), workers) as ex:
+            futures = [ex.submit(fine_align._pool_task, job, self._root,
+                                 self._poi_specs, self._cfg)
                        for job in self._jobs]
             for fut in futures:
                 if self._cancel.is_set() and not dropped:
@@ -1534,8 +1540,6 @@ class FineAlignAllWorker(QObject):
                 if res is not None:
                     self.progress.emit(done, n, res[0])
                     self.result.emit(*res)
-        finally:
-            ex.shutdown(wait=True)
         if self._cancel.is_set():
             self.cancelled.emit()
         else:
@@ -5813,6 +5817,9 @@ class MainWindow(QMainWindow):
         # in QSettings so it survives a restart.
         self._dev_mode = bool(
             QSettings("GLAS", "GLAS").value("dev_mode", False, type=bool))
+        # Match batch fine-align timing to the persisted dev-mode state before
+        # any pool spawns, so warmed workers inherit GLAS_FA_TIMING from launch.
+        self._apply_fa_timing()
 
         _icon_path = Path(__file__).resolve().parent / "icons" / "glas_icon_32.svg"
         if _icon_path.exists():
@@ -6501,6 +6508,7 @@ class MainWindow(QMainWindow):
         self._sem_images = images
         self._klarf_path = path
         self.sem_panel.set_images(images)
+        self._maybe_prewarm_batch_pool()   # F23 M2: batch now plausible
         with_coords = sum(1 for i in images if i.has_coords)
         self._status_state(
             f"KLARF: {len(images)} images ({with_coords} with coords) · "
@@ -6517,6 +6525,7 @@ class MainWindow(QMainWindow):
         images = sem_loader.load_folder(path)
         self._sem_images = images
         self.sem_panel.set_images(images)
+        self._maybe_prewarm_batch_pool()   # F23 M2: batch now plausible
         self._status_state(
             f"Folder: {len(images)} images · {Path(path).name}")
         self._update_guidance()
@@ -6597,7 +6606,8 @@ class MainWindow(QMainWindow):
         # Trace (--trace): print the conversion for klayout/diag comparison.
         # Fires on every jump/drag, so it's level-2 only.
         if oasis_random.TRACE:
-            print(f"[jump] DID={img.image_id}  XREL={img.xrel} YREL={img.yrel}  "
+            print(f"{devlog.tag('jump')} DID={img.image_id}  "
+                  f"XREL={img.xrel} YREL={img.yrel}  "
                   f"chip_corner=({self._chip_corner_x:,.0f}, "
                   f"{self._chip_corner_y:,.0f}) nm  "
                   f"origin=({self._origin_dx:,.0f}, "
@@ -6689,6 +6699,7 @@ class MainWindow(QMainWindow):
             [(e.key.key(), _entry_label(e)) for e in self._poi_entries])
         if self._poi_entries:          # expand Fine Align when a POI is picked
             self.sem_panel.set_fine_collapsed(False)
+        self._maybe_prewarm_batch_pool()   # F23 M2: POIs ready -> warm the pool
 
     def _capture_fa_setup(self) -> None:
         """Snapshot per-layer visibility / colour / opacity / POI / Foreground
@@ -6823,6 +6834,56 @@ class MainWindow(QMainWindow):
             if spec is not None:
                 out.append((spec, fgs.get(e.key.key(), 200)))
         return out
+
+    def _maybe_prewarm_batch_pool(self) -> None:
+        """F23 M2: once an OASIS reader + POIs + a pooled-size batch are all
+        ready, spin up the persistent process pool *in the background* so the
+        first Run all starts instantly instead of paying the spawn + per-worker
+        reader build. No-op when a batch would run in-thread (<=2 images), when
+        the pieces aren't ready yet, or when a warm is already underway; the
+        pool itself self-guards on its key, so repeat calls are cheap."""
+        if cv2 is None or self._rar is None or self._roi_root is None:
+            return
+        if len(self._sem_images) <= 2:
+            return                       # small batch runs in-thread (no pool)
+        if not self._poi_specs():
+            return
+        if getattr(self, "_prewarming", False):
+            return
+        rar = self._rar
+        override = self.sem_panel.fine_align.values().get("max_workers", 0)
+        workers = min(fine_align.batch_worker_count(override),
+                      len(self._sem_images))
+        if workers <= 1:
+            return
+        # Capture picklable reader params on the GUI thread; the warm itself
+        # (process spawn + per-worker reader build) runs off-thread so the UI
+        # never blocks. Worker count matches what _run_process_pool will use, so
+        # the warmed pool's key is the one Run all reuses.
+        args = (str(rar._path), rar._init_wanted, rar._dtype, rar._bbox_layer,
+                rar.index_snapshot(), workers)
+        self._prewarming = True
+
+        def _warm():
+            try:
+                fine_align.batch_pool.ensure_warm(*args)
+            except Exception:           # best-effort; Run all still works cold
+                pass
+            finally:
+                self._prewarming = False
+
+        threading.Thread(target=_warm, name="glas-batch-prewarm",
+                         daemon=True).start()
+
+    def closeEvent(self, ev) -> None:  # type: ignore[override]
+        # F23 M2: release the persistent batch pool's idle worker processes
+        # (each holds an mmap + name-table index) on quit. Best-effort —
+        # ProcessPoolExecutor's atexit handler reaps any stragglers anyway.
+        try:
+            fine_align.batch_pool.shutdown()
+        except Exception:
+            pass
+        super().closeEvent(ev)
 
     def _render_gds_preview(self, anchor, W, H, nm_per_px) -> np.ndarray:
         """RGB (H, W, 3) raster of the visible GDS layers over the FOV centred
@@ -7410,7 +7471,8 @@ class MainWindow(QMainWindow):
         cached = sum(getattr(s, "cells_cached", 0) for _, s in per_layer)
         t_decode = sum(getattr(s, "t_decode", 0.0) for _, s in per_layer)
         sbbox_on = any(s.sbbox_prune for _, s in per_layer)
-        print(f"[roi] ── loaded in {elapsed:.1f}s · {len(per_layer)} layer(s) · "
+        print(f"{devlog.tag('roi')} ── loaded in {elapsed:.1f}s · "
+              f"{len(per_layer)} layer(s) · "
               f"{total_rects:,} rects {total_polys:,} polys · "
               f"decode {t_decode:.1f}s ({cached} from cache, {decoded} decoded) · "
               f"prune {'ON' if sbbox_on else 'off'}"
@@ -7428,7 +7490,8 @@ class MainWindow(QMainWindow):
         if oasis_random.DEBUG and doc is not None and doc.entries:
             bb = doc.bbox_nm
             rc = self._roi_center or (0.0, 0.0)
-            print(f"[roi] geometry bbox = ({bb[0]/1e3:,.1f}, {bb[1]/1e3:,.1f}) .. "
+            print(f"{devlog.tag('roi')} geometry bbox = "
+                  f"({bb[0]/1e3:,.1f}, {bb[1]/1e3:,.1f}) .. "
                   f"({bb[2]/1e3:,.1f}, {bb[3]/1e3:,.1f}) µm  "
                   f"| requested centre = ({rc[0]/1e3:,.1f}, {rc[1]/1e3:,.1f}) µm  "
                   f"| centre in bbox? "
@@ -7448,7 +7511,7 @@ class MainWindow(QMainWindow):
                         best = (area, e.key.layer, e.key.datatype, x0, y0, x1, y1)
             if best is not None:
                 _, ly, dt, x0, y0, x1, y1 = best
-                print(f"[roi] LARGEST {ly}/{dt} rect: "
+                print(f"{devlog.tag('roi')} LARGEST {ly}/{dt} rect: "
                       f"({x0/1e3:,.3f}, {y0/1e3:,.3f}) .. "
                       f"({x1/1e3:,.3f}, {y1/1e3:,.3f}) µm "
                       f"(W×H {(x1-x0)/1e3:,.3f}×{(y1-y0)/1e3:,.3f} µm) "
@@ -7529,7 +7592,8 @@ class MainWindow(QMainWindow):
                 path, wanted_layers=set(layer_keys),
                 bbox_layer=oasis_random.DEFAULT_BBOX_LAYER)
             n_sbbox = len(rar._sbbox_by_refnum) + len(rar._sbbox_by_name)
-            print(f"[roi] reader built in {_t.perf_counter() - _t0:.1f}s · "
+            print(f"{devlog.tag('roi')} reader built in "
+                  f"{_t.perf_counter() - _t0:.1f}s · "
                   f"{len(rar._by_refnum):,} cells indexed · S_BOUNDING_BOX on "
                   f"{n_sbbox:,} cells "
                   f"({'decode-free prune' if n_sbbox else 'NONE -> bbox-by-decode'})",
@@ -7550,6 +7614,10 @@ class MainWindow(QMainWindow):
         self._oas_path = path
         self._roi_root = root
         self._roi_layers = layer_keys
+        # F23 M2: a new layout invalidates any pool warmed for the old file;
+        # release those worker processes now (the next prewarm rebuilds for the
+        # new reader). shutdown() is a no-op when no pool is live.
+        fine_align.batch_pool.shutdown()
         # New layout → drop any recipes from a previously-open file.
         self._recipes = []
         lyr_txt = ", ".join(f"L{l}/D{d}" for l, d in layer_keys)
@@ -8065,6 +8133,24 @@ class MainWindow(QMainWindow):
         self._dev_mode = bool(on)
         QSettings("GLAS", "GLAS").setValue("dev_mode", self._dev_mode)
         self._refresh_dev_ui()
+        # Toggling dev mode flips batch fine-align per-stage timing. Drop any
+        # warmed pool so the next batch spawns workers that inherit the new
+        # GLAS_FA_TIMING env (workers read it at import / spawn time).
+        self._apply_fa_timing()
+        fine_align.batch_pool.shutdown()
+
+    def _apply_fa_timing(self) -> None:
+        """Dev mode ON → batch fine-align prints per-stage timing
+        (``[fa-timing] read / poi(walk+bool) / template / match``, per worker)
+        to stdout; OFF → silent. Sets both the in-process flag (the in-thread
+        small-batch path) and the ``GLAS_FA_TIMING`` env var (inherited by the
+        spawned pool workers). No env fiddling — it follows dev mode."""
+        on = bool(self._dev_mode)
+        fine_align._FA_TIMING = on
+        if on:
+            os.environ["GLAS_FA_TIMING"] = "1"
+        else:
+            os.environ.pop("GLAS_FA_TIMING", None)
 
     def _refresh_dev_ui(self) -> None:
         """Show / hide developer-only controls to match ``self._dev_mode``."""
@@ -8170,6 +8256,16 @@ def main() -> int:
     # Required on Windows so the child loader process re-imports this module
     # cleanly when it spawns. No-op on POSIX.
     mp.freeze_support()
+    # Dev-mode diagnostics print ·, µm, ── etc. A legacy console code page
+    # (e.g. cp950 on a zh-TW Windows) would raise UnicodeEncodeError on those
+    # and abort the print; reconfigure the std streams to UTF-8 with replacement
+    # so logs degrade to '?' instead of crashing. PyCharm's console is already
+    # UTF-8, so this is a no-op there.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # pragma: no cover - very old / non-reconfigurable
+            pass
     # Filter two harmless, very chatty Qt warnings (a pixel-sized font reports
     # pointSize()==-1; a dialog whose min-height nudges past the requested
     # geometry triggers a setGeometry notice) while letting everything else
@@ -8191,13 +8287,14 @@ def main() -> int:
     if "--trace" in sys.argv:
         oasis_random.set_debug(True, level=2)
         sys.argv = [a for a in sys.argv if a != "--trace"]
-        print("[gds-align] trace mode ON (level 2: deep per-cell telemetry)",
-              file=sys.stderr, flush=True)
+        print(f"{devlog.tag('gds-align', stream=sys.stderr)} trace mode ON "
+              "(level 2: deep per-cell telemetry)", file=sys.stderr, flush=True)
     elif "--debug" in sys.argv:
         oasis_random.set_debug(True, level=1)
         sys.argv = [a for a in sys.argv if a != "--debug"]
-        print("[gds-align] debug mode ON (concise ROI summaries; use --trace "
-              "for full detail)", file=sys.stderr, flush=True)
+        print(f"{devlog.tag('gds-align', stream=sys.stderr)} debug mode ON "
+              "(concise ROI summaries; use --trace for full detail)",
+              file=sys.stderr, flush=True)
     app = QApplication(sys.argv)
 
     app.setApplicationName("GLAS")

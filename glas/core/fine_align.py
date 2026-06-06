@@ -17,6 +17,14 @@ stays in the app module.
 """
 from __future__ import annotations
 
+import contextlib
+import multiprocessing as mp
+import os
+import sys
+import threading
+import time
+from concurrent.futures import ProcessPoolExecutor
+
 import numpy as np
 
 try:
@@ -24,6 +32,7 @@ try:
 except Exception:  # pragma: no cover
     cv2 = None  # rasterize_layer falls back to a pure-numpy scanline fill
 
+import devlog
 import gds_boolean
 import oasis_random
 
@@ -399,8 +408,65 @@ def poi_polys_for_roi(rar, root, roi_bbox, poi_spec, cancel_cb=None):
     expression, resolving any nested synthetic references via ``recipes``
     (``{name: (expr, bindings)}``). For the hole-preserving geometry (mask
     export) use :func:`poi_polys_and_geometry_for_roi`."""
+    # F23 batch-perf: a raw POI only needs the outline polygons here — the
+    # template rasterizer fills overlapping polys idempotently, so it does NOT
+    # need the unioned geometry. poi_polys_and_geometry_for_roi would compute a
+    # unary_union (30 ms–1 s on a dense FOV) only for us to drop it via [0]; the
+    # raw walk result is returned directly instead. Expression POIs still go
+    # through the full path because their Boolean evaluation needs the geometry.
+    if poi_spec[0] == "raw":
+        _, layer, datatype = poi_spec
+        return _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb)
     return poi_polys_and_geometry_for_roi(
         rar, root, roi_bbox, poi_spec, cancel_cb)[0]
+
+
+# ── Optional per-stage timing (diagnostic) ───────────────────────────────────
+# Set GLAS_FA_TIMING=1 before launching to have each batch worker accumulate
+# per-image stage times and print a running per-worker average every
+# GLAS_FA_TIMING_EVERY images (default 25). Stages: read (cv2.imread), poi
+# (ROI walk + any Boolean/union), template (rasterize + blur), match
+# (cv2.matchTemplate). Lets us see where a real batch actually spends its time
+# instead of guessing. Off → the four perf_counter() calls are the only cost
+# (nanoseconds), so the production path is unaffected.
+_FA_TIMING = bool(os.environ.get("GLAS_FA_TIMING"))
+try:
+    _FA_TIMING_EVERY = max(1, int(os.environ.get("GLAS_FA_TIMING_EVERY", "25")))
+except ValueError:
+    _FA_TIMING_EVERY = 25
+_FA_TIMING_ACC = {"read": 0.0, "poi": 0.0, "template": 0.0, "match": 0.0,
+                  "n": 0}
+
+
+def _record_timing(read_s: float, poi_s: float, tmpl_s: float,
+                   match_s: float) -> None:
+    a = _FA_TIMING_ACC
+    a["read"] += read_s
+    a["poi"] += poi_s
+    a["template"] += tmpl_s
+    a["match"] += match_s
+    a["n"] += 1
+    n = a["n"]
+    # Print after the very first image (so even a tiny batch — fewer images than
+    # workers — yields a line per worker), then every _FA_TIMING_EVERY. The n==1
+    # line includes that worker's cold ROI walk (memo not yet warm); later lines
+    # are the steady-state average.
+    if n == 1 or n % _FA_TIMING_EVERY == 0:
+        read_ms, poi_ms = a["read"] / n * 1e3, a["poi"] / n * 1e3
+        tmpl_ms, match_ms = a["template"] / n * 1e3, a["match"] / n * 1e3
+        # Bold-highlight whichever of the two heavy stages (poi / match)
+        # dominates, so the bottleneck pops out of the line at a glance.
+        poi_s = f"poi(walk+bool)={poi_ms:.1f}"
+        match_s = f"match={match_ms:.1f}"
+        if poi_ms >= match_ms:
+            poi_s = devlog.paint(poi_s, "fa-timing", bold=True)
+        else:
+            match_s = devlog.paint(match_s, "fa-timing", bold=True)
+        print(f"{devlog.tag('fa-timing')} "
+              f"{devlog.dim(f'pid={os.getpid()} n={n}')}  "
+              f"read={read_ms:.1f}  {poi_s}  "
+              f"template={tmpl_ms:.1f}  {match_s}  {devlog.dim('ms/img')}",
+              flush=True)
 
 
 def _fine_align_image(job, rar, root, poi_specs, cfg, cancel_is_set):
@@ -418,6 +484,7 @@ def _fine_align_image(job, rar, root, poi_specs, cfg, cancel_is_set):
     c = cfg
     if anchor is None:
         return (str(image_id), 0.0, 0.0, 0.0, 0, "no-coords")
+    t0 = time.perf_counter()
     sem = (cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
            if (cv2 and exists) else None)
     if sem is None:
@@ -429,6 +496,7 @@ def _fine_align_image(job, rar, root, poi_specs, cfg, cancel_is_set):
         return (str(image_id), 0.0, 0.0, 0.0, 0, "no-scale")
     roi = (anchor[0] - c["fov_w"], anchor[1] - c["fov_h"],
            anchor[0] + c["fov_w"], anchor[1] + c["fov_h"])
+    t1 = time.perf_counter()
     poi_layers = []
     for spec, fg in poi_specs:
         polys = poi_polys_for_roi(rar, root, roi, spec, cancel_cb=cancel_is_set)
@@ -436,10 +504,15 @@ def _fine_align_image(job, rar, root, poi_specs, cfg, cancel_is_set):
             poi_layers.append((polys, fg))
     if not poi_layers:
         return (str(image_id), 0.0, 0.0, 0.0, 0, "flat")
+    t2 = time.perf_counter()
     template = render_composite_template(
         poi_layers, anchor, W, H, nm_per_px, c["bg_glv"], c["blur_sigma_px"])
     radius_px = c["search_radius_nm"] / nm_per_px
+    t3 = time.perf_counter()
     dx, dy, score, used_r = fine_align_one(sem, template, nm_per_px, radius_px)
+    if _FA_TIMING:
+        _record_timing(t1 - t0, t2 - t1, t3 - t2,
+                       time.perf_counter() - t3)
     return (str(image_id), dx, dy, score, int(used_r), "ok")
 
 
@@ -460,9 +533,17 @@ def _fine_align_image(job, rar, root, poi_specs, cfg, cancel_is_set):
 _G: dict = {}
 
 
-def _pool_init(path, wanted_layers, dtype, bbox_layer, root, poi_specs, cfg):
-    """ProcessPoolExecutor initializer: build the per-process reader + cache the
-    immutable batch context. Runs once in each worker process."""
+def _pool_init(path, wanted_layers, dtype, bbox_layer, prebuilt_index=None):
+    """ProcessPoolExecutor initializer: build this worker's private reader once.
+
+    F23 M1: ``prebuilt_index`` (the orchestrator's already-built name-table
+    index) lets the worker's reader skip the per-process ``scan_cell_offsets``
+    rescan — the dominant per-worker build cost on big files.
+
+    F23 M2: only the *reader* is cached here (it depends on file + layer filter,
+    which rarely change). The per-batch context (root / POI specs / cfg) rides
+    each task instead (see :func:`_pool_task`), so a persistent pool can be
+    reused across batches even when the POI selection or search radius changes."""
     # F14: pin cv2 to one thread per worker so matchTemplate's internal threads
     # don't multiply across the process pool (the reason the old cap was 8).
     if cv2 is not None:
@@ -470,20 +551,198 @@ def _pool_init(path, wanted_layers, dtype, bbox_layer, root, poi_specs, cfg):
             cv2.setNumThreads(1)
         except Exception:  # pragma: no cover - older cv2
             pass
+    # Match the main process: keep [fa-timing] prints from crashing on a legacy
+    # console code page (UnicodeEncodeError) by reconfiguring this worker's
+    # stdout to UTF-8 with replacement.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # pragma: no cover - non-reconfigurable stream
+        pass
     _G["rar"] = oasis_random.RandomAccessReader(
-        path, wanted_layers=wanted_layers, dtype=dtype, bbox_layer=bbox_layer)
-    _G["root"] = root
-    _G["specs"] = poi_specs
-    _G["cfg"] = cfg
+        path, wanted_layers=wanted_layers, dtype=dtype, bbox_layer=bbox_layer,
+        prebuilt_index=prebuilt_index)
 
 
 def _never_cancel() -> bool:
     return False
 
 
-def _pool_task(job):
+def _pool_task(job, root, poi_specs, cfg):
     """ProcessPoolExecutor task: fine-align one image using this process's
-    private reader. Cancellation is handled by the orchestrator dropping
-    not-yet-started futures, so the task itself never checks a flag."""
-    return _fine_align_image(job, _G["rar"], _G["root"], _G["specs"],
-                             _G["cfg"], _never_cancel)
+    private reader. The per-batch context (root / specs / cfg) arrives with the
+    job so the worker's reader can be reused across batches (F23 M2).
+    Cancellation is handled by the orchestrator dropping not-yet-started
+    futures, so the task itself never checks a flag."""
+    return _fine_align_image(job, _G["rar"], root, poi_specs, cfg,
+                             _never_cancel)
+
+
+def _pool_warm_probe() -> bool:
+    """Warm-up task (F23 M2): proves this worker booted *and* built its reader,
+    so :meth:`_BatchPool.ensure_warm` can pay the import + reader-build cost
+    before the user clicks Run all."""
+    return _G.get("rar") is not None
+
+
+# Default idle window before a warm-but-unused pool releases its workers (F23
+# M2 idle-timeout). Long enough to cover normal review gaps between batches,
+# short enough to free the K mmaps + indexes when the user walks away.
+_POOL_IDLE_TIMEOUT_S = 300.0
+
+
+class _BatchPool:
+    """A spawn-based process pool for batch fine-align that survives across
+    batches and can be pre-warmed (F23 M2), instead of being created and torn
+    down on every "Run all".
+
+    Keyed on the reader identity ``(path, layer filter, dtype, bbox layer)`` +
+    the worker count: a request whose key matches the live pool reuses it (near
+    zero startup); a different key shuts the old pool down and builds a new one.
+    The per-batch context (root / POI specs / cfg) is *not* baked into the
+    workers — it rides each task — so changing the POI selection or search
+    radius still reuses the same warm pool.
+
+    Trade-off: a live pool keeps ``workers`` idle processes, each holding its
+    own mmap + name-table index. To bound that, the pool **auto-releases** after
+    ``idle_timeout`` seconds with no batch running (set ``idle_timeout=None`` to
+    disable). It is also released explicitly via :meth:`shutdown` on app close /
+    new-file open; worst case the interpreter's atexit handler reaps it at quit.
+
+    Idle-timeout safety: the timer is only armed while no batch is in flight. A
+    run holds the pool via :meth:`lease` (a busy refcount); the timer is
+    cancelled on acquire and re-armed only when the refcount falls back to zero,
+    so it can never shut workers down mid-batch.
+
+    Thread-safe: pre-warm runs on a background thread while the batch worker
+    thread leases the pool, and the idle timer fires on its own thread — an
+    ``RLock`` guards all state."""
+
+    def __init__(self, idle_timeout: float | None = None) -> None:
+        self._lock = threading.RLock()
+        self._ex: ProcessPoolExecutor | None = None
+        self._key: tuple | None = None
+        self._warmed = False
+        self._inuse = 0                       # active leases (batches running)
+        self._idle_timeout = idle_timeout
+        self._idle_timer: threading.Timer | None = None
+
+    @staticmethod
+    def _key_for(path, wanted, dtype, bbox, workers) -> tuple:
+        wkey = frozenset(wanted) if wanted is not None else None
+        dname = getattr(dtype, "__name__", str(dtype))
+        return (str(path), wkey, dname, bbox, int(workers))
+
+    def _get_locked(self, path, wanted, dtype, bbox, prebuilt_index,
+                    workers) -> ProcessPoolExecutor:
+        """Build or reuse the executor for this key (caller holds the lock)."""
+        key = self._key_for(path, wanted, dtype, bbox, workers)
+        if self._ex is not None and self._key == key:
+            return self._ex
+        self._shutdown_locked()
+        ctx = mp.get_context("spawn")
+        self._ex = ProcessPoolExecutor(
+            max_workers=int(workers), mp_context=ctx,
+            initializer=_pool_init,
+            initargs=(str(path), wanted, dtype, bbox, prebuilt_index))
+        self._key = key
+        self._warmed = False
+        return self._ex
+
+    def get(self, path, wanted, dtype, bbox, prebuilt_index,
+            workers) -> ProcessPoolExecutor:
+        """A ready executor for this reader / worker count, reusing the live one
+        when the key matches, else (re)building it. Low-level builder — the run
+        path uses :meth:`lease` (which adds busy/idle bookkeeping) instead."""
+        with self._lock:
+            return self._get_locked(path, wanted, dtype, bbox, prebuilt_index,
+                                    workers)
+
+    @contextlib.contextmanager
+    def lease(self, path, wanted, dtype, bbox, prebuilt_index, workers):
+        """Context manager yielding a ready executor for the duration of a
+        batch. Marks the pool busy (cancelling the idle timer) on enter and
+        re-arms the idle timer on exit, so the auto-release can never fire while
+        a batch is running."""
+        with self._lock:
+            self._cancel_idle_locked()
+            ex = self._get_locked(path, wanted, dtype, bbox, prebuilt_index,
+                                  workers)
+            self._inuse += 1
+        try:
+            yield ex
+        finally:
+            with self._lock:
+                self._inuse = max(0, self._inuse - 1)
+                self._arm_idle_locked()
+
+    def ensure_warm(self, path, wanted, dtype, bbox, prebuilt_index,
+                    workers) -> None:
+        """Build the pool (if needed) and force every worker to boot + build its
+        reader now, so a later Run all starts instantly. Idempotent: returns
+        immediately when the matching pool is already warm. Safe on a background
+        thread; best-effort (a key change before Run all just rebuilds). Held as
+        a lease so the idle timer can't fire mid-warm; the timer is (re)armed
+        when warming finishes, so a never-used warm pool still auto-releases."""
+        key = self._key_for(path, wanted, dtype, bbox, workers)
+        with self._lock:
+            if self._ex is not None and self._key == key and self._warmed:
+                return
+            self._cancel_idle_locked()
+            ex = self._get_locked(path, wanted, dtype, bbox, prebuilt_index,
+                                  workers)
+            self._inuse += 1
+        try:
+            # ProcessPoolExecutor spawns workers lazily as tasks are submitted,
+            # so submitting one probe per worker forces all `workers` processes
+            # to boot and run _pool_init (the cost we want paid up front).
+            futs = [ex.submit(_pool_warm_probe) for _ in range(int(workers))]
+            for f in futs:
+                f.result()
+            with self._lock:
+                if self._key == key:
+                    self._warmed = True
+        finally:
+            with self._lock:
+                self._inuse = max(0, self._inuse - 1)
+                self._arm_idle_locked()
+
+    def shutdown(self) -> None:
+        with self._lock:
+            self._shutdown_locked()
+
+    # ── idle-timer helpers (all callers hold the lock) ──────────────────────
+    def _cancel_idle_locked(self) -> None:
+        if self._idle_timer is not None:
+            self._idle_timer.cancel()
+            self._idle_timer = None
+
+    def _arm_idle_locked(self) -> None:
+        self._cancel_idle_locked()
+        if (self._idle_timeout and self._ex is not None
+                and self._inuse == 0):
+            t = threading.Timer(self._idle_timeout, self._on_idle_fire)
+            t.daemon = True
+            self._idle_timer = t
+            t.start()
+
+    def _on_idle_fire(self) -> None:
+        # Fires on the Timer's own thread after idle_timeout of no activity.
+        # Only release when still idle — a batch that started meanwhile holds a
+        # lease (_inuse > 0) and must not have its workers pulled out.
+        with self._lock:
+            if self._inuse == 0:
+                self._shutdown_locked()
+
+    def _shutdown_locked(self) -> None:
+        self._cancel_idle_locked()
+        if self._ex is not None:
+            self._ex.shutdown(wait=False)
+            self._ex = None
+            self._key = None
+            self._warmed = False
+
+
+# Session-wide singleton: the GUI's batch worker leases it, a background
+# pre-warm primes it once the OASIS + POIs are ready, and an idle timer releases
+# its workers when the user stops batching for a while (F23 M2).
+batch_pool = _BatchPool(idle_timeout=_POOL_IDLE_TIMEOUT_S)

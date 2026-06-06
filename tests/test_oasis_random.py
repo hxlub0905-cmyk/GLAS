@@ -748,3 +748,63 @@ class TestExtVectorized:
         rt = np.empty(0, dtype=np.int16)
         rr = np.empty(0, dtype=object)
         assert orx._ext_from_columnar(base, rt, rr).shape == (0, 4)
+
+
+class TestPrebuiltIndex:
+    """F23 M1: a reader built with ``prebuilt_index=`` (the index handed over
+    from another reader over the same file) must be byte/value identical to one
+    that ran its own ``scan_cell_offsets`` — that equivalence is what lets the
+    batch process pool hand the orchestrator's index to its workers instead of
+    each worker rescanning the name table."""
+
+    def _index_fields(self, rar):
+        return (rar._by_refnum, rar._by_name, rar._unit, rar._layernames,
+                rar._sbbox_by_refnum, rar._sbbox_by_name, rar._offset_flag,
+                rar._offsets_via)
+
+    def test_injected_index_matches_scanned(self, tmp_path):
+        data, off_a, off_b = _build_two_cell()
+        p = tmp_path / "two.oas"
+        p.write_bytes(data)
+
+        scanned = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
+        snap = scanned.index_snapshot()
+        # No scan_cell_offsets call happens on this build — it reuses ``snap``.
+        injected = orx.RandomAccessReader(
+            p, wanted_layers={(17, 0)}, prebuilt_index=snap)
+
+        assert self._index_fields(injected) == self._index_fields(scanned)
+        assert injected.offset_for(0) == off_a == scanned.offset_for(0)
+        assert injected.offset_for("A") == off_a
+        assert injected.offset_for(1) == off_b
+        # Geometry decoded through the injected-index reader is identical.
+        for cid in (0, 1):
+            a = scanned.load_cell(cid)
+            b = injected.load_cell(cid)
+            assert a.rects((17, 0)).tolist() == b.rects((17, 0)).tolist()
+            assert a.bbox == b.bbox
+
+    def test_injected_sbbox_matches(self, tmp_path):
+        p = tmp_path / "sb.oas"
+        p.write_bytes(_build_hierarchy_sbbox(
+            [(0, 0)], root_sbbox=[0, 0, 0, 99999, 99999],
+            child_sbbox=[0, 0, 0, 20, 20]))
+        scanned = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
+        injected = orx.RandomAccessReader(
+            p, wanted_layers={(17, 0)},
+            prebuilt_index=scanned.index_snapshot())
+        assert injected.sbbox_for(1) == scanned.sbbox_for(1) == (0, 0, 20, 20)
+        assert injected.sbbox_for("R") == (0, 0, 99999, 99999)
+        assert injected._n_bbox_props == scanned._n_bbox_props == 2
+
+    def test_clone_reuses_index(self, tmp_path):
+        data, _, _ = _build_two_cell()
+        p = tmp_path / "two.oas"
+        p.write_bytes(data)
+        rar = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
+        clone = rar.clone()
+        # clone() now forwards the parent index, so the clone shares the very
+        # same index object (no rescan) yet decodes identical geometry.
+        assert clone.index_snapshot() is rar.index_snapshot()
+        assert (clone.load_cell(0).rects((17, 0)).tolist()
+                == rar.load_cell(0).rects((17, 0)).tolist())

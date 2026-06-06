@@ -377,13 +377,13 @@ class TestProcessPoolEquivalence:
             seq[r[0]] = r
 
         # Pool entry points: _pool_init rebuilds the reader from the PATH only
-        # (exactly what a spawned worker does), _pool_task runs the per-image
-        # work against that rebuilt reader.
+        # (exactly what a spawned worker does); the per-batch context (root /
+        # specs / cfg) now rides each task (F23 M2), so _pool_task takes them.
         fa._pool_init(str(p), base._init_wanted, base._dtype,
-                      base._bbox_layer, root, specs, cfg)
+                      base._bbox_layer)
         pool = {}
         for job in jobs:
-            r = fa._pool_task(job)
+            r = fa._pool_task(job, root, specs, cfg)
             pool[r[0]] = r
         fa._G["rar"].close()
         base.close()
@@ -391,3 +391,178 @@ class TestProcessPoolEquivalence:
         assert seq == pool
         assert seq["img2"][5] == "no-coords"
         assert seq["img3"][5] == "missing-file"
+
+
+# ── F23 M2: persistent / pre-warmable batch pool bookkeeping ─────────────────
+
+
+class _FakeFuture:
+    def __init__(self, val):
+        self._val = val
+
+    def result(self):
+        return self._val
+
+
+class _FakeExec:
+    """Stand-in for ProcessPoolExecutor: records submits / shutdown without
+    spawning real workers (the file's stance: real spawns are slow/fragile
+    under pytest — the manager's reuse/rebuild logic is what we pin here)."""
+
+    def __init__(self, max_workers, mp_context, initializer, initargs):
+        self.max_workers = max_workers
+        self.initargs = initargs
+        self.submitted = 0
+        self.shut = False
+
+    def submit(self, fn, *a):
+        self.submitted += 1
+        return _FakeFuture(True)
+
+    def shutdown(self, wait=False):
+        self.shut = True
+
+
+class TestBatchPoolManager:
+    """F23 M2: the session-persistent pool reuses a live executor when the key
+    (file + layer filter + dtype + bbox + worker count) matches, rebuilds it
+    otherwise, and pre-warms idempotently."""
+
+    def _patch(self, monkeypatch):
+        import fine_align as fa
+        monkeypatch.setattr(fa, "ProcessPoolExecutor", _FakeExec)
+        monkeypatch.setattr(fa.mp, "get_context", lambda kind: None)
+        return fa
+
+    def test_same_key_reuses_executor(self, monkeypatch):
+        fa = self._patch(monkeypatch)
+        pool = fa._BatchPool()
+        e1 = pool.get("f.oas", {(17, 0)}, int, None, {}, 4)
+        e2 = pool.get("f.oas", {(17, 0)}, int, None, {}, 4)
+        assert e2 is e1 and not e1.shut
+        # The prebuilt index travels in the initializer args (F23 M1 path).
+        assert e1.initargs[-1] == {}
+
+    def test_key_change_rebuilds_and_shuts_old(self, monkeypatch):
+        fa = self._patch(monkeypatch)
+        pool = fa._BatchPool()
+        e1 = pool.get("f.oas", {(17, 0)}, int, None, {}, 4)
+        # Worker count is part of the key → new pool, old one shut down.
+        e2 = pool.get("f.oas", {(17, 0)}, int, None, {}, 8)
+        assert e2 is not e1 and e1.shut and not e2.shut
+        # A different file likewise rebuilds.
+        e3 = pool.get("other.oas", {(17, 0)}, int, None, {}, 8)
+        assert e3 is not e2 and e2.shut
+
+    def test_shutdown_clears_state(self, monkeypatch):
+        fa = self._patch(monkeypatch)
+        pool = fa._BatchPool()
+        e1 = pool.get("f.oas", None, int, None, {}, 2)
+        pool.shutdown()
+        assert e1.shut and pool._ex is None and pool._key is None
+        # After shutdown the next get builds fresh.
+        e2 = pool.get("f.oas", None, int, None, {}, 2)
+        assert e2 is not e1
+
+    def test_ensure_warm_is_idempotent(self, monkeypatch):
+        fa = self._patch(monkeypatch)
+        pool = fa._BatchPool()
+        pool.ensure_warm("f.oas", {(17, 0)}, int, None, {}, 3)
+        ex = pool._ex
+        assert pool._warmed and ex.submitted == 3   # one probe per worker
+        # Already warm for this key → no rebuild, no extra probes.
+        pool.ensure_warm("f.oas", {(17, 0)}, int, None, {}, 3)
+        assert pool._ex is ex and ex.submitted == 3
+
+    def test_idle_fire_releases_when_idle(self, monkeypatch):
+        fa = self._patch(monkeypatch)
+        pool = fa._BatchPool(idle_timeout=999)
+        ex = pool.get("f.oas", {(17, 0)}, int, None, {}, 2)
+        # No batch in flight → the idle timer firing releases the workers.
+        pool._on_idle_fire()
+        assert ex.shut and pool._ex is None
+
+    def test_idle_fire_skips_while_batch_running(self, monkeypatch):
+        fa = self._patch(monkeypatch)
+        pool = fa._BatchPool(idle_timeout=999)
+        with pool.lease("f.oas", {(17, 0)}, int, None, {}, 2) as ex:
+            # A timer that fires mid-batch must NOT pull the workers out.
+            pool._on_idle_fire()
+            assert not ex.shut and pool._ex is ex
+        # Lease released → pool still alive, idle timer now armed for next gap.
+        assert pool._ex is ex and pool._idle_timer is not None
+        pool.shutdown()       # cancels the armed timer
+
+    def test_lease_cancels_then_rearms_idle_timer(self, monkeypatch):
+        fa = self._patch(monkeypatch)
+        pool = fa._BatchPool(idle_timeout=999)
+        with pool.lease("f.oas", {(17, 0)}, int, None, {}, 2):
+            # Busy → no idle timer armed.
+            assert pool._idle_timer is None and pool._inuse == 1
+        assert pool._inuse == 0 and pool._idle_timer is not None
+        pool.shutdown()
+        assert pool._idle_timer is None and pool._ex is None
+
+    def test_idle_timer_fires_end_to_end(self, monkeypatch):
+        import time
+        fa = self._patch(monkeypatch)
+        pool = fa._BatchPool(idle_timeout=0.1)
+        pool.ensure_warm("f.oas", {(17, 0)}, int, None, {}, 2)
+        # ensure_warm re-arms a 0.1s timer on exit; it should fire and release.
+        deadline = time.monotonic() + 2.0
+        while pool._ex is not None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert pool._ex is None     # auto-released after the idle window
+
+
+# ── F23 batch-perf: raw POI skips the discarded unary_union ──────────────────
+
+
+class TestRawPoiSkipsUnion:
+    """A raw POI's batch fine-align only needs the outline polygons for the
+    template; the unioned geometry that ``poi_polys_and_geometry_for_roi``
+    builds is dropped by ``poi_polys_for_roi``'s ``[0]``. The fast raw path must
+    return the *same* polygons while skipping that union (the per-image cost we
+    cut)."""
+
+    def _reader(self, tmp_path):
+        import oasis_random as orx
+        data, _, _ = _build_two_cell()
+        p = tmp_path / "two.oas"
+        p.write_bytes(data)
+        return orx.RandomAccessReader(p, wanted_layers={(17, 0)})
+
+    def test_raw_skips_union_same_polys(self, tmp_path, monkeypatch):
+        np = pytest.importorskip("numpy")
+        import fine_align as fa
+        import gds_boolean
+        rar = self._reader(tmp_path)
+        roi = (-1000.0, -1000.0, 1000.0, 1000.0)   # covers cell A's geometry
+        spec = ("raw", 17, 0)
+
+        calls = {"n": 0}
+        orig = gds_boolean.polys_to_geometry
+        monkeypatch.setattr(gds_boolean, "polys_to_geometry",
+                            lambda ps: (calls.__setitem__("n", calls["n"] + 1)
+                                        or orig(ps)))
+
+        fast = fa.poi_polys_for_roi(rar, "A", roi, spec)
+        assert calls["n"] == 0          # raw fast path does NOT union
+        assert len(fast) > 0
+
+        full = fa.poi_polys_and_geometry_for_roi(rar, "A", roi, spec)[0]
+        assert calls["n"] == 1          # the full path still unions
+        # Same polygons either way → identical template downstream.
+        assert len(fast) == len(full)
+        for a, b in zip(fast, full):
+            assert np.array_equal(np.asarray(a), np.asarray(b))
+
+    def test_timing_accumulates(self, monkeypatch):
+        import fine_align as fa
+        monkeypatch.setattr(
+            fa, "_FA_TIMING_ACC",
+            {"read": 0.0, "poi": 0.0, "template": 0.0, "match": 0.0, "n": 0})
+        monkeypatch.setattr(fa, "_FA_TIMING_EVERY", 1000)   # suppress the print
+        fa._record_timing(0.001, 0.002, 0.003, 0.004)
+        a = fa._FA_TIMING_ACC
+        assert a["n"] == 1 and abs(a["poi"] - 0.002) < 1e-9
