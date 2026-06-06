@@ -1996,15 +1996,19 @@ class LayerPanel(QFrame):
         title_item.setFont(font)
         self.list.addItem(title_item)
 
-        # 次文
-        hint_item = QListWidgetItem("toolbar → Open OASIS…")
-        hint_item.setFlags(Qt.ItemFlag.NoItemFlags)
-        hint_item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
-        hint_item.setForeground(QColor(_TK_TEXT_HINT))
-        font2 = hint_item.font()
-        font2.setPixelSize(_FS_CAPTION)
-        hint_item.setFont(font2)
-        self.list.addItem(hint_item)
+        # 次文 — primary path + alternative cache restore (T3: surface
+        # that File menu also has Load cache… so users who saved one
+        # before don't think they have to re-open the OASIS).
+        for sub in ("toolbar → Open OASIS…",
+                    "or  File → Load cache…"):
+            hint_item = QListWidgetItem(sub)
+            hint_item.setFlags(Qt.ItemFlag.NoItemFlags)
+            hint_item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
+            hint_item.setForeground(QColor(_TK_TEXT_HINT))
+            font2 = hint_item.font()
+            font2.setPixelSize(_FS_CAPTION)
+            hint_item.setFont(font2)
+            self.list.addItem(hint_item)
 
     def set_document(self, doc: Optional[GdsDocument]) -> None:
         self._doc = doc
@@ -5981,7 +5985,11 @@ class MainWindow(QMainWindow):
         self._klarf_path: str = ""
         self._oas_path: str = ""
 
-        self._status_doc.setText("ready — open an OASIS to begin")
+        # T2: initial state — _status_state also stores the message so a
+        # subsequent transient flash can revert back to it.
+        self._status_state_msg = "ready — open an OASIS to begin"
+        self._status_revert_timer: Optional[QTimer] = None
+        self._status_doc.setText(self._status_state_msg)
 
         self._update_guidance()
 
@@ -6091,14 +6099,17 @@ class MainWindow(QMainWindow):
         self._seg_sem.setChecked(True)
 
         h.addWidget(_divider())
-        fit_btn = QPushButton(_qicon("maximize"), " Fit")
-        fit_btn.setToolTip("Fit the GDS overview to all defects.")
-        fit_btn.clicked.connect(self._on_fit_view)
-        h.addWidget(fit_btn)
+        # T1: keep references on self so _refresh_action_states can gate
+        # buttons whose meaning depends on what's already loaded.
+        self._fit_btn = QPushButton(_qicon("maximize"), " Fit")
+        self._fit_btn.setToolTip("Fit the GDS overview to all defects.")
+        self._fit_btn.clicked.connect(self._on_fit_view)
+        h.addWidget(self._fit_btn)
 
         # Goto GDS coordinate (µm) — same as klayout Ctrl+G, for direct
         # same-coordinate layout comparison. Loads a ~50µm ROI there.
-        h.addWidget(QLabel("Goto µm:"))
+        self._goto_lbl = QLabel("Goto µm:")
+        h.addWidget(self._goto_lbl)
         self._goto_edit = QLineEdit()
         self._goto_edit.setPlaceholderText("e.g. 12345, 6789")
         self._goto_edit.setMaximumWidth(120)
@@ -6107,21 +6118,21 @@ class MainWindow(QMainWindow):
             "geometry — same coordinate as klayout's Ctrl+G for layout comparison.")
         self._goto_edit.returnPressed.connect(self._on_goto_gds)
         h.addWidget(self._goto_edit)
-        goto_btn = QPushButton(_qicon("target"), " Goto")
-        goto_btn.setToolTip("Goto the typed GDS coordinate (loads a ~50µm ROI there).")
-        goto_btn.clicked.connect(self._on_goto_gds)
-        h.addWidget(goto_btn)
+        self._goto_btn = QPushButton(_qicon("target"), " Goto")
+        self._goto_btn.setToolTip("Goto the typed GDS coordinate (loads a ~50µm ROI there).")
+        self._goto_btn.clicked.connect(self._on_goto_gds)
+        h.addWidget(self._goto_btn)
 
         h.addWidget(_divider())
 
         # ── Export group ──
         h.addWidget(_group("EXPORT"))
-        align_btn = QPushButton(_qicon("download"), " Export Alignment…")
-        align_btn.setToolTip(
+        self._align_btn = QPushButton(_qicon("download"), " Export Alignment…")
+        self._align_btn.setToolTip(
             "Export per-image alignment offsets (coarse + fine + score) to "
             "CSV / JSON for a future Recipe to anchor its ROI (M5).")
-        align_btn.clicked.connect(self._on_export_alignment)
-        h.addWidget(align_btn)
+        self._align_btn.clicked.connect(self._on_export_alignment)
+        h.addWidget(self._align_btn)
 
         # F9: OASIS export — advanced, hidden unless developer mode is on.
         self._export_oasis_btn = QPushButton(_qicon("save"), " Export OASIS…")
@@ -6188,7 +6199,7 @@ class MainWindow(QMainWindow):
         if self._current_sem is not None:
             self._jump_to_image(self._current_sem)
         self._fit_view_to_defects()
-        self._status_doc.setText(
+        self._status_transient(
             f"origin δ nudged to ({self._origin_dx:,.0f}, "
             f"{self._origin_dy:,.0f}) nm")
 
@@ -6263,6 +6274,78 @@ class MainWindow(QMainWindow):
                    "then press Set Offset. Wheel zooms; middle/right-drag pans.")
         self._guidance.setText(msg)
         self._guidance.setVisible(True)
+        # T1: every guidance update also refreshes which actions are enabled
+        # so the toolbar reflects the current prerequisites.
+        self._refresh_action_states()
+
+    def _refresh_action_states(self) -> None:
+        """T1: enable/disable toolbar + right-column actions to match the
+        current state. Driven by what's loaded; a button is enabled only
+        when invoking it would actually do something.
+
+        Defensive ``getattr`` checks let this run even before some widgets
+        exist (it's called from ``_update_guidance`` and that fires once
+        from ``__init__`` before the menu and toolbar are fully built)."""
+        has_doc = self._doc is not None or self._rar is not None
+        has_sem = bool(self._sem_images)
+        has_defects = has_sem and any(
+            getattr(im, "has_coords", False) for im in self._sem_images)
+        # GDS overview is only meaningful when there's geometry to draw.
+        seg_gds = getattr(self, "_seg_gds", None)
+        if seg_gds is not None:
+            seg_gds.setEnabled(has_doc)
+        # Fit / Goto operate on the overview pane and need a layout.
+        for name in ("_fit_btn", "_goto_btn", "_goto_edit", "_goto_lbl"):
+            w = getattr(self, name, None)
+            if w is not None:
+                w.setEnabled(has_doc)
+        # Export Alignment needs at least an image list to enumerate rows.
+        align = getattr(self, "_align_btn", None)
+        if align is not None:
+            align.setEnabled(has_sem)
+        # Export OASIS (dev) needs geometry; visibility is still gated by
+        # dev mode in _refresh_dev_ui.
+        oasis = getattr(self, "_export_oasis_btn", None)
+        if oasis is not None:
+            oasis.setEnabled(has_doc)
+        # Right column: Load GDS ROI here needs both a reader and a SEM
+        # image to centre on. Disabling it stops the "OASIS not loaded"
+        # MessageBox firing on a misclick.
+        sem_panel = getattr(self, "sem_panel", None)
+        if sem_panel is not None:
+            roi_btn = getattr(sem_panel, "load_roi_btn", None)
+            if roi_btn is not None:
+                roi_btn.setEnabled(self._rar is not None and has_defects)
+
+    # ── T2: transient status-bar messages auto-revert ────────────────────────
+
+    def _status_state(self, msg: str) -> None:
+        """Set the status-bar's persistent state message. Use for changes
+        that reflect the current loaded state (KLARF loaded, ROI opened, ...).
+        Cancels any pending transient revert."""
+        self._status_state_msg = msg
+        timer = getattr(self, "_status_revert_timer", None)
+        if timer is not None:
+            timer.stop()
+        self._status_doc.setText(msg)
+
+    def _status_transient(self, msg: str, ms: int = 4500) -> None:
+        """Flash a short confirmation in the status bar then revert to the
+        most recent state message. Use for "X complete" style feedback so
+        the bar doesn't pile up stale notifications."""
+        self._status_doc.setText(msg)
+        timer = getattr(self, "_status_revert_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._status_revert_now)
+            self._status_revert_timer = timer
+        timer.start(ms)
+
+    def _status_revert_now(self) -> None:
+        self._status_doc.setText(
+            getattr(self, "_status_state_msg",
+                    "ready — open an OASIS to begin"))
 
     def _build_menu(self) -> None:
         menu = self.menuBar().addMenu("&File")
@@ -6374,7 +6457,7 @@ class MainWindow(QMainWindow):
         self._klarf_path = path
         self.sem_panel.set_images(images)
         with_coords = sum(1 for i in images if i.has_coords)
-        self._status_doc.setText(
+        self._status_state(
             f"KLARF: {len(images)} images ({with_coords} with coords) · "
             f"{Path(path).name}")
         # Overview: frame all defect positions so the FOV marker visibly
@@ -6389,7 +6472,7 @@ class MainWindow(QMainWindow):
         images = sem_loader.load_folder(path)
         self._sem_images = images
         self.sem_panel.set_images(images)
-        self._status_doc.setText(
+        self._status_state(
             f"Folder: {len(images)} images · {Path(path).name}")
         self._update_guidance()
 
@@ -6541,7 +6624,7 @@ class MainWindow(QMainWindow):
         if self._current_sem is not None:
             self._jump_to_image(self._current_sem)
         self._fit_view_to_defects()
-        self._status_doc.setText(
+        self._status_transient(
             f"origin δ set to ({self._origin_dx:,.0f}, {self._origin_dy:,.0f}) nm")
 
     def _on_clear_offset(self) -> None:
@@ -6552,7 +6635,7 @@ class MainWindow(QMainWindow):
         if self._current_sem is not None:
             self._jump_to_image(self._current_sem)
         self._fit_view_to_defects()
-        self._status_doc.setText("origin δ cleared")
+        self._status_transient("origin δ cleared")
 
     # ── F3: multi-POI template + auto fine alignment ─────────────────────────
     def _on_pois_changed(self, entries) -> None:
@@ -7007,7 +7090,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Export failed", str(exc))
             return
-        self._status_doc.setText(
+        self._status_transient(
             f"exported {len(rows)} image(s) → {Path(path).name}")
         if exp_raw or exp_overlay or exp_gray or exp_label:
             self._export_overlay_images(images, exp_raw, exp_overlay,
@@ -7425,7 +7508,7 @@ class MainWindow(QMainWindow):
         # New layout → drop any recipes from a previously-open file.
         self._recipes = []
         lyr_txt = ", ".join(f"L{l}/D{d}" for l, d in layer_keys)
-        self._status_doc.setText(
+        self._status_state(
             f"ROI mode: {Path(path).name} · root '{root}' · {lyr_txt}"
             f" · {len(rar._by_refnum):,} cells indexed · click a SEM image")
         # U9: surface the active OASIS in the title bar so a user with
@@ -7652,7 +7735,7 @@ class MainWindow(QMainWindow):
             return
         self._recipes.remove(rec)
         self._recompute_recipes()
-        self._status_doc.setText(f"deleted expression layer '{name}'")
+        self._status_transient(f"deleted expression layer '{name}'")
 
     # ── M2.1: layer cache export / import ───────────────────────────────────
     def _on_export_cache(self) -> None:
@@ -7691,7 +7774,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Cache export failed", str(exc))
             return
-        self._status_doc.setText(f"cache exported · {Path(path).name}")
+        self._status_transient(f"cache exported · {Path(path).name}")
 
     def _on_export_oasis(self) -> None:
         """F9 M3: export selected raw / Boolean layers to OASIS, optionally
@@ -7733,7 +7816,7 @@ class MainWindow(QMainWindow):
                 self, "Nothing exported",
                 "No geometry fell inside the crop region.")
             return
-        self._status_doc.setText(
+        self._status_transient(
             f"OASIS exported · {Path(path).name} ({n} layer{'s' if n != 1 else ''})")
         if report is not None:
             sidecar = path + ".debug.txt"
@@ -7886,7 +7969,7 @@ class MainWindow(QMainWindow):
         self.layer_panel.set_document(doc)
         self.canvas.set_document(doc)
         self.setWindowTitle(f"GLAS — {Path(path).name} (cache)")
-        self._status_doc.setText(
+        self._status_state(
             f"{Path(path).name} (cache)  ·  {doc.summary()}")
         self._restore_expr_sidecar(path)
 
@@ -7958,7 +8041,7 @@ class MainWindow(QMainWindow):
         dlg = CatalogEditorDialog(self, panel._catalog)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             panel.reload_catalog()
-            self._status_doc.setText(
+            self._status_transient(
                 "catalog saved · PART / CHIP dropdowns refreshed")
 
     def _on_diagnose_oasis(self) -> None:

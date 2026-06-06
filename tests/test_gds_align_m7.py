@@ -143,11 +143,12 @@ class TestRefinements:
     """M7 visual refinements (single-column setup, empty hints, weights)."""
 
     def test_layers_empty_hint(self, mw):
-        # No document -> a non-selectable LAYERS onboarding hint (icon + title
-        # + sub-hint).
+        # No document -> non-selectable LAYERS onboarding hint (icon + title
+        # + "toolbar → Open OASIS…" + "or  File → Load cache…").
         lst = mw.layer_panel.list
-        assert lst.count() == 3
+        assert lst.count() == 4
         assert "Open an OASIS" in lst.item(1).text()
+        assert "Load cache" in lst.item(3).text()
         from PyQt6.QtCore import Qt
         for i in range(lst.count()):
             assert lst.item(i).flags() == Qt.ItemFlag.NoItemFlags

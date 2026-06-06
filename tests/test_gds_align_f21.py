@@ -354,3 +354,60 @@ class TestCatalogEditor:
         dlg._on_add_part()
         # Still exactly one DUP, no silent overwrite.
         assert list(dlg._catalog) == ["DUP"]
+
+
+class TestActionGating:
+    """T1: toolbar + right-column actions enable / disable based on what's
+    currently loaded."""
+
+    def test_initial_state_most_buttons_disabled(self, mw):
+        # No OASIS, no SEM: only "Open OASIS…" (and SEM seg / Load SEM…)
+        # should be live.
+        assert mw._seg_gds.isEnabled() is False
+        assert mw._fit_btn.isEnabled() is False
+        assert mw._goto_btn.isEnabled() is False
+        assert mw._goto_edit.isEnabled() is False
+        assert mw._align_btn.isEnabled() is False
+        assert mw.sem_panel.load_roi_btn.isEnabled() is False
+
+    def test_export_alignment_needs_sem(self, mw):
+        from PyQt6.QtCore import QSettings  # noqa: F401
+        # Pretend SEM images arrived: align button activates, GDS still
+        # disabled (no doc), Load GDS ROI still disabled (no reader).
+        from sem_loader import SemImage
+        mw._sem_images = [SemImage(
+            image_id="D1", filename="a.png",
+            file_path=Path("a.png"), xrel=1.0, yrel=2.0)]
+        mw._refresh_action_states()
+        assert mw._align_btn.isEnabled() is True
+        assert mw._seg_gds.isEnabled() is False
+        assert mw.sem_panel.load_roi_btn.isEnabled() is False
+
+    def test_goto_fit_need_doc(self, mw):
+        # Stub a doc → goto / fit / GDS view become live.
+        mw._doc = gat.GdsDocument()
+        mw._refresh_action_states()
+        assert mw._seg_gds.isEnabled() is True
+        assert mw._fit_btn.isEnabled() is True
+        assert mw._goto_btn.isEnabled() is True
+
+
+class TestStatusTransient:
+    """T2: status-bar messages classified as transient revert after a delay."""
+
+    def test_transient_then_revert(self, mw):
+        mw._status_state("loaded thing")
+        mw._status_transient("did the action", ms=50)
+        assert "did the action" in mw._status_doc.text()
+        mw._status_revert_now()
+        assert "loaded thing" in mw._status_doc.text()
+
+    def test_state_clears_pending_revert(self, mw):
+        # A new state assignment must cancel the previous transient timer
+        # so the state message isn't replaced by a stale revert.
+        mw._status_state("initial state")
+        mw._status_transient("transient", ms=10_000)
+        mw._status_state("new state")
+        assert mw._status_revert_timer is not None
+        assert mw._status_revert_timer.isActive() is False
+        assert mw._status_doc.text() == "new state"

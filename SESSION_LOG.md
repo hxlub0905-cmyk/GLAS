@@ -4,6 +4,48 @@
 
 ---
 
+## [2026-06-05] [UX] T1 + T2 + T3 — toolbar gating / 訊息自動清除 / LAYERS hint 加 cache 路徑
+
+**變更類型：** UX 細節三條（按鈕 disabled 邏輯 + 狀態列 transient revert + 空狀態
+hint）·  **狀態：完成**
+
+**動機：** Toolbar 上很多按鈕（GDS / Fit / Goto / Export Alignment / Export OASIS）
+在沒前置條件時還是恆亮，點下去要嘛沒反應、要嘛 QMessageBox 罵人。狀態列訊息（catalog
+saved、cache exported…）永久停留、累積 noise。U3 把 Load Cache 移進 File menu 後，空
+LAYERS panel 完全沒提示有「載 cache」這條替代路徑。
+
+**T1 — 按鈕 gating：** 新增 `MainWindow._refresh_action_states()`，從
+`_update_guidance()` 末尾呼叫（既有觸發點已涵蓋所有相關時機，不必新增 hook）。toolbar
+按鈕引用搬到 `self._fit_btn` / `self._goto_btn` / `self._goto_edit` / `self._goto_lbl`
+/ `self._align_btn`，加上 `self._seg_gds` / `self._export_oasis_btn` 共同套
+enable/disable：
+- `seg_gds` / `Fit` / `Goto*` 需要 `_doc` 或 `_rar`
+- `Export Alignment` 需要 `_sem_images`
+- `Export OASIS` 需要 doc（且仍由 dev mode 控制 visibility）
+- 右欄 `Load GDS ROI here` 需要 `_rar` + 有座標的 SEM image
+- `Open OASIS…` / `Load SEM…` 永遠 enabled
+
+**T2 — 狀態列 transient revert：** 新增 `_status_state(msg)` / `_status_transient(msg,
+ms=4500)` / `_status_revert_now()` helper。state 訊息存 `_status_state_msg`、
+transient 訊息 4.5 秒後自動 revert 回 state。轉換的呼叫站：
+- **State**（永久）：KLARF / Folder 載入、ROI mode 開啟、cache 載入
+- **Transient**（自動清）：origin δ set / cleared / nudged、cache exported、OASIS
+  exported、alignment exported、catalog saved、deleted expression
+- 其他 inline validation 訊息（fine align / preview 等）維持原樣，會被下一個狀態變更
+  自然蓋掉。
+
+**T3 — LAYERS hint：** `_show_empty_hint` 加第二行「or  File → Load cache…」（4 row
+instead of 3）。
+
+**測試：** 全套件 **672 passed**（+5：3 action gating + 2 status transient）。修兩
+個既有 layers-empty-hint count 測試（3 → 4 rows）。
+
+**影響檔案：** `glas/app/gds_align_tool.py`、`tests/test_gds_align_f21.py`、
+`tests/test_gds_align_m6.py`、`tests/test_gds_align_m7.py`、`SESSION_LOG.md`。
+**PR：** #11
+
+---
+
 ## [2026-06-05] [UX] T4 — 把 GLAS wordmark 從 toolbar 搬到 status bar 並帶版本號
 
 **變更類型：** UX 微調（toolbar 減重 + 版本辨識） ·  **狀態：完成**
