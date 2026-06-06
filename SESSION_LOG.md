@@ -4,6 +4,36 @@
 
 ---
 
+## [2026-06-05] [UX] T5 + T6 + T7 + T8 — wizard polish + Load ROI 文案
+
+**變更類型：** UX wizard / 文案 batch（4 條） ·  **狀態：完成**
+
+**動機：** T1/T2/T3 完工後剩四條 polish：(5) wizard 每次 Browse 從 home dir 開、(6)
+wizard subtitle Qt 預設灰得幾乎看不見、(7) Load GDS ROI 按鈕載過後仍叫「Load…」讓人
+以為要再載一次、(8) wizard Next 按鈕跟 Cancel 同色視覺平等。
+
+**改動：**
+- **T5** `_FilePickPage._on_browse` 用 `QSettings("GLAS","GLAS")` key
+  `"wizard/last_oas_dir"` 存上次選的目錄，下次預填當作 `QFileDialog.getOpenFileName`
+  的起始路徑。
+- **T6** 新增 helper `_wizard_subtitle(html)` 把 subtitle 文字包進
+  `<span style="color:{_TK_TEXT_PRI}; font-size:12px;">…</span>`；3 頁 setSubTitle
+  都改走它，subtitle 對比拉到跟 title 同色系（沿用 design tokens）。
+- **T7** `MainWindow._refresh_action_states` 加 already-loaded 偵測：當
+  `_doc.entries` 非空且 `_current_sem` 存在時，右欄 Load GDS ROI 按鈕文字改成
+  「Reload GDS ROI  ▶」；未載入時維持「Load GDS ROI here  ▶」。
+- **T8** `OpenOasisWizard.__init__` 末尾抓 `button(NextButton)` /
+  `button(FinishButton)` 套 accent QSS：橘底白字 / 圓角 4 / padding 5×16 / hover 變
+  深橘 / disabled 變淡米色 + 灰字。Cancel 維持中性樣式，視覺權重 Next >> Cancel。
+
+**測試：** 全套件 **677 passed**（+5）：T5 browse-remembers-last-dir、T6 subtitle 有
+顏色 span、T7 label flips 兩個 case、T8 next button accent qss。
+
+**影響檔案：** `glas/app/gds_align_tool.py`、`tests/test_gds_align_f20.py`、
+`tests/test_gds_align_f21.py`、`SESSION_LOG.md`。 **PR：** #11
+
+---
+
 ## [2026-06-05] [UX] T1 + T2 + T3 — toolbar gating / 訊息自動清除 / LAYERS hint 加 cache 路徑
 
 **變更類型：** UX 細節三條（按鈕 disabled 邏輯 + 狀態列 transient revert + 空狀態

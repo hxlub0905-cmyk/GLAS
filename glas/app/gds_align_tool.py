@@ -503,16 +503,27 @@ def roi_document_from_reader(rar, root, layer_keys, roi_bbox, cancel_cb=None,
 # ── F20: Open OASIS Wizard ──────────────────────────────────────────────────
 
 
+def _wizard_subtitle(html: str) -> str:
+    """T6: Qt's default subtitle colour is so washed out the text is hard
+    to read on the wizard's cream background. Wrap in an explicit primary
+    text colour + slightly larger size so subtitles are first-class copy."""
+    return (f'<span style="color:{_TK_TEXT_PRI.name()}; font-size:12px;">'
+            f'{html}</span>')
+
+
 class _FilePickPage(QWizardPage):
     """Step 1 — pick the .oas file and surface its index status."""
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setTitle("Step 1 — Pick an OASIS file")
-        self.setSubTitle(
+        # T6: wizard subtitles use Qt's default washed-out grey; wrap in an
+        # explicit colour span so the text actually reads against the
+        # warm-cream wizard background.
+        self.setSubTitle(_wizard_subtitle(
             "Choose the layout (.oas) file to align against your SEM "
             "images. Large files are fine — only ROI geometry is loaded "
-            "on demand.")
+            "on demand."))
 
         v = QVBoxLayout(self)
         v.setSpacing(8)
@@ -547,12 +558,20 @@ class _FilePickPage(QWizardPage):
         self._file_path: Optional[str] = None
         self._has_offsets = False
 
+    _SETTINGS_LAST_DIR = "wizard/last_oas_dir"
+
     def _on_browse(self) -> None:
+        # T5: remember the last directory the user picked from, so the next
+        # time they Open OASIS the dialog opens in the right place. Files
+        # are routinely big and live in one or two project folders.
+        settings = QSettings("GLAS", "GLAS")
+        start = str(settings.value(self._SETTINGS_LAST_DIR, "", type=str) or "")
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open OASIS", "",
+            self, "Open OASIS", start,
             "OASIS files (*.oas *.oasis);;All files (*)")
         if not path:
             return
+        settings.setValue(self._SETTINGS_LAST_DIR, str(Path(path).parent))
         self._edit.setText(path)
         self._update_info(path)
         self.completeChanged.emit()
@@ -609,10 +628,10 @@ class _LayerPickPage(QWizardPage):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setTitle("Step 2 — Pick layers to load")
-        self.setSubTitle(
+        self.setSubTitle(_wizard_subtitle(
             "GLAS only loads the layers you need — picking 1–3 is the norm. "
             "Click Scan to discover what's in the file, or type "
-            "<code>layer/datatype</code> pairs directly.")
+            "<code>layer/datatype</code> pairs directly."))
 
         v = QVBoxLayout(self)
         v.setSpacing(8)
@@ -756,10 +775,10 @@ class _RootCellPage(QWizardPage):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setTitle("Step 3 — Pick the root cell")
-        self.setSubTitle(
+        self.setSubTitle(_wizard_subtitle(
             "The root cell is the top of the layout hierarchy — usually the "
             "whole chip. The recommended default is named ‘top’ or ‘merge’; "
-            "if your file uses a different convention, override below.")
+            "if your file uses a different convention, override below."))
 
         v = QVBoxLayout(self)
         v.setSpacing(8)
@@ -842,6 +861,24 @@ class OpenOasisWizard(QWizard):
         self.addPage(self._file_page)
         self.addPage(self._layer_page)
         self.addPage(self._root_page)
+
+        # T8: keep the Next / Finish button accent-orange so the eye is
+        # pulled to the forward action — Qt's default leaves it visually
+        # tied with Cancel. Disabled state still reads as muted.
+        accent = _TK_ACCENT.name()
+        accent_dk = _TK_ACCENT_DK.name()
+        next_qss = (
+            f"QPushButton {{ background:{accent}; color:#ffffff; "
+            f"border:1px solid {accent_dk}; border-radius:4px; "
+            f"padding:5px 16px; font-weight:700; }}"
+            f"QPushButton:hover {{ background:{accent_dk}; }}"
+            f"QPushButton:disabled {{ background:#f6e5cf; "
+            f"color:#cdb89b; border:1px solid #e6d2b0; }}")
+        for which in (QWizard.WizardButton.NextButton,
+                      QWizard.WizardButton.FinishButton):
+            btn = self.button(which)
+            if btn is not None:
+                btn.setStyleSheet(next_qss)
 
     # Public accessors (used by MainWindow._on_open_roi after exec()).
 
@@ -6310,12 +6347,20 @@ class MainWindow(QMainWindow):
             oasis.setEnabled(has_doc)
         # Right column: Load GDS ROI here needs both a reader and a SEM
         # image to centre on. Disabling it stops the "OASIS not loaded"
-        # MessageBox firing on a misclick.
+        # MessageBox firing on a misclick. T7: once geometry has been
+        # loaded for the current image, the action is actually a re-load
+        # (after FOV / chip change) — flip the label so it doesn't read
+        # as "I haven't loaded anything yet" once a defect is open.
         sem_panel = getattr(self, "sem_panel", None)
         if sem_panel is not None:
             roi_btn = getattr(sem_panel, "load_roi_btn", None)
             if roi_btn is not None:
                 roi_btn.setEnabled(self._rar is not None and has_defects)
+                already_loaded = (
+                    self._doc is not None and bool(self._doc.entries)
+                    and self._current_sem is not None)
+                roi_btn.setText("Reload GDS ROI  ▶" if already_loaded
+                                else "Load GDS ROI here  ▶")
 
     # ── T2: transient status-bar messages auto-revert ────────────────────────
 

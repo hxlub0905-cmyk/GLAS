@@ -411,3 +411,29 @@ class TestStatusTransient:
         assert mw._status_revert_timer is not None
         assert mw._status_revert_timer.isActive() is False
         assert mw._status_doc.text() == "new state"
+
+
+class TestLoadRoiButtonLabel:
+    """T7: the right column's Load GDS ROI button changes label after the
+    current image's ROI has been loaded, so it no longer reads "I haven't
+    loaded anything"."""
+
+    def test_label_before_load(self, mw):
+        assert "Load GDS ROI here" in mw.sem_panel.load_roi_btn.text()
+
+    def test_label_flips_to_reload_when_doc_has_entries(self, mw):
+        # Simulate an active session: reader + current image + non-empty doc.
+        from sem_loader import SemImage
+        from gds_align_tool import LayerEntry, LayerKey
+        import numpy as np
+        mw._rar = object()        # any non-None sentinel
+        mw._sem_images = [SemImage(
+            image_id="D1", filename="a.png",
+            file_path=Path("a.png"), xrel=1.0, yrel=2.0)]
+        mw._current_sem = mw._sem_images[0]
+        doc = gat.GdsDocument()
+        doc.entries = [LayerEntry(key=LayerKey(17, 0),
+                                  polygons=[np.zeros((4, 2))])]
+        mw._doc = doc
+        mw._refresh_action_states()
+        assert "Reload" in mw.sem_panel.load_roi_btn.text()

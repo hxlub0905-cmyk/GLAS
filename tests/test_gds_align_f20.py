@@ -145,3 +145,42 @@ class TestMainWindowOpenROI:
     def test_legacy_dialogs_removed(self):
         assert not hasattr(gat, "LayerFilterDialog")
         assert not hasattr(gat, "LayerPickDialog")
+
+
+class TestWizardPolish:
+    """T5–T8 wizard polish."""
+
+    def test_browse_remembers_last_dir(self, wiz, tmp_path, monkeypatch):
+        # T5: clicking Browse stores the directory in QSettings so the
+        # next session opens the file picker in the same place.
+        from PyQt6.QtCore import QSettings
+        from PyQt6.QtWidgets import QFileDialog
+        sample = tmp_path / "design.oas"
+        sample.write_bytes(b"\x00" * 32)
+        # Stub the modal QFileDialog so the test is non-interactive.
+        monkeypatch.setattr(
+            QFileDialog, "getOpenFileName",
+            staticmethod(lambda *a, **k: (str(sample), "")))
+        wiz._file_page._on_browse()
+        stored = QSettings("GLAS", "GLAS").value(
+            wiz._file_page._SETTINGS_LAST_DIR, "", type=str)
+        assert stored == str(tmp_path)
+
+    def test_subtitles_have_explicit_colour(self, wiz):
+        # T6: subtitle text wraps in a coloured <span> so it doesn't read
+        # as Qt's default washed-out grey.
+        for page in (wiz._file_page, wiz._layer_page, wiz._root_page):
+            sub = page.subTitle()
+            assert "color:" in sub
+            assert "span" in sub
+
+    def test_next_button_has_accent_stylesheet(self, wiz):
+        # T8: Next / Finish buttons carry an accent stylesheet so the
+        # forward action visually dominates Cancel.
+        from PyQt6.QtWidgets import QWizard
+        for which in (QWizard.WizardButton.NextButton,
+                      QWizard.WizardButton.FinishButton):
+            btn = wiz.button(which)
+            qss = btn.styleSheet()
+            # Either the accent or accent-dark colour should appear.
+            assert ("#f29f4b" in qss.lower() or "#c97028" in qss.lower())
