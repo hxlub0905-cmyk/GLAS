@@ -39,6 +39,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import oasis_streamer as oas      # noqa: E402
+import devlog                      # noqa: E402  (dev-mode coloured tags)
 import layerscan_cache             # noqa: E402  (F12 M3: layer-scan sidecar)
 import cellcache                   # noqa: E402  (F16-B: decoded-cell sidecar)
 from oasis_store import Placement  # noqa: E402
@@ -83,12 +84,14 @@ def set_debug(on: bool, level: int = 1) -> None:
 
 def _dbg(msg: str) -> None:
     if DEBUG:
-        print(f"[roi] {msg}", file=sys.stderr, flush=True)
+        print(f"{devlog.tag('roi', stream=sys.stderr)} {msg}",
+              file=sys.stderr, flush=True)
 
 
 def _trace(msg: str) -> None:
     if TRACE:
-        print(f"[roi] {msg}", file=sys.stderr, flush=True)
+        print(f"{devlog.tag('roi', stream=sys.stderr)} {msg}",
+              file=sys.stderr, flush=True)
 
 
 def _hexdump(buf: bytes, center: int, span: int = 12) -> str:
@@ -568,7 +571,8 @@ class RandomAccessReader:
     def __init__(self, path: str | Path,
                  wanted_layers: Optional[set[LayerKey]] = None,
                  *, dtype=np.int32,
-                 bbox_layer: Optional[LayerKey] = None) -> None:
+                 bbox_layer: Optional[LayerKey] = None,
+                 prebuilt_index: Optional[dict] = None) -> None:
         self._path = Path(path)
         self._dtype = dtype
         # A per-cell boundary layer (e.g. CE 108/250): one rectangle whose
@@ -596,7 +600,18 @@ class RandomAccessReader:
         self._reader = oas.OasisReader(
             path, wanted_layers=wanted_layers,
             defer_repetition=True, shared_buf=shared)
-        idx = oas.scan_cell_offsets(path, shared_buf=shared)
+        # F23 M1: the name-table scan is the dominant per-reader build cost on
+        # big production files. When a caller already holds the index (the GUI's
+        # main reader does), it can hand it in via ``prebuilt_index`` so this
+        # reader skips the rescan. The dict is exactly what scan_cell_offsets
+        # returns (all plain dict/list/int -> picklable across the spawn pool);
+        # the mmap'd ``_reader`` above is still built normally since the worker
+        # needs it to decode geometry. The injected index must match this file
+        # (caller's responsibility — the batch pool keys on the file path).
+        idx = (prebuilt_index if prebuilt_index is not None
+               else oas.scan_cell_offsets(path, shared_buf=shared))
+        # Kept so this reader can in turn hand its index to another (index_snapshot).
+        self._idx = idx
         self._by_refnum: dict[int, int] = idx["by_refnum"]
         self._by_name: dict[str, int] = idx["by_name"]
         # OASIS START `unit` = grid steps per micron. Raw coordinates are in
@@ -649,7 +664,15 @@ class RandomAccessReader:
         clones, so N readers do not cost N× the RAM."""
         return RandomAccessReader(
             self._path, wanted_layers=self._init_wanted,
-            dtype=self._dtype, bbox_layer=self._bbox_layer)
+            dtype=self._dtype, bbox_layer=self._bbox_layer,
+            prebuilt_index=self._idx)
+
+    def index_snapshot(self) -> dict:
+        """The name-table index (F23 M1), shaped like ``scan_cell_offsets``'s
+        return. Hand it to another ``RandomAccessReader`` over the *same file*
+        via ``prebuilt_index=`` so it skips the rescan. All values are plain
+        dict/list/tuple/int, so this is picklable across the spawn pool."""
+        return self._idx
 
     def close(self) -> None:
         """Release the file map (F6 M2). Drops the shared-buffer wrappers

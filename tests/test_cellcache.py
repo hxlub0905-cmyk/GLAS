@@ -175,7 +175,10 @@ class TestSidecarIO:
 
         # Different wanted-layers tag -> different entry (miss).
         assert cellcache.load(src, 0, {(99, 0)}) is None
-        # Touch the source (size change) -> stale -> miss.
+        # Touch the source (size change) -> stale -> miss. Release the reader's
+        # mmap first: on Windows a live mapping locks the file and blocks the
+        # rewrite (OSError 22); POSIX would allow it, so this only bit Windows.
+        rar.close()
         src.write_bytes(data + b"\x00")
         assert cellcache.load(src, 0, {(17, 0)}) is None
 

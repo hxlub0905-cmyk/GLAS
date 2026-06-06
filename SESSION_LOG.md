@@ -4,6 +4,113 @@
 
 ---
 
+## [2026-06-07] [devlog] dev-mode 終端機輸出上色分類 + 主控台編碼防呆
+
+**變更類型：** DX / 可讀性 · **狀態：完成**（同 branch claude/f23-batch-align-startup-accel）
+
+**動機現象：** dev mode 會把多類診斷訊息噴到終端機（`[roi]` reader/load、`[fa-timing]` 批次計時、
+`[jump]` 座標換算、`[gds-align]` 模式 banner），user 反映「一大片資訊」難讀、希望上色分類。
+
+**實作：**
+- 新增 `glas/core/devlog.py`（Qt-free、純 stdlib）：依類別給 `[tag]` 上色（roi=cyan、fa-timing=
+  magenta、jump=yellow、gds-align=green），`paint()` / `dim()` 輔助。**安全偵測**是否支援色彩：
+  `NO_COLOR`/`GLAS_NO_COLOR` → 純文字（opt-out）；`PYCHARM_HOSTED` → 上色（PyCharm console 吃 ANSI
+  但非 TTY）；真 TTY → 上色並一次性開 Windows VT（ENABLE_VIRTUAL_TERMINAL_PROCESSING）；其餘（導檔/
+  dumb）→ 純文字，確保不把 `\033[` 漏進 log。spawn worker 可如一般 core 模組 import。
+- 把 `oasis_random._dbg/_trace`、`fine_align._record_timing`、app 的 `[roi]×4 / [jump] / [gds-align]×2`
+  前綴改用 `devlog.tag(...)`。`[fa-timing]` 另把 poi/match 中較大者 **bold** 標出，瓶頸一眼可見；pid/n 用 dim。
+- **主控台編碼防呆：** 既有診斷訊息含 `·`、`µm`、`──` 等非 ASCII，在 cp950（繁中 Windows）裸終端機會
+  `UnicodeEncodeError` 中斷 print。`main()` 與 worker `_pool_init` 把 stdout/stderr `reconfigure(encoding=
+  "utf-8", errors="replace")`，PyCharm（本就 UTF-8）為 no-op。
+
+**測試：** `test_devlog.py`（9 項：TTY 上色 / 非 TTY 純文字 / NO_COLOR / GLAS_NO_COLOR / PYCHARM_HOSTED /
+未知類別 / paint / dim）。`pytest tests/` 707 passed（含先前修好的 cellcache，0 fail）。
+
+**影響檔案：** 新增 `glas/core/devlog.py` · `tests/test_devlog.py`；改 `glas/core/oasis_random.py`、
+`glas/core/fine_align.py`、`glas/app/gds_align_tool.py`。
+
+---
+
+## [2026-06-07] [batch-perf] Batch run 途中加速：raw POI 跳過被丟棄的 unary_union + 分段計時儀表
+
+**變更類型：** 效能優化 + 診斷工具 · **狀態：完成**（接續 F23、同 branch
+claude/f23-batch-align-startup-accel）
+
+**動機現象：** F23 解決「批次啟動延遲」後，user 要求探查「batch run **途中**」的加速點。實測各
+per-image 階段（worker 內單執行緒）：matchTemplate 3ms(512²)/14ms(1024²)/62ms(2048²)、rasterize+blur
+可忽略、**matchTemplate 多執行緒無加速**（故 cv2 pin 單執行緒零損失）；shapely `unary_union` 隨形狀數
+陡升（200→5ms、1k→34ms、5k→258ms、20k→1095ms）。
+
+**頭號發現 + 修復：** `poi_polys_for_roi`（batch fine-align 唯一入口、只用 polys 做模板）對 **raw POI**
+仍呼叫 `poi_polys_and_geometry_for_roi`，後者算了一個 `unary_union` 卻被 `[0]` 丟掉——密集 FOV 每張白燒
+30ms~1s。修：raw POI 直接回傳 `_walk_roi_polys` 結果、不算 geometry（模板 rasterize 對重疊 polys 冪等、
+不需 union）；expression POI 仍走全路徑（boolean 需 geometry）。
+
+**分段計時儀表（診斷）：** `_fine_align_image` 加 4 段 perf_counter（read / poi(walk+bool) / template /
+match）。**綁定既有 dev mode**：`_apply_fa_timing()`（`__init__` 依持久化 dev_mode 套用、`_set_dev_mode`
+切換時套用並 `batch_pool.shutdown()` 讓 worker 重生繼承新 env）設 `fine_align._FA_TIMING`（in-thread 路徑）
++ `GLAS_FA_TIMING` env（spawn worker 繼承）——**免手設環境變數，開 dev mode 就有**，輸出印到 console。
+每個 worker 第 1 張即印一行（小批<worker 數也看得到，n==1 含冷 walk）、之後每 `GLAS_FA_TIMING_EVERY`
+（預設 25）張印一次平均。off 時僅 4 個 perf_counter（奈秒級）、production 路徑不受影響。供在**真實檔案**上量
+walk+shapely vs match 佔比、據以決定後續 #2(expr 同層去重)/#3(matchTemplate 金字塔)。
+
+**順手修 [Bxx] cellcache 測試 Windows bug：** `test_save_load_and_invalidate` 在 `RandomAccessReader`
+開著 mmap 時 `src.write_bytes(...)` 重寫來源檔，Windows mmap 鎖檔 → `OSError 22`（POSIX 不鎖故只在 Windows
+壞、user 實機 + clean tree 皆 fail）。修：重寫前先 `rar.close()` 釋放 mmap。`pytest tests/` 由 697+1fail
+→ **698 全綠**。
+
+**其餘脈絡：** ROI walk 已有 per-worker memo + `cellcache` 磁碟 sidecar（大 cell 跨 worker/session 重用）+
+S_BOUNDING_BOX 免解碼剪枝；殘留僅「批次第一波 K worker 同時撞同一大 cell」、跨 process 不易治、列為低優先。
+
+**測試：** `TestRawPoiSkipsUnion`（raw 路徑不呼叫 `polys_to_geometry`、polys 與全路徑 `[0]` 完全相等）+
+timing 累加測試；env-gated 儀表實機驗證會印。`pytest tests/` 697 passed（唯一 fail 為既有 Windows 暫存
+路徑問題、與本案無關）。
+
+**影響檔案：** `glas/core/fine_align.py`、`glas/app/gds_align_tool.py`、
+`tests/test_accel_equivalence.py`、`tests/test_cellcache.py`。
+
+---
+
+## [2026-06-07] [F23] Batch Align 啟動延遲加速：注入索引 + 常駐/預熱 process pool
+
+**變更類型：** 效能優化（並行模型）· **狀態：完成 [F23]**（M1+M2）·
+**Branch：** claude/f23-batch-align-startup-accel
+
+**動機現象：** user 回報每次按 **Batch Align → Run all** 之前都有一段明顯啟動延遲、UI 像卡住。
+追碼 + 實測（spawn pool k=4→0.28s、k=8→0.38s、k=20→0.87s）確認延遲來自
+`FineAlignAllWorker._run_process_pool` 每次都**重新** spawn 一個 process pool、用完即 `shutdown`，
+成本兩塊：(1) K 個直譯器冷啟 + 重 import numpy/cv2/shapely/oasis；(2) 每個 worker 各自重跑一次
+`scan_cell_offsets` 重掃 name table——而主行程 `self._rar` 早已建好這份索引（純 dict 可 pickle）。
+
+**修復實作：**
+- **M1 注入既有索引：** `RandomAccessReader.__init__` 加 `prebuilt_index=` kwarg（有值即跳過
+  `scan_cell_offsets`，mmap/OasisReader 照建以供幾何解碼）；加 `index_snapshot()`；`clone()` 轉發索引。
+  `_pool_init` 加 `prebuilt_index`，`_run_process_pool` 的 initargs 帶 `rar.index_snapshot()`。
+  消掉 K× 重掃（隨 cell 數放大、第一次跑就受益）。
+- **M2 常駐/預熱 pool：** 新增 `fine_align._BatchPool`（session 單例 `batch_pool`，RLock 保護），
+  key=`(path, wanted, dtype, bbox, workers)`；`get()` 同 key 重用、異 key 關舊建新；`ensure_warm()`
+  背景預熱、對同 key 冪等。`_pool_init` 只建 reader、`root/poi_specs/cfg` 改 per-task 隨
+  `_pool_task` 傳（本就已 pickle，故 POI/半徑變更仍重用暖 pool）。`_run_process_pool` 改用
+  `batch_pool.get()` 且不再 per-batch shutdown。GUI：`_maybe_prewarm_batch_pool()` 於
+  `_on_pois_changed` / KLARF / folder 載入時背景預熱（門檻 SEM>2、`_prewarming` 防重入）；
+  `closeEvent` + 開新 OASIS 時 `shutdown()`。
+- **M2 idle-timeout（記憶體控管）：** 暖 pool 整 session 佔 K 份 mmap+索引，故加 idle auto-release
+  —— `_BatchPool(idle_timeout=)` 預設 300s，閒置（無批次在跑）逾時自動釋放 worker。安全：批次以
+  `lease()`（busy refcount）持有，timer 只在 `_inuse==0` 武裝、acquire 取消、fire 時再驗 `_inuse==0`，
+  **絕不在批次中途殺 worker**。
+
+**測試：** `TestPrebuiltIndex`（注入 vs 重掃等價：by_refnum/by_name/unit/layernames/sbbox/
+offset_flag 全等、ROI 幾何一致、clone 共用索引）；`TestBatchPoolManager`（fake executor：重用/重建/
+shutdown/warm 冪等）；更新 `test_accel_equivalence` 的 `_pool_init/_pool_task` 新簽名；real-spawn smoke
+驗證暖 pool 結果 == 順序；idle-timeout 以 fake-executor 確定性測試（閒置釋放 / 批次中不釋放 / lease 重新武裝 /
+短 timer 端到端）+ real-spawn smoke（lease==順序、重用、自動釋放）。`pytest tests/` 695 passed
+（唯一 fail 為既有 Windows 暫存路徑問題、與本案無關）。
+
+**影響檔案：** `glas/core/oasis_random.py`、`glas/core/fine_align.py`、`glas/app/gds_align_tool.py`、
+`tests/test_oasis_random.py`、`tests/test_accel_equivalence.py`、`docs/plans/F23-batch-align-startup-accel.md`。
+
+---
+
 ## [2026-06-05] [PR #11 UX polish] 實機回饋驅動的 30+ 條細節整理（U/S/T 三輪 + Minimap 移除 + Codex review fix）
 
 **變更類型：** UX 細節 batch（多輪 user 實機回饋累積、本日連續推進，已合併）·
