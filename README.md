@@ -33,6 +33,16 @@ alignment offset 供下游量測工具使用。
   的影像（下游免 fallback）。
 - **批次加速**：Run all 與 image 匯出皆多進程平行（spawn process pool）。Fine Align 面板
   「Parallel workers」可調並行度（0 = auto，每核一個、cap 16）；大量影像時明顯縮短時間。
+  **F23 啟動加速**：Batch Align pool 改為常駐/預熱（session 期間重用同一組 worker，
+  按下 Run all 不再重新 spawn；索引一次性注入 worker 省去 K× 重掃 name table）；
+  idle 超過 300s 自動釋放（記憶體控管）。
+- **PART/CHIP catalog + Wizard**：fab 工程師以 PART / CHIP 下拉選定 chip，工具自動帶入
+  chip corner / FOV / nm-per-px，取代原本 6 欄手填的 Coordinate Setup。
+  Open OASIS 改為三頁 Wizard（檔案選擇 → layer 選擇 → root cell），首次啟動有 Welcome
+  五頁 onboarding；UI 各區塊依載入狀態 enable/disable、狀態列顯示即時狀態。
+- **開發者模式終端機着色**：dev mode 下診斷訊息依類別上色（`[roi]` cyan、`[fa-timing]` magenta
+  等），Non-TTY / `NO_COLOR` 自動降純文字；fine-align 各階段（read / poi / template / match）
+  有分段計時儀表（批次 dev mode 自動啟用）。
 - **OASIS 匯出**（開發者模式）：把選定的 raw layer + Boolean 合成 layer 反向寫出成 `.oas`（自寫
   writer、不依賴 klayout / gdstk，KLayout 可開）。匯出範圍可選 **目前 FOV**（可再以 GDS 座標框裁剪
   特定 ROI）或 **整顆 chip**（分 tile 串流走訪 + 全 chip 重算 Boolean，記憶體受單一 tile 控制）。入口在
@@ -89,5 +99,5 @@ MMH 未來透過 GLAS 匯出的 alignment CSV（`image_id` join）做 Recipe ROI
 ## 測試
 
 ```bash
-pytest tests/ -v          # ~218 項（OASIS parser / 座標 / Boolean / 對位 / KLARF 載入）
+pytest tests/ -v          # ~707 項（OASIS parser / 座標 / Boolean / 對位 / KLARF 載入 / catalog / batch accel）
 ```
