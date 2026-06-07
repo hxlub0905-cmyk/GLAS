@@ -4,6 +4,27 @@
 
 ---
 
+## [2026-06-07] [doc-sync] README / CLAUDE.md 文件整理
+
+**變更類型：** 文件同步 · **狀態：完成**
+
+**動機：** README 與 CLAUDE.md 的測試計數、目錄結構、功能描述停在舊版（F21/F23/devlog
+完成前），與現況不符。
+
+**修改內容：**
+- **README.md**：測試計數 `~218` → `~707`；Features 補充 F21 PART/CHIP catalog + Wizard +
+  Welcome dialog、F23 batch pool 常駐/預熱加速、dev mode 終端機着色 + 分段計時儀表。
+- **CLAUDE.md §3**：測試計數 `~218` → `~707`。
+- **CLAUDE.md §4 目錄**：補 `fine_align.py`（F8/F14/F23 batch pool）、`parts_catalog.py`
+  （F21 catalog model）、`devlog.py`（終端機着色）；`gds_layer_cache.py` 備註 v4/v5；
+  tests 計數更新。
+- **CLAUDE.md §5.2**：§並行模型補 F23 `_BatchPool` 說明。
+
+**影響檔案：** `README.md`、`CLAUDE.md`、`SESSION_LOG.md`。
+**Branch：** claude/loving-brown-XwlrJ
+
+---
+
 ## [2026-06-07] [devlog] dev-mode 終端機輸出上色分類 + 主控台編碼防呆
 
 **變更類型：** DX / 可讀性 · **狀態：完成**（同 branch claude/f23-batch-align-startup-accel）

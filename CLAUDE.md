@@ -64,7 +64,7 @@ read-only 探索（沒動任何檔案）才可略過。
 
 ```bash
 python main.py                          # 啟動 GUI
-pytest tests/ -v                        # 完整測試（~218 項，需 numpy / cv2 / shapely / PyQt6）
+pytest tests/ -v                        # 完整測試（~707 項，需 numpy / cv2 / shapely / PyQt6）
 python3 -m py_compile <file>            # 修改後語法檢查
 ```
 
@@ -93,9 +93,12 @@ GLAS/
 │   │   │                        #   + F12 enumerate_layers/sample_layers（無 LAYERNAME 時 bounded 抽樣列 layer）
 │   │   │                        #   + F16 sbbox_for：有 S_BOUNDING_BOX 時 reachable_bbox 免解幾何直接剪枝
 │   │   ├── layerscan_cache.py   # F12 layer 列舉結果 sidecar 快取（keyed by mtime+size+params）
+│   │   ├── fine_align.py        # F8/F14 batch fine-align worker + _BatchPool 常駐 pool（F23）
+│   │   ├── parts_catalog.py     # F21 PART/CHIP catalog data model（ChipSpec/PartSpec，無 Qt）
+│   │   ├── devlog.py            # 終端機上色分類 log（tag/paint/dim，ANSI 安全偵測，無 Qt）
 │   │   ├── gds_fov.py           # KLARF↔GDS 座標換算 + FOV 空間查詢
 │   │   ├── gds_boolean.py       # 遞迴下降 parser + shapely Boolean 引擎 + mask
-│   │   ├── gds_layer_cache.py   # layer .npz cache + metadata
+│   │   ├── gds_layer_cache.py   # layer .npz cache + metadata（schema v4/v5）
 │   │   ├── cellcache.py         # F16-B：大 cell 解碼結果 + placement prep 的 sidecar 快取（欄狀 .npz）
 │   │   └── klarf_parser.py      # KLARF I/O（自 MMH 複製，純標準庫）
 │   └── app/                 # 🖼 PyQt6 app 殼
@@ -104,7 +107,7 @@ GLAS/
 │       ├── styles.py            # QSS 設計 token（自 MMH 複製）
 │       ├── collapsible.py       # CollapsibleSection widget（自 MMH 複製）
 │       └── icons/               # Lucide-style SVG icon set（自 MMH 複製）
-├── tests/                   # ~218 項（test_oasis_* / test_gds_* / test_sem_loader）
+├── tests/                   # ~707 項（test_oasis_* / test_gds_* / test_sem_loader / test_parts_catalog / test_cellcache / test_devlog / test_accel_*）
 │   └── fixtures/sample_real.klarf
 └── docs/plans/              # plan 檔（_template.md + F2 design history）
 ```
@@ -144,12 +147,14 @@ sem_loader 載 KLARF（die-corner XREL/YREL）→ 選 PART/CHIP（PartChipPanel 
   `gray[label==id]` 取 ROI；取代 F13 binary mask；manifest schema mmh-gds-overlay-v2 帶 label_map）
 ```
 
-**並行模型（F8/F14）：** batch fine-align（`FineAlignAllWorker`）與 image 匯出
+**並行模型（F8/F14/F23）：** batch fine-align（`FineAlignAllWorker`）與 image 匯出
 （`OverlayExportWorker`，含 raw/overlay/gray/label）的 per-image 工作都是獨立的，跑在 spawn-based `ProcessPoolExecutor`
 （compute 抽到 Qt-free 的 `fine_align` / `overlay_export`，worker 各自重建 reader）。worker 數
 由 `fine_align.batch_worker_count`（UI「Parallel workers」override；0=auto=每核一個 cap 16）決定，
 worker 內 `cv2.setNumThreads(1)` 避免「多進程 × cv2 多執行緒」oversubscription。小批 / raw-only
-走 in-thread fallback。
+走 in-thread fallback。**F23 常駐 pool**：`fine_align._BatchPool`（session 單例 `batch_pool`）在
+相同 key（path/layers/workers…）下跨多次 Run all 重用同一組 worker，索引透過 `index_snapshot()`
+一次注入（省 K× 重掃 name table）；idle 超過 300s 自動釋放（lease refcount 確保批次中不釋放）。
 
 ### 5.3 Boolean 引擎（gds_boolean）
 
