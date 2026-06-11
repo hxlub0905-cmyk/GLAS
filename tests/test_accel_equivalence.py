@@ -561,8 +561,10 @@ class TestRawPoiSkipsUnion:
         import fine_align as fa
         monkeypatch.setattr(
             fa, "_FA_TIMING_ACC",
-            {"read": 0.0, "poi": 0.0, "template": 0.0, "match": 0.0, "n": 0})
+            {"read": 0.0, "poi": 0.0, "walk": 0.0, "template": 0.0,
+             "match": 0.0, "n": 0})
         monkeypatch.setattr(fa, "_FA_TIMING_EVERY", 1000)   # suppress the print
-        fa._record_timing(0.001, 0.002, 0.003, 0.004)
+        fa._record_timing(0.001, 0.002, 0.003, 0.004, walk_s=0.0015)
         a = fa._FA_TIMING_ACC
         assert a["n"] == 1 and abs(a["poi"] - 0.002) < 1e-9
+        assert abs(a["walk"] - 0.0015) < 1e-9   # P5 walk/bool split

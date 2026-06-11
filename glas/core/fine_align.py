@@ -368,7 +368,8 @@ def _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb=None):
 
 def poi_polys_and_geometry_for_roi(rar, root, roi_bbox, poi_spec,
                                    cancel_cb=None, *, walk_memo=None,
-                                   raw_geom_memo=None, eval_cache=None):
+                                   raw_geom_memo=None, eval_cache=None,
+                                   walk_acc=None):
     """POI outline polygons *and* the hole-preserving resolved geometry for a
     ROI, from a single walk (F13). ``poi_spec`` is ``('raw', layer, datatype)``
     or ``('expr', expr_text, bindings[, recipes])``.
@@ -385,13 +386,22 @@ def poi_polys_and_geometry_for_roi(rar, root, roi_bbox, poi_spec,
     by several POIs/recipes is walked + unioned once and a shared sub-expression
     like ``(A>W:7)`` is evaluated once — the batch counterpart of the live
     ``_recompute_recipes`` sharing."""
+    def _do_walk(layer, datatype):
+        # ``walk_acc`` (a ``[float]`` box) accumulates ROI-walk wall-time so the
+        # batch per-stage diagnostic can split poi into walk vs Boolean (P5).
+        if walk_acc is None:
+            return _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb)
+        _t = time.perf_counter()
+        r = _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb)
+        walk_acc[0] += time.perf_counter() - _t
+        return r
+
     def _walk(layer, datatype):
         if walk_memo is None:
-            return _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb)
+            return _do_walk(layer, datatype)
         key = (layer, datatype)
         if key not in walk_memo:
-            walk_memo[key] = _walk_roi_polys(
-                rar, root, roi_bbox, layer, datatype, cancel_cb)
+            walk_memo[key] = _do_walk(layer, datatype)
         return walk_memo[key]
 
     def _raw_geom(layer, datatype):
@@ -422,7 +432,8 @@ def poi_polys_and_geometry_for_roi(rar, root, roi_bbox, poi_spec,
 
 
 def poi_polys_for_roi(rar, root, roi_bbox, poi_spec, cancel_cb=None, *,
-                      walk_memo=None, raw_geom_memo=None, eval_cache=None):
+                      walk_memo=None, raw_geom_memo=None, eval_cache=None,
+                      walk_acc=None):
     """POI polygons (nm, root coords) for a given ROI, for batch fine align
     (plan M4b "Run all") and overlay outlines. ``poi_spec`` is
     ``('raw', layer, datatype)`` or ``('expr', expr_text, bindings[, recipes])``;
@@ -441,16 +452,25 @@ def poi_polys_for_roi(rar, root, roi_bbox, poi_spec, cancel_cb=None, *,
     # through the full path because their Boolean evaluation needs the geometry.
     if poi_spec[0] == "raw":
         _, layer, datatype = poi_spec
+
+        def _do_walk():
+            if walk_acc is None:
+                return _walk_roi_polys(rar, root, roi_bbox, layer, datatype,
+                                       cancel_cb)
+            _t = time.perf_counter()
+            r = _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb)
+            walk_acc[0] += time.perf_counter() - _t
+            return r
+
         if walk_memo is not None:
             key = (layer, datatype)
             if key not in walk_memo:
-                walk_memo[key] = _walk_roi_polys(
-                    rar, root, roi_bbox, layer, datatype, cancel_cb)
+                walk_memo[key] = _do_walk()
             return walk_memo[key]
-        return _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb)
+        return _do_walk()
     return poi_polys_and_geometry_for_roi(
         rar, root, roi_bbox, poi_spec, cancel_cb, walk_memo=walk_memo,
-        raw_geom_memo=raw_geom_memo, eval_cache=eval_cache)[0]
+        raw_geom_memo=raw_geom_memo, eval_cache=eval_cache, walk_acc=walk_acc)[0]
 
 
 # ── Optional per-stage timing (diagnostic) ───────────────────────────────────
@@ -466,15 +486,16 @@ try:
     _FA_TIMING_EVERY = max(1, int(os.environ.get("GLAS_FA_TIMING_EVERY", "25")))
 except ValueError:
     _FA_TIMING_EVERY = 25
-_FA_TIMING_ACC = {"read": 0.0, "poi": 0.0, "template": 0.0, "match": 0.0,
-                  "n": 0}
+_FA_TIMING_ACC = {"read": 0.0, "poi": 0.0, "walk": 0.0, "template": 0.0,
+                  "match": 0.0, "n": 0}
 
 
 def _record_timing(read_s: float, poi_s: float, tmpl_s: float,
-                   match_s: float) -> None:
+                   match_s: float, walk_s: float = 0.0) -> None:
     a = _FA_TIMING_ACC
     a["read"] += read_s
     a["poi"] += poi_s
+    a["walk"] += walk_s        # ROI-walk portion of poi (P5); poi-walk = Boolean
     a["template"] += tmpl_s
     a["match"] += match_s
     a["n"] += 1
@@ -486,9 +507,11 @@ def _record_timing(read_s: float, poi_s: float, tmpl_s: float,
     if n == 1 or n % _FA_TIMING_EVERY == 0:
         read_ms, poi_ms = a["read"] / n * 1e3, a["poi"] / n * 1e3
         tmpl_ms, match_ms = a["template"] / n * 1e3, a["match"] / n * 1e3
+        walk_ms = a["walk"] / n * 1e3
+        bool_ms = max(0.0, poi_ms - walk_ms)    # poi = ROI walk + Boolean
         # Bold-highlight whichever of the two heavy stages (poi / match)
         # dominates, so the bottleneck pops out of the line at a glance.
-        poi_s = f"poi(walk+bool)={poi_ms:.1f}"
+        poi_s = f"poi={poi_ms:.1f}(walk={walk_ms:.1f}+bool={bool_ms:.1f})"
         match_s = f"match={match_ms:.1f}"
         if poi_ms >= match_ms:
             poi_s = devlog.paint(poi_s, "fa-timing", bold=True)
@@ -536,11 +559,12 @@ def _fine_align_image(job, rar, root, poi_specs, cfg, cancel_is_set):
     walk_memo: dict = {}
     raw_geom_memo: dict = {}
     eval_cache: dict = {}
+    walk_acc = [0.0]            # P5: ROI-walk time within the poi stage
     poi_layers = []
     for spec, fg in poi_specs:
         polys = poi_polys_for_roi(rar, root, roi, spec, cancel_cb=cancel_is_set,
                                   walk_memo=walk_memo, raw_geom_memo=raw_geom_memo,
-                                  eval_cache=eval_cache)
+                                  eval_cache=eval_cache, walk_acc=walk_acc)
         if polys:
             poi_layers.append((polys, fg))
     if not poi_layers:
@@ -553,7 +577,7 @@ def _fine_align_image(job, rar, root, poi_specs, cfg, cancel_is_set):
     dx, dy, score, used_r = fine_align_one(sem, template, nm_per_px, radius_px)
     if _FA_TIMING:
         _record_timing(t1 - t0, t2 - t1, t3 - t2,
-                       time.perf_counter() - t3)
+                       time.perf_counter() - t3, walk_s=walk_acc[0])
     return (str(image_id), dx, dy, score, int(used_r), "ok")
 
 
@@ -629,7 +653,8 @@ def pool_collect_timing() -> dict:
     long as every worker runs it at least once. Only meaningful when
     ``_FA_TIMING`` was on (dev mode) so the per-image stages were recorded."""
     acc = dict(_FA_TIMING_ACC)
-    _FA_TIMING_ACC.update(read=0.0, poi=0.0, template=0.0, match=0.0, n=0)
+    _FA_TIMING_ACC.update(read=0.0, poi=0.0, walk=0.0, template=0.0,
+                          match=0.0, n=0)
     return acc
 
 

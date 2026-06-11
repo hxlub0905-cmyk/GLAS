@@ -4,6 +4,28 @@
 
 ---
 
+## [2026-06-11] [F24] M9 驗證 + M10：batch POI walk/bool 分段診斷
+
+**變更類型：** 效能優化驗證 + 診斷 · **狀態：M10 完成** · **Branch：** claude/gifted-lovelace-uvnn8v
+
+**M9 實測成效（第三次 .txt，E3B/399）：** batch **17.9→11.6 分**（原始 21.5 → −46%）、
+POI walk+bool **21.2→13.6s/img（−36%）**、img/s 0.4→0.6。POI 仍 ~99% 瓶頸。
+
+**M10（診斷）：** POI 仍合在一起看不出 walk vs bool 殘餘佔比，故再拆。`_fine_align_image` 用
+`walk_acc` box 累計 ROI-walk 時間（`poi_polys_for_roi`/`_and_geometry` 的 `_walk` 計時）；
+`_record_timing` 加 `walk_s=`、`_FA_TIMING_ACC` 加 `walk`、`pool_collect_timing` 帶 walk、
+`[fa-timing]` 改印 `poi=…(walk=…+bool=…)`；`_on_fa_stage_timing` 記 `batch:walk`+`batch:bool`
+（=poi−walk）。發現 cellcache 只存大 cell（E3B 多小 cell ~0.9ms→不進磁碟、各 worker 各自解碼），
+推測殘餘 POI 由 ROI-walk 冷解碼主導，待 walk/bool 數據確認。
+
+**測試：** 合成 batch 驗證 walk/bool 拆分（`poi=280(walk=162+bool=118)`）；更新
+`test_accel_equivalence.py::test_timing_accumulates` 含 walk。`pytest tests/` **742 passed**。
+
+**影響檔案：** `glas/core/fine_align.py`、`glas/core/perfmon.py`、`glas/app/gds_align_tool.py`、
+`tests/test_accel_equivalence.py`、`docs/plans/F24-perf-roiwalk-finealign.md`、`SESSION_LOG.md`。
+
+---
+
 ## [2026-06-11] [F24] M9：batch 跨 POI-spec 快取共用（第二次實機數據驅動）
 
 **變更類型：** 效能優化 · **狀態：M9 完成** · **Branch：** claude/gifted-lovelace-uvnn8v

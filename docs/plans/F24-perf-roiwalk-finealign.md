@@ -263,6 +263,27 @@ per-image 四階段：`read`(cv2.imread) → `poi`(walk+bool) → `template`(ras
       （`tests/test_gds_boolean_cache.py::TestFineAlignCrossSpecShare`）
 - [ ] 待 user 回傳新 .txt 確認 batch POI(walk+bool) 降幅
 
+### ✅ M2c 第三次實機數據（2026-06-11，M9 之後，同 E3B / 399 張）
+
+| 項目 | M1+P5 | P1+P4 | **+M9** | 原始→現在 |
+|---|---|---|---|---|
+| Batch align | — | 17.9 分 | **11.6 分** | 21.5→11.6（**−46%**）|
+| POI walk+bool /img | 21.2s | 21.2s | **13.6s** | −36% |
+| img/s | 0.4 | 0.4 | **0.6** | ×2 |
+
+M9（跨 POI-spec 共用）把 batch POI 砍 −36%、整批 −35%。POI 仍是 ~99% 瓶頸。
+**新增診斷（M10）**：把 batch POI 再拆成 `batch:walk`（ROI 解碼）vs `batch:bool`（Boolean），
+`[fa-timing]` 也改印 `poi=…(walk=…+bool=…)`，下次 .txt 即可定位殘餘大頭。已知 cellcache 只存
+**大 cell**（`nrec≥min_records`），E3B 多為小 cell（~0.9ms/個）→ 不進磁碟快取、各 worker 各自
+解碼，推測殘餘 POI 由 ROI-walk 冷解碼主導，待 walk/bool 數據確認。
+
+### M10: batch POI walk/bool 分段  [status: done 2026-06-11]
+
+- [x] `_fine_align_image` 用 `walk_acc` 計 ROI-walk 時間；`_record_timing(walk_s=)`、
+      `_FA_TIMING_ACC["walk"]`、`pool_collect_timing` 帶 walk；`[fa-timing]` 印 walk/bool
+- [x] `_on_fa_stage_timing` 記 `batch:walk` + `batch:bool`（=poi−walk）進 monitor
+- [x] 驗證：合成 batch 跑出 walk/bool 拆分；`test_timing_accumulates` 更新含 walk
+
 ### M6（候選 · 未做）: matchTemplate 金字塔  [status: planned · 若 match 主導]
 
 - 實機數據顯示 batch 是 **poi(walk+bool) 主導**、match 微不足道（0.3ms/img），故**暫不需要**。

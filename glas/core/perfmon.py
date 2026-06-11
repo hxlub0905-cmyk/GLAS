@@ -36,6 +36,8 @@ OP_LABELS = {
     "batch": "Batch align",
     "batch:read": "  ├ read SEM",
     "batch:poi": "  ├ POI walk+bool",
+    "batch:walk": "  │  ├ ROI walk",
+    "batch:bool": "  │  └ Boolean",
     "batch:template": "  ├ template",
     "batch:match": "  └ matchTemplate",
     "export": "Image export",

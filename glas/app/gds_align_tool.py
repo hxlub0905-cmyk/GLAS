@@ -1558,7 +1558,7 @@ class FineAlignAllWorker(QObject):
             # least one collect; each returns its real totals once then zeros,
             # so the sum is exact. Guarded by dev-mode timing being on.
             if fine_align._FA_TIMING and not self._cancel.is_set():
-                acc = {"read": 0.0, "poi": 0.0, "template": 0.0,
+                acc = {"read": 0.0, "poi": 0.0, "walk": 0.0, "template": 0.0,
                        "match": 0.0, "n": 0}
                 probes = [ex.submit(fine_align.pool_collect_timing)
                           for _ in range(workers * 3)]
@@ -7133,15 +7133,19 @@ class MainWindow(QMainWindow):
         self.batch_panel.set_progress(done, total, image_id)
 
     def _on_fa_stage_timing(self, acc: dict) -> None:
-        """P5: record the batch's per-image stage breakdown (read / poi(walk+
-        bool) / template / match) into the perf monitor as four `batch:*`
-        events, so the HUD / .txt log show where Run all actually spent its time
-        (the per-stage `[fa-timing]` console lines aggregated)."""
+        """P5: record the batch's per-image stage breakdown into the perf
+        monitor as `batch:*` events, so the HUD / .txt log show where Run all
+        actually spent its time. ``poi`` is further split into ``walk`` (ROI
+        decode) and ``bool`` (Boolean/union) so we know which to attack next."""
         n = max(1, int(acc.get("n", 0)))
         for stage in ("read", "poi", "template", "match"):
             ms = acc.get(stage, 0.0) / n * 1e3
             perfmon.monitor.record(f"batch:{stage}", ms,
                                    label=f"avg over {n} img")
+        walk_ms = acc.get("walk", 0.0) / n * 1e3
+        bool_ms = max(0.0, acc.get("poi", 0.0) / n * 1e3 - walk_ms)
+        perfmon.monitor.record("batch:walk", walk_ms, label=f"avg over {n} img")
+        perfmon.monitor.record("batch:bool", bool_ms, label=f"avg over {n} img")
 
     def _on_fa_result(self, image_id: str, dx: float, dy: float,
                       score: float, used_r: int, status: str) -> None:
