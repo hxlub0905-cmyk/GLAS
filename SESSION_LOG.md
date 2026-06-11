@@ -4,6 +4,41 @@
 
 ---
 
+## [2026-06-11] [F24] ROI walk + 批次 fine-align 效能分析 harness
+
+**變更類型：** 效能量測工具 + 分析企劃 · **狀態：進行中（M0 完成）** ·
+**Branch：** claude/gifted-lovelace-uvnn8v
+
+**動機：** user 要求做效能分析與測試、之後提改善方案。Q&A 收斂聚焦 **ROI walk 隨機存取 +
+批次 fine-align**；因 repo 無大型 OASIS 樣本檔、瓶頸只在 production 實機顯現，決定
+「我寫量測腳本、user 在實機跑、回傳 log」再據以排優先序。產出設定為「分析報告 + 改善 plan」。
+
+**實作（M0）：**
+- 新增 `tools/bench/bench_roiwalk_finealign.py`：
+  turnkey harness，最少只要一個 OASIS 路徑（root / layer / ROI 全自動推導），印五區段 +
+  可直接複製回傳的摘要：[1] reader build（name-table scan + **S_BOUNDING_BOX 覆蓋率**=剪枝
+  關鍵訊號）、[2] resolve（root/layer/ROI）、[3] ROI walk cold+warm + 可選 cProfile（dump
+  `RoiWalkStats` 全欄位：cells_decoded/cached、instances_materialized vs visited、max_array_k、
+  t_place/t_rect/t_poly）、[4] fine-align per-stage（walk / rasterize+blur / matchTemplate
+  真實幾何分段）、[5] batch parallel（真實 process pool 端到端吞吐 + 對序列加速比）。`--json`
+  另存機器可讀結果。
+- 新增 `tools/bench/_make_sample_oasis.py`：產帶 S_CELL_OFFSET 的合成 OASIS（root TOP +
+  N leaf），僅供 harness 自我驗證（非代表性樣本）。修正一處 PLACEMENT info-byte（應為 0xF0
+  = C+N+X+Y，原誤寫 0xC0 只宣告 refnum 卻多塞 x/y → 解碼器 desync）。
+- 新增 `docs/plans/F24-perf-roiwalk-finealign.md`：分析報告 + 改善 plan（靜態分析假說 +
+  量測方法 + data-gated milestones M1–M5 候選池：matchTemplate 金字塔 / expr 同層 walk 去重 /
+  批次首波熱 cell 預解碼 / regular-grid analytic clip 補強）。
+
+**測試：** harness 在合成 OASIS 上五區段全綠（reader build / walk cold 7.9ms warm 2.1ms /
+fine-align 分段 / 4-worker pool 2.2× 加速 / cProfile / --json 皆驗證）。本 session 另為跑
+測試而在環境裝齊 numpy/cv2(headless)/shapely/pytest/PyQt6 + Qt 系統庫；`pytest tests/`
+707 passed。**未動 production 程式碼**（M2+ 待 user 實機 log 定案）。
+
+**影響檔案：** 新增 `tools/bench/bench_roiwalk_finealign.py`、`tools/bench/_make_sample_oasis.py`、
+`docs/plans/F24-perf-roiwalk-finealign.md`；改 `SESSION_LOG.md`、`CLAUDE.md`（§8 註冊 [F24]）。
+
+---
+
 ## [2026-06-07] [doc-sync] README / CLAUDE.md 文件整理
 
 **變更類型：** 文件同步 · **狀態：完成**

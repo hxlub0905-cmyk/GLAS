@@ -204,7 +204,9 @@ HMI 風格表達式 → 遞迴下降 parser → AST → shapely 運算。運算�
 
 ### 進行中 (In Progress)
 
-- （目前無）
+- [F24] ROI walk + 批次 fine-align 效能分析與改善。M0 量測 harness 已完成
+  （`tools/bench/bench_roiwalk_finealign.py`）；待 user 在實機跑、回傳 log 後填數據、
+  排 M2+ 優先序。plan：`docs/plans/F24-perf-roiwalk-finealign.md`。
 
 ### 待辦 (Backlog)
 
