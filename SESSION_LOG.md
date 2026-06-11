@@ -4,7 +4,48 @@
 
 ---
 
-## [2026-06-11] [F24] ROI walk + 批次 fine-align 效能分析 harness
+## [2026-06-11] [F24] M1：app 內建即時效能監測 HUD（perfmon + perf_panel）
+
+**變更類型：** 效能可觀測性（in-app 即時監測）· **狀態：M1 完成** ·
+**Branch：** claude/gifted-lovelace-uvnn8v
+
+**動機（轉向）：** 接續同日 M0 離線 harness，user 指出「離線跑合成檔測不準」——實際工作流是
+**載入大 + 小兩組檔 → 載 3~4 layer 做 Boolean → 填 POI → Batch align**，希望**在 UI 操作當下
+時時監測**這些步驟的效能。Q&A 收斂：UI 內嵌面板（HUD）+ 可選 **.txt** log 匯出（不做 JSON/CSV），
+涵蓋每個步驟，本 session 直接實作。
+
+**實作：**
+- **新增 `glas/core/perfmon.py`（Qt-free）：** session 單例 `monitor`。`record(op, ms, **meta)`
+  累積 ring buffer（最近 400 筆）+ per-op 聚合（次數/總和/平均/最大/最近）；`set_logfile()` 開
+  .txt 即時逐行寫（`format_event` 人類可讀、套 `OP_LABELS` 中文化操作名）；`on_event` callback
+  餵 UI；`timed()` context manager。RLock 保護，可從 ROI / batch worker thread 安全呼叫。
+  batch per-image 分段在獨立 process、不回主行程，故 monitor 記 batch 整批耗時 + img/s，
+  per-stage 仍走既有 `[fa-timing]` console。
+- **新增 `glas/app/perf_panel.py`（Qt）：** `PerfPanel` QWidget——上半 per-op 聚合表
+  （Operation/last/count/avg/max）、下半逐筆事件 log（QPlainTextEdit）、工具列「Log to .txt…」
+  /「Clear」。`_Bridge(QObject)` 的 `pyqtSignal(object)` 把 worker-thread 事件 queued marshal
+  回 GUI thread 才更新 widget；`detach()` 切斷 callback + 關 log。bound-signal `emit` 快取成穩定
+  參照（每次存取回新 wrapper，detach 身分比對才成立）。
+- **`glas/app/gds_align_tool.py`：** import perfmon / PerfPanel；主視窗建 `QDockWidget`
+  「Performance monitor」掛底部、dev mode 顯示（`_refresh_dev_ui` 連動）、View 選單加可切
+  action；closeEvent `detach()`；補 module 級 `import time`。**五處插樁：** `open`（reader build
+  = 開檔 + name-table scan，含 file_mb/cells/sbbox/prune）、`roi`（ROI walk 整批 per-layer 總和，
+  含 rects/polys/decoded/cached/prune）、`boolean`（`_eval_expression` 每次評估，含 expr/bindings/
+  out_polys）、`template`（POI→模板合成）、`batch`（Run all 整批 wall-clock + img/s + ms/img）。
+
+**測試：** `tests/test_perfmon.py`（13：record/聚合/順序/meta/ring buffer/disabled/clear/callback
+（含例外不外傳）/timed/.txt log 開關與替換與壞路徑/format）+ `tests/test_perf_panel.py`（5：事件上
+聚合表 + log、多 op 聚合、clear、晚建面板 prime 既有狀態、detach 停 callback；Qt offscreen gated）。
+headless 主視窗整合手測：dev mode 切換 → dock 顯示/隱藏、事件入表、選單 action 連動皆正確。
+`pytest tests/` **725 passed**（707 + 18）。
+
+**影響檔案：** 新增 `glas/core/perfmon.py`、`glas/app/perf_panel.py`、`tests/test_perfmon.py`、
+`tests/test_perf_panel.py`；改 `glas/app/gds_align_tool.py`、`docs/plans/F24-perf-roiwalk-finealign.md`、
+`SESSION_LOG.md`、`CLAUDE.md`。
+
+---
+
+## [2026-06-11] [F24] M0：ROI walk + 批次 fine-align 離線效能 harness
 
 **變更類型：** 效能量測工具 + 分析企劃 · **狀態：進行中（M0 完成）** ·
 **Branch：** claude/gifted-lovelace-uvnn8v

@@ -54,6 +54,7 @@ import os
 import re
 import sys
 import threading
+import time
 import traceback
 from concurrent.futures import CancelledError, ProcessPoolExecutor
 from dataclasses import dataclass, field
@@ -127,6 +128,7 @@ import gds_layer_cache  # noqa: E402
 import sem_loader       # noqa: E402
 import oasis_random     # noqa: E402
 import devlog            # noqa: E402  (dev-mode coloured console tags)
+import perfmon           # noqa: E402  (live perf-event monitor — Qt-free core)
 import layout_export     # noqa: E402  (F9: OASIS export — shapely guarded inside)
 import oasis_debug        # noqa: E402  (F10: OASIS diagnostics — Qt-free)
 # F8: the Qt-free fine-align compute lives in glas/core/fine_align.py so a
@@ -165,6 +167,10 @@ try:
     from collapsible import CollapsibleSection  # noqa: E402
 except Exception:  # pragma: no cover
     CollapsibleSection = None
+try:
+    from perf_panel import PerfPanel  # noqa: E402  (live perf monitor HUD)
+except Exception:  # pragma: no cover
+    PerfPanel = None
 try:
     from icons import qicon as _qicon  # noqa: E402
 except Exception:  # pragma: no cover
@@ -5918,6 +5924,22 @@ class MainWindow(QMainWindow):
         self._status_bar.addWidget(self._status_cursor)
         self._status_bar.addPermanentWidget(self._coord_readout)
 
+        # Live performance monitor (HUD) — a bottom dock showing per-operation
+        # timing (open+index / ROI walk / Boolean / batch). Visible only in dev
+        # mode (toggleable via the View menu). Qt-free collector lives in
+        # perfmon; the panel marshals events back to this thread.
+        self._perf_panel = None
+        self._perf_dock = None
+        if PerfPanel is not None:
+            from PyQt6.QtWidgets import QDockWidget
+            self._perf_panel = PerfPanel(perfmon.monitor, self)
+            self._perf_dock = QDockWidget("Performance monitor", self)
+            self._perf_dock.setObjectName("perfDock")
+            self._perf_dock.setWidget(self._perf_panel)
+            self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea,
+                               self._perf_dock)
+            self._perf_dock.setVisible(self._dev_mode)
+
         self._build_menu()
         self._build_shortcuts()
 
@@ -6426,6 +6448,16 @@ class MainWindow(QMainWindow):
         quit_action.triggered.connect(self.close)
         menu.addAction(quit_action)
 
+        # View menu: toggle the live performance monitor dock (dev-mode only).
+        view_menu = self.menuBar().addMenu("&View")
+        self._perf_action = QAction("&Performance monitor", self)
+        self._perf_action.setCheckable(True)
+        self._perf_action.setChecked(bool(self._perf_dock
+                                          and self._perf_dock.isVisible()))
+        self._perf_action.setVisible(self._dev_mode)
+        self._perf_action.toggled.connect(self._on_toggle_perf_monitor)
+        view_menu.addAction(self._perf_action)
+
         help_menu = self.menuBar().addMenu("&Help")
         welcome_action = QAction("Show &welcome…", self)
         welcome_action.triggered.connect(self._show_welcome_dialog)
@@ -6755,9 +6787,15 @@ class MainWindow(QMainWindow):
 
     def _build_template(self, anchor, W, H, nm_per_px, cfg):
         """Composite the active POI layers into one template at ``anchor``."""
-        return render_composite_template(
-            self._poi_layers(), anchor, W, H, nm_per_px,
+        poi_layers = self._poi_layers()
+        _t0 = time.perf_counter()
+        tmpl = render_composite_template(
+            poi_layers, anchor, W, H, nm_per_px,
             cfg["bg_glv"], cfg["blur_sigma_px"])
+        perfmon.monitor.record(
+            "template", (time.perf_counter() - _t0) * 1e3,
+            label=f"{len(poi_layers)} POI layer(s)", px=f"{W}×{H}")
+        return tmpl
 
     def _coarse_anchor(self, img):
         """Coarse FOV-centre GDS anchor for ``img`` (klarf→gds + δ),
@@ -6883,6 +6921,13 @@ class MainWindow(QMainWindow):
             fine_align.batch_pool.shutdown()
         except Exception:
             pass
+        # Stop the perf monitor from emitting into a tearing-down widget and
+        # close any open .txt log.
+        if self._perf_panel is not None:
+            try:
+                self._perf_panel.detach()
+            except Exception:
+                pass
         super().closeEvent(ev)
 
     def _render_gds_preview(self, anchor, W, H, nm_per_px) -> np.ndarray:
@@ -7019,6 +7064,10 @@ class MainWindow(QMainWindow):
     def _launch_fa(self, specs, jobs, cfg) -> None:
         """Start the batch fine-align worker thread (shared by Run all and the
         F13 subset re-run)."""
+        # Perf monitor: remember batch start + size so _on_fa_finished can record
+        # total wall-clock + throughput (per-stage detail stays in [fa-timing]).
+        self._fa_perf_t0 = time.perf_counter()
+        self._fa_perf_jobs = len(jobs)
         self.batch_panel.start_progress()
         self._fa_thread = QThread(self)
         self._fa_worker = FineAlignAllWorker(
@@ -7088,6 +7137,15 @@ class MainWindow(QMainWindow):
     def _on_fa_finished(self, count: int) -> None:
         self._batch_refresh_timer.stop()      # final refresh supersedes it
         self.batch_panel.end_progress()
+        t0 = getattr(self, "_fa_perf_t0", None)
+        if t0 is not None:
+            dt = time.perf_counter() - t0
+            ips = count / dt if dt > 0 else 0.0
+            perfmon.monitor.record(
+                "batch", dt * 1e3, label=f"{count} image(s)",
+                img_per_s=f"{ips:.1f}",
+                ms_per_img=(f"{dt / count * 1e3:.0f}" if count else "—"))
+            self._fa_perf_t0 = None
         self._status_doc.setText(f"fine align: processed {count} image(s)")
         self._refresh_overview_defects()      # recolour all dots by score
         if self._current_sem is not None:
@@ -7477,6 +7535,12 @@ class MainWindow(QMainWindow):
               f"decode {t_decode:.1f}s ({cached} from cache, {decoded} decoded) · "
               f"prune {'ON' if sbbox_on else 'off'}"
               + (f" · ⚠ {errs} decode error(s)" if errs else ""), flush=True)
+        perfmon.monitor.record(
+            "roi", elapsed * 1e3,
+            label=f"{len(per_layer)} layer(s)",
+            rects=f"{total_rects:,}", polys=f"{total_polys:,}",
+            decoded=decoded, cached=cached,
+            prune=("on" if sbbox_on else "off"))
         if errs:
             msg += f" · ⚠ {errs} cell decode error(s) — run with --debug"
         if expr_errs:
@@ -7591,13 +7655,23 @@ class MainWindow(QMainWindow):
             rar = oasis_random.RandomAccessReader(
                 path, wanted_layers=set(layer_keys),
                 bbox_layer=oasis_random.DEFAULT_BBOX_LAYER)
+            _build_s = _t.perf_counter() - _t0
             n_sbbox = len(rar._sbbox_by_refnum) + len(rar._sbbox_by_name)
+            n_cells = len(rar._by_refnum)
             print(f"{devlog.tag('roi')} reader built in "
-                  f"{_t.perf_counter() - _t0:.1f}s · "
-                  f"{len(rar._by_refnum):,} cells indexed · S_BOUNDING_BOX on "
+                  f"{_build_s:.1f}s · "
+                  f"{n_cells:,} cells indexed · S_BOUNDING_BOX on "
                   f"{n_sbbox:,} cells "
                   f"({'decode-free prune' if n_sbbox else 'NONE -> bbox-by-decode'})",
                   flush=True)
+            try:
+                _sz = Path(path).stat().st_size / 1e6
+            except OSError:
+                _sz = 0.0
+            perfmon.monitor.record(
+                "open", _build_s * 1e3, label=Path(path).name,
+                file_mb=f"{_sz:.0f}", cells=f"{n_cells:,}",
+                sbbox=n_sbbox, prune=("decode-free" if n_sbbox else "by-decode"))
         except Exception as exc:
             QApplication.restoreOverrideCursor()
             self._show_load_error("ROI open failed", str(exc))
@@ -7663,11 +7737,17 @@ class MainWindow(QMainWindow):
             sel = [entry.polygons[int(i)] for i in idx]
             return gds_boolean.polys_to_geometry(sel)
 
+        _t0 = time.perf_counter()
         geom = gds_boolean.resolve_expression(
             expr, bindings, raw_provider=raw_provider,
             recipe_provider=self._recipe_def,
             fov_bbox=gds_boolean.fov_box(cx, cy, w, h))
-        return gds_boolean.geometry_to_polygons(geom)
+        polys = gds_boolean.geometry_to_polygons(geom)
+        perfmon.monitor.record(
+            "boolean", (time.perf_counter() - _t0) * 1e3,
+            label=(expr[:40] if expr else ""),
+            bindings=len(bindings or {}), out_polys=len(polys))
+        return polys
 
     def _next_expr_color(self) -> QColor:
         c = _LAYER_PALETTE[self._expr_color_idx % len(_LAYER_PALETTE)]
@@ -8152,6 +8232,11 @@ class MainWindow(QMainWindow):
         else:
             os.environ.pop("GLAS_FA_TIMING", None)
 
+    def _on_toggle_perf_monitor(self, on: bool) -> None:
+        """View-menu toggle for the live performance monitor dock."""
+        if self._perf_dock is not None:
+            self._perf_dock.setVisible(bool(on))
+
     def _refresh_dev_ui(self) -> None:
         """Show / hide developer-only controls to match ``self._dev_mode``."""
         btn = getattr(self, "_export_oasis_btn", None)
@@ -8160,6 +8245,15 @@ class MainWindow(QMainWindow):
         act = getattr(self, "_diagnose_action", None)
         if act is not None:
             act.setVisible(self._dev_mode)
+        # Live perf monitor: the menu toggle + dock follow dev mode (the dock
+        # auto-shows when dev mode turns on, hides when it turns off).
+        pact = getattr(self, "_perf_action", None)
+        if pact is not None:
+            pact.setVisible(self._dev_mode)
+        if self._perf_dock is not None:
+            self._perf_dock.setVisible(self._dev_mode)
+            if pact is not None:
+                pact.setChecked(self._perf_dock.isVisible())
         # F21 M4: catalog editor button on the PART/CHIP panel.
         if self.sem_panel is not None:
             self.sem_panel.coord_setup.set_dev_mode(self._dev_mode)

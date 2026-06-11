@@ -58,7 +58,28 @@ turnkey harness，跑出 cold/warm ROI walk、per-stage fine-align、平行吞�
 
 ## 量測方法（Methodology）
 
-### Harness：`tools/bench/bench_roiwalk_finealign.py`
+> **2026-06-11 轉向：** user 指出「離線跑合成檔測不準」——實際工作流是**載入兩組（大 +
+> 小）檔 → 載 3~4 layer 做 Boolean → 填 POI → Batch align**，希望**在 UI 操作當下時時監測**。
+> 故主要量測手段改為 **app 內建即時效能監測（HUD）**；下方合成 harness 退為次要（CI / 離線
+> 重現用）。
+
+### 主要：app 內建即時效能監測 HUD（M1，已完成）
+
+- 核心 `glas/core/perfmon.py`（Qt-free）：session 單例 `monitor`，`record(op, ms, **meta)`
+  累積 ring buffer + per-op 聚合（次數/平均/最大/最近），可開 **.txt log** 即時逐行寫出，
+  並透過 `on_event` callback 餵 UI。執行緒安全（RLock），可從 ROI / batch worker thread 呼叫。
+- UI `glas/app/perf_panel.py`：QDockWidget HUD（dev mode 顯示、View 選單可切），上半 per-op
+  聚合表、下半逐筆事件 log、「Log to .txt…」按鈕。worker thread 事件經 pyqtSignal marshal
+  回 GUI thread。
+- 插樁點（covered 工作流每一步）：`open`（reader build = 開檔 + name-table scan）、`roi`
+  （ROI walk 整批 per-layer 總和）、`boolean`（`_eval_expression` 每次表達式評估）、`template`
+  （POI → 模板合成）、`batch`（Run all 整批 wall-clock + img/s）。batch 的 per-image 分段
+  （read/poi/template/match）仍走既有 `[fa-timing]` console（worker 在獨立 process）。
+- **使用：** 連點 About icon 5 次開 dev mode → 底部出現「Performance monitor」面板 → 照常操作
+  （載大小檔、Boolean、POI、Batch align）即時看數字；按「Log to .txt…」把整段工作流寫成
+  純文字檔回傳，供後續 M2+ 改善分析。
+
+### 次要：離線合成 harness `tools/bench/bench_roiwalk_finealign.py`
 
 turnkey、最少只要一個 OASIS 路徑（root / layer / ROI 全自動推導）。在 **user 實機 + 真實 .oas**
 上跑，印出五區段 + 一段可直接複製回傳的摘要。
@@ -152,34 +173,43 @@ per-image 四階段：`read`(cv2.imread) → `poi`(walk+bool) → `template`(ras
 > **全部 data-gated**：M0 已完成（harness）；M1 待 user 回傳 log 後啟動，依數據決定
 > M2+ 做哪幾條、順序為何。
 
-### M0: 量測 harness  [status: done 2026-06-11]
+### M0: 離線量測 harness  [status: done 2026-06-11]
 
 - [x] `tools/bench/bench_roiwalk_finealign.py`：五區段 + paste-back 摘要 + `--json`
 - [x] `tools/bench/_make_sample_oasis.py`：合成檔供 harness 自我驗證
 - [x] 在合成 OASIS 上 smoke-test 五區段全綠
 
-### M1: 實機量測 + 數據定優先序  [status: planned]
+### M1: app 內建即時效能監測 HUD  [status: done 2026-06-11]
 
-- [ ] user 在實機跑 harness（三個常用檔，建議含 `--profile`），回傳 paste-back + cProfile
+- [x] `glas/core/perfmon.py`：Qt-free 事件收集器（聚合 + .txt log + callback，thread-safe）
+- [x] `glas/app/perf_panel.py`：QDockWidget HUD（聚合表 + 事件 log + .txt 開關），cross-thread 橋接
+- [x] 主視窗掛 dock（dev mode 顯示、View 選單可切）、closeEvent detach
+- [x] 插樁 open / roi / boolean / template / batch 五類操作
+- [x] `tests/test_perfmon.py`（13）+ `tests/test_perf_panel.py`（5）+ 主視窗整合驗證
+
+### M2: 實機量測 + 數據定優先序  [status: planned]
+
+- [ ] user 在 dev mode 下照常操作（大小檔 → 3~4 layer Boolean → POI → Batch align），
+      開「Log to .txt…」把整段工作流寫成純文字檔回傳
 - [ ] 把數字填回本檔「靜態分析」各條，確認 / 推翻假說
-- [ ] 依數據排出 M2+ 的實作順序（下列為候選池，非承諾全做）
+- [ ] 依數據排出後續改善的實作順序（下列為候選池，非承諾全做）
 
-### M2（候選）: matchTemplate 金字塔  [status: planned · 若 match 主導]
+### M3（候選）: matchTemplate 金字塔  [status: planned · 若 match 主導]
 
 - [ ] coarse-to-fine：降採樣粗搜 + 原解析度局部精修，保持結果等價（峰值位置一致）
 - [ ] 驗證：`tests/test_accel_equivalence.py` 加金字塔 vs 全解析度 dx/dy/score 等價（容差內）
 
-### M3（候選）: expression POI 同層 walk 去重  [status: planned · 若 poi 主導且用表達式]
+### M4（候選）: expression POI 同層 walk 去重  [status: planned · 若 boolean/poi 主導]
 
 - [ ] `raw_provider` 內加 per-(layer,datatype) ROI memo，同層只 walk 一次
 - [ ] 驗證：同表達式多次引用同層，結果與去重前 byte 等價
 
-### M4（候選）: 批次首波熱 cell 預解碼  [status: planned · 若 [5] 顯示首波重複解碼明顯]
+### M5（候選）: 批次首波熱 cell 預解碼  [status: planned · 若 batch 首波重複解碼明顯]
 
 - [ ] 主行程在 dispatch 前對 ROI 涉及的熱 cell `load_cell` 一次（寫入 cellcache）
 - [ ] 驗證：worker 第一波 cellcache 命中率上升、warm→first-image 延遲下降
 
-### M5（候選）: regular-grid analytic sub-grid clip 補強  [status: planned · 若 inst_mat≫visited]
+### M6（候選）: regular-grid analytic sub-grid clip 補強  [status: planned · 若 inst_mat≫visited]
 
 - [ ] 檢視 `_clip_grid_offsets` 為何沒咬到大陣列；補 analytic 子網格裁剪
 - [ ] 驗證：`instances_materialized` 大幅下降、結果幾何等價
@@ -188,9 +218,12 @@ per-image 四階段：`read`(cv2.imread) → `poi`(walk+bool) → `template`(ras
 
 ## Affected Files
 
-- `tools/bench/bench_roiwalk_finealign.py`（新增，M0 完成）
-- `tools/bench/_make_sample_oasis.py`（新增，M0 完成）
-- 後續（依 M2+ 定案）：`glas/core/fine_align.py`、`glas/core/oasis_random.py`、
+- `tools/bench/bench_roiwalk_finealign.py`、`tools/bench/_make_sample_oasis.py`（新增，M0）
+- `glas/core/perfmon.py`（新增，M1：Qt-free 監測核心）
+- `glas/app/perf_panel.py`（新增，M1：HUD 面板）
+- `glas/app/gds_align_tool.py`（M1：掛 dock + View 選單 + 五處插樁）
+- `tests/test_perfmon.py`、`tests/test_perf_panel.py`（新增，M1）
+- 後續（依 M2 數據定案）：`glas/core/fine_align.py`、`glas/core/oasis_random.py`、
   `tests/test_accel_equivalence.py`
 
 ---
