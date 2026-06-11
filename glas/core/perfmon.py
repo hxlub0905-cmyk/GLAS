@@ -34,6 +34,10 @@ OP_LABELS = {
     "poi": "POI build",
     "template": "Template build",
     "batch": "Batch align",
+    "batch:read": "  ├ read SEM",
+    "batch:poi": "  ├ POI walk+bool",
+    "batch:template": "  ├ template",
+    "batch:match": "  └ matchTemplate",
     "export": "Image export",
 }
 

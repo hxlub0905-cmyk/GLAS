@@ -4,6 +4,46 @@
 
 ---
 
+## [2026-06-11] [F24] M3-M5：實機數據驅動的 Boolean 去重 + morph 加速 + batch 分段診斷
+
+**變更類型：** 效能優化（數據驅動）· **狀態：M3/M4/M5 完成** ·
+**Branch：** claude/gifted-lovelace-uvnn8v
+
+**動機（實機數據）：** user 用 HUD 在 E3B 小檔（346MB / 13,276 cells / **sbbox=0** / 4 layer /
+~399 張）跑真實工作流回傳 .txt。瓶頸明確：① **Boolean eval 0.8~2.9s/次、在 GUI thread**，且每次
+ROI 重載 3 個 recipe 各重算、共用子式 `(A>W:7)` 被算 3 次；② 首次 ROI walk **12.4s 解碼整檔**
+（sbbox=0）；③ **Batch 21.5 分 / 399 張**（poi(walk+bool) 主導）。user 選擇實作 P1 + P5 + P4。
+
+**實作：**
+- **P5 batch per-stage 診斷：** `fine_align.pool_collect_timing()` 回傳並重置 worker 的
+  `_FA_TIMING_ACC`；`FineAlignAllWorker` 加 `stage_timing` signal——process-pool 路徑在 lease 內
+  over-submit workers×3 個 collect probe 聚合（每 worker 真值計一次、之後回 0，總和精確），
+  in-thread 路徑本地收集；`_on_fa_stage_timing` 把 `batch:read/poi/template/match` 記進 monitor。
+  端到端驗證：合成 batch 量到 per-image 分段（poi 主導）。
+- **P1 Boolean 共用子式去重：** `gds_boolean.evaluate` 加 `node_cache`+`ref_ids`，以 `_canon_key`
+  （leaf 用「解析後 (layer,datatype)/recipe 名」而非字母）memo 每個 AST 子樹結果；
+  `resolve_expression` 加 `_eval_cache` 串接（含 nested recipe）。app `_recompute_recipes` 跨 recipe
+  共用 `raw_memo`+`eval_cache` → `(A>W:7)` 算 1 次；`fine_align` expression POI 每張共用 per-image
+  raw_memo + `_eval_cache`。shapely 幾何不可變、set op 不改輸入，故共用快取值等價。
+- **P4 morph 加速：** profile 出 `_dilate_axis` = `unary_union`(53%) + per-edge `Polygon()`(~25%)。
+  改成單一 `shapely.polygons` 向量化建 parallelogram + **跳過與掃描向量平行的退化邊**（零面積、
+  丟棄為精確；rectilinear 約少一半 pieces）。實測 9000-poly grow **4007ms → 2565ms（−36%）、
+  symdiff=0**。與 P1（live recompute 少算 ~2/3 morph）相乘。
+
+**測試：** 新增 `tests/test_gds_boolean_cache.py`（16：共用子樹只算一次 / 不同 layer 不混淆 /
+含 morph·diagonal·hole 的 cache 與 no-cache 等價 / 向量化 `_dilate_axis` vs per-edge 參考等價）。
+既有 `test_gds_boolean.py`(63) + `test_accel_equivalence.py` 全綠。`pytest tests/` **741 passed**。
+未動對位/解碼正確性紅線（§7）。
+
+**未做（候選）：** M6 matchTemplate 金字塔（數據顯示 match 僅 0.3ms/img，不需要）、M7 無 sbbox
+檔 bbox sidecar（[F17]，user 本輪未選）、M8 grid analytic clip。
+
+**影響檔案：** `glas/core/gds_boolean.py`、`glas/core/fine_align.py`、`glas/core/perfmon.py`、
+`glas/app/gds_align_tool.py`、`tests/test_gds_boolean_cache.py`、
+`docs/plans/F24-perf-roiwalk-finealign.md`、`SESSION_LOG.md`、`CLAUDE.md`。
+
+---
+
 ## [2026-06-11] [F24] M1：app 內建即時效能監測 HUD（perfmon + perf_panel）
 
 **變更類型：** 效能可觀測性（in-app 即時監測）· **狀態：M1 完成** ·

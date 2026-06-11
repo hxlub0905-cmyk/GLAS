@@ -389,14 +389,23 @@ def poi_polys_and_geometry_for_roi(rar, root, roi_bbox, poi_spec,
     x0, y0, x1, y1 = roi_bbox
     cx, cy, w, h = (x0 + x1) / 2.0, (y0 + y1) / 2.0, (x1 - x0), (y1 - y0)
 
+    # P1: memo each raw layer's ROI walk + the resolved sub-expressions for
+    # THIS image, so a layer / sub-tree referenced more than once in the
+    # expression (or its nested recipes) is walked / evaluated once.
+    raw_memo: dict = {}
+
     def raw_provider(layer: int, datatype: int):
-        ps = _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb)
-        return gds_boolean.polys_to_geometry(ps)
+        key = (layer, datatype)
+        if key not in raw_memo:
+            ps = _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb)
+            raw_memo[key] = gds_boolean.polys_to_geometry(ps)
+        return raw_memo[key]
 
     geom = gds_boolean.resolve_expression(
         expr, bindings, raw_provider=raw_provider,
         recipe_provider=lambda n: recipes.get(n),
-        fov_bbox=gds_boolean.fov_box(cx, cy, w, h))
+        fov_bbox=gds_boolean.fov_box(cx, cy, w, h),
+        _eval_cache={})
     return gds_boolean.geometry_to_polygons(geom), geom
 
 
@@ -575,6 +584,21 @@ def _pool_task(job, root, poi_specs, cfg):
     futures, so the task itself never checks a flag."""
     return _fine_align_image(job, _G["rar"], root, poi_specs, cfg,
                              _never_cancel)
+
+
+def pool_collect_timing() -> dict:
+    """Return this process's accumulated per-stage fine-align timing
+    (``{read, poi, template, match, n}`` seconds / count) and reset it (P5).
+
+    The orchestrator submits one of these per worker after a batch and sums the
+    results to record a batch-wide per-stage breakdown in the perf monitor.
+    Resetting means a worker that runs this twice contributes its real totals
+    once and zeros after, so summing over (worker count)× probes is exact as
+    long as every worker runs it at least once. Only meaningful when
+    ``_FA_TIMING`` was on (dev mode) so the per-image stages were recorded."""
+    acc = dict(_FA_TIMING_ACC)
+    _FA_TIMING_ACC.update(read=0.0, poi=0.0, template=0.0, match=0.0, n=0)
+    return acc
 
 
 def _pool_warm_probe() -> bool:

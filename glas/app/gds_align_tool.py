@@ -1449,6 +1449,10 @@ class FineAlignAllWorker(QObject):
     finished = pyqtSignal(int)                  # count aligned
     failed = pyqtSignal(str)
     cancelled = pyqtSignal()
+    # P5: batch-wide per-stage timing {read,poi,template,match,n} (seconds),
+    # aggregated from the workers. Emitted before `finished` when dev-mode
+    # per-stage timing was active; the main thread records it in the monitor.
+    stage_timing = pyqtSignal(dict)
 
     def __init__(self, rar, root, poi_specs, jobs, cfg) -> None:
         super().__init__()
@@ -1503,6 +1507,9 @@ class FineAlignAllWorker(QObject):
             if res is not None:
                 self.progress.emit(done, n, res[0])
                 self.result.emit(*res)
+        # P5: in-thread path accumulated stages in THIS process's accumulator.
+        if fine_align._FA_TIMING:
+            self.stage_timing.emit(fine_align.pool_collect_timing())
         self.finished.emit(done)
 
     def _run_process_pool(self, workers: int) -> None:
@@ -1546,6 +1553,24 @@ class FineAlignAllWorker(QObject):
                 if res is not None:
                     self.progress.emit(done, n, res[0])
                     self.result.emit(*res)
+            # P5: gather each worker's per-stage accumulator while the pool is
+            # still leased. Over-submit (workers×3) so every worker runs at
+            # least one collect; each returns its real totals once then zeros,
+            # so the sum is exact. Guarded by dev-mode timing being on.
+            if fine_align._FA_TIMING and not self._cancel.is_set():
+                acc = {"read": 0.0, "poi": 0.0, "template": 0.0,
+                       "match": 0.0, "n": 0}
+                probes = [ex.submit(fine_align.pool_collect_timing)
+                          for _ in range(workers * 3)]
+                for pf in probes:
+                    try:
+                        d = pf.result()
+                    except Exception:
+                        continue
+                    for k in acc:
+                        acc[k] += d.get(k, 0)
+                if acc["n"]:
+                    self.stage_timing.emit(acc)
         if self._cancel.is_set():
             self.cancelled.emit()
         else:
@@ -7076,6 +7101,7 @@ class MainWindow(QMainWindow):
         self._fa_thread.started.connect(self._fa_worker.run)
         self._fa_worker.progress.connect(self._on_fa_progress)
         self._fa_worker.result.connect(self._on_fa_result)
+        self._fa_worker.stage_timing.connect(self._on_fa_stage_timing)
         self._fa_worker.finished.connect(self._on_fa_finished)
         self._fa_worker.failed.connect(self._on_fa_failed)
         self._fa_worker.cancelled.connect(self._on_fa_cancelled)
@@ -7105,6 +7131,17 @@ class MainWindow(QMainWindow):
 
     def _on_fa_progress(self, done: int, total: int, image_id: str) -> None:
         self.batch_panel.set_progress(done, total, image_id)
+
+    def _on_fa_stage_timing(self, acc: dict) -> None:
+        """P5: record the batch's per-image stage breakdown (read / poi(walk+
+        bool) / template / match) into the perf monitor as four `batch:*`
+        events, so the HUD / .txt log show where Run all actually spent its time
+        (the per-stage `[fa-timing]` console lines aggregated)."""
+        n = max(1, int(acc.get("n", 0)))
+        for stage in ("read", "poi", "template", "match"):
+            ms = acc.get(stage, 0.0) / n * 1e3
+            perfmon.monitor.record(f"batch:{stage}", ms,
+                                   label=f"avg over {n} img")
 
     def _on_fa_result(self, image_id: str, dx: float, dy: float,
                       score: float, used_r: int, status: str) -> None:
@@ -7719,29 +7756,43 @@ class MainWindow(QMainWindow):
         return out
 
     def _eval_expression(self, expr: str, bindings: dict,
-                         fov: tuple[float, float, float, float]) -> list:
+                         fov: tuple[float, float, float, float],
+                         *, raw_memo: Optional[dict] = None,
+                         eval_cache: Optional[dict] = None) -> list:
         """Evaluate ``expr`` over the polygons inside ``fov`` and return a
         list of result polygons (each ``(n, 2)`` ndarray). Bindings may be
         raw layers or references to other synthetic recipes (nested). Raises
-        on parse / evaluation error or missing shapely (caller shows it)."""
+        on parse / evaluation error or missing shapely (caller shows it).
+
+        ``raw_memo`` / ``eval_cache`` (P1): pass the same dicts across several
+        evaluations over one FOV (a recipe recompute) so a shared raw layer is
+        converted once (``raw_memo``) and a shared sub-expression like
+        ``(A>W:7)`` is computed once (``eval_cache``)."""
         x0, y0, x1, y1 = fov
         cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
         w, h = (x1 - x0), (y1 - y0)
 
         def raw_provider(layer: int, datatype: int):
+            if raw_memo is not None and (layer, datatype) in raw_memo:
+                return raw_memo[(layer, datatype)]
             entry = (self._doc.find(LayerKey(layer=layer, datatype=datatype))
                      if self._doc is not None else None)
             if entry is None or entry.bboxes is None or entry.bboxes.shape[0] == 0:
-                return gds_boolean.polys_to_geometry([])
-            idx = gds_fov.fov_overlap_indices(cx, cy, w, h, entry.bboxes)
-            sel = [entry.polygons[int(i)] for i in idx]
-            return gds_boolean.polys_to_geometry(sel)
+                g = gds_boolean.polys_to_geometry([])
+            else:
+                idx = gds_fov.fov_overlap_indices(cx, cy, w, h, entry.bboxes)
+                sel = [entry.polygons[int(i)] for i in idx]
+                g = gds_boolean.polys_to_geometry(sel)
+            if raw_memo is not None:
+                raw_memo[(layer, datatype)] = g
+            return g
 
         _t0 = time.perf_counter()
         geom = gds_boolean.resolve_expression(
             expr, bindings, raw_provider=raw_provider,
             recipe_provider=self._recipe_def,
-            fov_bbox=gds_boolean.fov_box(cx, cy, w, h))
+            fov_bbox=gds_boolean.fov_box(cx, cy, w, h),
+            _eval_cache=eval_cache)
         polys = gds_boolean.geometry_to_polygons(geom)
         perfmon.monitor.record(
             "boolean", (time.perf_counter() - _t0) * 1e3,
@@ -7812,9 +7863,16 @@ class MainWindow(QMainWindow):
         if fov is None:
             fov = self._recipe_fov()
         errors: list[str] = []
+        # P1: share a raw-layer geometry memo + sub-expression result cache
+        # across all recipes in this recompute, so a layer / sub-tree used by
+        # several recipes (e.g. (A>W:7) in three of them) is computed once.
+        raw_memo: dict = {}
+        eval_cache: dict = {}
         for r in self._recipes:
             try:
-                polys = self._eval_expression(r["expr"], r["bindings"], fov)
+                polys = self._eval_expression(r["expr"], r["bindings"], fov,
+                                              raw_memo=raw_memo,
+                                              eval_cache=eval_cache)
             except Exception as exc:
                 errors.append(f"{r['name']}: {exc}")
                 polys = []

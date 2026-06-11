@@ -111,8 +111,25 @@ python tools/bench/bench_roiwalk_finealign.py /path/to/prod.oas \
 
 ## 靜態分析（待實機數據佐證 / 推翻）
 
-> 以下為讀碼得到的瓶頸假說與量測訊號的對應；**待 user 回傳 log 後**在各條補真實數字、
-> 排優先序。
+### ✅ M2 實機數據（2026-06-11，E3B 小檔：346MB / 13,276 cells / sbbox=0 / 4 layer / ~399 張 batch）
+
+| 操作 | 實測 | 判讀 |
+|---|---|---|
+| Open + index | 180 ms | 不是問題 |
+| ROI walk（首次/cold） | **12,395 ms** · decoded=13,330（≈全檔） | **sbbox=0 → reachable_bbox 解碼整檔**（[F17] 假說證實） |
+| ROI walk（warm） | 1,000~2,500 ms · decoded 0~50 | reach_memo 暖後只解少數新 cell；殘 1~2.5s 為 4-layer 遍歷+emit |
+| **Boolean eval** | **800~2,900 ms/次**（GUI thread！） | morph（`W:n` grow/shrink）× 數千 poly 為主成本；隨 out_polys 陡升 |
+| Boolean 重複算 | 每次 ROI 重載 3 recipe 各重算；`(A>W:7)` 子式被算 3× | **共用子式無 memo** → 去重可省 ~1/3+ |
+| Template build | 30~45 ms | 可忽略 |
+| **Batch align** | **1,293,328 ms / 399 張 = 3,241 ms/張、0.3 img/s** | 頭號痛點；每張 worker 重跑 walk+boolean，boolean×399 為主因 |
+
+**結論（依數據定的優先序）：**
+1. **Boolean 是雙重痛點** —— 互動時凍 UI（0.8~2.9s × 3 recipe／重載），且乘 399 撐起整個 batch。
+   → 共用子式去重（P1）+ morph 本身加速（P4）一次打中 live 與 batch。
+2. **sbbox=0 → 首次 walk 解碼整檔 12.4s** —— 大檔更痛、每個 batch worker 各付一次。
+   → 一次性 per-cell bbox sweep + 磁碟 sidecar（P3 = [F17]），跨 session / 跨 worker 重用。
+3. **Boolean 在 GUI thread** → 互動凍結。→ 移到 worker thread（P2，純體感修復）。
+4. **batch per-stage 缺口** → 加 batch per-image 計時回傳（P5），確認 boolean vs walk 佔比。
 
 ### A. ROI walk（`oasis_random.walk_roi`）
 
@@ -194,37 +211,57 @@ per-image 四階段：`read`(cv2.imread) → `poi`(walk+bool) → `template`(ras
 - [ ] 把數字填回本檔「靜態分析」各條，確認 / 推翻假說
 - [ ] 依數據排出後續改善的實作順序（下列為候選池，非承諾全做）
 
-### M3（候選）: matchTemplate 金字塔  [status: planned · 若 match 主導]
+### M3: P5 batch per-stage 診斷  [status: done 2026-06-11]
 
-- [ ] coarse-to-fine：降採樣粗搜 + 原解析度局部精修，保持結果等價（峰值位置一致）
-- [ ] 驗證：`tests/test_accel_equivalence.py` 加金字塔 vs 全解析度 dx/dy/score 等價（容差內）
+- [x] `fine_align.pool_collect_timing()`：回傳並重置 worker 的 `_FA_TIMING_ACC`
+- [x] `FineAlignAllWorker` 加 `stage_timing` signal；process-pool 路徑 over-submit
+      workers×3 個 collect probe 聚合（每 worker 真值計一次、其餘 0，總和精確）；
+      in-thread 路徑本地收集
+- [x] `_on_fa_stage_timing` 記 `batch:read/poi/template/match` 四事件進 monitor（HUD/.txt）
+- [x] 端到端驗證：合成 batch 跑出 per-image 分段（poi(walk+bool) 主導）
 
-### M4（候選）: expression POI 同層 walk 去重  [status: planned · 若 boolean/poi 主導]
+### M4: P1 Boolean 共用子式去重  [status: done 2026-06-11]
 
-- [ ] `raw_provider` 內加 per-(layer,datatype) ROI memo，同層只 walk 一次
-- [ ] 驗證：同表達式多次引用同層，結果與去重前 byte 等價
+- [x] `gds_boolean.evaluate` 加 `node_cache`+`ref_ids`：以 `_canon_key`（leaf 用解析後
+      layer 身分）memo 每個 AST 子樹結果；`resolve_expression` 加 `_eval_cache` 串接
+- [x] app `_recompute_recipes`：跨 recipe 共用 `raw_memo` + `eval_cache`
+      → `(A>W:7)` 算 1 次而非 3 次；`fine_align` expression POI 每張共用 per-image cache
+- [x] 驗證：`tests/test_gds_boolean_cache.py`（16）—— 共用子樹只算一次、不同 layer 不混、
+      含 morph/diagonal/hole 的結果與無 cache 等價
 
-### M5（候選）: 批次首波熱 cell 預解碼  [status: planned · 若 batch 首波重複解碼明顯]
+### M5: P4 morph 加速  [status: done 2026-06-11]
 
-- [ ] 主行程在 dispatch 前對 ROI 涉及的熱 cell `load_cell` 一次（寫入 cellcache）
-- [ ] 驗證：worker 第一波 cellcache 命中率上升、warm→first-image 延遲下降
+- [x] profile 確認 `_dilate_axis` 成本 = `unary_union`(53%) + per-edge `Polygon()`(~25%)
+- [x] 向量化 parallelogram（單一 `shapely.polygons`）+ 跳過與掃描向量平行的退化邊
+      （rectilinear 約少一半 pieces）→ **9000-poly grow 4007ms → 2565ms（−36%）、symdiff=0 等價**
+- [x] 驗證：上述 cache 測試含 morph 等價；既有 63 項 boolean 測試全綠
 
-### M6（候選）: regular-grid analytic sub-grid clip 補強  [status: planned · 若 inst_mat≫visited]
+### M6（候選 · 未做）: matchTemplate 金字塔  [status: planned · 若 match 主導]
 
-- [ ] 檢視 `_clip_grid_offsets` 為何沒咬到大陣列；補 analytic 子網格裁剪
-- [ ] 驗證：`instances_materialized` 大幅下降、結果幾何等價
+- 實機數據顯示 batch 是 **poi(walk+bool) 主導**、match 微不足道（0.3ms/img），故**暫不需要**。
+- 若日後大檔 + 大影像使 match 變重再做：coarse-to-fine 粗搜 + 原解析度精修。
+
+### M7（候選 · 未做）: 無 S_BOUNDING_BOX 檔 per-cell bbox sidecar（[F17]）  [status: planned]
+
+- 實機證實首次 ROI walk 因 sbbox=0 解碼整檔 12.4s；大檔 + 每個 batch worker 更痛。
+- 一次性 bbox sweep + 磁碟 sidecar，跨 session / worker 重用。user 本輪未選，列候選。
+
+### M8（候選 · 未做）: regular-grid analytic sub-grid clip 補強  [status: planned]
+
+- 待數據顯示 `instances_materialized ≫ visited` 再做。
 
 ---
 
 ## Affected Files
 
 - `tools/bench/bench_roiwalk_finealign.py`、`tools/bench/_make_sample_oasis.py`（新增，M0）
-- `glas/core/perfmon.py`（新增，M1：Qt-free 監測核心）
+- `glas/core/perfmon.py`（新增，M1：Qt-free 監測核心；M3 加 batch:* OP_LABELS）
 - `glas/app/perf_panel.py`（新增，M1：HUD 面板）
-- `glas/app/gds_align_tool.py`（M1：掛 dock + View 選單 + 五處插樁）
-- `tests/test_perfmon.py`、`tests/test_perf_panel.py`（新增，M1）
-- 後續（依 M2 數據定案）：`glas/core/fine_align.py`、`glas/core/oasis_random.py`、
-  `tests/test_accel_equivalence.py`
+- `glas/app/gds_align_tool.py`（M1 掛 dock + 五處插樁；M3 stage_timing；M4 共用 cache）
+- `glas/core/gds_boolean.py`（M4 node_cache/_eval_cache；M5 向量化 `_dilate_axis`）
+- `glas/core/fine_align.py`（M3 `pool_collect_timing`；M4 expression POI per-image cache）
+- `tests/test_perfmon.py`、`tests/test_perf_panel.py`、`tests/test_gds_boolean_cache.py`（新增）
+- 後續候選：`tests/test_accel_equivalence.py`（若做 M6 金字塔）、`oasis_random.py`（M7/M8）
 
 ---
 

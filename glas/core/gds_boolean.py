@@ -346,7 +346,8 @@ def resolve_expression(expr: str,
                        recipe_provider,
                        fov_bbox: Optional["BaseGeometry"] = None,
                        _cache: Optional[dict] = None,
-                       _visiting: Optional[set] = None) -> "BaseGeometry":
+                       _visiting: Optional[set] = None,
+                       _eval_cache: Optional[dict] = None) -> "BaseGeometry":
     """Evaluate ``expr`` whose ``bindings`` may reference raw layers AND
     other synthetic recipes (nested composition).
 
@@ -354,17 +355,27 @@ def resolve_expression(expr: str,
     geometry; ``recipe_provider(name) -> (expr, bindings) | None`` supplies
     a referenced recipe's definition. Referenced recipes are evaluated
     recursively and memoized in ``_cache``; cycles raise
-    :class:`BooleanExprError`."""
+    :class:`BooleanExprError`.
+
+    ``_eval_cache`` (P1): a sub-expression result cache shared across calls.
+    Pass the *same* dict when evaluating several expressions over the same FOV
+    (e.g. a recompute of all recipes) so a shared sub-tree like ``(A>W:7)`` —
+    same resolved layers — is computed once instead of once per expression."""
     cache = {} if _cache is None else _cache
     visiting = set() if _visiting is None else _visiting
     _, ast = parse_expression(expr)
     geoms: dict[str, "BaseGeometry"] = {}
+    # Resolved identity per letter, for the sub-expression cache's canonical
+    # keys (so a letter that means the same layer across expressions matches).
+    ref_ids: dict[str, tuple] = {}
     for letter, raw_val in bindings.items():
         val = normalize_binding(raw_val)
         if val[0] == "raw":
+            ref_ids[letter] = ("raw", val[1], val[2])
             geoms[letter] = raw_provider(val[1], val[2])
             continue
         name = val[1]
+        ref_ids[letter] = ("rec", name)
         if name in cache:
             geoms[letter] = cache[name]
             continue
@@ -378,11 +389,12 @@ def resolve_expression(expr: str,
         g = resolve_expression(rec[0], rec[1], raw_provider=raw_provider,
                                recipe_provider=recipe_provider,
                                fov_bbox=fov_bbox, _cache=cache,
-                               _visiting=visiting)
+                               _visiting=visiting, _eval_cache=_eval_cache)
         visiting.discard(name)
         cache[name] = g
         geoms[letter] = g
-    return evaluate(ast, geoms, fov_bbox=fov_bbox)
+    return evaluate(ast, geoms, fov_bbox=fov_bbox,
+                    node_cache=_eval_cache, ref_ids=ref_ids)
 
 
 # ── Geometry helpers ─────────────────────────────────────────────────
@@ -470,17 +482,38 @@ def _dilate_axis(geom: "BaseGeometry", n: float, axis: str) -> "BaseGeometry":
     'H'->Y): the Minkowski sum of ``geom`` with the centred segment
     ``[-n, n]`` on that axis. Computed as the union of ``geom``, its
     translated copy, and each boundary edge swept into a parallelogram —
-    exact for arbitrary polygons (F4)."""
+    exact for arbitrary polygons (F4).
+
+    P4 perf: the swept parallelograms are built in one vectorized
+    ``shapely.polygons`` call instead of a Python ``Polygon(...)`` per edge,
+    and edges parallel to the sweep vector are skipped — their parallelogram is
+    degenerate (zero area) so dropping it is exact, and on rectilinear layout
+    that removes ~half the pieces fed to ``unary_union`` (the dominant cost)."""
     if geom.is_empty or n <= 0:
         return geom
     vx, vy = (2.0 * n, 0.0) if axis == "W" else (0.0, 2.0 * n)
     base = translate(geom, -vx / 2.0, -vy / 2.0)   # centre the bias
     parts = [base, translate(base, vx, vy)]
+    p0_chunks: list = []
+    p1_chunks: list = []
     for ring in _iter_rings(base):
-        coords = list(ring.coords)
-        for (x0, y0), (x1, y1) in zip(coords, coords[1:]):
-            parts.append(Polygon([(x0, y0), (x1, y1),
-                                   (x1 + vx, y1 + vy), (x0 + vx, y0 + vy)]))
+        c = np.asarray(ring.coords, dtype=float)
+        if c.shape[0] < 2:
+            continue
+        p0_chunks.append(c[:-1])
+        p1_chunks.append(c[1:])
+    if p0_chunks:
+        p0 = np.concatenate(p0_chunks)
+        p1 = np.concatenate(p1_chunks)
+        # Drop edges parallel to v (cross(edge, v) == 0): degenerate sweep.
+        d = p1 - p0
+        keep = np.abs(d[:, 0] * vy - d[:, 1] * vx) > 1e-9
+        p0, p1 = p0[keep], p1[keep]
+        if p0.shape[0]:
+            v = np.array([vx, vy])
+            # (M, 5, 2) closed parallelogram rings: p0, p1, p1+v, p0+v, p0.
+            quads = np.stack([p0, p1, p1 + v, p0 + v, p0], axis=1)
+            parts.extend(shapely.polygons(quads).tolist())
     g = unary_union(parts)
     return g if g.is_valid else g.buffer(0)
 
@@ -509,9 +542,32 @@ def fov_box(cx: float, cy: float, fov_w: float, fov_h: float) -> "BaseGeometry":
                cx + fov_w / 2.0, cy + fov_h / 2.0)
 
 
+def _canon_key(node: object, ref_ids: Mapping[str, tuple]) -> tuple:
+    """A hashable canonical key for an AST sub-tree, with leaf ``Ref`` nodes
+    keyed by their *resolved* identity (``ref_ids``: letter -> ("raw",L,D) /
+    ("rec",name)) rather than the letter. Two structurally-identical sub-trees
+    over the same resolved layers therefore share a key — the basis for the
+    sub-expression result cache (P1), so e.g. ``(A>W:7)`` repeated across
+    several recipes is evaluated once per recompute."""
+    if isinstance(node, Ref):
+        return ("ref", ref_ids.get(node.name, ("name", node.name)))
+    if isinstance(node, Not):
+        return ("not", _canon_key(node.child, ref_ids))
+    if isinstance(node, Morph):
+        return ("morph", node.sign, node.amount, node.label,
+                _canon_key(node.child, ref_ids))
+    if isinstance(node, BinOp):
+        return ("bin", node.op, _canon_key(node.left, ref_ids),
+                _canon_key(node.right, ref_ids))
+    return ("id", id(node))
+
+
 def evaluate(ast: object,
              bindings: Mapping[str, "BaseGeometry"],
-             fov_bbox: Optional["BaseGeometry"] = None) -> "BaseGeometry":
+             fov_bbox: Optional["BaseGeometry"] = None,
+             *,
+             node_cache: Optional[dict] = None,
+             ref_ids: Optional[Mapping[str, tuple]] = None) -> "BaseGeometry":
     """Evaluate ``ast`` against shapely geometries bound per layer name.
 
     Args:
@@ -520,12 +576,20 @@ def evaluate(ast: object,
         fov_bbox: the FOV rectangle as a shapely polygon, required only
             if the expression uses complement (``~``); it bounds the
             complement so it isn't infinite.
+        node_cache / ref_ids: P1 sub-expression result cache. When *both*
+            are given, every AST node's result is memoized by
+            :func:`_canon_key` (leaves keyed by resolved layer identity), so a
+            sub-tree appearing more than once — within one expression or across
+            several expressions sharing the same dict — is computed once.
+            Shapely geometries are immutable and set ops don't mutate their
+            inputs, so sharing a cached result is safe / value-identical.
 
     Returns a shapely geometry (possibly empty / MultiPolygon).
     """
     _require_shapely()
+    use_cache = node_cache is not None and ref_ids is not None
 
-    def ev(n: object) -> "BaseGeometry":
+    def compute(n: object) -> "BaseGeometry":
         if isinstance(n, Ref):
             g = bindings.get(n.name)
             if g is None:
@@ -554,6 +618,17 @@ def evaluate(ast: object,
                 return a.difference(b)
             raise BooleanExprError(f"unknown binary op {n.op!r}")
         raise BooleanExprError(f"unknown AST node {n!r}")
+
+    def ev(n: object) -> "BaseGeometry":
+        if not use_cache:
+            return compute(n)
+        k = _canon_key(n, ref_ids)
+        hit = node_cache.get(k)
+        if hit is not None:
+            return hit
+        res = compute(n)
+        node_cache[k] = res
+        return res
 
     return ev(ast)
 
