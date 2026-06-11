@@ -175,3 +175,48 @@ class TestMorphVectorizedEquivalence:
         new = gb._dilate_axis(ring, 2.0, "W")
         ref = self._old_dilate(ring, 2.0, "W")
         assert new.symmetric_difference(ref).area < 1e-6
+
+
+class TestFineAlignCrossSpecShare:
+    """P1 batch path: sharing walk_memo / raw_geom_memo / eval_cache across an
+    image's POI specs walks each raw layer once and is result-equivalent to the
+    unshared path."""
+
+    def _reader(self, tmp_path):
+        import subprocess
+        oas = tmp_path / "s.oas"
+        subprocess.run([sys.executable, "tools/bench/_make_sample_oasis.py",
+                        str(oas), "300"], check=True,
+                       cwd=Path(__file__).resolve().parents[1])
+        import oasis_random as orx
+        return orx.RandomAccessReader(
+            str(oas), wanted_layers={(17, 0)},
+            bbox_layer=orx.DEFAULT_BBOX_LAYER), orx
+
+    def test_shared_walks_once_and_equivalent(self, tmp_path, monkeypatch):
+        import fine_align as fa
+        rar, orx = self._reader(tmp_path)
+        roi = (180000.0, 160000.0, 220000.0, 200000.0)
+        specs = [("expr", "A>W:7", {"A": (17, 0)}),
+                 ("expr", "A>W:10", {"A": (17, 0)}),
+                 ("expr", "A>W:7", {"A": (17, 0)})]
+        calls = {"n": 0}
+        real = fa._walk_roi_polys
+
+        def counting(*a, **k):
+            calls["n"] += 1
+            return real(*a, **k)
+
+        monkeypatch.setattr(fa, "_walk_roi_polys", counting)
+        calls["n"] = 0
+        unshared = [fa.poi_polys_for_roi(rar, "TOP", roi, s) for s in specs]
+        n_unshared = calls["n"]
+        calls["n"] = 0
+        wm, rgm, ec = {}, {}, {}
+        shared = [fa.poi_polys_for_roi(rar, "TOP", roi, s, walk_memo=wm,
+                                       raw_geom_memo=rgm, eval_cache=ec)
+                  for s in specs]
+        n_shared = calls["n"]
+        assert n_unshared == 3 and n_shared == 1   # layer 17 walked once
+        # same polygon count per spec
+        assert [len(x) for x in unshared] == [len(x) for x in shared]

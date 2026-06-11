@@ -206,7 +206,9 @@ HMI 風格表達式 → 遞迴下降 parser → AST → shapely 運算。運算�
 
 - [F24] ROI walk + 批次 fine-align 效能分析與改善。已完成：M0 離線 harness、M1 app 內建
   即時效能監測 HUD（`perfmon`+`perf_panel`）、M3 batch per-stage 診斷、M4 Boolean 共用子式
-  去重（`gds_boolean` node_cache）、M5 morph 向量化（`_dilate_axis` −36%）。**未做候選**：
+  去重（`gds_boolean` node_cache）、M5 morph 向量化（`_dilate_axis` −36%）、M9 batch 跨 POI-spec
+  快取共用（`_fine_align_image` 同張影像 walk_memo/eval_cache 共用，raw layer 每張只 walk 一次）。
+  P5 分段證實 batch 由 POI(walk+bool) 主導、match 不是瓶頸。**未做候選**：
   M6 matchTemplate 金字塔（數據顯示不需要）、M7 無 S_BOUNDING_BOX 檔 bbox sidecar（[F17]，
   消首次 walk 整檔解碼 12.4s）、M8 grid analytic clip。待 user 回傳新 .txt 驗證改善幅度後
   決定是否做 M7。plan：`docs/plans/F24-perf-roiwalk-finealign.md`。

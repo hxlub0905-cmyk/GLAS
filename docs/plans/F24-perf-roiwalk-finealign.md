@@ -131,6 +131,23 @@ python tools/bench/bench_roiwalk_finealign.py /path/to/prod.oas \
 3. **Boolean 在 GUI thread** → 互動凍結。→ 移到 worker thread（P2，純體感修復）。
 4. **batch per-stage 缺口** → 加 batch per-image 計時回傳（P5），確認 boolean vs walk 佔比。
 
+### ✅ M2b 第二次實機數據（2026-06-11，P1+P4+P5 之後，同 E3B / 399 張）
+
+| 項目 | 改善前 | 改善後 | 變化 |
+|---|---|---|---|
+| Boolean `(K>W:10<W:10)-(A>W:7)`（morph 最重） | 最高 2,922 ms | 最高 1,881 ms | **−36%**（P4 morph） |
+| live recompute（3 recipe 總和，估） | ~4,500 ms | ~2,800 ms | **−35%** |
+| **Batch align** | 1,293,328 ms（21.5 分） | 1,073,929 ms（17.9 分） | **−17%** |
+
+**P5 揪出 batch 真凶（per-image CPU，399 張平均）：** read=67ms · **POI walk+bool=21,159ms** ·
+template=95ms · match=90ms。→ **match 完全不是瓶頸（確認 M6 金字塔不需要）**；POI(walk+bool) 佔
+~99%。21,159ms × 399 ÷ ~8 worker ÷ 60 ≈ 17.9 分，與總時間吻合。
+
+**新發現 → M9：** batch 每張有 **3 個 POI 表達式，彼此不共用快取**（P1 的 per-image 快取原本是
+「每個 spec 各建一份」），故共用 raw layer A **每張被 walk 3 次**、`(A>W:7)` 每張算 3 次——
+live 的 `_recompute_recipes` 有跨 recipe 共用、batch 漏掉。→ M9 把快取共用到「同一張影像的所有
+POI spec」。
+
 ### A. ROI walk（`oasis_random.walk_roi`）
 
 1. **首次（cold）walk 的剪枝是否「免解碼」是頭號變因。**
@@ -235,6 +252,16 @@ per-image 四階段：`read`(cv2.imread) → `poi`(walk+bool) → `template`(ras
 - [x] 向量化 parallelogram（單一 `shapely.polygons`）+ 跳過與掃描向量平行的退化邊
       （rectilinear 約少一半 pieces）→ **9000-poly grow 4007ms → 2565ms（−36%）、symdiff=0 等價**
 - [x] 驗證：上述 cache 測試含 morph 等價；既有 63 項 boolean 測試全綠
+
+### M9: batch 跨 POI-spec 快取共用  [status: done 2026-06-11]
+
+- [x] `poi_polys_for_roi` / `poi_polys_and_geometry_for_roi` 加
+      `walk_memo`/`raw_geom_memo`/`eval_cache` kwargs
+- [x] `_fine_align_image` 對「同一張影像的所有 POI spec」共用這三個快取（同一 ROI）
+      → 共用 raw layer 每張只 walk 一次、共用子式只算一次
+- [x] 驗證：3 spec 共用 layer 17 → walk 3 次降為 1 次、結果等價
+      （`tests/test_gds_boolean_cache.py::TestFineAlignCrossSpecShare`）
+- [ ] 待 user 回傳新 .txt 確認 batch POI(walk+bool) 降幅
 
 ### M6（候選 · 未做）: matchTemplate 金字塔  [status: planned · 若 match 主導]
 

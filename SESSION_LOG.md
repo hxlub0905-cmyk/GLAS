@@ -4,6 +4,29 @@
 
 ---
 
+## [2026-06-11] [F24] M9：batch 跨 POI-spec 快取共用（第二次實機數據驅動）
+
+**變更類型：** 效能優化 · **狀態：M9 完成** · **Branch：** claude/gifted-lovelace-uvnn8v
+
+**動機（第二次實機 .txt + P5 分段）：** P1/P4/P5 之後 user 重跑 E3B/399 張：morph 最重的
+`(K...)` recipe 2922→1881ms（−36%）、batch 21.5→17.9 分（−17%）。**P5 分段揪出真凶**：
+batch per-image CPU 中 **POI walk+bool = 21,159ms（~99%）**、match 僅 90ms（確認 M6 金字塔
+不需要）。進一步發現：batch 每張有 3 個 POI 表達式但**彼此不共用快取**（P1 的 per-image 快取原本
+每個 spec 各建一份），共用 raw layer A 每張被 walk 3 次、`(A>W:7)` 每張算 3 次——live 的
+`_recompute_recipes` 有跨 recipe 共用、batch 漏掉。
+
+**實作：** `poi_polys_for_roi` / `poi_polys_and_geometry_for_roi` 加 `walk_memo`/`raw_geom_memo`/
+`eval_cache` kwargs；`_fine_align_image` 對「同一張影像的所有 POI spec」（同一 ROI）共用這三個
+快取 → 共用 raw layer 每張只 walk 一次、共用子式只算一次。等價（shapely 幾何不可變）。
+
+**測試：** `tests/test_gds_boolean_cache.py::TestFineAlignCrossSpecShare`（3 spec 共用 layer 17 →
+walk 3→1、結果等價）。`pytest tests/` **742 passed**。
+
+**影響檔案：** `glas/core/fine_align.py`、`tests/test_gds_boolean_cache.py`、
+`docs/plans/F24-perf-roiwalk-finealign.md`、`SESSION_LOG.md`、`CLAUDE.md`。
+
+---
+
 ## [2026-06-11] [F24] M3-M5：實機數據驅動的 Boolean 去重 + morph 加速 + batch 分段診斷
 
 **變更類型：** 效能優化（數據驅動）· **狀態：M3/M4/M5 完成** ·

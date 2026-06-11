@@ -367,7 +367,8 @@ def _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb=None):
 
 
 def poi_polys_and_geometry_for_roi(rar, root, roi_bbox, poi_spec,
-                                   cancel_cb=None):
+                                   cancel_cb=None, *, walk_memo=None,
+                                   raw_geom_memo=None, eval_cache=None):
     """POI outline polygons *and* the hole-preserving resolved geometry for a
     ROI, from a single walk (F13). ``poi_spec`` is ``('raw', layer, datatype)``
     or ``('expr', expr_text, bindings[, recipes])``.
@@ -377,46 +378,61 @@ def poi_polys_and_geometry_for_roi(rar, root, roi_bbox, poi_spec,
     overlay outlines but would *fill* Boolean interior exclusions (subtraction /
     complement) once rasterised into a mask. The mask path therefore needs the
     geometry, not the rings. Returns ``(polys, geom)`` so one ROI walk feeds
-    both the overlay (polys) and the mask (geom)."""
+    both the overlay (polys) and the mask (geom).
+
+    ``walk_memo`` / ``raw_geom_memo`` / ``eval_cache`` (P1): pass the same dicts
+    across every POI spec of ONE image (same ``roi_bbox``) so a raw layer shared
+    by several POIs/recipes is walked + unioned once and a shared sub-expression
+    like ``(A>W:7)`` is evaluated once — the batch counterpart of the live
+    ``_recompute_recipes`` sharing."""
+    def _walk(layer, datatype):
+        if walk_memo is None:
+            return _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb)
+        key = (layer, datatype)
+        if key not in walk_memo:
+            walk_memo[key] = _walk_roi_polys(
+                rar, root, roi_bbox, layer, datatype, cancel_cb)
+        return walk_memo[key]
+
+    def _raw_geom(layer, datatype):
+        key = (layer, datatype)
+        if raw_geom_memo is not None and key in raw_geom_memo:
+            return raw_geom_memo[key]
+        g = gds_boolean.polys_to_geometry(_walk(layer, datatype))
+        if raw_geom_memo is not None:
+            raw_geom_memo[key] = g
+        return g
+
     kind = poi_spec[0]
     if kind == "raw":
         _, layer, datatype = poi_spec
-        polys = _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb)
-        return polys, gds_boolean.polys_to_geometry(polys)
+        polys = _walk(layer, datatype)
+        return polys, _raw_geom(layer, datatype)
     # expression POI
     expr, bindings = poi_spec[1], poi_spec[2]
     recipes = poi_spec[3] if len(poi_spec) > 3 else {}
     x0, y0, x1, y1 = roi_bbox
     cx, cy, w, h = (x0 + x1) / 2.0, (y0 + y1) / 2.0, (x1 - x0), (y1 - y0)
-
-    # P1: memo each raw layer's ROI walk + the resolved sub-expressions for
-    # THIS image, so a layer / sub-tree referenced more than once in the
-    # expression (or its nested recipes) is walked / evaluated once.
-    raw_memo: dict = {}
-
-    def raw_provider(layer: int, datatype: int):
-        key = (layer, datatype)
-        if key not in raw_memo:
-            ps = _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb)
-            raw_memo[key] = gds_boolean.polys_to_geometry(ps)
-        return raw_memo[key]
-
     geom = gds_boolean.resolve_expression(
-        expr, bindings, raw_provider=raw_provider,
+        expr, bindings, raw_provider=_raw_geom,
         recipe_provider=lambda n: recipes.get(n),
         fov_bbox=gds_boolean.fov_box(cx, cy, w, h),
-        _eval_cache={})
+        _eval_cache=(eval_cache if eval_cache is not None else {}))
     return gds_boolean.geometry_to_polygons(geom), geom
 
 
-def poi_polys_for_roi(rar, root, roi_bbox, poi_spec, cancel_cb=None):
+def poi_polys_for_roi(rar, root, roi_bbox, poi_spec, cancel_cb=None, *,
+                      walk_memo=None, raw_geom_memo=None, eval_cache=None):
     """POI polygons (nm, root coords) for a given ROI, for batch fine align
     (plan M4b "Run all") and overlay outlines. ``poi_spec`` is
     ``('raw', layer, datatype)`` or ``('expr', expr_text, bindings[, recipes])``;
     the latter walks each bound layer over the ROI and evaluates the Boolean
     expression, resolving any nested synthetic references via ``recipes``
     (``{name: (expr, bindings)}``). For the hole-preserving geometry (mask
-    export) use :func:`poi_polys_and_geometry_for_roi`."""
+    export) use :func:`poi_polys_and_geometry_for_roi`.
+
+    ``walk_memo`` / ``raw_geom_memo`` / ``eval_cache`` (P1): see
+    :func:`poi_polys_and_geometry_for_roi` — share them across an image's POIs."""
     # F23 batch-perf: a raw POI only needs the outline polygons here — the
     # template rasterizer fills overlapping polys idempotently, so it does NOT
     # need the unioned geometry. poi_polys_and_geometry_for_roi would compute a
@@ -425,9 +441,16 @@ def poi_polys_for_roi(rar, root, roi_bbox, poi_spec, cancel_cb=None):
     # through the full path because their Boolean evaluation needs the geometry.
     if poi_spec[0] == "raw":
         _, layer, datatype = poi_spec
+        if walk_memo is not None:
+            key = (layer, datatype)
+            if key not in walk_memo:
+                walk_memo[key] = _walk_roi_polys(
+                    rar, root, roi_bbox, layer, datatype, cancel_cb)
+            return walk_memo[key]
         return _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb)
     return poi_polys_and_geometry_for_roi(
-        rar, root, roi_bbox, poi_spec, cancel_cb)[0]
+        rar, root, roi_bbox, poi_spec, cancel_cb, walk_memo=walk_memo,
+        raw_geom_memo=raw_geom_memo, eval_cache=eval_cache)[0]
 
 
 # ── Optional per-stage timing (diagnostic) ───────────────────────────────────
@@ -506,9 +529,18 @@ def _fine_align_image(job, rar, root, poi_specs, cfg, cancel_is_set):
     roi = (anchor[0] - c["fov_w"], anchor[1] - c["fov_h"],
            anchor[0] + c["fov_w"], anchor[1] + c["fov_h"])
     t1 = time.perf_counter()
+    # P1: share one raw-layer walk memo + raw-geometry memo + sub-expression
+    # cache across ALL POI specs of this image (they share the same ROI), so a
+    # layer / sub-tree used by several POIs/recipes is walked + evaluated once
+    # — the batch counterpart of the live _recompute_recipes sharing.
+    walk_memo: dict = {}
+    raw_geom_memo: dict = {}
+    eval_cache: dict = {}
     poi_layers = []
     for spec, fg in poi_specs:
-        polys = poi_polys_for_roi(rar, root, roi, spec, cancel_cb=cancel_is_set)
+        polys = poi_polys_for_roi(rar, root, roi, spec, cancel_cb=cancel_is_set,
+                                  walk_memo=walk_memo, raw_geom_memo=raw_geom_memo,
+                                  eval_cache=eval_cache)
         if polys:
             poi_layers.append((polys, fg))
     if not poi_layers:
