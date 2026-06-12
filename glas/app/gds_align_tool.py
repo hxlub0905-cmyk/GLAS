@@ -1679,7 +1679,11 @@ class OverlayExportWorker(QObject):
         initargs = (str(rar._path), rar._init_wanted, rar._dtype,
                     rar._bbox_layer, self._root, self._poi, self._cfg,
                     str(self._out_dir), self._export_raw, self._export_overlay,
-                    self._export_gray, self._export_label, self._score_thr)
+                    self._export_gray, self._export_label, self._score_thr,
+                    # F24: inject the already-built name-table index so each
+                    # export worker skips its own scan_cell_offsets rescan (the
+                    # 1.8 GB-file "wind-up" before every export).
+                    rar.index_snapshot())
         ctx = mp.get_context("spawn")
         ex = ProcessPoolExecutor(max_workers=workers, mp_context=ctx,
                                  initializer=overlay_export._export_pool_init,

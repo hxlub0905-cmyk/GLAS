@@ -215,16 +215,22 @@ _GE: dict = {}
 
 def _export_pool_init(path, wanted_layers, dtype, bbox_layer, root, poi, cfg,
                       out_dir, export_raw, export_overlay, export_gray,
-                      export_label, score_thr):
+                      export_label, score_thr, prebuilt_index=None):
     """ProcessPoolExecutor initializer: build the per-process reader + cache the
-    immutable export context. Runs once in each worker process."""
+    immutable export context. Runs once in each worker process.
+
+    F24: ``prebuilt_index`` (the orchestrator's already-built name-table index)
+    lets each worker skip its own ``scan_cell_offsets`` rescan — the dominant
+    per-worker startup cost on a big file (the export "wind-up"). Mirrors the
+    fine-align pool's F23 M1 injection."""
     if cv2 is not None:
         try:
             cv2.setNumThreads(1)
         except Exception:  # pragma: no cover - older cv2
             pass
     _GE["rar"] = oasis_random.RandomAccessReader(
-        path, wanted_layers=wanted_layers, dtype=dtype, bbox_layer=bbox_layer)
+        path, wanted_layers=wanted_layers, dtype=dtype, bbox_layer=bbox_layer,
+        prebuilt_index=prebuilt_index)
     _GE["root"] = root
     _GE["poi"] = poi
     _GE["cfg"] = cfg

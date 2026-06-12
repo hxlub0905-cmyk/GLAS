@@ -4,6 +4,29 @@
 
 ---
 
+## [2026-06-12] [F24] M13：匯出 pool 注入索引（消除每次匯出的「前搖」）
+
+**變更類型：** 效能優化（啟動延遲）· **狀態：完成** · **Branch：** claude/gifted-lovelace-uvnn8v
+
+**動機（user 觀察）：** 大檔（1.8GB）用「Align during export」融合匯出時，user 反映**每次 export
+都有明顯前搖**。追查：F23 當初只幫 fine-align 的 process pool 注入既有索引（worker 跳過
+`scan_cell_offsets`），**export pool 漏掉** → 每次 export、每個 worker 都對 1.8GB 檔重掃一次
+name table = 前搖。（M11 快取在 walk decode 有幫助，但前搖是 reader 建構期的另一筆成本。）
+
+**實作（鏡像 F23 M1）：** `overlay_export._export_pool_init` 加 `prebuilt_index=` 並轉給
+`RandomAccessReader`；`OverlayExportWorker._run_process_pool` 的 initargs 追加
+`rar.index_snapshot()`。worker 從此跳過 name-table 重掃。
+
+**驗證：** overlay 對齊在真實檔已確認正確（M12 融合匯出可用、Run all 可從流程移除）。
+index 注入 worker smoke 測試通過（status=ok、gray 有輸出）。`pytest tests/` **749 passed**。
+
+**未做（候選）：** 常駐 export pool（F23 M2 等價，跨多次匯出重用 worker，再省 spawn+import 冷啟）；
+export 路徑 per-stage（walk/render）診斷（看 M11 後殘餘成本是 walk 還是 gray/overlay render）。
+
+**影響檔案：** `glas/core/overlay_export.py`、`glas/app/gds_align_tool.py`、`SESSION_LOG.md`。
+
+---
+
 ## [2026-06-12] [F24] M12：對齊+匯出融合（以終為始：只要對齊後的 template 圖）
 
 **變更類型：** 效能優化（流程融合）· **狀態：M12 完成** · **Branch：** claude/gifted-lovelace-uvnn8v
