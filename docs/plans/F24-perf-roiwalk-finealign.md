@@ -148,6 +148,28 @@ template=95ms · match=90ms。→ **match 完全不是瓶頸（確認 M6 金字�
 live 的 `_recompute_recipes` 有跨 recipe 共用、batch 漏掉。→ M9 把快取共用到「同一張影像的所有
 POI spec」。
 
+### ✅ M2d 大檔實機數據（2026-06-12，LTV 1.8GB / 44,997 cells / **sbbox=89994** / 3 layer / 480 張）
+
+| 階段 | ms/img | 判讀 |
+|---|---|---|
+| Open + index | 922 ms | 1.8GB 仍快（mmap + 注入索引）|
+| 首次 ROI walk | 35,257 ms · decoded=538 | **sbbox prune 有效**（非整檔），但 decode 538 大 cell ≈ 65ms/cell |
+| warm ROI walk | ~7,000 ms · decoded ~80-200 | 每張新 FOV 仍冷解 ~100 大 cell |
+| **Batch ROI walk** | **23,709 (85% POI)** | **大頭：解碼大 cell** |
+| Batch Boolean | 4,246 (15%) | 輕（單純 `A>W:6`；P1/P4/M9 白賺）|
+| Batch align | 1,711,479 ms（28.5 分）· 0.3 img/s | — |
+
+**大檔 vs 小檔是相反瓶頸：** 小檔 Boolean 主導（morph），大檔 **ROI-walk 主導（大 cell 解碼）**。
+sbbox 有效 → **M7 對大檔無用**（已證實）。
+
+**兩個根因：**
+1. **cellcache 失效（指標用錯）：** 門檻是「過濾後 kept records ≥ 100k」，但這些 cell **解碼貴
+   （總 record 多）卻過濾後只剩 ~40 rect** → 永不達標 → 不快取 → 每張/每 worker 重解。
+   → 應改用「**解碼成本/時間**」決定，而非過濾後大小（M11）。但需 cache 能容納**大量** cell
+   （現行 per-cell `.npz` + `_evict()` O(n²) glob 不適合上萬 cell → 需 consolidated store）。
+2. **平行效率差：** 小檔 8 workers ~8×；大檔同設定僅 ~2.2×（28.5 分）。疑似 1.8GB ×8 worker
+   mmap + 大 cell 解碼的記憶體頻寬/IO 競爭，或 worker 數不同。待確認機器核數 / Parallel workers。
+
 ### A. ROI walk（`oasis_random.walk_roi`）
 
 1. **首次（cold）walk 的剪枝是否「免解碼」是頭號變因。**
