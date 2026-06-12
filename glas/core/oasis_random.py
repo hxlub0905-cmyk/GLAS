@@ -762,7 +762,9 @@ class RandomAccessReader:
             return content
 
         try:
+            _t_decode = time.perf_counter()
             content = self._decode_at(offset)
+            _decode_s = time.perf_counter() - _t_decode
         except oas.OasisFormatError as exc:
             cur = self._reader._f.tell()
             msg = f"decode desync near byte {cur}: {exc}"
@@ -778,13 +780,18 @@ class RandomAccessReader:
             if TRACE and self._n_loaded % 500 == 0:
                 _trace(f"… {self._n_loaded:,} cells decoded so far "
                        f"(last {cell_id!r} @ {offset})")
-            # F16-B: persist big cells so the next session loads them in seconds.
+            # F16-B / F24 M11: persist cells the next session would re-decode
+            # expensively. A cell qualifies if it kept many records OR was simply
+            # *slow to decode* (many total records but few survive the wanted-
+            # layer filter — the big-file ROI-walk case). Caching by decode cost
+            # makes a re-run of the same file read these from disk in ms.
             nrec = (content.placement_count() + content.total_rects()
                     + content.total_polys())
-            if nrec >= cellcache.min_records():
+            if cellcache.should_cache(nrec, _decode_s):
                 if cellcache.save(self._path, cell_id, self._init_wanted, content):
                     _dbg(f"cached decoded cell {cell_id!r} "
-                         f"({nrec:,} records) → sidecar (next session loads fast)")
+                         f"({nrec:,} kept records, {_decode_s * 1e3:.0f} ms decode) "
+                         f"→ sidecar (next session loads fast)")
         self._memo[cell_id] = content
         return content
 

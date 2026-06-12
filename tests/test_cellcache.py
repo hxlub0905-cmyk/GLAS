@@ -251,3 +251,43 @@ class TestSidecarIO:
         c = rar.load_cell(0)
         assert cellcache.save(src, 0, {(17, 0)}, c) is False
         assert cellcache.load(src, 0, {(17, 0)}) is None
+
+
+class TestDecodeCostTrigger:
+    """F24 M11: cache by decode cost, not just kept-record count."""
+
+    def test_should_cache_by_records(self, monkeypatch):
+        import cellcache
+        monkeypatch.setenv("GLAS_CELLCACHE_MIN_RECORDS", "1000")
+        monkeypatch.setenv("GLAS_CELLCACHE_MIN_DECODE_MS", "10")
+        assert cellcache.should_cache(2000, 0.0) is True      # records trigger
+        assert cellcache.should_cache(5, 0.0) is False        # neither
+
+    def test_should_cache_by_decode_cost(self, monkeypatch):
+        import cellcache
+        monkeypatch.setenv("GLAS_CELLCACHE_MIN_RECORDS", "100000")
+        monkeypatch.setenv("GLAS_CELLCACHE_MIN_DECODE_MS", "10")
+        # Few kept records but a slow decode -> cache it (the big-file case).
+        assert cellcache.should_cache(5, 0.050) is True
+        assert cellcache.should_cache(5, 0.005) is False      # fast decode
+
+    def test_decode_cost_trigger_disabled(self, monkeypatch):
+        import cellcache
+        monkeypatch.setenv("GLAS_CELLCACHE_MIN_RECORDS", "100000")
+        monkeypatch.setenv("GLAS_CELLCACHE_MIN_DECODE_MS", "0")   # disabled
+        assert cellcache.should_cache(5, 10.0) is False
+
+    def test_min_decode_s_parses_ms(self, monkeypatch):
+        import cellcache
+        monkeypatch.setenv("GLAS_CELLCACHE_MIN_DECODE_MS", "25")
+        assert abs(cellcache.min_decode_s() - 0.025) < 1e-9
+
+    def test_maybe_evict_throttled(self, monkeypatch):
+        import cellcache
+        calls = {"n": 0}
+        monkeypatch.setattr(cellcache, "_evict", lambda: calls.__setitem__("n", calls["n"] + 1))
+        monkeypatch.setattr(cellcache, "_EVICT_EVERY", 4)
+        monkeypatch.setattr(cellcache, "_saves_since_evict", 0)
+        for _ in range(10):
+            cellcache._maybe_evict()
+        assert calls["n"] == 2     # fired at 4 and 8, not every call

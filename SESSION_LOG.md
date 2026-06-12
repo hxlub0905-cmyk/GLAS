@@ -4,6 +4,35 @@
 
 ---
 
+## [2026-06-12] [F24] M11：cellcache 改用「解碼成本」快取（大檔 walk-bound 修法）
+
+**變更類型：** 效能優化（快取策略）· **狀態：M11 完成** · **Branch：** claude/gifted-lovelace-uvnn8v
+
+**動機（大檔實機數據 + 機器資訊）：** 大檔 LTV 1.8GB / 44,997 cells / **sbbox=89994**（decode-free
+prune 有效 → M7 對大檔無用）。batch 480 張 = 28.5 分，**ROI-walk 主導（23.7s/img，85% POI）**，
+Boolean 輕（4.2s，P1/P4/M9 白賺）。machine = **4 實體核/8 邏輯**：batch 開 8 worker 擠 4 核 →
+per-image perf_counter 計時被排程灌水（先前誤判「2.2×」），真實 4 核吃滿、CPU-bound。瓶頸 = 解碼
+大 cell：這些 cell 總 record 多（~65ms 解碼）但過濾後只剩 ~40 rect → `min_records=100k` 永不達標 →
+**cellcache 完全沒接住**，每次/每 worker 重解。user 回報**常重跑同一個 .oas** → 持久快取極有價值。
+
+**實作：**
+- `cellcache.min_decode_s()`（env `GLAS_CELLCACHE_MIN_DECODE_MS`，預設 10ms）+
+  `should_cache(kept_records, decode_s)`：kept≥`min_records()` **或** decode≥`min_decode_s()` 即快取。
+  → 解碼貴但過濾後小的 cell 現在也會落地，re-run 從磁碟讀（~ms）。
+- `oasis_random.load_cell` 在 `_decode_at` 兩側計 `_decode_s`，改用 `should_cache` 決定 save。
+- `cellcache._maybe_evict()` 節流（module 計數，每 512 saves 才 `_evict()` glob 一次）—— 上萬 cell
+  快取時避免每次 save 都 glob 整個 dir 的 O(n²)。
+- 等價/正確性不變：cellcache 仍以 mtime+size 驗證、毀損當 miss、原子寫；快取的是過濾後 content。
+
+**測試：** `tests/test_cellcache.py::TestDecodeCostTrigger`（5：records 觸發 / decode-cost 觸發 /
+關閉 / ms 解析 / evict 節流）+ e2e（合成檔 run2 從磁碟讀回、`walk_roi` 幾何 byte 相同）。
+`pytest tests/` **747 passed**。
+
+**影響檔案：** `glas/core/cellcache.py`、`glas/core/oasis_random.py`、`tests/test_cellcache.py`、
+`docs/plans/F24-perf-roiwalk-finealign.md`、`SESSION_LOG.md`。
+
+---
+
 ## [2026-06-11] [F24] M9 驗證 + M10：batch POI walk/bool 分段診斷
 
 **變更類型：** 效能優化驗證 + 診斷 · **狀態：M10 完成** · **Branch：** claude/gifted-lovelace-uvnn8v

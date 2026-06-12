@@ -167,8 +167,10 @@ sbbox 有效 → **M7 對大檔無用**（已證實）。
    （總 record 多）卻過濾後只剩 ~40 rect** → 永不達標 → 不快取 → 每張/每 worker 重解。
    → 應改用「**解碼成本/時間**」決定，而非過濾後大小（M11）。但需 cache 能容納**大量** cell
    （現行 per-cell `.npz` + `_evict()` O(n²) glob 不適合上萬 cell → 需 consolidated store）。
-2. **平行效率差：** 小檔 8 workers ~8×；大檔同設定僅 ~2.2×（28.5 分）。疑似 1.8GB ×8 worker
-   mmap + 大 cell 解碼的記憶體頻寬/IO 競爭，或 worker 數不同。待確認機器核數 / Parallel workers。
+2. **平行「2.2×」是量測假象：** 機器 **4 實體核 / 8 邏輯**，batch 用 `os.cpu_count()`=8 開 8
+   worker 擠 4 核 → 解碼工作被排程切換，per-image `perf_counter` 計時被**灌水**（含被 deschedule
+   的等待）。真實是 **4 核吃滿**、CPU-bound；加 worker 無法再快。→ 唯一槓桿是**少解碼**。
+   user 回報**常重跑同一個 .oas** → 持久快取（M11）極有價值（第二次起跳過解碼）。
 
 ### A. ROI walk（`oasis_random.walk_roi`）
 
@@ -305,6 +307,18 @@ M9（跨 POI-spec 共用）把 batch POI 砍 −36%、整批 −35%。POI 仍是
       `_FA_TIMING_ACC["walk"]`、`pool_collect_timing` 帶 walk；`[fa-timing]` 印 walk/bool
 - [x] `_on_fa_stage_timing` 記 `batch:walk` + `batch:bool`（=poi−walk）進 monitor
 - [x] 驗證：合成 batch 跑出 walk/bool 拆分；`test_timing_accumulates` 更新含 walk
+
+### M11: cellcache 改用「解碼成本」決定快取（大檔 walk-bound）  [status: done 2026-06-12]
+
+大檔（1.8GB）batch 由 ROI-walk 主導（85%），cell 解碼貴（~65ms）但過濾後只剩 ~40 rect →
+`min_records=100k` 永不達標 → 每次/每 worker 重解。user 常重跑同檔 → 持久快取極有價值。
+
+- [x] `cellcache.min_decode_s()`（env `GLAS_CELLCACHE_MIN_DECODE_MS`，預設 10ms）+
+      `should_cache(kept, decode_s)`：kept≥min_records **或** decode≥min_decode_s 即快取
+- [x] `oasis_random.load_cell` 計 `_decode_s`，用 `should_cache` 決定 save（log 印 kept+decode ms）
+- [x] `cellcache._maybe_evict()` 節流（每 512 saves 才 glob 一次）→ 上萬 cell 不變 O(n²)
+- [x] 驗證：合成檔 run2 從磁碟讀回、幾何 byte 相同（`TestDecodeCostTrigger` 5 項 + e2e）
+- [ ] 待 user 大檔**跑兩次** batch 確認：run1 建快取、run2 跳過解碼的降幅
 
 ### M6（候選 · 未做）: matchTemplate 金字塔  [status: planned · 若 match 主導]
 

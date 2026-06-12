@@ -41,12 +41,46 @@ def enabled() -> bool:
 
 
 def min_records() -> int:
-    """Cache only cells with at least this many records (placements + rects +
-    polys). Override via ``GLAS_CELLCACHE_MIN_RECORDS``; default 100k."""
+    """Cache cells with at least this many *kept* records (placements + rects +
+    polys). Override via ``GLAS_CELLCACHE_MIN_RECORDS``; default 100k.
+
+    NOTE: this counts records that *survive the wanted-layer filter*. A cell can
+    be expensive to decode (millions of records across all layers) yet keep very
+    few after filtering, so this threshold alone never caches it — see
+    :func:`min_decode_s` for the decode-cost trigger that catches those (F24 M11)."""
     try:
         return int(os.environ.get("GLAS_CELLCACHE_MIN_RECORDS", "100000"))
     except ValueError:
         return 100000
+
+
+def min_decode_s() -> float:
+    """Also cache any cell whose *decode took at least this long*, regardless of
+    how few records survive the wanted-layer filter (F24 M11).
+
+    The big-file ROI walk is dominated by cells that are costly to decode (many
+    total records, to keep the byte-stream in sync) but keep only a handful of
+    wanted-layer rects — so :func:`min_records` never caches them and every
+    session / batch worker re-decodes them. Caching by decode cost makes a
+    re-run of the same file read them from disk in milliseconds instead.
+    Override via ``GLAS_CELLCACHE_MIN_DECODE_MS`` (default 10 ms); 0 disables
+    the decode-cost trigger."""
+    try:
+        return max(0.0, float(
+            os.environ.get("GLAS_CELLCACHE_MIN_DECODE_MS", "10"))) / 1000.0
+    except ValueError:
+        return 0.010
+
+
+def should_cache(kept_records: int, decode_s: float) -> bool:
+    """Whether a freshly-decoded cell is worth persisting: either it kept a lot
+    of records (:func:`min_records`) or it was expensive to decode
+    (:func:`min_decode_s`). Keeping the decision here keeps the policy in one
+    place (F24 M11)."""
+    if kept_records >= min_records():
+        return True
+    mds = min_decode_s()
+    return mds > 0.0 and decode_s >= mds
 
 
 def _max_bytes() -> int:
@@ -56,6 +90,23 @@ def _max_bytes() -> int:
         return int(os.environ.get("GLAS_CELLCACHE_MAX_MB", "8192")) * 1024 * 1024
     except ValueError:
         return 8192 * 1024 * 1024
+
+
+# F24 M11: caching by decode-cost can write thousands of small sidecars in one
+# run, and the eviction sweep globs+stats the whole dir — calling it on every
+# save would be O(n²). Throttle it so it runs at most once per _EVICT_EVERY
+# saves (per process). The cap is a soft ceiling, so a slightly late sweep is
+# fine. Each process has its own counter (workers are separate processes).
+_EVICT_EVERY = 512
+_saves_since_evict = 0
+
+
+def _maybe_evict() -> None:
+    global _saves_since_evict
+    _saves_since_evict += 1
+    if _saves_since_evict >= _EVICT_EVERY:
+        _saves_since_evict = 0
+        _evict()
 
 
 def _evict() -> None:
@@ -216,7 +267,7 @@ def save(src, cell_id, wanted_layers, content) -> bool:
         # np.savez appends .npz to the path if missing
         tmp_npz = tmp if os.path.exists(tmp) else tmp + ".npz"
         os.replace(tmp_npz, p)
-        _evict()
+        _maybe_evict()
         return True
     except Exception:
         try:
@@ -276,7 +327,7 @@ def save_prep(src, cell_id, prep) -> bool:
         np.savez(tmp, **arrays)
         tmp_npz = tmp if os.path.exists(tmp) else tmp + ".npz"
         os.replace(tmp_npz, p)
-        _evict()
+        _maybe_evict()
         return True
     except Exception:
         try:
