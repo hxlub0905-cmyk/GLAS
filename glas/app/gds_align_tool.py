@@ -7391,6 +7391,11 @@ class MainWindow(QMainWindow):
                "search_radius_nm": fa["search_radius_nm"],
                "align_inline": bool(align_inline)}
         label_map = self._export_label_map() if exp_label else []
+        # Perf monitor: time the whole export pass so the HUD / .txt show it
+        # (lets you compare "Align during export" against Run-all + export).
+        self._ov_perf_t0 = time.perf_counter()
+        self._ov_perf_jobs = len(jobs)
+        self._ov_perf_inline = bool(align_inline)
         self._ov_progress = LoadProgressDialog(self)
         self._ov_progress.set_text("Exporting images…")
         self._ov_thread = QThread(self)
@@ -7419,6 +7424,18 @@ class MainWindow(QMainWindow):
             self._ov_progress.set_progress(done, total)
 
     def _on_ov_finished(self, count: int, manifest: str) -> None:
+        t0 = getattr(self, "_ov_perf_t0", None)
+        if t0 is not None:
+            dt = time.perf_counter() - t0
+            ips = count / dt if dt > 0 else 0.0
+            perfmon.monitor.record(
+                "export", dt * 1e3,
+                label=(f"{count} img · align-inline"
+                       if getattr(self, "_ov_perf_inline", False)
+                       else f"{count} img"),
+                img_per_s=f"{ips:.1f}",
+                ms_per_img=(f"{dt / count * 1e3:.0f}" if count else "—"))
+            self._ov_perf_t0 = None
         self._status_doc.setText(
             f"image export: {count} image(s) + manifest → {Path(manifest).name}")
 
