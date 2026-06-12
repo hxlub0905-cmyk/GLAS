@@ -164,3 +164,98 @@ def test_overlay_export_module_is_qt_free():
     assert hasattr(overlay_export, "overlay_outlines_on_sem")
     assert hasattr(overlay_export, "export_one_image")
     assert hasattr(overlay_export, "_export_pool_init")
+
+
+# ── F24: fused inline-align export equivalence + single walk ──────────────────
+def _build_reader(tmp_path):
+    import subprocess
+    oas = tmp_path / "s.oas"
+    subprocess.run([sys.executable, "tools/bench/_make_sample_oasis.py",
+                    str(oas), "400"], check=True, cwd=_ROOT)
+    import oasis_random as orx
+    return orx.RandomAccessReader(str(oas), wanted_layers={(17, 0)},
+                                  bbox_layer=orx.DEFAULT_BBOX_LAYER), orx
+
+
+def _matchable_sem(rar, root, coarse, cfg, shift_px=3):
+    """A SEM made by rendering the POI template and shifting it, so the inline
+    matchTemplate finds a real (non-zero) offset to exercise the alignment."""
+    cv2 = pytest.importorskip("cv2")
+    import numpy as np
+    W = H = 256
+    nm_per_px = cfg["fov_w"] / W
+    roi = (coarse[0] - cfg["fov_w"], coarse[1] - cfg["fov_h"],
+           coarse[0] + cfg["fov_w"], coarse[1] + cfg["fov_h"])
+    polys = fine_align.poi_polys_for_roi(rar, root, roi, ("raw", 17, 0))
+    tmpl = fine_align.render_composite_template(
+        [(polys, 200)], coarse, W, H, nm_per_px, cfg["bg_glv"],
+        cfg["blur_sigma_px"])
+    sem = np.roll(tmpl, shift_px, axis=1)        # shift right by shift_px
+    return sem, nm_per_px
+
+
+def test_inline_align_export_single_walk_and_equiv(tmp_path):
+    cv2 = pytest.importorskip("cv2")
+    import numpy as np
+    rar, orx = _build_reader(tmp_path)
+    coarse = (190000.0, 170000.0)
+    cfg = {"fov_w": 20000.0, "fov_h": 20000.0, "nm_auto": True,
+           "nm_manual": 0.0, "bg_glv": 80, "blur_sigma_px": 1.0,
+           "search_radius_nm": 4000.0, "align_inline": True}
+    sem, _ = _matchable_sem(rar, root="TOP", coarse=coarse, cfg=cfg)
+    sem_path = tmp_path / "i.png"
+    cv2.imwrite(str(sem_path), sem)
+    poi = [(("raw", 17, 0), (255, 0, 0), 200)]
+
+    # Count walks in the fused pass (should be exactly one for one POI).
+    calls = {"n": 0}
+    real = fine_align._walk_roi_polys
+    fine_align._walk_roi_polys = (
+        lambda *a, **k: (calls.__setitem__("n", calls["n"] + 1) or real(*a, **k)))
+    try:
+        out_fused = tmp_path / "fused"
+        out_fused.mkdir()
+        row_fused = overlay_export.export_one_image(
+            ("img1", coarse, None, str(sem_path), True), rar, "TOP", poi, cfg,
+            str(out_fused), export_raw=False, export_overlay=False,
+            export_gray=True, export_label=False, score_thr=0.0)
+    finally:
+        fine_align._walk_roi_polys = real
+    assert calls["n"] == 1                       # one walk for the whole pass
+    assert row_fused["status"] == "ok"
+    refined = (float(row_fused["fine_dx_nm"]), float(row_fused["fine_dy_nm"]),
+               float(row_fused["score"]))
+
+    # Two-pass: feed that refined back into a plain export (align_inline off) and
+    # confirm the grayscale is byte-identical.
+    cfg2 = dict(cfg); cfg2["align_inline"] = False
+    out_2pass = tmp_path / "twopass"
+    out_2pass.mkdir()
+    row_2 = overlay_export.export_one_image(
+        ("img1", coarse, refined, str(sem_path), True), rar, "TOP", poi, cfg2,
+        str(out_2pass), export_raw=False, export_overlay=False,
+        export_gray=True, export_label=False, score_thr=0.0)
+    g_fused = cv2.imread(str(out_fused / row_fused["gray_png"]),
+                         cv2.IMREAD_GRAYSCALE)
+    g_2 = cv2.imread(str(out_2pass / row_2["gray_png"]), cv2.IMREAD_GRAYSCALE)
+    assert np.array_equal(g_fused, g_2)          # fused == two-pass output
+
+
+def test_inline_align_off_keeps_coarse(tmp_path):
+    cv2 = pytest.importorskip("cv2")
+    rar, orx = _build_reader(tmp_path)
+    coarse = (190000.0, 170000.0)
+    cfg = {"fov_w": 20000.0, "fov_h": 20000.0, "nm_auto": True,
+           "nm_manual": 0.0, "bg_glv": 80, "blur_sigma_px": 1.0,
+           "search_radius_nm": 4000.0, "align_inline": False}
+    sem, _ = _matchable_sem(rar, root="TOP", coarse=coarse, cfg=cfg)
+    sem_path = tmp_path / "i.png"
+    cv2.imwrite(str(sem_path), sem)
+    poi = [(("raw", 17, 0), (255, 0, 0), 200)]
+    out = tmp_path / "o"; out.mkdir()
+    # align_inline off + refined None → status stays not-run (coarse anchor).
+    row = overlay_export.export_one_image(
+        ("img1", coarse, None, str(sem_path), True), rar, "TOP", poi, cfg,
+        str(out), export_raw=False, export_overlay=False, export_gray=True,
+        export_label=False, score_thr=0.0)
+    assert row["status"] == "not-run"

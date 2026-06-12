@@ -5767,6 +5767,21 @@ class AlignmentExportDialog(QDialog):
             "single `gray[label == id]` boolean index. Same score gate as above.")
         ibl.addWidget(self._exp_gray)
         ibl.addWidget(self._exp_label)
+        # F24: compute the fine-align offset DURING the image export, from the
+        # same ROI walk it already does — so a separate "Run all" pass (which
+        # re-walks every image) isn't needed to get aligned templates. Default
+        # ON when no alignment has been run yet; reuses existing refined offsets
+        # for images that already have them.
+        self._exp_align = QCheckBox(
+            "Align during export (skip separate Run all)", img_box)
+        self._exp_align.setToolTip(
+            "Render each POI template and match it against the SEM inside the "
+            "export pass, reusing that image's single ROI walk. The grayscale / "
+            "overlay are then drawn at the fine-aligned position. Skip a prior "
+            "Run all — halves the expensive ROI-walk work for aligned templates. "
+            "Images that already have a Run-all result reuse it.")
+        self._exp_align.setChecked(not self._refined)
+        ibl.addWidget(self._exp_align)
         thr_row = QHBoxLayout()
         thr_row.addWidget(QLabel("Score threshold", img_box))
         self._score_thr = QDoubleSpinBox(img_box)
@@ -5822,11 +5837,13 @@ class AlignmentExportDialog(QDialog):
 
     def selected(self) -> tuple:
         """``(fmt, [image_id, ...], export_raw, export_overlay, export_gray,
-        export_label, score_threshold)`` where ``fmt`` is 'csv' or 'json'."""
+        export_label, score_threshold, align_inline)`` where ``fmt`` is 'csv' or
+        'json'."""
         fmt = "csv" if self._fmt.currentIndex() == 0 else "json"
         return (fmt, self._checked_ids(), self._exp_raw.isChecked(),
                 self._exp_overlay.isChecked(), self._exp_gray.isChecked(),
-                self._exp_label.isChecked(), float(self._score_thr.value()))
+                self._exp_label.isChecked(), float(self._score_thr.value()),
+                self._exp_align.isChecked())
 
 
 # ── Main window ──────────────────────────────────────────────────────────────
@@ -7267,8 +7284,8 @@ class MainWindow(QMainWindow):
         dlg = AlignmentExportDialog(self, self._sem_images, self._refined)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        fmt, ids, exp_raw, exp_overlay, exp_gray, exp_label, score_thr = \
-            dlg.selected()
+        fmt, ids, exp_raw, exp_overlay, exp_gray, exp_label, score_thr, \
+            align_inline = dlg.selected()
         if not ids:
             self._status_doc.setText("export: no images selected")
             return
@@ -7299,7 +7316,8 @@ class MainWindow(QMainWindow):
             f"exported {len(rows)} image(s) → {Path(path).name}")
         if exp_raw or exp_overlay or exp_gray or exp_label:
             self._export_overlay_images(images, exp_raw, exp_overlay,
-                                        exp_gray, exp_label, score_thr)
+                                        exp_gray, exp_label, score_thr,
+                                        align_inline=align_inline)
 
     # ── F5 M6: SEM + aligned-overlay PNG export ──────────────────────────────
     def _poi_specs_colored(self) -> list:
@@ -7335,7 +7353,8 @@ class MainWindow(QMainWindow):
     def _export_overlay_images(self, images, exp_raw: bool,
                                exp_overlay: bool, exp_gray: bool = False,
                                exp_label: bool = False,
-                               score_thr: float = 0.0) -> None:
+                               score_thr: float = 0.0,
+                               align_inline: bool = False) -> None:
         if cv2 is None:
             QMessageBox.warning(self, "Image export",
                                 "opencv (cv2) is required for image export.")
@@ -7366,7 +7385,11 @@ class MainWindow(QMainWindow):
                # F15: grayscale rendering greys / blur (same as the template).
                "bg_glv": fa["bg_glv"], "blur_sigma_px": fa["blur_sigma_px"],
                # F14: parallel export worker count (0 = auto).
-               "max_workers": fa["max_workers"]}
+               "max_workers": fa["max_workers"],
+               # F24: fuse fine-align into the export (one walk per image). The
+               # search radius is the matchTemplate window; align_inline gates it.
+               "search_radius_nm": fa["search_radius_nm"],
+               "align_inline": bool(align_inline)}
         label_map = self._export_label_map() if exp_label else []
         self._ov_progress = LoadProgressDialog(self)
         self._ov_progress.set_text("Exporting images…")

@@ -131,18 +131,48 @@ def export_one_image(job, rar, root, poi, cfg, out_dir,
             entries = []
             geoms_fgs = []          # [(geom, fg_glv)]  → grayscale
             geoms_ids = []          # [(geom, label_id)] → label map
+            tmpl_layers = []        # [(polys, fg_glv)]  → inline-align template
+            # P1/M9: share one walk + union + sub-expression cache across this
+            # image's POIs (same ROI) so each raw layer is walked / unioned once.
+            walk_memo: dict = {}
+            raw_geom_memo: dict = {}
+            eval_cache: dict = {}
             for idx, (spec, color, fg_glv) in enumerate(poi):
                 # ``polys`` (exterior rings) stroke the overlay; ``geom`` keeps
                 # Boolean interior holes for the grayscale/label fill (F15).
                 polys, geom = fine_align.poi_polys_and_geometry_for_roi(
-                    rar, root, roi, spec, cancel_cb=cancel_cb)
+                    rar, root, roi, spec, cancel_cb=cancel_cb,
+                    walk_memo=walk_memo, raw_geom_memo=raw_geom_memo,
+                    eval_cache=eval_cache)
                 if polys:
                     entries.append((polys, color))
+                    tmpl_layers.append((polys, fg_glv))
                 if geom is not None and not geom.is_empty:
                     geoms_fgs.append((geom, fg_glv))
                     # label id = POI's 1-based position, so it matches the
                     # manifest ``label_map`` regardless of which layers are empty.
                     geoms_ids.append((geom, idx + 1))
+            # F24: fuse fine-align into the export. When ``align_inline`` is set
+            # and no refined offset was supplied (no prior Run all), compute the
+            # match here from the SAME walk — render the POI template at the
+            # coarse anchor, slide it over the SEM, and use the resulting offset
+            # for the aligned grayscale / overlay below. This makes the separate
+            # Run-all pass (which would re-walk every image) unnecessary, halving
+            # the expensive ROI-walk work for the "aligned templates" use case.
+            if (c.get("align_inline") and refined is None and tmpl_layers
+                    and cv2 is not None):
+                tmpl = fine_align.render_composite_template(
+                    tmpl_layers, coarse, W, H, nm_per_px,
+                    c.get("bg_glv", 80), c.get("blur_sigma_px", 1.0))
+                r_px = (c.get("search_radius_nm", 0.0) / nm_per_px
+                        if nm_per_px > 0 else 0.0)
+                dx, dy, score, _used = fine_align.fine_align_one(
+                    sem, tmpl, nm_per_px, r_px)
+                refined = (dx, dy, score)
+                row["fine_dx_nm"] = round(dx, 3)
+                row["fine_dy_nm"] = round(dy, 3)
+                row["score"] = round(score, 6)
+                row["status"] = "ok"
             anchor = (coarse if refined is None else
                       (coarse[0] + refined[0], coarse[1] + refined[1]))
             if export_overlay and entries:

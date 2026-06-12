@@ -4,6 +4,35 @@
 
 ---
 
+## [2026-06-12] [F24] M12：對齊+匯出融合（以終為始：只要對齊後的 template 圖）
+
+**變更類型：** 效能優化（流程融合）· **狀態：M12 完成** · **Branch：** claude/gifted-lovelace-uvnn8v
+
+**動機（以終為始）：** user 釐清真正目的是匯出**對齊後的 GDS template 圖**（gray + overlay）給下游，
+不需 label/raw、但要精修(match)。原流程 **Run all（對齊）+ 影像匯出兩趟，各自把最貴的 POI walk
+重做一次** → 大檔 walk-bound 等於做兩遍。
+
+**實作（融合成一趟，walk 一次）：**
+- `overlay_export.export_one_image` 加 inline-align：`cfg["align_inline"]` 且該圖無 refined 時，
+  用**已 walk 出的 polys** render template @ coarse → `fine_align.fine_align_one` 對 SEM match →
+  得 refined offset → 用它 render 對齊後 gray/overlay。同一次 walk 服務 template+match+gray+overlay。
+  順帶把 M9 跨-POI 共用快取（walk_memo/raw_geom_memo/eval_cache）也加進 export 迴圈。
+- 旗標走 `cfg` dict（`align_inline` + `search_radius_nm`），免改 pool init/task/worker 簽章。
+- UI：`AlignmentExportDialog` 加「Align during export (skip separate Run all)」勾選框（無 refined
+  時預設開、已有 Run-all 結果則預設關、會沿用），`selected()` 回 8-tuple；`_export_overlay_images`
+  cfg 帶入。
+- **效果：** 想要「對齊後 template 圖」時，**跳過整個 Run all 那趟**，walk 從兩趟變一趟（大檔近砍半），
+  再疊 M11 快取，re-run 更快。
+
+**測試：** `tests/test_export_perf.py` +2：fused 一張只 walk 1 次、fused gray 與「先對齊再匯出」
+**byte 相同**、align_inline off 無 refined 維持 coarse。UI smoke：dialog 回 8-tuple、align_inline
+預設依 refined 有無。`pytest tests/` **749 passed**。
+
+**影響檔案：** `glas/core/overlay_export.py`、`glas/app/gds_align_tool.py`、`tests/test_export_perf.py`、
+`docs/plans/F24-perf-roiwalk-finealign.md`、`SESSION_LOG.md`。
+
+---
+
 ## [2026-06-12] [F24] M11：cellcache 改用「解碼成本」快取（大檔 walk-bound 修法）
 
 **變更類型：** 效能優化（快取策略）· **狀態：M11 完成** · **Branch：** claude/gifted-lovelace-uvnn8v
