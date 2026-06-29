@@ -4,6 +4,31 @@
 
 ---
 
+## [2026-06-29] [Bxx] Layer overlay 配色擴充：更多顏色 + 不重複（golden-angle fallback）
+
+**變更類型：** bug fix / UX（overlay 配色）· **狀態：完成**
+
+**動機現象：** user 反映 layer overlay 顏色看起來只有 4 種（紅藍綠黃）循環，希望多一點顏色。
+
+**追碼：** 三處配色 call site（ROI 載入 `_load_roi_layers`、cache 載入、synthetic expr）皆走
+`_LAYER_PALETTE[idx % len]`，當時 palette 僅 12 色 → 超過 12 層即重複，且前 4 色（terracotta/blue/
+green/gold）即 user 描述的「紅藍綠黃」。無真正的 period-4 bug，但顏色數偏少且會 wrap。
+
+**修復：**
+- `_LAYER_PALETTE` 由 12 擴充為 **20 個視覺上明顯區隔**的色（保留前 8、新增 12 個 distinct hue）。
+- 新增 `layer_color(idx)` helper：前 N 用 curated palette；超過則以 **golden-angle（137.5°）hue 螺旋**
+  + 交替 S/V 程序化產生，使**任意層數都不重複、不 wrap 回前幾色**。一律回傳新 `QColor`（呼叫端可改
+  alpha/darker 不污染 palette）。
+- 三處 call site 改用 `layer_color(idx)`（取代 `_LAYER_PALETTE[idx % len]`）。
+
+**測試：** 新增 `tests/test_gds_align_palette.py` 5 項（前 N 對齊 curated / palette ≥16 且全相異 /
+40 層 ≥36 distinct / 無 +4 與 +12 短週期重複 / 回傳 fresh QColor）。`pytest tests/` **729 passed**。
+
+**影響檔案：** `glas/app/gds_align_tool.py`、`tests/test_gds_align_palette.py`(新)、`SESSION_LOG.md`。
+**Branch：** claude/glas-project-progress-vzu25j
+
+---
+
 ## [2026-06-29] 完成 [F24] Export all 一鍵化 + label PNG 全黑修正（上色預覽）
 
 **變更類型：** 功能（UX 合併 batch fine-align + 匯出）+ bug fix（label_view 預覽）· **狀態：完成 [F24]**

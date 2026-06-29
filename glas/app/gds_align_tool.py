@@ -274,12 +274,39 @@ def _config_list(lst) -> None:
     lst.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
 
-# Default layer-color palette (cycled by index of first appearance).
+# Default layer-color palette, assigned by index of first appearance via
+# :func:`layer_color`. A hand-picked set of visually distinct hues (warm-theme
+# friendly); when more layers are loaded than the palette has entries, colours
+# are generated procedurally so they never visibly repeat (see ``layer_color``).
 _LAYER_PALETTE = [
     QColor("#e07a5f"), QColor("#3d8ec9"), QColor("#5a9461"), QColor("#d49a3a"),
     QColor("#8a5db5"), QColor("#3aa3b0"), QColor("#c54f8e"), QColor("#7a6a4a"),
-    QColor("#b13a3a"), QColor("#3a6fb1"), QColor("#3a8b6f"), QColor("#a87b25"),
+    QColor("#d1495b"), QColor("#2e86ab"), QColor("#6a994e"), QColor("#e9c46a"),
+    QColor("#9b5de5"), QColor("#00b4d8"), QColor("#f15bb5"), QColor("#ff8c42"),
+    QColor("#b5179e"), QColor("#06a77d"), QColor("#5e548e"), QColor("#bc4749"),
 ]
+
+# Golden angle (deg) — successive hues are maximally spread for any count.
+_GOLDEN_ANGLE_DEG = 137.50776405003785
+
+
+def layer_color(idx: int) -> QColor:
+    """Distinct overlay colour for the ``idx``-th layer (0-based).
+
+    The first ``len(_LAYER_PALETTE)`` layers use the hand-picked palette; beyond
+    that, colours are generated on a golden-angle hue spiral with alternating
+    saturation/value, so any number of layers stays visually distinct instead of
+    wrapping back to the first few palette entries. Always returns a fresh
+    ``QColor`` so callers can mutate (alpha / darker) without side effects."""
+    if 0 <= idx < len(_LAYER_PALETTE):
+        return QColor(_LAYER_PALETTE[idx])
+    over = idx - len(_LAYER_PALETTE)
+    h = (idx * _GOLDEN_ANGLE_DEG) % 360.0
+    s = 0.72 if over % 2 == 0 else 0.52     # alternate so wrapped hues separate
+    v = 0.86 if over % 3 != 0 else 0.66
+    c = QColor()
+    c.setHsvF(h / 360.0, s, v)
+    return c
 
 
 _FALLBACK_QSS = """
@@ -488,7 +515,7 @@ def roi_document_from_reader(rar, root, layer_keys, roi_bbox, cancel_cb=None,
     for idx, (layer, datatype) in enumerate(layer_keys):
         if progress_cb is not None:
             progress_cb(idx, len(layer_keys), (layer, datatype))
-        color = QColor(_LAYER_PALETTE[idx % len(_LAYER_PALETTE)])
+        color = layer_color(idx)
         entry, stats = _roi_entry(rar, root, layer, datatype, roi_bbox, color,
                                   cancel_cb=cancel_cb)
         if entry is not None:
@@ -7738,9 +7765,9 @@ class MainWindow(QMainWindow):
         return gds_boolean.geometry_to_polygons(geom)
 
     def _next_expr_color(self) -> QColor:
-        c = _LAYER_PALETTE[self._expr_color_idx % len(_LAYER_PALETTE)]
+        c = layer_color(self._expr_color_idx)
         self._expr_color_idx += 1
-        return QColor(c)
+        return c
 
     # ── F4: synthetic-layer recipe store ────────────────────────────────────
     def _recipe(self, name: str) -> Optional[dict]:
@@ -8128,7 +8155,7 @@ class MainWindow(QMainWindow):
         doc.format = "CACHE"
         doc.top_cell_name = data.meta.top_cell_name
         for idx, (layer, datatype, polys, bbs) in enumerate(data.layers):
-            color = _LAYER_PALETTE[idx % len(_LAYER_PALETTE)]
+            color = layer_color(idx)
             doc.entries.append(LayerEntry(
                 key=LayerKey(layer=int(layer), datatype=int(datatype)),
                 polygons=list(polys), visible=True, color=QColor(color),
