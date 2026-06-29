@@ -1685,7 +1685,10 @@ class OverlayExportWorker(QObject):
             for r in rows:
                 w.writerow({k: r.get(k, "") for k in self._COLS})
         json_path = self._out_dir / "overlay_manifest.json"
-        manifest = {"schema": "mmh-gds-overlay-v2", "columns": self._COLS,
+        # v3 (F24): adds the ``label_view_png`` column (human-viewable colourised
+        # preview of ``label_png``). Additive — readers that key by column name
+        # are unaffected; ``label_png`` stays the exact integer label map.
+        manifest = {"schema": "mmh-gds-overlay-v3", "columns": self._COLS,
                     "images": rows}
         # F15: id → POI layer map so downstream can turn label_png pixels back
         # into named layers (read a region with gray[label == id]).
@@ -4313,11 +4316,11 @@ class FineAlignPanel(QGroupBox):
     Toggle one or more POI layers on the left LayerPanel; each appears here
     with its own FG grey-level spinbox. They composite into one synthetic
     template (shared BG / blur), which is matched against the SEM with
-    ``cv2.matchTemplate``. Emits ``run_requested`` / ``run_all_requested`` /
+    ``cv2.matchTemplate``. Emits ``run_requested`` / ``export_all_requested`` /
     ``preview_requested`` for MainWindow to do the work."""
 
     run_requested = pyqtSignal()
-    run_all_requested = pyqtSignal()
+    export_all_requested = pyqtSignal()
     preview_requested = pyqtSignal()
     results_requested = pyqtSignal()
 
@@ -4383,12 +4386,13 @@ class FineAlignPanel(QGroupBox):
             "selected SEM image (needs ≥1 POI + loaded ROI + image).")
         self._run_btn.clicked.connect(self.run_requested)
 
-        self._run_all_btn = QPushButton("Run all images", self)
-        self._run_all_btn.setEnabled(False)
-        self._run_all_btn.setToolTip(
-            "Walk each defect's ROI and fine-align every image in the dataset "
-            "(slow on big files; cancellable).")
-        self._run_all_btn.clicked.connect(self.run_all_requested)
+        self._export_all_btn = QPushButton("Export all…", self)
+        self._export_all_btn.setEnabled(False)
+        self._export_all_btn.setToolTip(
+            "Fine-align every image that hasn't been run yet (the ones you "
+            "already ran are reused), then open the export dialog for the whole "
+            "dataset. Slow on big files; cancellable.")
+        self._export_all_btn.clicked.connect(self.export_all_requested)
 
         self._preview_btn = QPushButton("Preview template…", self)
         self._preview_btn.setEnabled(False)
@@ -4412,7 +4416,7 @@ class FineAlignPanel(QGroupBox):
             ("Search radius (nm)", self._radius),
             ("Score threshold", self._thresh),
             ("Parallel workers (0 = auto)", self._workers),
-            ("span", self._run_btn), ("span", self._run_all_btn),
+            ("span", self._run_btn), ("span", self._export_all_btn),
             ("span", self._preview_btn), ("span", self._results_btn),
             ("span", self._result_lbl),
         ]
@@ -4484,7 +4488,7 @@ class FineAlignPanel(QGroupBox):
     def _update_enabled(self, running: bool = False) -> None:
         on = self._poi_set and not running
         self._run_btn.setEnabled(on)
-        self._run_all_btn.setEnabled(on)
+        self._export_all_btn.setEnabled(on)
         self._preview_btn.setEnabled(on)
 
     def set_running(self, running: bool) -> None:
@@ -5944,7 +5948,7 @@ class MainWindow(QMainWindow):
         self.sem_panel.alignment_delta.set_requested.connect(self._on_set_offset)
         self.sem_panel.alignment_delta.clear_requested.connect(self._on_clear_offset)
         self.sem_panel.fine_align.run_requested.connect(self._on_run_fine_align)
-        self.sem_panel.fine_align.run_all_requested.connect(self._on_run_fine_align_all)
+        self.sem_panel.fine_align.export_all_requested.connect(self._on_export_all)
         self.sem_panel.fine_align.preview_requested.connect(self._on_preview_template)
         self.sem_panel.fine_align.results_requested.connect(self._open_fa_results)
         self.sem_viewer.drag_changed.connect(self._on_overlay_drag)
@@ -6000,6 +6004,9 @@ class MainWindow(QMainWindow):
         # F13: True while a batch *re-run* is in flight, so results only
         # overwrite when strictly better (rerun_should_overwrite).
         self._fa_rerun_mode = False
+        # F24: True while a one-click "Export all" is fine-aligning its un-run
+        # images, so the batch finish hands off to the export dialog.
+        self._export_after_fa = False
         # F5: per-image (used_radius_px, status) parallel to _refined, for the
         # results table (C3/C4). status: ok / no-coords / missing-file /
         # no-scale / flat.
@@ -6979,6 +6986,59 @@ class MainWindow(QMainWindow):
         self._refresh_batch_panel()
         self._launch_fa(specs, jobs, cfg)
 
+    def _on_export_all(self) -> None:
+        """F24: one-click "fine-align the un-run images, then export the whole
+        dataset". The images the operator already ran (in ``self._refined``) are
+        reused — only the rest are computed — and when everything is already
+        aligned we jump straight to the export dialog. Replaces the old
+        "Run all images" button (fine-align was never the deliverable; the
+        downstream export is)."""
+        if not self._sem_images:
+            self._status_doc.setText("export all: load SEM images first")
+            return
+        if self._fa_thread is not None:
+            return  # a batch is already running
+        todo = fine_align.images_needing_fine_align(
+            self._sem_images, self._refined)
+        if not todo:
+            # Everything with coordinates is already aligned — export directly.
+            self._on_export_alignment()
+            return
+        if cv2 is None:
+            QMessageBox.warning(self, "Fine align",
+                                "opencv (cv2) is required for fine alignment.")
+            return
+        specs = self._poi_specs()
+        if not specs:
+            self._status_doc.setText("export all: select a POI layer first")
+            return
+        if self._rar is None or self._roi_root is None:
+            self._status_doc.setText("export all: open an OASIS (ROI) first")
+            return
+        if self._fov_w <= 0 or self._fov_h <= 0:
+            self._status_doc.setText("export all: set FOV width/height first")
+            return
+        jobs = [(im.image_id, self._coarse_gds(im),
+                 str(im.file_path) if im.file_path else "", bool(im.exists))
+                for im in todo]
+        cfg = {
+            "fov_w": self._fov_w, "fov_h": self._fov_h,
+            "nm_auto": self._nm_auto, "nm_manual": self._nm_per_px_manual,
+            **self.sem_panel.fine_align.values(),
+        }
+        # Hand off to the export dialog once the batch finishes (see
+        # _on_fa_finished); a cancel / failure clears the flag so we never
+        # export a half-done set.
+        self._export_after_fa = True
+        self._fa_rerun_mode = False
+        self._batch_refresh_timer.stop()
+        self._enter_batch_workspace()
+        self.batch_panel.set_rerun_defaults(self.sem_panel.fine_align.values())
+        self._refresh_batch_panel()
+        self._status_doc.setText(
+            f"export all: fine-aligning {len(jobs)} un-run image(s)…")
+        self._launch_fa(specs, jobs, cfg)
+
     def _on_rerun_requested(self, image_ids: list, overrides: dict) -> None:
         """F13: re-run a subset (low-score / selected) with overridden params.
         Same guards as 'Run all'; results only overwrite when strictly better
@@ -7094,16 +7154,24 @@ class MainWindow(QMainWindow):
             self.sem_viewer.reset_drag()
             self._jump_to_image(self._current_sem)
         self._refresh_batch_panel()           # final rows + charts + median
+        if self._export_after_fa:
+            # F24: the un-run images are now aligned — hand off to the export
+            # dialog. Defer to the next event-loop tick so the batch QThread
+            # finishes tearing down before the modal dialog opens.
+            self._export_after_fa = False
+            QTimer.singleShot(0, self._on_export_alignment)
 
     def _on_fa_failed(self, msg: str) -> None:
+        self._export_after_fa = False         # F24: don't export a failed batch
         self._batch_refresh_timer.stop()
         self.batch_panel.end_progress()
         self._refresh_batch_panel()           # show whatever finished
-        QMessageBox.critical(self, "Run all failed", msg)
+        QMessageBox.critical(self, "Export all failed", msg)
 
     def _on_fa_cancelled(self) -> None:
         # Partial results are kept (not cleared), so the overview still reflects
         # whatever finished before the cancel (F5 M5).
+        self._export_after_fa = False         # F24: cancel aborts the export too
         self._batch_refresh_timer.stop()
         self.batch_panel.end_progress()
         self._status_doc.setText("fine align: cancelled (partial results kept)")

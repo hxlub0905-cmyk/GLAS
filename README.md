@@ -29,7 +29,7 @@
 |------|------|
 | **Boolean 表達式引擎** | HMI 風格語法 `L0 = [(A > W:10) & B] < H:10`，即時合成 layer，輸出 shapely polygon + uint8 mask |
 | **SEM↔GDS overlay 對位** | 手動拖動（AlignmentDelta Set Offset）+ `cv2.matchTemplate` 自動 fine-align |
-| **批次加速** | 多進程平行（spawn pool），常駐 worker 跨次 Run all 重用（F23），索引一次注入省 K× 重掃；idle 300s 自動釋放 |
+| **批次加速** | 多進程平行（spawn pool），常駐 worker 跨次 Export all 重用（F23），索引一次注入省 K× 重掃；idle 300s 自動釋放 |
 
 ### 匯出
 
@@ -38,6 +38,7 @@
 | **Alignment CSV / JSON** | per-image offset，schema `mmh-gds-alignment-v1`，`image_id` join key |
 | **GLV 灰階圖** `<id>_gray.png` | 各 POI 層以 FG 灰階繪於背景 + blur，SEM-like 工作底圖 |
 | **ROI label map** `<id>_label.png` | uint8 mask（0=背景 / 1..N=第 N POI 層），無 blur 邊界精確；MMH 端 `gray[label==id]` 單次取 ROI |
+| **label 上色預覽** `<id>_label_view.png` | label map 的人眼可視版（各 id 上 POI 色）；`_label.png` 因像素值=label id 在檢視器看似全黑，此檔供目視 QC，整數 label map 機器契約不變 |
 | **OASIS 匯出** *(dev mode)* | 選定 raw / Boolean layer 反向寫出 `.oas`（KLayout 可開）；可選 FOV ROI 或整顆 chip tile 串流 |
 
 ### 開發者模式 *(Help → About，點 icon ×5 啟用)*
@@ -80,9 +81,10 @@ python main.py
         ↓
 4. 點選 image   ── 自動跳位 + 載入 GDS ROI（半透明 overlay）
         ↓
-5. 對位         ── 手動拖動 Set Offset，或 Fine Align 自動 matchTemplate
+5. 對位         ── 手動拖動 Set Offset，或 Fine Align 自動 matchTemplate（單張確認幾張）
         ↓
-6. Export       ── Alignment CSV / JSON，可加勾 gray.png + label.png 匯出
+6. Export all   ── 一鍵補跑未跑的 fine-align（已跑複用）+ Alignment CSV / JSON，
+                   可加勾 gray.png + label.png（+ label_view.png 上色預覽）匯出
 ```
 
 ---

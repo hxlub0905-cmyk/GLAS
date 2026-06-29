@@ -1,6 +1,6 @@
 # [F24] Export all：一鍵「補跑未跑的 fine-align → 整包匯出」
 
-> **狀態：** planned
+> **狀態：** done (2026-06-29)
 > **§8 ID：** [F24]
 > **建立：** 2026-06-29
 > **負責 branch：** claude/glas-project-progress-vzu25j
@@ -60,35 +60,33 @@
 
 ## Milestones
 
-### M1: 補跑子集 helper + 一鍵 Export all 串接  [status: planned]
+### M1: 補跑子集 helper + 一鍵 Export all 串接  [status: done 2026-06-29]
 
-- [ ] `fine_align.py` 新增純函式 `images_needing_fine_align(images, refined) -> list`：
+- [x] `fine_align.py` 新增純函式 `images_needing_fine_align(images, refined) -> list`：
       回傳「有座標且 image_id 不在 refined」的影像（保持 dataset 順序）。對齊既有
       `rerun_image_subset` 的風格、Qt-free、可單元測試。
-- [ ] FineAlignPanel：`_run_all_btn` 文案改「Export all…」、tooltip 改述「補跑未跑的 fine-align
-      後整包匯出」；signal `run_all_requested` → `export_all_requested`（或新增並汰換）；
-      `set_can_run` 仍控制其 enable。
-- [ ] MainWindow 新 handler `_on_export_all()`：
-      - 沿用 `_on_run_fine_align_all` 的前置檢查（cv2 / specs / rar+roi / fov）。
+- [x] FineAlignPanel：`_run_all_btn`→`_export_all_btn`，文案「Export all…」、tooltip 改述「補跑未跑的
+      fine-align 後整包匯出」；signal `run_all_requested` → `export_all_requested`；`_update_enabled`
+      仍控制其 enable。
+- [x] MainWindow 新 handler `_on_export_all()`：
       - `todo = fine_align.images_needing_fine_align(self._sem_images, self._refined)`。
-      - `todo` 非空：`self._export_after_fa = True`，對 `todo` 建 jobs（同 `_on_run_fine_align_all`
-        的 job tuple 格式）→ `_enter_batch_workspace()` + `_refresh_batch_panel()` + `_launch_fa(...)`。
-      - `todo` 空：直接 `self._on_export_alignment()`。
-- [ ] `_on_fa_finished`：若 `self._export_after_fa` → 清旗標、`self._on_export_alignment()`；
-      `_on_fa_cancelled` / `_on_fa_failed`：清旗標、**不**匯出。
-- [ ] `__init__` 初始化 `self._export_after_fa = False`；訊號接線改到 `_on_export_all`。
-- [ ] 驗證：`pytest tests/test_accel_equivalence.py tests/test_gds_align_*.py -v`（含新測試）綠。
+      - `todo` 空：直接 `self._on_export_alignment()`（在 cv2/specs 等 guard 之前 early-return）。
+      - `todo` 非空：過 cv2 / specs / rar+roi / fov guard → `self._export_after_fa = True`，對 `todo`
+        建 jobs → `_enter_batch_workspace()` + `_refresh_batch_panel()` + `_launch_fa(...)`。
+- [x] `_on_fa_finished`：若 `self._export_after_fa` → 清旗標、`QTimer.singleShot(0, _on_export_alignment)`
+      （延一個 event-loop tick，讓 batch QThread 收尾後再開 modal）；`_on_fa_cancelled` / `_on_fa_failed`：
+      清旗標、**不**匯出。
+- [x] `__init__` 初始化 `self._export_after_fa = False`；訊號接線改到 `_on_export_all`。
+- [x] 驗證：`pytest tests/` 724 passed。
 
-### M2: 測試 + 文件  [status: planned]
+### M2: 測試 + 文件  [status: done 2026-06-29]
 
-- [ ] 新增 `images_needing_fine_align` 單元測試：全未跑 / 部分已跑（只回未跑）/ 全已跑（回空）/
-      無座標影像被排除 / 順序保持。
-- [ ] GUI 測試（offscreen，沿用既有 test_gds_align_* 慣例）：
-      - 部分 `_refined` 已有 → `_on_export_all` 只對未跑的建 jobs（monkeypatch `_launch_fa` 截 jobs）。
-      - 全已跑 → 不呼叫 `_launch_fa`、直接走 export 路徑（monkeypatch `_on_export_alignment` 驗證被呼叫）。
-      - `_export_after_fa` 旗標：finished 觸發匯出、cancelled/failed 不觸發。
-- [ ] README / CLAUDE.md §5.2 把流程敘述的「Run all → Export」更新為「Export all 一鍵（補跑未跑 + 匯出）」。
-- [ ] `CLAUDE.md` §8 移除 [F24]；`SESSION_LOG.md` 新增條目。
+- [x] 新增 `tests/test_gds_align_f24.py`：`images_needing_fine_align`（全未跑 / 部分已跑只回未跑 /
+      全已跑回空 / 無座標排除 / 順序保持 / None refined）+ `colorize_label_map`（上色 / bg / 未對應 id /
+      全黑變可視）+ `_on_export_all` GUI（無影像不動 / 全已跑直接匯出 / 只補跑未跑 / finished 接匯出 /
+      無旗標不匯出 / fail+cancel 清旗標）共 17 項。
+- [x] README / CLAUDE.md §5.2 把流程敘述更新為「Export all 一鍵（補跑未跑 + 匯出）」+ label_view 註記。
+- [x] `SESSION_LOG.md` 新增條目（§8 未曾登錄 F24，故無需移除）。
 
 ---
 

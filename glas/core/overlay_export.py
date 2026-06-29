@@ -103,7 +103,7 @@ def export_one_image(job, rar, root, poi, cfg, out_dir,
     c = cfg
     row = {
         "image_id": str(image_id), "raw_png": "", "overlay_png": "",
-        "gray_png": "", "label_png": "",
+        "gray_png": "", "label_png": "", "label_view_png": "",
         "fine_dx_nm": "" if refined is None else round(refined[0], 3),
         "fine_dy_nm": "" if refined is None else round(refined[1], 3),
         "score": "" if refined is None else round(refined[2], 6),
@@ -170,6 +170,17 @@ def export_one_image(job, rar, root, poi, cfg, out_dir,
                 name = f"{base}_label.png"
                 cv2.imwrite(str(out_dir / name), lbl)
                 row["label_png"] = name
+                # F24: a human-viewable colourised preview alongside the exact
+                # integer label map. The label.png above keeps ``label == id``
+                # (machine contract); this paints each id with its POI colour so
+                # an operator can see the ROIs instead of an all-black image.
+                id_to_rgb = {i + 1: color
+                             for i, (_spec, color, _fg) in enumerate(poi)}
+                view = fine_align.colorize_label_map(lbl, id_to_rgb)
+                vname = f"{base}_label_view.png"
+                # colorize returns RGB; cv2 writes BGR → flip channels.
+                cv2.imwrite(str(out_dir / vname), view[:, :, ::-1])
+                row["label_view_png"] = vname
     return row
 
 

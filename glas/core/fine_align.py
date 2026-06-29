@@ -49,6 +49,13 @@ import oasis_random
 OVERLAY_MANIFEST_COLS = [
     "image_id", "raw_png", "overlay_png",
     "fine_dx_nm", "fine_dy_nm", "score", "status", "gray_png", "label_png",
+    # ``label_view_png`` is a human-viewable colourised preview of ``label_png``
+    # (F24): the integer ``label_png`` looks all-black in a viewer because its
+    # pixel values are tiny label ids (1, 2, …). The preview paints each id with
+    # its POI colour so an operator can eyeball the ROIs; the exact integer
+    # ``label_png`` stays the machine contract (``label == id``) so downstream
+    # ``gray[label == id]`` is unaffected.
+    "label_view_png",
 ]
 
 
@@ -80,6 +87,25 @@ def rerun_image_subset(images, image_ids):
     re-run of a selected / low-score subset), preserving dataset order."""
     idset = {str(i) for i in image_ids}
     return [im for im in images if str(getattr(im, "image_id", im)) in idset]
+
+
+def images_needing_fine_align(images, refined):
+    """Images with coordinates that have no fine-align result yet (F24).
+
+    "Run all" folds into one-click "Export all": only the un-run images are
+    computed, while the images the operator already ran (whose ``image_id`` is in
+    ``refined``) reuse their stored offset — fine-align is deterministic, so
+    re-running them would just waste time. Images without coordinates can't be
+    aligned and are skipped. Dataset order is preserved."""
+    done = {str(k) for k in (refined or {})}
+    out = []
+    for im in images:
+        if not getattr(im, "has_coords", False):
+            continue
+        if str(getattr(im, "image_id", im)) in done:
+            continue
+        out.append(im)
+    return out
 
 
 def batch_worker_count(override: int = 0, cap: int = 16) -> int:
@@ -272,6 +298,27 @@ def render_label_image(poi_geoms_ids: list, anchor: tuple, width_px: int,
                                   nm_per_px=nm_per_px)
         lbl[m > 0] = np.uint8(label_id)
     return lbl
+
+
+def colorize_label_map(lbl: np.ndarray, id_to_rgb: dict,
+                       bg_rgb: tuple = (0, 0, 0)) -> np.ndarray:
+    """Human-viewable RGB preview of an integer label map (F24).
+
+    The exact integer ``label_png`` (from :func:`render_label_image`) is the
+    machine contract — its pixel value *is* the POI's label id, so it looks
+    almost all-black in a viewer (ids are 1, 2, …). This paints each id with a
+    distinct visible colour so an operator can eyeball which ROI is which,
+    without touching the integer map. ``id_to_rgb`` is ``{label_id: (r, g, b)}``
+    (typically the POI overlay colours); ids absent from the map are left at
+    ``bg_rgb``. Returns an ``(H, W, 3)`` uint8 RGB array."""
+    H, W = lbl.shape[:2]
+    rgb = np.empty((H, W, 3), dtype=np.uint8)
+    rgb[:, :] = (int(bg_rgb[0]), int(bg_rgb[1]), int(bg_rgb[2]))
+    for label_id, color in id_to_rgb.items():
+        m = lbl == np.uint8(label_id)
+        if m.any():
+            rgb[m] = (int(color[0]), int(color[1]), int(color[2]))
+    return rgb
 
 
 def render_grayscale_from_geoms(poi_geoms_fgs: list, anchor: tuple,
