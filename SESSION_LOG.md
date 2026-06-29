@@ -4,6 +4,26 @@
 
 ---
 
+## [2026-06-29] [F24] Export all 一鍵化規劃（plan 產出，待核准）
+
+**變更類型：** 規劃（plan 檔）· **狀態：planned（等待 user 核准後開工）**
+
+**動機：** user 反映實際工作流是「手動 Run 3-4 張確認對位 → 整包匯出下游產物」，覺得獨立的
+「Run all images」步驟多餘，想一鍵把「補跑未跑的 fine-align + 匯出」做完。
+
+**探索發現：** 匯出讀 `self._refined`，且 gray/label 產物被 `mask_should_export(refined, thr)`
+gate 擋掉 → 現況「只跑 3-4 張就整包匯出」只會拿到那 3-4 張的圖。
+
+**Q&A 收斂（3 題）：** (Q1) 保留每張 fine-align、只合成一鍵（非 coarse-only）；(Q2) 跳過已跑、
+只補跑未跑；(Q3)「Run all images」按鈕取代成「Export all…」，單張 Run 保留。
+
+**plan：** `docs/plans/F24-export-all-one-click.md`（M1 helper + 串接、M2 測試+文件）。
+
+**影響檔案：** 新增 `docs/plans/F24-export-all-one-click.md`、`SESSION_LOG.md`。
+**Branch：** claude/glas-project-progress-vzu25j
+
+---
+
 ## [2026-06-07] [doc-sync] README / CLAUDE.md 文件整理
 
 **變更類型：** 文件同步 · **狀態：完成**
