@@ -140,11 +140,16 @@ sem_loader 載 KLARF（die-corner XREL/YREL）→ 選 PART/CHIP（PartChipPanel 
 帶 chip_corner / FOV / nm-per-px）→ gds_fov.klarf_to_gds 換算 → 點 SEM image
 → oasis_random ROI walk 載入該處 geometry → SemViewer 半透明 overlay
 → 手動拖動（AlignmentDeltaPanel · Set Offset 折進 δ）或 FineAlignPanel
-  cv2.matchTemplate 自動 refine
+  cv2.matchTemplate 自動 refine（單張 Run 確認幾張即可）
+→ 「Export all」一鍵（F24，取代舊「Run all images」）：只補跑 `_refined` 裡還沒有的影像
+  （已跑的複用、deterministic 不重算；`images_needing_fine_align`），完成後接既有匯出對話框；
+  全部已跑則直接開對話框。補跑被 cancel/fail 則不匯出（`_export_after_fa` 旗標）。
 → 匯出 per-image offset CSV/JSON（schema mmh-gds-alignment-v1，image_id join key）
   + 影像匯出：模擬 GLV 灰階圖 `<id>_gray.png` + ROI label map `<id>_label.png`（F15，
   同一組 per-layer 幾何 rasterize、gray 套 blur / label 不 blur、像素網格一致，下游
-  `gray[label==id]` 取 ROI；取代 F13 binary mask；manifest schema mmh-gds-overlay-v2 帶 label_map）
+  `gray[label==id]` 取 ROI；取代 F13 binary mask）+ `<id>_label_view.png`（F24，label map 的
+  上色預覽供目視 QC，label.png 維持整數 id 機器契約不變）；manifest schema mmh-gds-overlay-v3
+  帶 label_map + label_view_png 欄
 ```
 
 **並行模型（F8/F14/F23）：** batch fine-align（`FineAlignAllWorker`）與 image 匯出

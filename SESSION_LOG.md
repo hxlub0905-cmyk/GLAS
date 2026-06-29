@@ -4,6 +4,75 @@
 
 ---
 
+## [2026-06-29] [Bxx] Layer overlay 配色擴充：更多顏色 + 不重複（golden-angle fallback）
+
+**變更類型：** bug fix / UX（overlay 配色）· **狀態：完成**
+
+**動機現象：** user 反映 layer overlay 顏色看起來只有 4 種（紅藍綠黃）循環，希望多一點顏色。
+
+**追碼：** 三處配色 call site（ROI 載入 `_load_roi_layers`、cache 載入、synthetic expr）皆走
+`_LAYER_PALETTE[idx % len]`，當時 palette 僅 12 色 → 超過 12 層即重複，且前 4 色（terracotta/blue/
+green/gold）即 user 描述的「紅藍綠黃」。無真正的 period-4 bug，但顏色數偏少且會 wrap。
+
+**修復：**
+- `_LAYER_PALETTE` 由 12 擴充為 **20 個視覺上明顯區隔**的色（保留前 8、新增 12 個 distinct hue）。
+- 新增 `layer_color(idx)` helper：前 N 用 curated palette；超過則以 **golden-angle（137.5°）hue 螺旋**
+  + 交替 S/V 程序化產生，使**任意層數都不重複、不 wrap 回前幾色**。一律回傳新 `QColor`（呼叫端可改
+  alpha/darker 不污染 palette）。
+- 三處 call site 改用 `layer_color(idx)`（取代 `_LAYER_PALETTE[idx % len]`）。
+
+**測試：** 新增 `tests/test_gds_align_palette.py` 5 項（前 N 對齊 curated / palette ≥16 且全相異 /
+40 層 ≥36 distinct / 無 +4 與 +12 短週期重複 / 回傳 fresh QColor）。`pytest tests/` **729 passed**。
+
+**影響檔案：** `glas/app/gds_align_tool.py`、`tests/test_gds_align_palette.py`(新)、`SESSION_LOG.md`。
+**Branch：** claude/glas-project-progress-vzu25j
+
+---
+
+## [2026-06-29] 完成 [F24] Export all 一鍵化 + label PNG 全黑修正（上色預覽）
+
+**變更類型：** 功能（UX 合併 batch fine-align + 匯出）+ bug fix（label_view 預覽）· **狀態：完成 [F24]**
+
+### F24：一鍵 Export all（取代 Run all images）
+**動機：** user 反映實際工作流是「手動 Run 3-4 張確認對位 → 整包匯出下游產物」，覺得獨立的
+「Run all images」步驟多餘，想一鍵把「補跑未跑的 fine-align + 匯出」做完。
+
+**探索發現：** 匯出讀 `self._refined`，且 gray/label 產物被 `mask_should_export(refined, thr)`
+gate 擋掉 → 現況「只跑 3-4 張就整包匯出」只會拿到那 3-4 張的圖。
+
+**Q&A 收斂（3 題）：** (Q1) 保留每張 fine-align、只合成一鍵（非 coarse-only）；(Q2) 跳過已跑、
+只補跑未跑（deterministic 重算結果一樣）；(Q3)「Run all images」按鈕取代成「Export all…」，單張 Run 保留。
+
+**實作：**
+- `fine_align.images_needing_fine_align(images, refined)`（純函式、Qt-free）：回「有座標且不在 refined」
+  的影像、保序。
+- FineAlignPanel：`_run_all_btn`→`_export_all_btn`（文案「Export all…」）；signal `run_all_requested`
+  →`export_all_requested`。
+- MainWindow `_on_export_all()`：todo 空 → 直接 `_on_export_alignment()`；非空 → 過 guard、`_export_after_fa
+  =True`、只對 todo 建 jobs → `_launch_fa`。`_on_fa_finished` 見旗標 → `QTimer.singleShot(0,
+  _on_export_alignment)`（延一 tick 讓 QThread 收尾）；`_on_fa_failed/cancelled` 清旗標、不匯出。
+
+### bug fix：label PNG 在檢視器全黑 → 加上色預覽 `<id>_label_view.png`
+**現象：** user 反映匯出的 label PNG 全黑。**根因（非資料壞）：** `_label.png` 像素值=label id（1,2,3…，
+bg=0、無 blur），這是下游 `gray[label==id]` 的機器契約，所以人眼看是全黑。**不能**直接調亮（會破壞契約）。
+
+**Q&A：** user 選「保留 label.png 原樣，另加上色預覽圖」。
+
+**實作：** `fine_align.colorize_label_map(lbl, id_to_rgb, bg_rgb)`（純 numpy，各 id 上 POI 色）；
+`overlay_export.export_one_image` 寫 `_label.png` 後另寫 `_label_view.png`（RGB→BGR）；row 加
+`label_view_png`、`OVERLAY_MANIFEST_COLS` 加該欄、manifest schema `mmh-gds-overlay-v2`→`v3`（additive）。
+
+**測試：** 新增 `tests/test_gds_align_f24.py` 17 項（helper 6 + colorize 4 + `_on_export_all` GUI 7）；
+更新 `test_gds_align_f5.py` 的 manifest schema 斷言 v2→v3 並驗 `label_view_png` 欄。`pytest tests/`
+**724 passed**（707→724，+17）。
+
+**影響檔案：** `glas/core/fine_align.py`、`glas/core/overlay_export.py`、`glas/app/gds_align_tool.py`、
+`tests/test_gds_align_f24.py`(新)、`tests/test_gds_align_f5.py`、`README.md`、`CLAUDE.md`、
+`docs/plans/F24-export-all-one-click.md`、`SESSION_LOG.md`。
+**Branch：** claude/glas-project-progress-vzu25j
+
+---
+
 ## [2026-06-07] [doc-sync] README / CLAUDE.md 文件整理
 
 **變更類型：** 文件同步 · **狀態：完成**
