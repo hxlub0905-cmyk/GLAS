@@ -35,10 +35,15 @@ jobs:
       - name: Stage + smoke-test the built .pyd
         shell: pwsh
         run: |
-          # build_ext --inplace drops it at the repo root for a top-level
-          # module; move it into glas/core (which is on sys.path) and import it.
+          # Ensure a copy of the .pyd lives in glas/core (on sys.path). On
+          # Windows build_ext --inplace already places it there, so skip files
+          # already in glas/core (copying onto itself errors); copy any that
+          # landed elsewhere (repo root / build\lib).
+          $core = (Resolve-Path "glas/core").Path
           Get-ChildItem -Recurse -Filter "oasis_fastdecode*.pyd" | ForEach-Object {
-            Copy-Item $_.FullName -Destination "glas/core/" -Force
+            if ($_.DirectoryName -ne $core) {
+              Copy-Item $_.FullName -Destination "glas/core/" -Force
+            }
           }
           Get-ChildItem "glas/core/oasis_fastdecode*.pyd"
           python -c "import sys; sys.path.insert(0, 'glas/core'); import oasis_fastdecode as f; print('VERSION', f.VERSION, 'selftest', f.selftest())"
