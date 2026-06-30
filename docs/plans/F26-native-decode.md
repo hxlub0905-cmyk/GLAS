@@ -65,17 +65,22 @@ parse + 改架構，不適合互動 ROI。
 - [ ] **user 下載 artifact、放進 `glas/core/`、跑 `python -c "import oasis_fastdecode as f; print(f.selftest())"` 成功**（驗證 IT 限制下「放檔」可行）。
 - [ ] 決策點：M0 成功 → 進 M1；失敗（artifact 被擋/AV 隔離）→ 改走 F17 + 純 Python。
 
-### M1: native varint 接進 decode 熱路徑  [status: planned]
+### M1: native varint 接進 decode 熱路徑  [status: done 2026-06-30 — 量測後撤回]
 
-- [ ] `oasis_streamer` gated 取用：`OasisStream.read_uvarint/read_svarint` 在 native 可用時走 `oasis_fastdecode`，否則純 Python。
-- [ ] 量測：`oas_profile.py` 對兩檔重跑，確認 varint 佔比下降、整體加速。
-- [ ] 全 round-trip 測試雙路徑綠。
+- [x] `oasis_streamer` gated 取用 read_uvarint/read_svarint（已實作、211 oasis 測試雙路徑綠）。
+- [x] **本機合成大檔量測（決定性）**：per-call native varint 是**回歸** —— 0.79–0.81×（更慢）。原因：每個
+      varint 一次 Python→C 呼叫 + tuple 配置/拆解的成本，超過它取代的 1–2 圈純 Python 迴圈（小 varint 是常態）。
+- [x] **撤回 per-varint 整合**（保留純 Python read_uvarint/svarint）。`oasis_fastdecode` 模組 + 交付管道（M0）
+      仍保留、已驗證，留給 M2 的 record-loop 用。**結論：唯一能贏的粒度是整個 record / record-run 在 native 攤提
+      C 邊界，不是 per-scalar。**
 
-### M2: native per-record 迴圈（最大收益）  [status: planned]
+### M2: native per-record 迴圈（唯一能贏的粒度，最大收益）  [status: deferred — 待 user 決定]
 
-- [ ] 把 `consume` 內層 + RECTANGLE/POLYGON decoder + modal state 搬進 Cython，每個 cell 才回 Python 一次、直接填 numpy buffer。
+- [ ] 把 `consume` 內層 + RECTANGLE/POLYGON decoder + modal state 搬進 Cython，每個 cell/run 才回 Python 一次、直接填 numpy buffer（攤提 C 邊界 → 才會贏）。
 - [ ] §7 spec 對齊：PLACEMENT info-byte N-bit（§22.6）、continuation/sign（§7.2/§7.3）、modal reuse、overflow guard。
 - [ ] byte-identical 護欄 + 量測（目標整檔 decode ~2.5–4×）。
+- [ ] **成本/風險評估：** 大且 spec-critical 的 port + 脆弱的二進位交付（base64-in-zip，會隨 IT 政策/防毒變動）。
+      鑑於 F17（無 binary）很可能已解決 user 實際痛點（檔1 首次載入慢），M2 的互動收益邊際 → **先做 F17，M2 視需要再啟動。**
 
 ### M3: 收尾 + 互補的 F17  [status: planned]
 

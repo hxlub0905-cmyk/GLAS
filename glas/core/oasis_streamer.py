@@ -60,6 +60,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO, Callable, Iterator, Optional
 
+# ── Optional native decode accelerator (F26) ─────────────────────────────────
+# NOTE (F26 M1 finding): wiring the native ext at the *per-varint* granularity
+# (one Python→C call per read_uvarint/read_svarint) is a REGRESSION — the call +
+# tuple overhead exceeds the 1-2 iteration Python loop it replaces (benchmarked
+# 0.79-0.81x on synthetic D2DB). The win requires amortizing the C boundary over
+# a whole record / record-run (M2: native record-decode loop), not per scalar.
+# The compiled module (``oasis_fastdecode``) and its delivery path are validated
+# (M0) and reserved for that M2 port; it is intentionally NOT imported here yet.
+
 
 # ── Constants ────────────────────────────────────────────────────────────────
 

@@ -30,6 +30,31 @@
 
 ---
 
+## [2026-06-30] [F26 M1] 量測：per-call native varint 是回歸 → 撤回，改建議 F17
+
+**變更類型：** 效能實驗（量測後撤回）· **狀態：M1 done（負結果）、M2 deferred**
+
+**做法：** `oasis_streamer.OasisStream.read_uvarint/read_svarint` 加 gated native 取用（native 可用走
+`oasis_fastdecode`，否則純 Python），211 oasis 測試雙路徑全綠（native 正確）。
+
+**量測（本機合成 1.5M-rect 大檔，native ON vs OFF）：** **per-call native = 0.79–0.81×（更慢）**。原因：
+每個 varint 一次 Python→C 呼叫 + tuple 配置/拆解，成本超過它取代的 1–2 圈純 Python 迴圈（小 varint 是常態）。
+這與 profiler 沒矛盾——varint 確實佔 82–85%，但贏的前提是「攤提 C 邊界」（整 record/run 一次 native 呼叫），
+而非 per-scalar。
+
+**處置：** **撤回 per-varint 整合**（read_uvarint/svarint 還原純 Python）。保留 `oasis_fastdecode` 模組 +
+base64 交付管道（M0 已驗證，留給未來 M2 record-loop）。M0 在 user 公司電腦驗證成功（zip 純文字可下載、unpack
+出 .pyd、import+selftest=1、防毒未擋）——交付機制本身可行，只是 per-varint 粒度錯。
+
+**建議轉向：** **F17 bbox sweep**（無 binary、純 Python）直接治 user 檔1（E3B，無 S_BOUNDING_BOX）首次 ROI
+載入慢——很可能就是 user「解包很久」的主因。M2（native record-loop，唯一能贏 decode 吞吐的粒度）成本/風險大
++ 二進位交付脆弱，列為 deferred、視需要再啟。
+
+**影響檔案：** `glas/core/oasis_streamer.py`（加 gated → 撤回，留 M1 finding 註解）、
+`docs/plans/F26-native-decode.md`、`SESSION_LOG.md`。**Branch：** claude/project-perf-optimization-86i8yt
+
+---
+
 ## [2026-06-30] [F26 M0] 交付管道改 base64 文字 sidecar（locked-down 環境連 zip 內含 .pyd 都被擋）
 
 **變更類型：** 交付機制修正 · **狀態：M0 進行中（第 N 次繞 IT 限制）**
