@@ -1573,16 +1573,25 @@ class FineAlignAllWorker(QObject):
             self.finished.emit(done)
 
 
-class OverlayExportWorker(QObject):
-    """Batch export of SEM frames + aligned GDS-outline overlays + a manifest
-    (F5 M6). For every selected image it optionally writes ``<id>_raw.png`` and
-    ``<id>_overlay.png`` (the POI layer outlines stroked on the SEM at the
-    coarse+refined anchor), then a manifest (CSV + JSON) keyed by image_id so a
-    downstream tool — e.g. MMH — can join back. Sequential single reader, like
-    :class:`FineAlignAllWorker`."""
+class ExportWorker(QObject):
+    """F25 unified batch worker: for every selected image, walk the POI ROI
+    **once** and from that single walk both fine-align the image (when it isn't
+    already aligned) and rasterize the requested products
+    (``<id>_raw/overlay/gray/label[/label_view].png``), then a manifest. Replaces
+    the old two-pass ``FineAlignAllWorker`` → ``OverlayExportWorker`` sequence
+    that walked each ROI twice.
+
+    Freshly-computed fine-align results are streamed via :pyattr:`result` so
+    ``_refined`` / the batch panel fill live; images that were already aligned
+    reuse their stored offset (no ``result`` emitted — the orchestrator leaves
+    ``_refined`` untouched). Per-image work is order-independent, so the output
+    is identical in-thread or across the (shared F23) process pool (§7)."""
 
     progress = pyqtSignal(int, int, str)        # (done, total, image_id)
-    finished = pyqtSignal(int, str)             # (count, manifest_csv_path)
+    # Freshly fine-aligned image (image_id, dx, dy, score, used_radius_px,
+    # status); not emitted for images whose stored alignment was reused.
+    result = pyqtSignal(str, float, float, float, int, str)
+    finished = pyqtSignal(int, str)             # (count, manifest_csv_path|"")
     failed = pyqtSignal(str)
     cancelled = pyqtSignal()
 
@@ -1613,21 +1622,25 @@ class OverlayExportWorker(QObject):
     def cancel(self) -> None:
         self._cancel.set()
 
+    def _want_products(self) -> bool:
+        return bool(self._export_overlay or self._export_gray
+                    or self._export_label)
+
     def run(self) -> None:
         try:
             n = len(self._jobs)
             if n == 0:
-                self.finished.emit(0, self._write_manifest([]))
+                self.finished.emit(0, "")
                 return
             workers = min(
                 fine_align.batch_worker_count(self._cfg.get("max_workers", 0)), n)
-            # F14: parallelise the export across a process pool (mirrors
-            # FineAlignAllWorker). The ROI walk dominates and is GIL-bound, so
-            # processes are what actually speed it up. Tiny batches, a single
-            # worker, or a raw-only run (no reader to rebuild) stay in-thread.
-            if (n <= 2 or workers <= 1 or self._rar is None
-                    or not (self._export_overlay or self._export_gray
-                            or self._export_label)):
+            # The GIL-bound ROI walk is what a process pool actually speeds up;
+            # it is needed for a fresh alignment or an image product. A pure CSV
+            # re-export of already-aligned images needs no walk, so it (and tiny
+            # / single-worker / reader-less runs) stays in-thread.
+            needs_walk = self._want_products() or any(
+                j[2] is None and j[1] is not None for j in self._jobs)
+            if n <= 2 or workers <= 1 or self._rar is None or not needs_walk:
                 rows = self._run_in_thread()
             else:
                 rows = self._run_process_pool(workers)
@@ -1639,19 +1652,21 @@ class OverlayExportWorker(QObject):
             if rows is None:
                 self.cancelled.emit()
             else:
-                self.finished.emit(len(rows), self._write_manifest(rows))
+                manifest = (self._write_manifest(rows)
+                            if self._want_products() else "")
+                self.finished.emit(len(rows), manifest)
 
     def _run_in_thread(self):
-        """Sequential fallback (tiny / raw-only batches): export each image on
-        this worker thread. Returns the manifest rows in job order, or ``None``
-        if cancelled mid-batch."""
+        """Sequential fallback (tiny / CSV-only batches): align+export each image
+        on this worker thread. Returns the manifest rows in job order, or
+        ``None`` if cancelled mid-batch."""
         n = len(self._jobs)
         rows = []
         for job in self._jobs:
             if self._cancel.is_set():
                 return None
             try:
-                row = overlay_export.export_one_image(
+                fa, row = overlay_export.align_and_export_one_image(
                     job, self._rar, self._root, self._poi, self._cfg,
                     self._out_dir, self._export_raw, self._export_overlay,
                     self._export_gray, self._export_label, self._score_thr,
@@ -1659,53 +1674,47 @@ class OverlayExportWorker(QObject):
             except oasis_random.WalkCancelled:
                 return None
             rows.append(row)
+            if fa is not None:
+                self.result.emit(*fa)
             self.progress.emit(len(rows), n, str(row["image_id"]))
         return rows
 
     def _run_process_pool(self, workers: int):
-        """Parallel path: fan the per-image export out to a spawn-based process
-        pool. Each worker rebuilds its reader once via the initializer and writes
-        its own PNGs. All jobs are submitted up front (workers stay busy), but
-        results are consumed in *submission order* (F14: image order) so progress
-        ticks top-to-bottom and the manifest is stable / matches the sequential
-        output. Returns rows, or ``None`` if cancelled (partial PNGs on disk are
-        kept, like the old path)."""
+        """Parallel path: fan the per-image align+export out to the **shared,
+        warm F23 pool** (keyed on reader identity; the reader is built once by
+        ``fine_align._pool_init``). The per-batch context rides each task, and
+        ``rar.index_snapshot()`` lets each worker skip its own name-table scan.
+        Jobs are submitted up front (workers stay busy) and consumed in
+        submission order so progress ticks top-to-bottom and the manifest matches
+        the sequential output. Returns rows, or ``None`` if cancelled (partial
+        PNGs on disk are kept)."""
         n = len(self._jobs)
         rar = self._rar
-        # F23 M1 (extended to export): hand each worker the already-built
-        # name-table index so it skips its own scan_cell_offsets rescan — the
-        # dominant per-reader build cost on big files. Plain dict/list/int over
-        # the same file the workers open, so it is correct by construction and
-        # pickles cleanly into the spawn pool.
-        initargs = (str(rar._path), rar._init_wanted, rar._dtype,
-                    rar._bbox_layer, rar.index_snapshot(),
-                    self._root, self._poi, self._cfg,
-                    str(self._out_dir), self._export_raw, self._export_overlay,
-                    self._export_gray, self._export_label, self._score_thr)
-        ctx = mp.get_context("spawn")
-        ex = ProcessPoolExecutor(max_workers=workers, mp_context=ctx,
-                                 initializer=overlay_export._export_pool_init,
-                                 initargs=initargs)
         done = 0
         dropped = False
         rows = []
-        try:
-            futures = [ex.submit(overlay_export._export_pool_task, job)
-                       for job in self._jobs]
+        with fine_align.batch_pool.lease(
+                str(rar._path), rar._init_wanted, rar._dtype, rar._bbox_layer,
+                rar.index_snapshot(), workers) as ex:
+            futures = [ex.submit(
+                overlay_export._afe_pool_task, job, self._root, self._poi,
+                self._cfg, str(self._out_dir), self._export_raw,
+                self._export_overlay, self._export_gray, self._export_label,
+                self._score_thr) for job in self._jobs]
             for fut in futures:
                 if self._cancel.is_set() and not dropped:
                     for f in futures:
                         f.cancel()          # drop not-yet-started tasks
                     dropped = True
                 try:
-                    row = fut.result()
+                    fa, row = fut.result()
                 except CancelledError:
                     continue                # a pending task we just dropped
                 rows.append(row)
                 done += 1
+                if fa is not None:
+                    self.result.emit(*fa)
                 self.progress.emit(done, n, str(row["image_id"]))
-        finally:
-            ex.shutdown(wait=True)
         if self._cancel.is_set():
             return None
         return rows
@@ -4396,11 +4405,11 @@ class FineAlignPanel(QGroupBox):
     Toggle one or more POI layers on the left LayerPanel; each appears here
     with its own FG grey-level spinbox. They composite into one synthetic
     template (shared BG / blur), which is matched against the SEM with
-    ``cv2.matchTemplate``. Emits ``run_requested`` / ``export_all_requested`` /
+    ``cv2.matchTemplate``. Emits ``run_requested`` / ``export_requested`` /
     ``preview_requested`` for MainWindow to do the work."""
 
     run_requested = pyqtSignal()
-    export_all_requested = pyqtSignal()
+    export_requested = pyqtSignal()
     preview_requested = pyqtSignal()
     results_requested = pyqtSignal()
 
@@ -4466,13 +4475,14 @@ class FineAlignPanel(QGroupBox):
             "selected SEM image (needs ≥1 POI + loaded ROI + image).")
         self._run_btn.clicked.connect(self.run_requested)
 
-        self._export_all_btn = QPushButton("Export all…", self)
-        self._export_all_btn.setEnabled(False)
-        self._export_all_btn.setToolTip(
-            "Fine-align every image that hasn't been run yet (the ones you "
-            "already ran are reused), then open the export dialog for the whole "
-            "dataset. Slow on big files; cancellable.")
-        self._export_all_btn.clicked.connect(self.export_all_requested)
+        self._export_btn = QPushButton("Export…", self)
+        self._export_btn.setEnabled(False)
+        self._export_btn.setToolTip(
+            "Pick what to export, then make one pass over the dataset that "
+            "fine-aligns any images you haven't run yet (already-run ones are "
+            "reused) and writes the alignment manifest + chosen image products. "
+            "Slow on big files; cancellable.")
+        self._export_btn.clicked.connect(self.export_requested)
 
         self._preview_btn = QPushButton("Preview template…", self)
         self._preview_btn.setEnabled(False)
@@ -4496,7 +4506,7 @@ class FineAlignPanel(QGroupBox):
             ("Search radius (nm)", self._radius),
             ("Score threshold", self._thresh),
             ("Parallel workers (0 = auto)", self._workers),
-            ("span", self._run_btn), ("span", self._export_all_btn),
+            ("span", self._run_btn), ("span", self._export_btn),
             ("span", self._preview_btn), ("span", self._results_btn),
             ("span", self._result_lbl),
         ]
@@ -4568,7 +4578,7 @@ class FineAlignPanel(QGroupBox):
     def _update_enabled(self, running: bool = False) -> None:
         on = self._poi_set and not running
         self._run_btn.setEnabled(on)
-        self._export_all_btn.setEnabled(on)
+        self._export_btn.setEnabled(on)
         self._preview_btn.setEnabled(on)
 
     def set_running(self, running: bool) -> None:
@@ -6028,7 +6038,7 @@ class MainWindow(QMainWindow):
         self.sem_panel.alignment_delta.set_requested.connect(self._on_set_offset)
         self.sem_panel.alignment_delta.clear_requested.connect(self._on_clear_offset)
         self.sem_panel.fine_align.run_requested.connect(self._on_run_fine_align)
-        self.sem_panel.fine_align.export_all_requested.connect(self._on_export_all)
+        self.sem_panel.fine_align.export_requested.connect(self._on_export)
         self.sem_panel.fine_align.preview_requested.connect(self._on_preview_template)
         self.sem_panel.fine_align.results_requested.connect(self._open_fa_results)
         self.sem_viewer.drag_changed.connect(self._on_overlay_drag)
@@ -6089,9 +6099,11 @@ class MainWindow(QMainWindow):
         # F13: True while a batch *re-run* is in flight, so results only
         # overwrite when strictly better (rerun_should_overwrite).
         self._fa_rerun_mode = False
-        # F24: True while a one-click "Export all" is fine-aligning its un-run
-        # images, so the batch finish hands off to the export dialog.
-        self._export_after_fa = False
+        # F25: the deferred per-image alignment-manifest write for the unified
+        # Export pass ({"images", "fmt", "path"}); set in _on_export, consumed in
+        # _on_export_finished, cleared on cancel / failure so a half-done set is
+        # never written. None when no export is in flight.
+        self._export_pending = None
         # F5: per-image (used_radius_px, status) parallel to _refined, for the
         # results table (C3/C4). status: ok / no-coords / missing-file /
         # no-scale / flat.
@@ -6113,10 +6125,6 @@ class MainWindow(QMainWindow):
         self._batch_refresh_timer.setInterval(300)
         self._batch_refresh_timer.timeout.connect(
             lambda: self._refresh_batch_panel(rebuild_charts=False))
-        # F5 M6 overlay/image export worker state.
-        self._ov_thread: Optional[QThread] = None
-        self._ov_worker = None
-        self._ov_progress = None
         # M5 export: remember the source KLARF / OASIS paths for the manifest.
         self._klarf_path: str = ""
         self._oas_path: str = ""
@@ -6261,14 +6269,9 @@ class MainWindow(QMainWindow):
 
         h.addWidget(_divider())
 
-        # ── Export group ──
+        # ── Export group (F25: the single Export entry lives on the FineAlign
+        # panel; the toolbar keeps only the developer-mode OASIS export). ──
         h.addWidget(_group("EXPORT"))
-        self._align_btn = QPushButton(_qicon("download"), " Export Alignment…")
-        self._align_btn.setToolTip(
-            "Export per-image alignment offsets (coarse + fine + score) to "
-            "CSV / JSON for a future Recipe to anchor its ROI (M5).")
-        self._align_btn.clicked.connect(self._on_export_alignment)
-        h.addWidget(self._align_btn)
 
         # F9: OASIS export — advanced, hidden unless developer mode is on.
         self._export_oasis_btn = QPushButton(_qicon("save"), " Export OASIS…")
@@ -6435,10 +6438,6 @@ class MainWindow(QMainWindow):
             w = getattr(self, name, None)
             if w is not None:
                 w.setEnabled(has_doc)
-        # Export Alignment needs at least an image list to enumerate rows.
-        align = getattr(self, "_align_btn", None)
-        if align is not None:
-            align.setEnabled(has_sem)
         # Export OASIS (dev) needs geometry; visibility is still gated by
         # dev mode in _refresh_dev_ui.
         oasis = getattr(self, "_export_oasis_btn", None)
@@ -7097,58 +7096,164 @@ class MainWindow(QMainWindow):
         self._refresh_batch_panel()
         self._launch_fa(specs, jobs, cfg)
 
-    def _on_export_all(self) -> None:
-        """F24: one-click "fine-align the un-run images, then export the whole
-        dataset". The images the operator already ran (in ``self._refined``) are
-        reused — only the rest are computed — and when everything is already
-        aligned we jump straight to the export dialog. Replaces the old
-        "Run all images" button (fine-align was never the deliverable; the
-        downstream export is)."""
+    def _on_export(self) -> None:
+        """F25: the single Export entry. Pick the options up front, then make
+        ONE pass over the selected images that both fine-aligns the un-run ones
+        AND writes the requested products — each ROI walked once (replacing the
+        old fine-align-pass + export-pass that walked it twice). The per-image
+        alignment CSV/JSON is written from the (now-updated) ``_refined`` when
+        the pass finishes."""
         if not self._sem_images:
-            self._status_doc.setText("export all: load SEM images first")
+            self._status_doc.setText("export: load SEM images first")
             return
         if self._fa_thread is not None:
             return  # a batch is already running
-        todo = fine_align.images_needing_fine_align(
-            self._sem_images, self._refined)
-        if not todo:
-            # Everything with coordinates is already aligned — export directly.
-            self._on_export_alignment()
+        # D3: options BEFORE the run (the fused worker needs to know what to
+        # write before it starts).
+        dlg = AlignmentExportDialog(self, self._sem_images, self._refined)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        if cv2 is None:
-            QMessageBox.warning(self, "Fine align",
-                                "opencv (cv2) is required for fine alignment.")
+        fmt, ids, exp_raw, exp_overlay, exp_gray, exp_label, score_thr = \
+            dlg.selected()
+        if not ids:
+            self._status_doc.setText("export: no images selected")
             return
-        specs = self._poi_specs()
-        if not specs:
-            self._status_doc.setText("export all: select a POI layer first")
+        images = [i for i in self._sem_images if i.image_id in ids]
+        want_products = exp_overlay or exp_gray or exp_label
+        todo = fine_align.images_needing_fine_align(images, self._refined)
+        # Aligning the un-run images and rasterizing products both need a POI +
+        # an open OASIS ROI + a FOV; a pure CSV re-export of already-aligned
+        # images needs none of that.
+        specs_colored = []
+        if todo or want_products:
+            if cv2 is None:
+                QMessageBox.warning(self, "Export",
+                                    "opencv (cv2) is required for fine align "
+                                    "/ image export.")
+                return
+            specs_colored = self._poi_specs_colored()
+            if not specs_colored:
+                self._status_doc.setText("export: select a POI layer first")
+                return
+            if self._rar is None or self._roi_root is None:
+                self._status_doc.setText("export: open an OASIS (ROI) first")
+                return
+            if self._fov_w <= 0 or self._fov_h <= 0:
+                self._status_doc.setText("export: set FOV width/height first")
+                return
+        out_dir = ""
+        if want_products:
+            out_dir = QFileDialog.getExistingDirectory(
+                self, "Export images to…", self._dlg_start_dir("export_images"))
+            if not out_dir:
+                return
+            self._dlg_remember("export_images", out_dir, is_dir=True)
+        ext = "csv" if fmt == "csv" else "json"
+        flt = "CSV (*.csv)" if fmt == "csv" else "JSON (*.json)"
+        start = str(Path(self._dlg_start_dir("export_align"))
+                    / f"alignment.{ext}") if self._dlg_start_dir(
+                        "export_align") else f"alignment.{ext}"
+        align_path, _ = QFileDialog.getSaveFileName(
+            self, "Export alignment", start, flt)
+        if not align_path:
             return
-        if self._rar is None or self._roi_root is None:
-            self._status_doc.setText("export all: open an OASIS (ROI) first")
-            return
-        if self._fov_w <= 0 or self._fov_h <= 0:
-            self._status_doc.setText("export all: set FOV width/height first")
-            return
+        self._dlg_remember("export_align", align_path)
         jobs = [(im.image_id, self._coarse_gds(im),
+                 self._refined.get(im.image_id),
                  str(im.file_path) if im.file_path else "", bool(im.exists))
-                for im in todo]
+                for im in images]
         cfg = {
             "fov_w": self._fov_w, "fov_h": self._fov_h,
             "nm_auto": self._nm_auto, "nm_manual": self._nm_per_px_manual,
             **self.sem_panel.fine_align.values(),
         }
-        # Hand off to the export dialog once the batch finishes (see
-        # _on_fa_finished); a cancel / failure clears the flag so we never
-        # export a half-done set.
-        self._export_after_fa = True
+        label_map = self._export_label_map() if exp_label else []
+        # Stash the deferred alignment-manifest write for the finish handler (a
+        # cancel / failure clears it so a half-done set is never written).
+        self._export_pending = {"images": images, "fmt": fmt,
+                                "path": align_path}
         self._fa_rerun_mode = False
         self._batch_refresh_timer.stop()
         self._enter_batch_workspace()
         self.batch_panel.set_rerun_defaults(self.sem_panel.fine_align.values())
         self._refresh_batch_panel()
+        n_todo = len(todo)
         self._status_doc.setText(
-            f"export all: fine-aligning {len(jobs)} un-run image(s)…")
-        self._launch_fa(specs, jobs, cfg)
+            f"export: {len(jobs)} image(s)"
+            + (f" ({n_todo} to fine-align)" if n_todo else "") + "…")
+        self._launch_export(specs_colored, jobs, cfg, out_dir, exp_raw,
+                            exp_overlay, exp_gray, exp_label, score_thr,
+                            label_map)
+
+    def _launch_export(self, specs_colored, jobs, cfg, out_dir, exp_raw,
+                       exp_overlay, exp_gray, exp_label, score_thr,
+                       label_map) -> None:
+        """Start the unified align+export worker (F25). Reuses the batch
+        (``_fa_*``) thread slot + batch-panel progress, since fresh fine-align
+        results stream into the panel exactly like a Run."""
+        self.batch_panel.start_progress()
+        self._fa_thread = QThread(self)
+        self._fa_worker = ExportWorker(
+            self._rar, self._roi_root, specs_colored, jobs, cfg, out_dir,
+            exp_raw, exp_overlay, exp_gray, exp_label, score_thr, label_map)
+        self._fa_worker.moveToThread(self._fa_thread)
+        self._fa_thread.started.connect(self._fa_worker.run)
+        self._fa_worker.progress.connect(self._on_fa_progress)
+        self._fa_worker.result.connect(self._on_fa_result)
+        self._fa_worker.finished.connect(self._on_export_finished)
+        self._fa_worker.failed.connect(self._on_fa_failed)
+        self._fa_worker.cancelled.connect(self._on_fa_cancelled)
+        for sig in (self._fa_worker.finished, self._fa_worker.failed,
+                    self._fa_worker.cancelled):
+            sig.connect(self._fa_thread.quit)
+        self._fa_thread.finished.connect(self._cleanup_fa)
+        self.sem_panel.fine_align.set_running(True)
+        QApplication.processEvents()
+        self._fa_thread.start()
+
+    def _on_export_finished(self, count: int, manifest_csv: str) -> None:
+        """Unified-pass finish: refresh the batch view, then write the alignment
+        CSV/JSON from the (now-updated) ``_refined``."""
+        self._batch_refresh_timer.stop()
+        self.batch_panel.end_progress()
+        self._refresh_overview_defects()
+        if self._current_sem is not None:
+            self.sem_viewer.reset_drag()
+            self._jump_to_image(self._current_sem)
+        self._refresh_batch_panel()
+        pend = self._export_pending
+        self._export_pending = None
+        wrote = ""
+        if pend is not None:
+            wrote = self._write_alignment_manifest(pend["images"], pend["fmt"],
+                                                   pend["path"])
+        parts = [f"{count} image(s)"]
+        if manifest_csv:
+            parts.append(f"images+manifest → {Path(manifest_csv).name}")
+        if wrote:
+            parts.append(f"alignment → {Path(wrote).name}")
+        self._status_doc.setText("export: " + ", ".join(parts))
+
+    def _write_alignment_manifest(self, images, fmt, path) -> str:
+        """Write the per-image alignment CSV/JSON from the current ``_refined``
+        (M5). Returns the written path, or ``""`` on failure."""
+        gds_path = self._oas_path or (str(self._doc.path)
+                                      if self._doc and self._doc.path else "")
+        poi = "; ".join(_entry_label(e) for e in self._poi_entries)
+        rows = alignment_rows(
+            images, self._refined, coarse_of=self._coarse_gds,
+            klarf_path=self._klarf_path, gds_path=gds_path,
+            poi_layer=poi, nm_per_px=self._effective_nm_per_px())
+        try:
+            if fmt == "csv":
+                write_alignment_csv(path, rows)
+            else:
+                write_alignment_json(
+                    path, rows, synthetic_layer_specs(self._doc))
+        except Exception as exc:                       # noqa: BLE001
+            QMessageBox.critical(self, "Export alignment failed", str(exc))
+            return ""
+        return str(path)
 
     def _on_rerun_requested(self, image_ids: list, overrides: dict) -> None:
         """F13: re-run a subset (low-score / selected) with overridden params.
@@ -7257,6 +7362,8 @@ class MainWindow(QMainWindow):
             self._batch_refresh_timer.start()
 
     def _on_fa_finished(self, count: int) -> None:
+        # Fine-align-only finish (F13 subset re-run). The unified Export run uses
+        # _on_export_finished instead.
         self._batch_refresh_timer.stop()      # final refresh supersedes it
         self.batch_panel.end_progress()
         self._status_doc.setText(f"fine align: processed {count} image(s)")
@@ -7265,24 +7372,18 @@ class MainWindow(QMainWindow):
             self.sem_viewer.reset_drag()
             self._jump_to_image(self._current_sem)
         self._refresh_batch_panel()           # final rows + charts + median
-        if self._export_after_fa:
-            # F24: the un-run images are now aligned — hand off to the export
-            # dialog. Defer to the next event-loop tick so the batch QThread
-            # finishes tearing down before the modal dialog opens.
-            self._export_after_fa = False
-            QTimer.singleShot(0, self._on_export_alignment)
 
     def _on_fa_failed(self, msg: str) -> None:
-        self._export_after_fa = False         # F24: don't export a failed batch
+        self._export_pending = None           # F25: don't write a failed set
         self._batch_refresh_timer.stop()
         self.batch_panel.end_progress()
         self._refresh_batch_panel()           # show whatever finished
-        QMessageBox.critical(self, "Export all failed", msg)
+        QMessageBox.critical(self, "Export failed", msg)
 
     def _on_fa_cancelled(self) -> None:
         # Partial results are kept (not cleared), so the overview still reflects
         # whatever finished before the cancel (F5 M5).
-        self._export_after_fa = False         # F24: cancel aborts the export too
+        self._export_pending = None           # F25: cancel aborts the write too
         self._batch_refresh_timer.stop()
         self.batch_panel.end_progress()
         self._status_doc.setText("fine align: cancelled (partial results kept)")
@@ -7339,53 +7440,7 @@ class MainWindow(QMainWindow):
             img.xrel, img.yrel, self._chip_corner_x, self._chip_corner_y)
         return (gx + self._origin_dx, gy + self._origin_dy)
 
-    # ── M5: per-image alignment export ───────────────────────────────────────
-    def _on_export_alignment(self) -> None:
-        if not self._sem_images:
-            self._status_doc.setText("export: load SEM images first")
-            return
-        dlg = AlignmentExportDialog(self, self._sem_images, self._refined)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
-        fmt, ids, exp_raw, exp_overlay, exp_gray, exp_label, score_thr = \
-            dlg.selected()
-        if not ids:
-            self._status_doc.setText("export: no images selected")
-            return
-        images = [i for i in self._sem_images if i.image_id in ids]
-        gds_path = self._oas_path or (str(self._doc.path)
-                                      if self._doc and self._doc.path else "")
-        poi = "; ".join(_entry_label(e) for e in self._poi_entries)
-        rows = alignment_rows(
-            images, self._refined, coarse_of=self._coarse_gds,
-            klarf_path=self._klarf_path, gds_path=gds_path,
-            poi_layer=poi, nm_per_px=self._effective_nm_per_px())
-        ext = "csv" if fmt == "csv" else "json"
-        flt = "CSV (*.csv)" if fmt == "csv" else "JSON (*.json)"
-        start = str(Path(self._dlg_start_dir("export_align"))
-                    / f"alignment.{ext}") if self._dlg_start_dir(
-                        "export_align") else f"alignment.{ext}"
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export alignment", start, flt)
-        if not path:
-            return
-        self._dlg_remember("export_align", path)
-        try:
-            if fmt == "csv":
-                write_alignment_csv(path, rows)
-            else:
-                write_alignment_json(
-                    path, rows, synthetic_layer_specs(self._doc))
-        except Exception as exc:
-            QMessageBox.critical(self, "Export failed", str(exc))
-            return
-        self._status_transient(
-            f"exported {len(rows)} image(s) → {Path(path).name}")
-        if exp_raw or exp_overlay or exp_gray or exp_label:
-            self._export_overlay_images(images, exp_raw, exp_overlay,
-                                        exp_gray, exp_label, score_thr)
-
-    # ── F5 M6: SEM + aligned-overlay PNG export ──────────────────────────────
+    # ── F25: SEM + aligned-overlay PNG export helpers (used by _on_export) ────
     def _poi_specs_colored(self) -> list:
         """``[(spec, (r, g, b), fg_glv), ...]`` for the active POI layers, for
         image export — the spec walks the ROI, the colour strokes the overlay
@@ -7415,94 +7470,6 @@ class MainWindow(QMainWindow):
             out.append({"id": idx, "layer": _entry_label(e),
                         "fg_glv": int(fgs.get(e.key.key(), 200))})
         return out
-
-    def _export_overlay_images(self, images, exp_raw: bool,
-                               exp_overlay: bool, exp_gray: bool = False,
-                               exp_label: bool = False,
-                               score_thr: float = 0.0) -> None:
-        if cv2 is None:
-            QMessageBox.warning(self, "Image export",
-                                "opencv (cv2) is required for image export.")
-            return
-        if self._ov_thread is not None:
-            return
-        specs = self._poi_specs_colored()
-        # Overlay / grayscale / label all need an OASIS ROI + a POI layer.
-        if (exp_overlay or exp_gray or exp_label) and (
-                not specs or self._rar is None or self._roi_root is None):
-            QMessageBox.information(
-                self, "Overlay export",
-                "Overlay / grayscale / label PNGs need an OASIS (ROI) open and "
-                "≥1 POI layer; exporting raw images / manifest only.")
-            exp_overlay = False
-            exp_gray = False
-            exp_label = False
-        out_dir = QFileDialog.getExistingDirectory(
-            self, "Export images to…", self._dlg_start_dir("export_images"))
-        if not out_dir:
-            return
-        self._dlg_remember("export_images", out_dir, is_dir=True)
-        jobs = [(im.image_id, self._coarse_gds(im),
-                 self._refined.get(im.image_id),
-                 str(im.file_path) if im.file_path else "", bool(im.exists))
-                for im in images]
-        fa = self.sem_panel.fine_align.values()
-        cfg = {"fov_w": self._fov_w, "fov_h": self._fov_h,
-               "nm_auto": self._nm_auto, "nm_manual": self._nm_per_px_manual,
-               # F15: grayscale rendering greys / blur (same as the template).
-               "bg_glv": fa["bg_glv"], "blur_sigma_px": fa["blur_sigma_px"],
-               # F14: parallel export worker count (0 = auto).
-               "max_workers": fa["max_workers"]}
-        label_map = self._export_label_map() if exp_label else []
-        self._ov_progress = LoadProgressDialog(self)
-        self._ov_progress.set_text("Exporting images…")
-        self._ov_thread = QThread(self)
-        self._ov_worker = OverlayExportWorker(
-            self._rar, self._roi_root, specs, jobs, cfg, out_dir,
-            exp_raw, exp_overlay, exp_gray, exp_label, score_thr, label_map)
-        self._ov_worker.moveToThread(self._ov_thread)
-        self._ov_thread.started.connect(self._ov_worker.run)
-        self._ov_worker.progress.connect(self._on_ov_progress)
-        self._ov_worker.finished.connect(self._on_ov_finished)
-        self._ov_worker.failed.connect(self._on_ov_failed)
-        self._ov_worker.cancelled.connect(self._on_ov_cancelled)
-        self._ov_progress.cancel_requested.connect(
-            self._ov_worker.cancel, Qt.ConnectionType.DirectConnection)
-        for sig in (self._ov_worker.finished, self._ov_worker.failed,
-                    self._ov_worker.cancelled):
-            sig.connect(self._ov_thread.quit)
-        self._ov_thread.finished.connect(self._cleanup_ov)
-        self._ov_progress.show()
-        QApplication.processEvents()
-        self._ov_thread.start()
-
-    def _on_ov_progress(self, done: int, total: int, image_id: str) -> None:
-        if self._ov_progress is not None:
-            self._ov_progress.set_text(f"Exporting images…\ncurrent: {image_id}")
-            self._ov_progress.set_progress(done, total)
-
-    def _on_ov_finished(self, count: int, manifest: str) -> None:
-        self._status_doc.setText(
-            f"image export: {count} image(s) + manifest → {Path(manifest).name}")
-
-    def _on_ov_failed(self, msg: str) -> None:
-        QMessageBox.critical(self, "Image export failed", msg)
-
-    def _on_ov_cancelled(self) -> None:
-        self._status_doc.setText("image export: cancelled")
-
-    def _cleanup_ov(self) -> None:
-        if self._ov_progress is not None:
-            self._ov_progress.shutdown()
-            self._ov_progress.close()
-            self._ov_progress.deleteLater()
-            self._ov_progress = None
-        if self._ov_worker is not None:
-            self._ov_worker.deleteLater()
-            self._ov_worker = None
-        if self._ov_thread is not None:
-            self._ov_thread.deleteLater()
-            self._ov_thread = None
 
     def _on_goto_gds(self) -> None:
         """Goto a GDS coordinate (µm) typed in the toolbar — the same thing

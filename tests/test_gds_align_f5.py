@@ -142,7 +142,7 @@ class TestOverlayOutlines:
 class TestManifest:
 
     def test_write_manifest_csv_json(self, tmp_path):
-        w = gat.OverlayExportWorker(
+        w = gat.ExportWorker(
             rar=None, root=None, poi_specs_colored=[], jobs=[], cfg={},
             out_dir=str(tmp_path), export_raw=True, export_overlay=False)
         rows = [

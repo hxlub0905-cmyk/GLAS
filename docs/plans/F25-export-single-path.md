@@ -1,6 +1,6 @@
 # [F25] EXPORT 單一路徑單一按鈕：融合對位+匯出（ROI 只走一次）
 
-> **狀態：** planned（DRAFT — 待 user 核准 + 確認 D1–D3）
+> **狀態：** done (2026-06-30)（D1–D3 = A/A/A，user 核准）
 > **§8 ID：** [F25]
 > **建立：** 2026-06-30
 > **負責 branch：** claude/project-perf-optimization-86i8yt
@@ -103,34 +103,33 @@ User 進一步要求：**EXPORT 只留一個路徑與一個按鈕**。
       - manifest row + 五產物 PNG 與舊 `export_one_image` **byte-identical**（fresh + reused，`_build_two_cell`）；
       - 已對位 + 無產物 → spy 斷言**完全不 walk**；missing-file 路徑；`_afe_pool_task` 取用共享 reader。
 
-### M2: App 單一 worker + 單一 handler  [status: planned]
+### M2: App 單一 worker + 單一 handler  [status: done 2026-06-30]
 
-- [ ] 新 `ExportWorker`（取代 `FineAlignAllWorker` + `OverlayExportWorker`）：驅動 F23 常駐 pool；
-      stream `progress` / 每張 `result`(refined) / 收集 `manifest rows`；in-thread fallback（小批 / raw-only / no-cv2）；
-      cancel 語意（丟未起跑 future、partial PNG 保留）沿用。
-- [ ] 新 `_on_export`（合併 `_on_export_all` + `_on_export_alignment` + `_export_overlay_images`）：
-      guard（images / POI / OASIS / FOV）→ **開跑前**開選項對話框（格式 / 產物 / 影像 / 輸出資料夾）→
-      對所有被選影像建 jobs（夾帶各自 `prior_refined`）→ launch `ExportWorker` →
-      完成後寫 alignment CSV/JSON + 收集到的 overlay manifest。
-- [ ] `_refined` 串流更新沿用（手動 Run 過的影像不被覆寫，除非更佳 / rerun 模式）。
-- [ ] 驗證：`_on_export` 連線測試（仿 `test_gds_align_f24.py` 的 monkeypatch 風格）：todo 計算、
-      jobs 帶 prior_refined、cancel/fail 不寫部分 manifest、純 CSV 路徑不 walk。
+- [x] 新 `ExportWorker`（取代 `OverlayExportWorker`，並接手 export 流程的對位）：`_run_process_pool` 改用
+      **F23 常駐 pool** `fine_align.batch_pool.lease(...)` + `overlay_export._afe_pool_task`（export 不再自建冷 pool）；
+      stream `progress` / 每張 fresh `result`(refined) / 收集 manifest rows；in-thread fallback（小批 / CSV-only / no-walk）；
+      cancel 語意（丟未起跑 future、partial PNG 保留）沿用；`__init__` 與 `_write_manifest` 與舊 `OverlayExportWorker` 相容。
+- [x] 新 `_on_export`（合併 `_on_export_all` + `_on_export_alignment` + `_export_overlay_images`）：
+      **開跑前**開選項對話框 → guard（POI / OASIS / FOV，僅在需對位或要產物時）→ 產物才問輸出資料夾 → 問 alignment 存檔路徑 →
+      對**所有被選影像**建 jobs（夾帶各自 `prior_refined`）→ `_launch_export(ExportWorker)`；`_on_export_finished` 寫 alignment CSV/JSON。
+- [x] `_refined` 串流更新沿用（手動 Run 過的影像沿用不重算；fresh 才 emit `result`）。`_export_pending` 取代 `_export_after_fa`，
+      `_on_fa_failed`/`_on_fa_cancelled` 清旗標、不寫半套。
+- [x] 驗證：`test_gds_align_f24.py::TestOnExport`（7 項，monkeypatch dialog/file-picker/`_launch_export`）：
+      無影像不動、dialog 取消中止、所有被選影像皆為 job 帶 prior_refined、CSV-only 不問輸出夾、finish 寫 manifest、fail/cancel 清 pending。
 
-### M3: UI 收斂成單一按鈕  [status: planned]
+### M3: UI 收斂成單一按鈕  [status: done 2026-06-30]
 
-- [ ] 移除工具列 `_align_btn`「Export Alignment…」+ 其 wiring（D1=A）。
-- [ ] FineAlign 面板 `_export_all_btn` 文案改「Export…」、tooltip 更新；signal `export_all_requested`→`export_requested`。
-- [ ] 保留單張 `_run_btn`「Run fine align」（目視抽查）。
-- [ ] 更新 guidance / status / 動作 gating（`_refresh_action_states`）文案，反映「選選項→一鍵跑完」。
-- [ ] 驗證：offscreen GUI smoke——按鈕存在性、單一入口、選項對話框於開跑前出現。
+- [x] 移除工具列 `_align_btn`「Export Alignment…」+ 其 wiring + `_refresh_action_states` 內 gating（D1=A）。
+- [x] FineAlign 面板 `_export_all_btn`→`_export_btn`、文案「Export…」、tooltip 更新；signal `export_all_requested`→`export_requested`。
+- [x] 保留單張 `_run_btn`「Run fine align」（目視抽查，in-thread 不變）。
+- [x] 驗證：`test_gds_align_f21.py` 兩個 gating 測試遷移成「Export 按鈕 POI-gated（非 SEM-gated）」。
 
-### M4: 測試遷移 + 文件  [status: planned]
+### M4: 測試遷移 + 文件  [status: done 2026-06-30]
 
-- [ ] 遷移引用舊 worker / 舊 handler 的測試（`test_export_perf.py`、`test_gds_align_f24.py`、
-      `test_gds_align_f5.py`、batch fine-align 相關）。保留 byte-identical 斷言作為融合正確性護欄。
-- [ ] `SESSION_LOG.md` 條目（§2.1 格式）；`CLAUDE.md` §5.2 改寫並行模型段（兩 worker → 一 worker）；
-      §8 註記 F25；`README.md` 更新匯出流程描述；`docs/plans/F24-export-all-one-click.md` 註記被 F25 取代。
-- [ ] 全測試綠（目前 742 → 預期持平或微增）。
+- [x] 遷移引用舊 worker / handler 的測試：`test_gds_align_f5.py`、`test_gds_align_f13.py`（`OverlayExportWorker`→`ExportWorker`）、
+      `test_gds_align_f24.py`（`TestOnExportAll`→`TestOnExport`）、`test_gds_align_f21.py`（gating）。byte-identical 護欄留在 `test_export_fused.py`。
+- [x] `SESSION_LOG.md` 條目；`CLAUDE.md` §5.2 改寫並行模型段（兩 worker → 一 worker）；`docs/plans/F24-export-all-one-click.md` 註記被 F25 取代。
+- [x] 全測試綠：747 passed。
 
 ---
 

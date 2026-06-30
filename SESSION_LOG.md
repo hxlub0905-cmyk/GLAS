@@ -4,6 +4,44 @@
 
 ---
 
+## [2026-06-30] 完成 [F25] EXPORT 單一路徑單一按鈕：融合對位+匯出（ROI 只走一次）
+
+**變更類型：** 效能重構 + UX（匯出流程收斂）· **狀態：完成 [F25]**（M1–M4 全完成）
+
+**動機：** 「大改 #1」。F24「Export all」對每張影像 ROI 解碼兩次（fine-align pass walk → export pass 再
+walk）。user 指示「EXPORT 只留一個路徑與一個按鈕」。審查列為「輸出」最大槓桿。
+
+**Q&A 收斂（D1/D2/D3 = A/A/A，user 核准）：** 保留單張「Run fine align」抽查 + 1 個 Export 鈕（移除工具列
+「Export Alignment」）；融合成單一 worker（ROI 只走一次）；匯出選項對話框前移到開跑前。
+
+**實作：**
+- **M1 核心（Qt-free）：** `overlay_export.align_and_export_one_image`——walk ROI 一次 → 未對位才合成
+  template+`matchTemplate`、已對位沿用 `prior_refined` → 於 `coarse+refined` rasterize 產物、寫 PNG，回
+  `(fa_result|None, manifest_row)`。需對位或要產物才 walk；`need_geom` 才算 raw POI union（保 F23 fast path）。
+  新增 `fine_align.pool_reader()` + `overlay_export._afe_pool_task`，**重用 F23 常駐 pool**（reader 共用、
+  context 隨 task），export 不再自建冷 pool。
+- **M2 App worker/handler：** `ExportWorker` 取代 `OverlayExportWorker`（`__init__`/`_write_manifest` 相容、
+  加 `result` signal、`_run_process_pool` 走 `batch_pool.lease`+`_afe_pool_task`、stream fresh 對位、
+  in-thread fallback 含 CSV-only/no-walk）。`_on_export` 合併 `_on_export_all`+`_on_export_alignment`+
+  `_export_overlay_images`：選項前置 → guard → 建全部被選影像 jobs（帶各自 prior_refined）→ `_launch_export`
+  → `_on_export_finished` 寫 alignment CSV/JSON。`_export_pending` 取代 `_export_after_fa`。
+- **M3 UI：** 移除工具列 `_align_btn`；FineAlign 面板 `_export_all_btn`→`_export_btn` 文案「Export…」、
+  signal `export_all_requested`→`export_requested`；保留單張 Run。
+- 移除 `OverlayExportWorker`/`_export_overlay_images`/`_on_export_alignment`/`_on_ov_*`/`_cleanup_ov`/`_ov_*`。
+
+**測試：** 新增 `tests/test_export_fused.py`（5，byte-identical 護欄：refined 對齊 `_fine_align_image`、
+PNG+row 對齊 `export_one_image`（fresh+reused）、CSV-only 不 walk、missing-file、shared-reader）；
+遷移 `test_gds_align_f24.py`（`TestOnExportAll`→`TestOnExport` 7 項）、`f5`/`f13`（`OverlayExportWorker`→
+`ExportWorker`）、`f21`（gating 改 POI-gated）。`pytest tests/` **747 passed**。
+
+**影響檔案：** `glas/core/overlay_export.py`、`glas/core/fine_align.py`、`glas/app/gds_align_tool.py`、
+`tests/test_export_fused.py`(新)、`tests/test_gds_align_f24.py`、`tests/test_gds_align_f5.py`、
+`tests/test_gds_align_f13.py`、`tests/test_gds_align_f21.py`、`CLAUDE.md`、
+`docs/plans/F25-export-single-path.md`(新)、`docs/plans/F24-export-all-one-click.md`、`SESSION_LOG.md`。
+**Branch：** claude/project-perf-optimization-86i8yt
+
+---
+
 ## [2026-06-30] 效能/流程審查 + 4 個 quick win（export index、共用 raster、ROI coalesce、設定持久化）
 
 **變更類型：** 效能優化 + UX/workflow · **狀態：完成（第一批 quick wins；「大改」另議）**

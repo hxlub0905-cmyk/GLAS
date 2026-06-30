@@ -1,5 +1,9 @@
 # [F24] Export all：一鍵「補跑未跑的 fine-align → 整包匯出」
 
+> **⚠ 已被 F25 取代（2026-06-30）：** 「Export all」按鈕 + 兩 pass（fine-align→export，ROI walk 兩次）
+> 已收斂為 F25 的單一「Export…」按鈕 + 單一融合 pass（ROI walk 一次）。本檔保留為設計沿革。
+> 詳見 `docs/plans/F25-export-single-path.md`。
+
 > **狀態：** done (2026-06-29)
 > **§8 ID：** [F24]
 > **建立：** 2026-06-29

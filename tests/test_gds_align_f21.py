@@ -367,19 +367,25 @@ class TestActionGating:
         assert mw._fit_btn.isEnabled() is False
         assert mw._goto_btn.isEnabled() is False
         assert mw._goto_edit.isEnabled() is False
-        assert mw._align_btn.isEnabled() is False
+        # F25: the single Export button lives on the FineAlign panel and is
+        # gated by a POI selection (not SEM); disabled initially.
+        assert mw.sem_panel.fine_align._export_btn.isEnabled() is False
         assert mw.sem_panel.load_roi_btn.isEnabled() is False
 
-    def test_export_alignment_needs_sem(self, mw):
-        from PyQt6.QtCore import QSettings  # noqa: F401
-        # Pretend SEM images arrived: align button activates, GDS still
-        # disabled (no doc), Load GDS ROI still disabled (no reader).
+    def test_export_button_needs_poi_not_sem(self, mw):
+        # F25: the unified Export button is POI-gated. SEM images arriving does
+        # NOT enable it (unlike the old toolbar Export Alignment button); only a
+        # POI selection does.
         from sem_loader import SemImage
         mw._sem_images = [SemImage(
             image_id="D1", filename="a.png",
             file_path=Path("a.png"), xrel=1.0, yrel=2.0)]
         mw._refresh_action_states()
-        assert mw._align_btn.isEnabled() is True
+        assert mw.sem_panel.fine_align._export_btn.isEnabled() is False
+        # A POI selection enables it.
+        mw.sem_panel.fine_align._poi_set = True
+        mw.sem_panel.fine_align._update_enabled()
+        assert mw.sem_panel.fine_align._export_btn.isEnabled() is True
         assert mw._seg_gds.isEnabled() is False
         assert mw.sem_panel.load_roi_btn.isEnabled() is False
 
