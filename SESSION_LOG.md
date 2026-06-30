@@ -4,6 +4,27 @@
 
 ---
 
+## [2026-06-30] [F26-prep] OASIS decode 量測工具 `tools/oas_profile.py`
+
+**變更類型：** 工具（效能量測）· **狀態：完成（F26「大改 #2」的前置量測 harness）**
+
+**動機：** 「大改 #2」（解碼加速）要在投入 Cython 前先用真實檔驗證瓶頸位置（varint loop vs zlib vs
+store vs IO），免得猜。也用來回答「該自寫 Cython 還是借 gdstk/klayout」。
+
+**實作：** 新增 `tools/oas_profile.py`（純 stdlib + GLAS core、read-only）：
+- Phase 1 name-table scan（`RandomAccessReader` build：cells indexed / unit / 有無 S_BOUNDING_BOX /
+  LAYERNAME / offsets_via）；
+- Phase 2 整檔 `consume()` 解碼吞吐（records/s、MB/s、record-type histogram，可 `--decode-limit` 抽樣）；
+- Phase 2b cProfile 分桶（varint / dispatch+decode / zlib / store+numpy / io）+ top-12 self-time；
+- Phase 3 選用 ROI walk 計時（`--roi cx cy half --root --layer`，互動路徑）；
+- 末尾依分桶比例給「該走 Cython(A) 還是 no-build wins(B) 還是 zlib/借 gdstk」的建議。
+
+**測試：** 以 `_build_two_cell` 合成 tiny `.oas` smoke 過全流程（三 phase + 分桶 + 建議皆正常）。
+**影響檔案：** 新增 `tools/oas_profile.py`、`SESSION_LOG.md`。
+**Branch：** claude/project-perf-optimization-86i8yt
+
+---
+
 ## [2026-06-30] 完成 [F25] EXPORT 單一路徑單一按鈕：融合對位+匯出（ROI 只走一次）
 
 **變更類型：** 效能重構 + UX（匯出流程收斂）· **狀態：完成 [F25]**（M1–M4 全完成）
