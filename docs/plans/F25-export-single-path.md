@@ -88,20 +88,20 @@ User 進一步要求：**EXPORT 只留一個路徑與一個按鈕**。
 
 > 每個 milestone 以「一個 session 可完成」為粒度切。
 
-### M1: 核心融合計算（Qt-free，決定論）  [status: planned]
+### M1: 核心融合計算（Qt-free，決定論）  [status: done 2026-06-30]
 
-- [ ] 新增 `fine_align.align_and_export_one_image(job, rar, root, poi_colored, cfg, out_dir, flags, score_thr, cancel_cb)`：
-      每個 POI 用 `poi_polys_and_geometry_for_roi` **walk 一次** → `polys`（template + overlay）、`geom`（gray/label）；
+- [x] 新增 `overlay_export.align_and_export_one_image(job, rar, root, poi_colored, cfg, out_dir, flags, score_thr, cancel_cb)`：
+      每個 POI walk **一次** → `polys`（template + overlay）、`geom`（gray/label）；
       `job` 帶 `prior_refined`：None → 合成 composite template + `matchTemplate` 算 refined；非 None → 沿用。
-      接著於 `anchor=coarse+refined` rasterize 要求的產物、寫 PNG、回 `(refined_tuple, status, manifest_row)`。
-- [ ] walk gating：無對位需求且未要求影像產物 → 跳過 walk（純 CSV 影像）。
-- [ ] 統一 pool init/task：合併 `fine_align._pool_init/_pool_task` 與 `overlay_export._export_pool_init/_task`
-      成單一組（context = poi_colored + cfg + out_dir + flags + thr，**ship `prebuilt_index`**，`cv2.setNumThreads(1)`）。
-- [ ] 驗證（pytest，無需真 GUI）：
+      接著於 `anchor=coarse+refined` rasterize 要求的產物、寫 PNG、回 `(fa_result|None, manifest_row)`。
+      （置於 `overlay_export` 而非 `fine_align`，避開 overlay→fine_align 既有單向 import 的循環。）
+- [x] walk gating：無對位需求且未要求影像產物 → 跳過 walk（純 CSV 影像）；`need_geom` 才算 raw POI 的 union（保 F23 fast path）。
+- [x] 統一 pool task：`overlay_export._afe_pool_task` 重用 **F23 常駐 pool**（reader 由 `fine_align.pool_reader()`
+      取得、context 隨 task），export 不再自建冷 pool；新增 `fine_align.pool_reader()` accessor。
+- [x] 驗證（`tests/test_export_fused.py`，5 項，無需真 GUI）：
       - refined 與舊 `_fine_align_image` 對同一輸入 **逐值相等**；
-      - 已對位影像沿用 `prior_refined`（不呼叫 matchTemplate，可用 spy 斷言）；
-      - manifest row + 三產物 PNG 與舊 `export_one_image` **byte-identical**（重用既有 fixtures / `_build_two_cell`）；
-      - gray+label 仍走 `render_gray_and_label_from_geoms` 共用 raster（F15 不變式）。
+      - manifest row + 五產物 PNG 與舊 `export_one_image` **byte-identical**（fresh + reused，`_build_two_cell`）；
+      - 已對位 + 無產物 → spy 斷言**完全不 walk**；missing-file 路徑；`_afe_pool_task` 取用共享 reader。
 
 ### M2: App 單一 worker + 單一 handler  [status: planned]
 

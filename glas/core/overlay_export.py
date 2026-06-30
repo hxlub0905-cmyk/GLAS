@@ -199,6 +199,158 @@ def export_one_image(job, rar, root, poi, cfg, out_dir,
     return row
 
 
+def align_and_export_one_image(job, rar, root, poi_colored, cfg, out_dir,
+                               export_raw, export_overlay, export_gray,
+                               export_label, score_thr, cancel_cb=None):
+    """Unified per-image compute (F25): walk the POI ROI **once**, then both
+    fine-align (when the image isn't already aligned) AND rasterize every
+    requested export product from that single walk — replacing the old
+    walk-twice fine-align-pass + export-pass sequence.
+
+    ``job`` is ``(image_id, coarse|None, prior_refined|None, path, exists)``;
+    ``poi_colored`` is ``[(spec, (r, g, b), fg_glv), ...]`` (the spec walks the
+    ROI, the colour strokes the overlay, the ``fg_glv`` paints the grayscale,
+    the POI's 1-based position is its label id).
+
+    Pure per-image work with no shared mutable state, so the result is identical
+    whether run in-thread or across the process pool (§7), and **byte-identical**
+    to ``fine_align._fine_align_image`` (the refined offset) composed with
+    :func:`export_one_image` (the PNGs / manifest row) on the same inputs.
+
+    Returns ``(fa_result, row)``:
+      * ``fa_result`` = ``(image_id, dx, dy, score, used_r, status)`` when this
+        call freshly fine-aligned the image (``prior_refined`` was ``None``), so
+        the orchestrator can stream it into ``_refined`` / the batch panel; it is
+        ``None`` when a stored alignment was reused (the orchestrator then leaves
+        ``_refined`` untouched, exactly like the F24 two-pass flow).
+      * ``row`` = the overlay-manifest row (filenames + dx/dy/score/status).
+    """
+    image_id, coarse, prior_refined, path, exists = job
+    c = cfg
+    out_dir = Path(out_dir)
+    row = {
+        "image_id": str(image_id), "raw_png": "", "overlay_png": "",
+        "gray_png": "", "label_png": "", "label_view_png": "",
+        "fine_dx_nm": "", "fine_dy_nm": "", "score": "", "status": "not-run",
+    }
+
+    def _finish(refined, fa_result):
+        if refined is not None:
+            row["fine_dx_nm"] = round(refined[0], 3)
+            row["fine_dy_nm"] = round(refined[1], 3)
+            row["score"] = round(refined[2], 6)
+            row["status"] = "ok"
+        return fa_result, row
+
+    if cancel_cb is not None and cancel_cb():
+        return None, row
+
+    sem = (cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+           if (cv2 and exists) else None)
+    if sem is None:
+        row["status"] = "missing-file"
+        fa = ((str(image_id), 0.0, 0.0, 0.0, 0, "missing-file")
+              if prior_refined is None else None)
+        return fa, row
+
+    base = _safe_name(image_id)
+    if export_raw:
+        name = f"{base}_raw.png"
+        cv2.imwrite(str(out_dir / name), sem)
+        row["raw_png"] = name
+
+    H, W = sem.shape[:2]
+    nm_per_px = (c["nm_manual"] if (not c["nm_auto"] and
+                 c["nm_manual"] > 0) else c["fov_w"] / max(1, W))
+
+    need_align = prior_refined is None
+    want_products = export_overlay or export_gray or export_label
+    fa_result = None
+    refined = prior_refined
+
+    # The walk is the heavy step — do it only when something needs it: a fresh
+    # alignment, or an image product to rasterize. (A pure CSV re-export of
+    # already-aligned images therefore never walks.)
+    if coarse is not None and nm_per_px > 0 and poi_colored \
+            and (need_align or want_products):
+        roi = (coarse[0] - c["fov_w"], coarse[1] - c["fov_h"],
+               coarse[0] + c["fov_w"], coarse[1] + c["fov_h"])
+        # Holes are only needed by the gray/label fill; the template + overlay
+        # need exterior rings only, so skip the (raw-POI) unary_union otherwise
+        # — preserving the F23 fine-align fast path.
+        need_geom = export_gray or export_label
+        entries = []          # [(polys, color)]   → overlay outlines
+        poi_layers = []       # [(polys, fg_glv)]  → composite template
+        geoms_fgs = []        # [(geom, fg_glv)]   → grayscale
+        geoms_ids = []        # [(geom, label_id)] → label map
+        for idx, (spec, color, fg_glv) in enumerate(poi_colored):
+            if need_geom:
+                polys, geom = fine_align.poi_polys_and_geometry_for_roi(
+                    rar, root, roi, spec, cancel_cb=cancel_cb)
+            else:
+                polys = fine_align.poi_polys_for_roi(
+                    rar, root, roi, spec, cancel_cb=cancel_cb)
+                geom = None
+            if polys:
+                entries.append((polys, color))
+                poi_layers.append((polys, fg_glv))
+            if geom is not None and not geom.is_empty:
+                geoms_fgs.append((geom, fg_glv))
+                geoms_ids.append((geom, idx + 1))
+
+        if need_align:
+            if not poi_layers:
+                # No geometry in this ROI → nothing to match against.
+                return _finish(None, (str(image_id), 0.0, 0.0, 0.0, 0, "flat"))
+            template = fine_align.render_composite_template(
+                poi_layers, coarse, W, H, nm_per_px,
+                c["bg_glv"], c["blur_sigma_px"])
+            radius_px = c["search_radius_nm"] / nm_per_px
+            dx, dy, score, used_r = fine_align.fine_align_one(
+                sem, template, nm_per_px, radius_px)
+            fa_result = (str(image_id), dx, dy, score, int(used_r), "ok")
+            refined = (dx, dy, score)
+
+        if want_products and refined is not None:
+            anchor = (coarse[0] + refined[0], coarse[1] + refined[1])
+            if export_overlay and entries:
+                rgb = overlay_outlines_on_sem(sem, entries, anchor, nm_per_px)
+                name = f"{base}_overlay.png"
+                cv2.imwrite(str(out_dir / name), rgb[:, :, ::-1])
+                row["overlay_png"] = name
+            gate = fine_align.mask_should_export(refined, score_thr)
+            gray_img = lbl_img = None
+            if gate and geoms_fgs and export_gray and export_label:
+                geoms_all = [(g, fg, lid)
+                             for (g, fg), (_g, lid) in zip(geoms_fgs, geoms_ids)]
+                gray_img, lbl_img = fine_align.render_gray_and_label_from_geoms(
+                    geoms_all, anchor, W, H, nm_per_px,
+                    c.get("bg_glv", 80), c.get("blur_sigma_px", 1.0))
+            elif gate and export_gray and geoms_fgs:
+                gray_img = fine_align.render_grayscale_from_geoms(
+                    geoms_fgs, anchor, W, H, nm_per_px,
+                    c.get("bg_glv", 80), c.get("blur_sigma_px", 1.0))
+            elif gate and export_label and geoms_ids:
+                lbl_img = fine_align.render_label_image(
+                    geoms_ids, anchor, W, H, nm_per_px)
+            if gray_img is not None:
+                name = f"{base}_gray.png"
+                cv2.imwrite(str(out_dir / name), gray_img)
+                row["gray_png"] = name
+            if lbl_img is not None:
+                name = f"{base}_label.png"
+                cv2.imwrite(str(out_dir / name), lbl_img)
+                row["label_png"] = name
+                id_to_rgb = {i + 1: color
+                             for i, (_spec, color, _fg) in enumerate(poi_colored)}
+                view = fine_align.colorize_label_map(lbl_img, id_to_rgb)
+                vname = f"{base}_label_view.png"
+                cv2.imwrite(str(out_dir / vname), view[:, :, ::-1])
+                row["label_view_png"] = vname
+
+    return _finish(refined, fa_result)
+
+
 # ── ProcessPool batch entry (F14; mirrors fine_align._pool_init/_pool_task) ──
 #
 # A RandomAccessReader isn't picklable (mmap + offset index), so each worker
@@ -246,3 +398,23 @@ def _export_pool_task(job):
     return export_one_image(
         job, _GE["rar"], _GE["root"], _GE["poi"], _GE["cfg"], _GE["out_dir"],
         _GE["raw"], _GE["overlay"], _GE["gray"], _GE["label"], _GE["thr"])
+
+
+# ── F25 unified align+export pool task ───────────────────────────────────────
+#
+# The fused worker reuses the SAME warm F23 pool as the fine-align path (keyed on
+# reader identity; the reader is built once by ``fine_align._pool_init``). Only
+# the per-batch context (root / coloured POI specs / cfg / out-dir / export flags
+# / threshold) rides each task, so a POI / search-radius / export-option change
+# still hits the warm pool. The reader is read back from ``fine_align`` rather
+# than re-stashed here, so there is exactly one reader per worker process.
+
+def _afe_pool_task(job, root, poi_colored, cfg, out_dir,
+                   export_raw, export_overlay, export_gray, export_label,
+                   score_thr):
+    """ProcessPoolExecutor task: align+export one image with this process's
+    private reader (built by ``fine_align._pool_init``). Cancellation is handled
+    by the orchestrator dropping not-yet-started futures."""
+    return align_and_export_one_image(
+        job, fine_align.pool_reader(), root, poi_colored, cfg, out_dir,
+        export_raw, export_overlay, export_gray, export_label, score_thr)

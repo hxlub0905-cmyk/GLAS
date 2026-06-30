@@ -667,6 +667,14 @@ def _pool_warm_probe() -> bool:
     return _G.get("rar") is not None
 
 
+def pool_reader():
+    """This worker process's private reader, built once by :func:`_pool_init`
+    (F25). The unified align+export task (in ``overlay_export``) reads it from
+    here so the fused worker shares the very same warm pool as the fine-align
+    path — keyed on reader identity, the per-batch context rides each task."""
+    return _G.get("rar")
+
+
 # Default idle window before a warm-but-unused pool releases its workers (F23
 # M2 idle-timeout). Long enough to cover normal review gaps between batches,
 # short enough to free the K mmaps + indexes when the user walks away.
