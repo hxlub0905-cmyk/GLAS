@@ -4,6 +4,46 @@
 
 ---
 
+## [2026-06-30] [F26 M2a-integrate] native rectangle-run 接進 per-cell 解碼（gated、byte-identical）
+
+**變更類型：** 效能（native 解碼整合）· **狀態：M2a-integrate done；M2b（polygon）next**
+
+**動機：** M2a-core 的 `decode_rect_run` 隔離量 48×，但要在批次端到端見效，得接進真正的熱路徑——
+`oasis_random._decode_at`（`walk_roi`→`load_cell` 每次散落 defect 都打它）。
+
+**做法：** `_decode_at` 改 gated 分派：有 `.pyd`→`_decode_at_native`，無→`_decode_at_py`（＝原 code 一字未動，
+零風險給無 build 的多數人）。native 路徑仍由 `iter_records()` 驅動（POLYGON / PLACEMENT §22.6 / CELL / CBLOCK
+全留純 Python 解碼器），但每 yield 一個 RECTANGLE 就把游標交給 `decode_rect_run`，**一次 C 呼叫吞掉同層剩下整串**
+rect（bulk (N,4) array 取代 per-record Python varint 迴圈），存進 columnar `_rcol`（CellContent accessor 本來就
+優先讀它；bbox 走新 `_analytic_bbox_columnar`，與 `_analytic_bbox` 同值）。layer filter / repetition rect / 非-rect
+仍走原 Python。
+
+**pyx 兩個整合不變式（VERSION 2→4）：**
+1. **repetition 早退（V3）：** rect 帶 repetition 時，在動任何 modal 欄位**前**就 rewind 回 rid_start 交回 Python——
+   stop 後回寫的 modal 永遠是「最後一個已存 rect 的狀態」，純 Python 重解該 rect 不會把 relative x/y double-apply。
+2. **`started` 旗標（V4）：** gobble 傳 `started=1`，把「呼叫端剛解的那層」當已建立層，下一個**不同層**的 rect 立刻
+   停（rewind）。確保吞回來的 rect 一定全在呼叫端的 (layer,dt)、不會誤吞下一層。**這個 bug 被
+   `test_reachable_bbox_union_with_child`（CE 邊界層 108/250 → device 層 17/0 交界）抓到**：原本 gobble 用
+   started=0 會把後面 17/0 的 rect 灌進 108/250 的 block → 漏 device 幾何。
+
+**測試：** 新增 `test_oasis_native_decode.py`（10 例逐一比對 native vs 純 Python 的 rects/bbox/placement/repetition
+描述子：modal reuse、XYRELATIVE、多層 run、repetition 夾 run 中、layer filter 丟棄、單/雙 CBLOCK、placement 切
+run、空 cell）。全 `tests/` 在「native 存在」下 **796 passed**；把 `.so` 搬走（native 缺檔）下 fallback 路徑亦綠。
+`test_huge_rect...` 一行 `cc.rect_specs[...]`（直接讀內部表示）改用 `cc.rect_count(...)` accessor（native 用 `_rcol`
+backing，與 cache-load 路徑一致）。
+
+**量測（合成 120 萬 rect、3 層長 modal-reuse run 的單 cell decode）：** 純 Python `_decode_at` 37–49ms →
+native 28–31ms ≈ **1.3–1.6×**，輸出 byte-identical。此合成是 Python 最佳情況（modal-reuse rect 只 2 svarint、又
+只 3 個 run），故低估；隔離 48× 受 Amdahl 限制（generator 驅動 + numpy 組裝 + IO 仍在）。真實 production 檔端到端
+降幅由 user 以 `GLAS_FA_TIMING` 在自己檔上量。
+
+**影響檔案：** `glas/core/oasis_fastdecode.pyx`（早退 + started）、`glas/core/oasis_random.py`（gated 分派 +
+`_decode_at_native` + `_analytic_bbox_columnar` + `_obj1`）、`tests/test_oasis_random.py`（1 行改 accessor）、
+`tests/test_oasis_native_decode.py`（新）、`docs/plans/F26-native-decode.md`、`SESSION_LOG.md`。
+**Branch：** claude/project-perf-optimization-86i8yt（推上去 → CI 重編 v4 `.pyd`/`.b64`，user 重抓 unpack）
+
+---
+
 ## [2026-06-30] [F25 follow-up] PR #17 review 修兩個 P2（raw-only 輸出夾 / CSV-only 免讀 SEM）
 
 **變更類型：** bug fix（F25 review 回饋）· **狀態：完成**

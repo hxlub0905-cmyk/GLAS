@@ -21,8 +21,11 @@ top of this once the delivery path is confirmed.
 import numpy as np
 
 # Native version tag so callers / the selftest can confirm which build loaded.
-# 1 = varint helpers only (M0); 2 = + decode_rect_run (M2a).
-VERSION = 2
+# 1 = varint helpers only (M0); 2 = + decode_rect_run (M2a-core); 3 = rect-run
+# rewinds on a repetition *before* mutating modal state; 4 = decode_rect_run
+# gained the ``started`` flag (continue a known-layer run, stopping on any
+# change) — both required by M2a-integrate's per-cell gobble.
+VERSION = 4
 
 
 def decode_uvarint(const unsigned char[::1] buf, Py_ssize_t pos):
@@ -67,7 +70,7 @@ def decode_svarint(const unsigned char[::1] buf, Py_ssize_t pos):
 def decode_rect_run(const unsigned char[::1] buf, Py_ssize_t pos,
                     long long layer, long long datatype,
                     long long w, long long h, long long x, long long y,
-                    int xy_relative):
+                    int xy_relative, int started=0):
     """Decode a *run* of consecutive RECTANGLE records that share one
     ``(layer, datatype)``, in one native call — the M2a amortization that the
     per-varint M1 attempt lacked. Inline-handles XYABSOLUTE / XYRELATIVE / PAD.
@@ -77,6 +80,16 @@ def decode_rect_run(const unsigned char[::1] buf, Py_ssize_t pos,
     with a repetition, or any non-rectangle record. Byte/modal semantics are
     identical to ``oasis_streamer._read_rectangle`` + ``OasisStore`` rect store
     (``x1,y1,x2,y2 = x, y, x+w, y+h``).
+
+    ``started`` selects how the *first* rectangle's layer is treated:
+
+    * ``0`` (default) — the run has no established layer yet, so the first rect
+      *adopts* whatever ``(layer, datatype)`` it carries (modal reuse keeps the
+      passed-in values). Used when starting a run cold.
+    * ``1`` — the passed-in ``(layer, datatype)`` is already the run's layer
+      (e.g. the caller just decoded one rect of it in Python and wants the rest):
+      a first rect on a *different* layer stops immediately (rewound), so the
+      gobbled rects are guaranteed to all share the caller's ``(layer, dt)``.
 
     Returns ``(new_pos, rects, layer, datatype, w, h, x, y, xy_relative,
     stop_rid)`` where ``rects`` is an ``(N, 4)`` int64 array (x1,y1,x2,y2) and
@@ -94,7 +107,6 @@ def decode_rect_run(const unsigned char[::1] buf, Py_ssize_t pos,
     cdef long long sval, nl, nd
     cdef int shift
     cdef unsigned int b, info, rid
-    cdef int started = 0
 
     while True:
         rid_start = p
@@ -119,6 +131,15 @@ def decode_rect_run(const unsigned char[::1] buf, Py_ssize_t pos,
                 return (rid_start, arr[:count], layer, datatype, w, h, x, y,
                         xy_relative, -1)
             info = buf[p]; p += 1
+            if info & 0x04:                # repetition → hand back *before*
+                # touching any modal field. A repeated rect is decoded by the
+                # Python path (it owns repetition); rewinding to rid_start with
+                # the modal exactly as the last stored rect left it means the
+                # caller can write the returned modal back verbatim and the
+                # Python re-decode of this record stays correct (no double-apply
+                # of a relative x/y). M2a-integrate relies on this invariant.
+                return (rid_start, arr[:count], layer, datatype, w, h, x, y,
+                        xy_relative, 20)
             nl = layer; nd = datatype
             if info & 0x01:                # layer
                 u = 0; shift = 0
@@ -213,9 +234,8 @@ def decode_rect_run(const unsigned char[::1] buf, Py_ssize_t pos,
                         raise OverflowError("y > 64-bit")
                 sval = -(<long long>(u >> 1)) if (u & 1) else <long long>(u >> 1)
                 y = (y + sval) if xy_relative else sval
-            if info & 0x04:                # repetition → hand back to Python
-                return (rid_start, arr[:count], layer, datatype, w, h, x, y,
-                        xy_relative, 20)
+            # (repetition is handled by the early-out above, before any modal
+            # field is touched, so there's no late repetition check here.)
             if count == cap:               # grow the output buffer
                 cap = cap * 2
                 arr2 = np.empty((cap, 4), dtype=np.int64)

@@ -90,10 +90,24 @@ parse + 改架構，不適合互動 ROI。
       Python。modal/byte 語意與 `_read_rectangle`+`_on_rectangle` 一致。**隔離量測：48–51×**（純 Python store
       301k rect/s → native 14.5M rect/s），輸出 byte-identical（`test_fastdecode` +4 護欄：modal / xy-relative /
       layer-change 停-續 / repetition 停）。VERSION 1→2。
-- [ ] **M2a-integrate：接進 per-cell 解碼**（next）：在 reader consume / oasis_random 的單 cell 解碼裡，碰到
-      RECTANGLE run 就呼叫 `decode_rect_run`、一次把 (N,4) array 灌進 rect buffer（取代 per-rect callback）；
-      layer filter / 非-rect（polygon/placement/property/cblock）走原 Python。gated + 全 `test_oasis_*` 雙路徑綠。
-      **這步才會在批次端到端看到加速**（隔離 48× 受 Amdahl 限制：polygon/repetition/IO/match 仍在）。
+- [x] **M2a-integrate：接進 per-cell 解碼**（2026-06-30）：`oasis_random._decode_at` 改 gated 分派 →
+      `_decode_at_native`（有 `.pyd`）/ `_decode_at_py`（無，原 code 原封不動）。native 路徑仍由
+      `iter_records()` 驅動（POLYGON/PLACEMENT §22.6/CELL/CBLOCK 全留純 Python 解碼器），但每次 yield 一個
+      RECTANGLE 就把游標交給 `decode_rect_run` 一次吞掉**同層剩下整串** rect（bulk (N,4) array，取代 per-record
+      Python varint 迴圈），存進 columnar `_rcol`（所有 CellContent accessor 本來就優先讀它）。**byte-identical
+      護欄**：`test_oasis_native_decode.py`（10 例：modal reuse / XYRELATIVE / 多層 run / repetition 夾在 run 中
+      / layer filter 丟棄 / 單 CBLOCK / 雙 CBLOCK / placement 切 run / 空 cell）逐一比對 native vs 純 Python 的
+      rects/bbox/placement/repetition 描述子；外加全 `test_oasis_*`+`test_cellcache`+`test_export_fused` 在「native
+      存在」下重跑（796 passed）+「native 缺檔」下重跑（fallback 綠）。
+      **pyx 兩個整合不變式**：(a) repetition rect 在動任何 modal 前就 rewind（VERSION 3），讓 stop 後回寫的 modal
+      永遠是「最後一個已存 rect 的狀態」、不會把 relative x/y double-apply；(b) `decode_rect_run` 加 `started` 旗標
+      （VERSION 4）——gobble 傳 started=1 把「呼叫端剛解的那層」當已建立層，下一個不同層的 rect 立刻停（rewind），
+      確保吞回來的 rect 一定全在呼叫端的 (layer,dt)、不會誤吞下一層（CE 邊界層→device 層交界的 bug，已被
+      `test_reachable_bbox_union_with_child` 抓到並修掉）。
+      **量測**：合成 120 萬 rect、3 層長 modal-reuse run 的單 cell，`_decode_at` 純 Python 37–49ms → native
+      28–31ms ≈ **1.3–1.6×**（此合成是 Python 的最佳情況：modal-reuse rect 只 2 個 svarint、又只有 3 個 run 幾乎
+      沒 generator 攤提空間，故低估）。隔離 48× 受 Amdahl 限制：generator 驅動 + numpy 組裝 + IO 仍在。真實
+      production 檔（fuller info byte）的端到端降幅由 user 以 `GLAS_FA_TIMING` 在自己檔上量。
 - [ ] **M2b：擴充 POLYGON**（point-list g-delta run 在 C 解）+ repetition raw 在 C 解（檔1 `read_repetition_raw`
       2s、檔2 `decode_point_list`/`decode_g_delta` ~7s 都在這）。
 - [ ] **M2c：接進 oasis_store**（gated：native 可用走 C run-decoder、否則純 Python `run()`）；cellcache 不變。

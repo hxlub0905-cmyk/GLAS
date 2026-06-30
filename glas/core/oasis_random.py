@@ -45,6 +45,21 @@ import cellcache                   # noqa: E402  (F16-B: decoded-cell sidecar)
 from oasis_store import Placement  # noqa: E402
 from oasis_walker import Transform  # noqa: E402
 
+# F26 M2a-integrate: optional native rectangle-run decoder. When the compiled
+# extension is present (a CI-built .pyd dropped into glas/core, or a local
+# build_ext), per-cell decode (_decode_at — the batch ROI-walk hot path) gobbles
+# whole RECTANGLE runs in one C call instead of per-record Python varint loops.
+# Absent → the pure-Python path below runs unchanged. The two MUST stay
+# byte-identical (CLAUDE.md §7); test_oasis_native_decode pins them together.
+try:
+    import oasis_fastdecode as _FAST   # noqa: E402
+    if getattr(_FAST, "VERSION", 0) < 4:
+        # <4 lacks the rewind-before-modal invariant + the started flag that
+        # _decode_at_native's per-run gobble relies on; fall back to Python.
+        _FAST = None
+except Exception:                       # pragma: no cover - no build present
+    _FAST = None
+
 LayerKey = tuple[int, int]
 Bbox = tuple[float, float, float, float]
 
@@ -561,6 +576,35 @@ def _analytic_bbox(rect_specs: dict, poly_specs: dict) -> Optional[Bbox]:
     return _union_bbox(boxes)
 
 
+def _obj1(v) -> np.ndarray:
+    """A length-1 object array holding ``v`` verbatim. Built element-wise so a
+    tuple ``v`` is stored as a single cell (``np.array([v], object)`` would make
+    a 2-D array when ``v`` is an equal-length tuple)."""
+    a = np.empty(1, dtype=object)
+    a[0] = v
+    return a
+
+
+def _analytic_bbox_columnar(rcol: dict, poly_specs: dict) -> Optional[Bbox]:
+    """Same analytic cell bbox as :func:`_analytic_bbox`, but reading the
+    columnar rectangle form ``rcol[key] = (coords (N,4), rt (N,), rr (N,))`` the
+    native decode path (F26 M2a) produces. Identical result: ``_ext_from_columnar``
+    grows each row by exactly the extent :func:`repetition_extent` would, and a
+    union of per-key min/max equals a union of every per-rect box."""
+    boxes: list = []
+    for coords, rt, rr in rcol.values():
+        if coords.shape[0]:
+            ext = _ext_from_columnar(coords.astype(np.float64), rt, rr)
+            boxes.append((ext[:, 0].min(), ext[:, 1].min(),
+                          ext[:, 2].max(), ext[:, 3].max()))
+    for specs in poly_specs.values():
+        for base, rt, rr in specs:
+            ex0, ey0, ex1, ey1 = oas.repetition_extent(rt, rr)
+            boxes.append((base[:, 0].min() + ex0, base[:, 1].min() + ey0,
+                          base[:, 0].max() + ex1, base[:, 1].max() + ey1))
+    return _union_bbox(boxes)
+
+
 class RandomAccessReader:
     """Seek-and-decode a single cell at a time, memoized.
 
@@ -965,6 +1009,11 @@ class RandomAccessReader:
                            _placements=placements, bbox=bbox)
 
     def _decode_at(self, offset: int) -> CellContent:
+        if _FAST is not None:
+            return self._decode_at_native(offset)
+        return self._decode_at_py(offset)
+
+    def _decode_at_py(self, offset: int) -> CellContent:
         reader = self._reader
         f = reader._f
         f.clear_substreams()
@@ -1033,6 +1082,125 @@ class RandomAccessReader:
         return CellContent(rect_specs=rect_specs, poly_specs=poly_specs,
                            _placements=placements,
                            bbox=_analytic_bbox(rect_specs, poly_specs))
+
+    def _decode_at_native(self, offset: int) -> CellContent:
+        """F26 M2a-integrate: native-accelerated twin of :meth:`_decode_at_py`.
+
+        Same generator drive (so PLACEMENT §22.6 / POLYGON / CELL / CBLOCK
+        handling stays in the proven pure-Python decoders), but every time a
+        RECTANGLE is yielded we hand the cursor to ``decode_rect_run`` to gobble
+        the *rest* of that same-(layer, datatype) run in one C call — bulk
+        ``(N,4)`` array instead of a Python varint loop + per-rect tuple. Rects
+        land in the columnar ``_rcol`` form (which every CellContent accessor
+        already prefers); the result is byte-identical to ``_decode_at_py``
+        (test_oasis_native_decode pins the two paths together)."""
+        reader = self._reader
+        modal = reader._modal
+        run = _FAST.decode_rect_run
+        filtered_out = reader._layer_filtered_out
+        f = reader._f
+        f.clear_substreams()
+        f.seek(int(offset))
+
+        rcol_blocks: dict[LayerKey, list] = {}   # key -> [(coords, rt, rr), …]
+        poly_specs: dict[LayerKey, list] = {}
+        placements: list = []
+        seen_cell_header = False
+        _pk = None
+        _plist = None
+
+        def _gobble():
+            # Decode the run of same-(layer,dt) rects after the just-yielded
+            # one; write the advanced modal + cursor back so the generator
+            # resumes correctly. Returns the (N,4) int64 array (no repetition —
+            # decode_rect_run rewinds before a repeated/foreign record).
+            # started=1: the modal layer IS this run's layer, so a first rect on
+            # a different layer stops immediately — the gobbled rects are all on
+            # (modal.layer, modal.datatype), never the next run's layer.
+            new_pos, rects, lay, dtp, w, h, gx, gy, xyrel, _stop = run(
+                f._buf, f._pos, modal.layer, modal.datatype,
+                modal.geometry_w, modal.geometry_h,
+                modal.geometry_x, modal.geometry_y,
+                1 if modal.xy_relative else 0, 1)
+            modal.layer = lay; modal.datatype = dtp
+            modal.geometry_w = w; modal.geometry_h = h
+            modal.geometry_x = gx; modal.geometry_y = gy
+            modal.xy_relative = bool(xyrel)
+            f._pos = new_pos
+            return rects
+
+        for rid, payload in reader.iter_records():
+            if rid == oas.RECTANGLE:
+                if payload.get("filtered_out"):
+                    # Still gobble (at C speed) so the cursor skips the whole
+                    # filtered run without a per-rect Python loop; drop output.
+                    _gobble()
+                    continue
+                key = (payload["layer"], payload["datatype"])
+                blk = rcol_blocks.get(key)
+                if blk is None:
+                    blk = rcol_blocks[key] = []
+                x1 = payload["x"]; y1 = payload["y"]
+                rt0 = payload.get("repetition_type")
+                # The generator already decoded this first rect (it may carry a
+                # repetition); store it as a 1-row block in stream order.
+                blk.append((
+                    np.array([[x1, y1, x1 + payload["width"],
+                               y1 + payload["height"]]], dtype=np.int64),
+                    np.array([-1 if rt0 is None else rt0], dtype=np.int16),
+                    _obj1(payload.get("repetition_raw"))))
+                rects = _gobble()           # the rest of this run, in C
+                n = rects.shape[0]
+                if n:
+                    # native rects carry no repetition: rt all -1, rr all None.
+                    # np.empty(object) is already None-initialized — no fill.
+                    blk.append((np.asarray(rects, dtype=np.int64),
+                                np.full(n, -1, dtype=np.int16),
+                                np.empty(n, dtype=object)))
+            elif rid == oas.POLYGON:
+                if payload.get("filtered_out"):
+                    continue
+                pts = payload.get("points") or []
+                if not pts:
+                    continue
+                pkey = (payload["layer"], payload["datatype"])
+                if pkey != _pk:
+                    _plist = poly_specs.get(pkey)
+                    if _plist is None:
+                        _plist = poly_specs[pkey] = []
+                    _pk = pkey
+                ax = payload["x"]; ay = payload["y"]
+                base = np.asarray(pts, dtype=self._dtype)
+                base[:, 0] += ax
+                base[:, 1] += ay
+                _plist.append((base, payload.get("repetition_type"),
+                               payload.get("repetition_raw")))
+            elif rid in (oas.PLACEMENT_NOMAG, oas.PLACEMENT_MAG):
+                placements.append(Placement(
+                    payload["cell_ref"], payload["cell_ref_kind"],
+                    payload["x"], payload["y"], float(payload["angle"]),
+                    float(payload["magnification"]), bool(payload["flip"]),
+                    payload.get("repetition_type"), [],
+                    payload.get("repetition_raw")))
+            elif rid in (oas.CELL_REFNUM, oas.CELL_NAME):
+                if seen_cell_header:
+                    break                  # next cell -> our cell is done
+                seen_cell_header = True
+            elif rid == oas.END:
+                break
+
+        # Concatenate each key's stream-ordered blocks into one columnar entry.
+        rcol: dict = {}
+        for key, blocks in rcol_blocks.items():
+            if len(blocks) == 1:
+                rcol[key] = blocks[0]
+            else:
+                rcol[key] = (np.vstack([b[0] for b in blocks]),
+                             np.concatenate([b[1] for b in blocks]),
+                             np.concatenate([b[2] for b in blocks]))
+        return CellContent(rect_specs={}, poly_specs=poly_specs,
+                           _placements=placements, _rcol=rcol,
+                           bbox=_analytic_bbox_columnar(rcol, poly_specs))
 
 
 # ── M3.5c: top-down ROI walker ───────────────────────────────────────────────
