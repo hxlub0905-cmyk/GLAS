@@ -30,6 +30,32 @@
 
 ---
 
+## [2026-06-30] [F26 M2a-core] native rectangle-run 解碼器：隔離量測 48–51×、byte-identical
+
+**變更類型：** 效能（native 解碼核心）· **狀態：M2a-core done；M2a-integrate next**
+
+**動機：** user 確認批次 poi（解碼）主導 → native 是對的槓桿。M1 的回歸只證明 per-varint 粒度錯；M2 走
+per-run 攤提 C 邊界。
+
+**實作：** `oasis_fastdecode.decode_rect_run(buf, pos, layer, dt, w, h, x, y, xy_rel)`（Cython）：一次解一整串
+同 (layer,dt) 的 RECTANGLE、inline 處理 XYABSOLUTE/XYRELATIVE/PAD、遇 layer/dt 變更 / repetition(0x04) / 非-rect
+即倒回游標（rid_start）回 Python。typed memoryview 直讀（零拷貝、無 cimport numpy），成長型 numpy buffer。
+modal/byte 語意與 `_read_rectangle`+`OasisStore._on_rectangle` 一致（x1,y1,x2,y2=x,y,x+w,y+h）。VERSION 1→2。
+
+**量測（本機合成 1.5M-rect，隔離 decode）：** pure-Python `store.run()` 301k rect/s → **native 14.5M rect/s
+= 48.3×**（heavy 6-varint 版 50.7×）。輸出與 `OasisGeometryStore` rects **byte-identical**。誠實註記：48× 是
+rectangle 解碼隔離數字，整批端到端受 Amdahl 限制（polygon/repetition/IO/matchTemplate 仍在），M2a-integrate +
+M2b 後才是真實批次加速。
+
+**測試：** `tests/test_fastdecode.py` +4（modal vs Python、xy-relative、layer-change 停-續、repetition 停），
+36 passed（importorskip，無 .pyd 環境自動 skip）。CI build-deps 加 numpy（runtime import）。
+
+**影響檔案：** `glas/core/oasis_fastdecode.pyx`、`tests/test_fastdecode.py`、
+`.github/workflows/build-fastdecode.yml`、`docs/plans/F26-native-decode.md`、`SESSION_LOG.md`。
+**Branch：** claude/project-perf-optimization-86i8yt
+
+---
+
 ## [2026-06-30] [F26 M1] 量測：per-call native varint 是回歸 → 撤回，改建議 F17
 
 **變更類型：** 效能實驗（量測後撤回）· **狀態：M1 done（負結果）、M2 deferred**

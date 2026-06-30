@@ -18,8 +18,11 @@ imports and runs on a locked-down machine. The full record-loop port lands on
 top of this once the delivery path is confirmed.
 """
 
+import numpy as np
+
 # Native version tag so callers / the selftest can confirm which build loaded.
-VERSION = 1
+# 1 = varint helpers only (M0); 2 = + decode_rect_run (M2a).
+VERSION = 2
 
 
 def decode_uvarint(const unsigned char[::1] buf, Py_ssize_t pos):
@@ -59,6 +62,180 @@ def decode_svarint(const unsigned char[::1] buf, Py_ssize_t pos):
     if raw & 1:
         return -(<long long>(raw >> 1)), new_pos
     return <long long>(raw >> 1), new_pos
+
+
+def decode_rect_run(const unsigned char[::1] buf, Py_ssize_t pos,
+                    long long layer, long long datatype,
+                    long long w, long long h, long long x, long long y,
+                    int xy_relative):
+    """Decode a *run* of consecutive RECTANGLE records that share one
+    ``(layer, datatype)``, in one native call — the M2a amortization that the
+    per-varint M1 attempt lacked. Inline-handles XYABSOLUTE / XYRELATIVE / PAD.
+
+    Stops (returning control to Python, cursor rewound to the start of the
+    stopping record) at: a RECTANGLE that changes layer/datatype, a RECTANGLE
+    with a repetition, or any non-rectangle record. Byte/modal semantics are
+    identical to ``oasis_streamer._read_rectangle`` + ``OasisStore`` rect store
+    (``x1,y1,x2,y2 = x, y, x+w, y+h``).
+
+    Returns ``(new_pos, rects, layer, datatype, w, h, x, y, xy_relative,
+    stop_rid)`` where ``rects`` is an ``(N, 4)`` int64 array (x1,y1,x2,y2) and
+    ``stop_rid`` is the id of the record that ended the run (-1 at EOF). On a
+    >64-bit varint it raises OverflowError so the caller falls back to Python.
+    """
+    cdef Py_ssize_t n = buf.shape[0]
+    cdef Py_ssize_t cap = 256
+    arr = np.empty((cap, 4), dtype=np.int64)
+    cdef long long[:, ::1] out = arr
+    cdef Py_ssize_t count = 0
+    cdef Py_ssize_t p = pos
+    cdef Py_ssize_t rid_start
+    cdef unsigned long long u
+    cdef long long sval, nl, nd
+    cdef int shift
+    cdef unsigned int b, info, rid
+    cdef int started = 0
+
+    while True:
+        rid_start = p
+        if p >= n:
+            return (p, arr[:count], layer, datatype, w, h, x, y,
+                    xy_relative, -1)
+        # ── rid (uvarint) ──
+        u = 0; shift = 0
+        while True:
+            b = buf[p]; p += 1
+            u |= (<unsigned long long>(b & 0x7F)) << shift
+            if not (b & 0x80):
+                break
+            shift += 7
+            if shift > 63 or p >= n:
+                return (rid_start, arr[:count], layer, datatype, w, h, x, y,
+                        xy_relative, -1)
+        rid = <unsigned int>u
+
+        if rid == 20:                      # RECTANGLE
+            if p >= n:
+                return (rid_start, arr[:count], layer, datatype, w, h, x, y,
+                        xy_relative, -1)
+            info = buf[p]; p += 1
+            nl = layer; nd = datatype
+            if info & 0x01:                # layer
+                u = 0; shift = 0
+                while True:
+                    if p >= n:
+                        return (rid_start, arr[:count], layer, datatype, w, h,
+                                x, y, xy_relative, -1)
+                    b = buf[p]; p += 1
+                    u |= (<unsigned long long>(b & 0x7F)) << shift
+                    if not (b & 0x80):
+                        break
+                    shift += 7
+                    if shift > 63:
+                        raise OverflowError("layer > 64-bit")
+                nl = <long long>u
+            if info & 0x02:                # datatype
+                u = 0; shift = 0
+                while True:
+                    if p >= n:
+                        return (rid_start, arr[:count], layer, datatype, w, h,
+                                x, y, xy_relative, -1)
+                    b = buf[p]; p += 1
+                    u |= (<unsigned long long>(b & 0x7F)) << shift
+                    if not (b & 0x80):
+                        break
+                    shift += 7
+                    if shift > 63:
+                        raise OverflowError("datatype > 64-bit")
+                nd = <long long>u
+            # layer/datatype change after the run started → hand back to Python.
+            if started and (nl != layer or nd != datatype):
+                return (rid_start, arr[:count], layer, datatype, w, h, x, y,
+                        xy_relative, 20)
+            layer = nl; datatype = nd; started = 1
+            if info & 0x40:                # width
+                u = 0; shift = 0
+                while True:
+                    if p >= n:
+                        return (rid_start, arr[:count], layer, datatype, w, h,
+                                x, y, xy_relative, -1)
+                    b = buf[p]; p += 1
+                    u |= (<unsigned long long>(b & 0x7F)) << shift
+                    if not (b & 0x80):
+                        break
+                    shift += 7
+                    if shift > 63:
+                        raise OverflowError("width > 64-bit")
+                w = <long long>u
+            if info & 0x80:                # square: height = width
+                h = w
+            elif info & 0x20:              # height
+                u = 0; shift = 0
+                while True:
+                    if p >= n:
+                        return (rid_start, arr[:count], layer, datatype, w, h,
+                                x, y, xy_relative, -1)
+                    b = buf[p]; p += 1
+                    u |= (<unsigned long long>(b & 0x7F)) << shift
+                    if not (b & 0x80):
+                        break
+                    shift += 7
+                    if shift > 63:
+                        raise OverflowError("height > 64-bit")
+                h = <long long>u
+            if info & 0x10:                # x (signed)
+                u = 0; shift = 0
+                while True:
+                    if p >= n:
+                        return (rid_start, arr[:count], layer, datatype, w, h,
+                                x, y, xy_relative, -1)
+                    b = buf[p]; p += 1
+                    u |= (<unsigned long long>(b & 0x7F)) << shift
+                    if not (b & 0x80):
+                        break
+                    shift += 7
+                    if shift > 63:
+                        raise OverflowError("x > 64-bit")
+                sval = -(<long long>(u >> 1)) if (u & 1) else <long long>(u >> 1)
+                x = (x + sval) if xy_relative else sval
+            if info & 0x08:                # y (signed)
+                u = 0; shift = 0
+                while True:
+                    if p >= n:
+                        return (rid_start, arr[:count], layer, datatype, w, h,
+                                x, y, xy_relative, -1)
+                    b = buf[p]; p += 1
+                    u |= (<unsigned long long>(b & 0x7F)) << shift
+                    if not (b & 0x80):
+                        break
+                    shift += 7
+                    if shift > 63:
+                        raise OverflowError("y > 64-bit")
+                sval = -(<long long>(u >> 1)) if (u & 1) else <long long>(u >> 1)
+                y = (y + sval) if xy_relative else sval
+            if info & 0x04:                # repetition → hand back to Python
+                return (rid_start, arr[:count], layer, datatype, w, h, x, y,
+                        xy_relative, 20)
+            if count == cap:               # grow the output buffer
+                cap = cap * 2
+                arr2 = np.empty((cap, 4), dtype=np.int64)
+                arr2[:count] = arr[:count]
+                arr = arr2
+                out = arr
+            out[count, 0] = x
+            out[count, 1] = y
+            out[count, 2] = x + w
+            out[count, 3] = y + h
+            count += 1
+        elif rid == 15:                    # XYABSOLUTE
+            xy_relative = 0
+        elif rid == 16:                    # XYRELATIVE
+            xy_relative = 1
+        elif rid == 0:                     # PAD
+            pass
+        else:                              # any other record → hand back
+            return (rid_start, arr[:count], layer, datatype, w, h, x, y,
+                    xy_relative, <long long>rid)
 
 
 def selftest():

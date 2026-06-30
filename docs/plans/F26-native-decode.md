@@ -84,10 +84,16 @@ parse + 改架構，不適合互動 ROI。
 > 觸發的那段）——批次 3000 次散落 `load_cell` 的成本就在這。native 解碼一個 cell 的 RECTANGLE/POLYGON run、
 > 遇到非幾何 record（CELL/PLACEMENT/PROPERTY/CBLOCK）就回 Python。PLACEMENT §22.6 留在 Python（native 不碰）。
 
-- [ ] **M2a：native RECTANGLE-run 解碼器**（98% record）：`decode_rect_run(buf, pos, modal…) → (new_pos,
-      modal_out, rects(N,4) int32, layer/dt arrays, stop_rid)`，一次解一整串 rect、填 numpy、遇非-rect 即停回
-      Python。modal state（layer/dt/w/h/x/y/xy_rel）在 C 維護、byte-identical（含 modal reuse / square bit /
-      signed x,y / repetition raw）。**先量測**（合成 + 你的真檔）確認攤提後是淨贏（≠ M1 的 per-call 回歸）。
+- [x] **M2a-core：native RECTANGLE-run 解碼器**（2026-06-30）：`oasis_fastdecode.decode_rect_run(buf, pos,
+      layer, dt, w, h, x, y, xy_rel) → (new_pos, rects(N,4) int64, modal_out…, stop_rid)`，一次解一整串同
+      (layer,dt) 的 rect、inline 處理 XYABS/XYREL/PAD、遇 layer/dt 變更 / repetition / 非-rect 即倒回游標回
+      Python。modal/byte 語意與 `_read_rectangle`+`_on_rectangle` 一致。**隔離量測：48–51×**（純 Python store
+      301k rect/s → native 14.5M rect/s），輸出 byte-identical（`test_fastdecode` +4 護欄：modal / xy-relative /
+      layer-change 停-續 / repetition 停）。VERSION 1→2。
+- [ ] **M2a-integrate：接進 per-cell 解碼**（next）：在 reader consume / oasis_random 的單 cell 解碼裡，碰到
+      RECTANGLE run 就呼叫 `decode_rect_run`、一次把 (N,4) array 灌進 rect buffer（取代 per-rect callback）；
+      layer filter / 非-rect（polygon/placement/property/cblock）走原 Python。gated + 全 `test_oasis_*` 雙路徑綠。
+      **這步才會在批次端到端看到加速**（隔離 48× 受 Amdahl 限制：polygon/repetition/IO/match 仍在）。
 - [ ] **M2b：擴充 POLYGON**（point-list g-delta run 在 C 解）+ repetition raw 在 C 解（檔1 `read_repetition_raw`
       2s、檔2 `decode_point_list`/`decode_g_delta` ~7s 都在這）。
 - [ ] **M2c：接進 oasis_store**（gated：native 可用走 C run-decoder、否則純 Python `run()`）；cellcache 不變。
