@@ -30,6 +30,34 @@
 
 ---
 
+## [2026-06-30] [F26 M0] 原生 decode 加速：機制驗證骨架（Cython + CI 編 + 放檔交付）
+
+**變更類型：** 效能（原生加速前置）· **狀態：M0 進行中**（CI/user 端驗證待確認）
+
+**動機：** `oas_profile.py` 在兩個真實檔（330 MB / 1.75 GB）量出 decode **82–85%** 卡在純 Python varint
+迴圈 + per-record 分派，zlib/store/IO≈0 → Cython 是對的槓桿（預期整檔 decode ~2.5–4×）。但 user 公司電腦
+MSVC 被 IT 擋、無法本機編譯，故採「**CI 編、本機放檔**」交付：GitHub Actions（內建 MSVC）以 Python 3.9 x64
+編出 `.pyd` artifact，user 下載複製進 `glas/core/`（非安裝、是放檔，繞過限制）。
+
+**實作（M0 機制驗證骨架）：**
+- `glas/core/oasis_fastdecode.pyx`：`decode_uvarint`/`decode_svarint`（memoryview 零拷貝、64-bit、>64-bit
+  raise 交回純 Python 不 wrap）+ `selftest()` + `VERSION`。
+- `setup.py`（cythonize + `build_ext --inplace`）；`.gitignore` 忽略 `*.pyd`/`*.so`/`build/`/生成的 `.c`。
+- `.github/workflows/build-fastdecode.yml`：windows + py3.9 x64 → build → smoke + round-trip → 上傳
+  `oasis_fastdecode-cp39-win_amd64` artifact。
+- `tests/test_fastdecode.py`（32 例，`importorskip`）：native 與 `OasisStream.read_uvarint/svarint`
+  round-trip（含 offset resume / EOF raise）。
+- 設計為**完全選用**：`oasis_streamer` 之後以 `try: import` gated 取用，缺 `.pyd` 走純 Python（§6/§7）。
+
+**測試：** 本機 Linux 編出 `.so` 驗證 import + selftest + round-trip 全過；`pytest tests/` **782 passed**
+（750→782，+32；其餘環境無 `.pyd` 時 test_fastdecode 自動 skip）。
+
+**影響檔案：** 新增 `glas/core/oasis_fastdecode.pyx`、`setup.py`、`.github/workflows/build-fastdecode.yml`、
+`tests/test_fastdecode.py`、`docs/plans/F26-native-decode.md`；改 `.gitignore`、`SESSION_LOG.md`。
+**Branch：** claude/project-perf-optimization-86i8yt
+
+---
+
 ## [2026-06-30] [F26-prep] OASIS decode 量測工具 `tools/oas_profile.py`
 
 **變更類型：** 工具（效能量測）· **狀態：完成（F26「大改 #2」的前置量測 harness）**
