@@ -209,6 +209,23 @@ class TestOnExport:
         assert captured["out_dir"] == "/tmp/out"
         assert mw._export_pending is not None
 
+    def test_raw_only_requests_output_dir(self, mw, monkeypatch):
+        # Raw-only export is an image product → an output dir must be picked
+        # (regression: raw used to skip the dir and land PNGs in the CWD), but
+        # it needs no POI / OASIS (no walk).
+        captured = {}
+        self._stub_common(mw, monkeypatch)
+        monkeypatch.setattr(mw, "_launch_export",
+                            lambda specs, jobs, cfg, out_dir, *a:
+                            captured.update(out_dir=out_dir, specs=specs))
+        mw._sem_images = [_img("D1", 1.0, 2.0)]
+        mw._refined = {"D1": (0.0, 0.0, 0.9)}            # aligned → no walk
+        _patch_export_dialog(monkeypatch, sel=(
+            "csv", {"D1"}, True, False, False, False, 0.0))   # raw only
+        mw._on_export()
+        assert captured["out_dir"] == "/tmp/out"         # dir WAS requested
+        assert captured["specs"] == []                   # no POI needed
+
     def test_csv_only_skips_output_dir(self, mw, monkeypatch):
         captured = {}
         self._stub_common(mw, monkeypatch)

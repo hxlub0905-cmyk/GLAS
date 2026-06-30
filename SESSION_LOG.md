@@ -4,6 +4,32 @@
 
 ---
 
+## [2026-06-30] [F25 follow-up] PR #17 review 修兩個 P2（raw-only 輸出夾 / CSV-only 免讀 SEM）
+
+**變更類型：** bug fix（F25 review 回饋）· **狀態：完成**
+
+**現象（Codex reviewer P2×2）：**
+1. **raw-only 匯出落到 CWD**：`_on_export` 的 `want_products` 只含 overlay/gray/label，**漏了 raw**。只勾「Raw
+   SEM PNG」時不問輸出資料夾、worker 收到 `out_dir==""`，`align_and_export_one_image` 仍寫 `<id>_raw.png`
+   → 落到 process 當前工作目錄；且 manifest 被 `_want_products()` gate 擋掉。
+2. **CSV-only 重匯出仍讀 SEM**：reused alignment + 無產物時，`align_and_export_one_image` 仍先 `cv2.imread`
+   才判定不需要 → 純 alignment CSV 重匯出會碰每個影像檔、缺檔還誤報 `missing-file`。
+
+**修復：**
+1. `_on_export` 拆成 `want_walk_products`（overlay/gray/label → 要 POI/OASIS/FOV）與 `want_image_products`
+   （含 raw → 要輸出資料夾）；worker `_want_products`→`_want_image_products`（含 raw，決定 manifest），
+   `needs_walk` 維持只看 overlay/gray/label（raw 是純複製、不需 walk）。
+2. `align_and_export_one_image` 在 `cv2.imread` 前短路：`need_align`（prior 無且有座標）/`export_raw`/
+   walk-products 皆無 → 直接 `_finish(prior_refined, None)`，完全不碰影像檔（缺檔不誤報）。
+
+**測試：** 新增 `test_export_fused.py` 2 項（CSV-only reused 缺檔不讀 SEM 報 ok、raw-only 寫進 out_dir）、
+`test_gds_align_f24.py` 1 項（raw-only 要 out_dir、不要 POI）。`pytest tests/` **750 passed**（747→750）。
+
+**影響檔案：** `glas/core/overlay_export.py`、`glas/app/gds_align_tool.py`、`tests/test_export_fused.py`、
+`tests/test_gds_align_f24.py`、`SESSION_LOG.md`。**Branch：** claude/project-perf-optimization-86i8yt
+
+---
+
 ## [2026-06-30] [F26-prep] OASIS decode 量測工具 `tools/oas_profile.py`
 
 **變更類型：** 工具（效能量測）· **狀態：完成（F26「大改 #2」的前置量測 harness）**

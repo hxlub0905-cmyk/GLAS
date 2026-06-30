@@ -1622,9 +1622,11 @@ class ExportWorker(QObject):
     def cancel(self) -> None:
         self._cancel.set()
 
-    def _want_products(self) -> bool:
-        return bool(self._export_overlay or self._export_gray
-                    or self._export_label)
+    def _want_image_products(self) -> bool:
+        """Any per-image PNG product (incl. raw) → an output dir + an overlay
+        manifest are produced."""
+        return bool(self._export_raw or self._export_overlay
+                    or self._export_gray or self._export_label)
 
     def run(self) -> None:
         try:
@@ -1635,10 +1637,12 @@ class ExportWorker(QObject):
             workers = min(
                 fine_align.batch_worker_count(self._cfg.get("max_workers", 0)), n)
             # The GIL-bound ROI walk is what a process pool actually speeds up;
-            # it is needed for a fresh alignment or an image product. A pure CSV
-            # re-export of already-aligned images needs no walk, so it (and tiny
-            # / single-worker / reader-less runs) stays in-thread.
-            needs_walk = self._want_products() or any(
+            # it is needed for a fresh alignment or an overlay/gray/label product
+            # (raw is a plain file copy, no walk). A pure CSV re-export of
+            # already-aligned images needs no walk either, so those (and tiny /
+            # single-worker / reader-less runs) stay in-thread.
+            needs_walk = (self._export_overlay or self._export_gray
+                          or self._export_label) or any(
                 j[2] is None and j[1] is not None for j in self._jobs)
             if n <= 2 or workers <= 1 or self._rar is None or not needs_walk:
                 rows = self._run_in_thread()
@@ -1653,7 +1657,7 @@ class ExportWorker(QObject):
                 self.cancelled.emit()
             else:
                 manifest = (self._write_manifest(rows)
-                            if self._want_products() else "")
+                            if self._want_image_products() else "")
                 self.finished.emit(len(rows), manifest)
 
     def _run_in_thread(self):
@@ -7119,13 +7123,17 @@ class MainWindow(QMainWindow):
             self._status_doc.setText("export: no images selected")
             return
         images = [i for i in self._sem_images if i.image_id in ids]
-        want_products = exp_overlay or exp_gray or exp_label
+        # overlay/gray/label rasterize from a walked ROI (need POI/OASIS/FOV);
+        # raw is a plain SEM copy (needs only an output dir). Any of the four is
+        # an image product → an output dir is picked.
+        want_walk_products = exp_overlay or exp_gray or exp_label
+        want_image_products = exp_raw or want_walk_products
         todo = fine_align.images_needing_fine_align(images, self._refined)
-        # Aligning the un-run images and rasterizing products both need a POI +
-        # an open OASIS ROI + a FOV; a pure CSV re-export of already-aligned
-        # images needs none of that.
+        # Aligning the un-run images and rasterizing walk-products both need a
+        # POI + an open OASIS ROI + a FOV; a raw-only or pure-CSV export of
+        # already-aligned images needs none of that.
         specs_colored = []
-        if todo or want_products:
+        if todo or want_walk_products:
             if cv2 is None:
                 QMessageBox.warning(self, "Export",
                                     "opencv (cv2) is required for fine align "
@@ -7142,7 +7150,7 @@ class MainWindow(QMainWindow):
                 self._status_doc.setText("export: set FOV width/height first")
                 return
         out_dir = ""
-        if want_products:
+        if want_image_products:
             out_dir = QFileDialog.getExistingDirectory(
                 self, "Export images to…", self._dlg_start_dir("export_images"))
             if not out_dir:

@@ -149,6 +149,44 @@ def test_fused_csv_only_skips_walk(tmp_path, monkeypatch):
     assert _files(out) == []             # nothing written
 
 
+def test_fused_csv_only_reused_skips_sem_read(tmp_path, monkeypatch):
+    # A reused-alignment CSV-only re-export must report the stored offsets from
+    # the index alone — never read the SEM, even if its file is gone.
+    rar = _reader(tmp_path)
+    reads = []
+    monkeypatch.setattr(overlay_export.cv2, "imread",
+                        lambda *a, **k: reads.append(a) or None)
+    out = tmp_path / "out"
+    out.mkdir()
+    fa, row = overlay_export.align_and_export_one_image(
+        ("D1", (60.0, 60.0), (1.0, 2.0, 0.9), str(tmp_path / "gone.png"), False),
+        rar, 0, _POI_COLORED, _CFG, str(out), score_thr=0.0,
+        export_raw=False, export_overlay=False, export_gray=False,
+        export_label=False)
+    assert reads == []                       # never touched the missing SEM
+    assert fa is None
+    assert row["status"] == "ok"             # not "missing-file"
+    assert row["fine_dx_nm"] == 1.0 and row["score"] == 0.9
+    assert _files(out) == []
+
+
+def test_fused_raw_only_writes_to_out_dir(tmp_path):
+    # Raw-only export still needs a real out_dir (regression: it used to land in
+    # the CWD when raw wasn't treated as an image product).
+    rar = _reader(tmp_path)
+    sem = _sem(tmp_path)
+    out = tmp_path / "out"
+    out.mkdir()
+    fa, row = overlay_export.align_and_export_one_image(
+        ("D1", (60.0, 60.0), (0.0, 0.0, 0.9), str(sem), True), rar, 0,
+        _POI_COLORED, _CFG, str(out), score_thr=0.0,
+        export_raw=True, export_overlay=False, export_gray=False,
+        export_label=False)
+    assert row["raw_png"] == "D1_raw.png"
+    assert (out / "D1_raw.png").exists()     # written under out_dir, not CWD
+    assert _files(out) == ["D1_raw.png"]     # no overlay/gray/label
+
+
 def test_fused_missing_file(tmp_path):
     rar = _reader(tmp_path)
     out = tmp_path / "out"

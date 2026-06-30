@@ -245,6 +245,16 @@ def align_and_export_one_image(job, rar, root, poi_colored, cfg, out_dir,
     if cancel_cb is not None and cancel_cb():
         return None, row
 
+    need_align = prior_refined is None and coarse is not None
+    want_products = export_overlay or export_gray or export_label
+    # The SEM frame is only needed to align, to copy the raw PNG, or to size /
+    # paint an overlay/gray/label. A reused-alignment CSV-only re-export (or a
+    # no-coords image with no products) needs none of it — report the stored
+    # offsets from the index alone and never touch the image file, so a missing
+    # SEM is not wrongly flagged.
+    if not (need_align or export_raw or want_products):
+        return _finish(prior_refined, None)
+
     sem = (cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
            if (cv2 and exists) else None)
     if sem is None:
@@ -263,8 +273,6 @@ def align_and_export_one_image(job, rar, root, poi_colored, cfg, out_dir,
     nm_per_px = (c["nm_manual"] if (not c["nm_auto"] and
                  c["nm_manual"] > 0) else c["fov_w"] / max(1, W))
 
-    need_align = prior_refined is None
-    want_products = export_overlay or export_gray or export_label
     fa_result = None
     refined = prior_refined
 
