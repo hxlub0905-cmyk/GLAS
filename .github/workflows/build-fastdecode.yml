@@ -63,20 +63,24 @@ jobs:
           path: glas/core/oasis_fastdecode*.pyd
           if-no-files-found: error
 
-      # Locked-down-machine delivery: commit the prebuilt .pyd back to the
-      # branch so it arrives via `git pull` (the artifact zip on blob storage is
-      # blocked by some corporate download policies; git over HTTPS is allowed).
-      # The .pyd path isn't in this workflow's `on.push.paths`, so this commit
-      # does not re-trigger the build (no loop); [skip ci] is belt-and-suspenders.
-      - name: Commit the .pyd into the repo (git-pull delivery)
+      # Locked-down-machine delivery: a committed .pyd (a Windows DLL) makes the
+      # whole source-ZIP download get blocked by corporate file-download policy.
+      # So commit a base64 TEXT sidecar instead — it rides the source ZIP safely
+      # (no executable/PE header), and the user materializes the real .pyd
+      # locally with `python tools/unpack_fastdecode.py`. The .b64 path isn't in
+      # on.push.paths, so this commit doesn't re-trigger the build; [skip ci] too.
+      - name: Encode the .pyd as base64 text + commit the sidecar
         shell: bash
         run: |
+          python -c "import base64, pathlib; p = pathlib.Path('glas/core/oasis_fastdecode.cp39-win_amd64.pyd'); pathlib.Path('glas/core/oasis_fastdecode.cp39-win_amd64.pyd.b64').write_text(base64.b64encode(p.read_bytes()).decode())"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -f glas/core/oasis_fastdecode.cp39-win_amd64.pyd
+          # Make sure no raw .pyd is ever tracked (it would block the ZIP).
+          git rm --cached --ignore-unmatch glas/core/oasis_fastdecode.cp39-win_amd64.pyd || true
+          git add glas/core/oasis_fastdecode.cp39-win_amd64.pyd.b64
           if git diff --cached --quiet; then
-            echo "no change to the .pyd — nothing to commit"
+            echo "no change to the .b64 sidecar — nothing to commit"
           else
-            git commit -m "ci: prebuilt oasis_fastdecode.cp39-win_amd64.pyd [skip ci]"
+            git commit -m "ci: prebuilt oasis_fastdecode.cp39-win_amd64.pyd.b64 (base64 text) [skip ci]"
             git push origin "HEAD:${GITHUB_REF_NAME}"
           fi

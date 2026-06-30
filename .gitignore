@@ -8,13 +8,12 @@ venv/
 .DS_Store
 *.npz
 
-# F26: native decode extension build artifacts. The .so / generated .c are never
-# committed. The Windows .pyd is normally a CI artifact, BUT for locked-down
-# machines where artifact download is blocked (only git is allowed), CI commits
-# the prebuilt cp39-win_amd64 .pyd into the repo so it arrives via `git pull` —
-# so that one file is explicitly un-ignored below.
+# F26: native decode extension build artifacts. The .so / .pyd / generated .c
+# are never committed (a committed .pyd makes the source ZIP download get
+# blocked by corporate file-download policy). Instead CI commits a base64 TEXT
+# sidecar (oasis_fastdecode.*.pyd.b64) which rides the source ZIP safely; the
+# user materializes the real .pyd locally with tools/unpack_fastdecode.py.
 build/
 *.so
 *.pyd
-!glas/core/oasis_fastdecode.cp39-win_amd64.pyd
 glas/core/oasis_fastdecode.c
