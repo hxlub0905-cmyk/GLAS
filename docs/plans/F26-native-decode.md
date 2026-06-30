@@ -1,6 +1,6 @@
 # [F26] 原生（Cython）OASIS 解碼加速 + 無編譯器交付
 
-> **狀態：** in progress（M0 機制驗證中）
+> **狀態：** in progress（M0 ✓ 交付驗證 / M1 ✗ per-varint 回歸已撤 / M2 GO — 批次 poi 主導已確認 / M3 F17）
 > **§8 ID：** [F26]
 > **建立：** 2026-06-30
 > **負責 branch：** claude/project-perf-optimization-86i8yt
@@ -74,13 +74,33 @@ parse + 改架構，不適合互動 ROI。
       仍保留、已驗證，留給 M2 的 record-loop 用。**結論：唯一能贏的粒度是整個 record / record-run 在 native 攤提
       C 邊界，不是 per-scalar。**
 
-### M2: native per-record 迴圈（唯一能贏的粒度，最大收益）  [status: deferred — 待 user 決定]
+### M2: native record-RUN 解碼（GO — user 確認批次 poi 主導）  [status: planned]
 
-- [ ] 把 `consume` 內層 + RECTANGLE/POLYGON decoder + modal state 搬進 Cython，每個 cell/run 才回 Python 一次、直接填 numpy buffer（攤提 C 邊界 → 才會贏）。
-- [ ] §7 spec 對齊：PLACEMENT info-byte N-bit（§22.6）、continuation/sign（§7.2/§7.3）、modal reuse、overflow guard。
-- [ ] byte-identical 護欄 + 量測（目標整檔 decode ~2.5–4×）。
-- [ ] **成本/風險評估：** 大且 spec-critical 的 port + 脆弱的二進位交付（base64-in-zip，會隨 IT 政策/防毒變動）。
-      鑑於 F17（無 binary）很可能已解決 user 實際痛點（檔1 首次載入慢），M2 的互動收益邊際 → **先做 F17，M2 視需要再啟動。**
+> **動機確認（2026-06-30）：** user 真實痛點＝整包 KLARF（~3000 顆散落 defect）批次對位，`GLAS_FA_TIMING`
+> 顯示 **poi（ROI walk＝解碼+Boolean）主導**（非 match）。3000 顆散落 → 加總碰整顆 chip 一大部分 cell →
+> 解碼吞吐 bound → native 是對的槓桿。M1 的回歸只證明「per-varint 粒度錯」，M2 走「per-run」攤提 C 邊界。
+>
+> **整合點：** 不是 `iter_records`，而是 **oasis_store 的 per-cell 幾何解碼**（`walk_roi`→`load_cell`→decode
+> 觸發的那段）——批次 3000 次散落 `load_cell` 的成本就在這。native 解碼一個 cell 的 RECTANGLE/POLYGON run、
+> 遇到非幾何 record（CELL/PLACEMENT/PROPERTY/CBLOCK）就回 Python。PLACEMENT §22.6 留在 Python（native 不碰）。
+
+- [ ] **M2a：native RECTANGLE-run 解碼器**（98% record）：`decode_rect_run(buf, pos, modal…) → (new_pos,
+      modal_out, rects(N,4) int32, layer/dt arrays, stop_rid)`，一次解一整串 rect、填 numpy、遇非-rect 即停回
+      Python。modal state（layer/dt/w/h/x/y/xy_rel）在 C 維護、byte-identical（含 modal reuse / square bit /
+      signed x,y / repetition raw）。**先量測**（合成 + 你的真檔）確認攤提後是淨贏（≠ M1 的 per-call 回歸）。
+- [ ] **M2b：擴充 POLYGON**（point-list g-delta run 在 C 解）+ repetition raw 在 C 解（檔1 `read_repetition_raw`
+      2s、檔2 `decode_point_list`/`decode_g_delta` ~7s 都在這）。
+- [ ] **M2c：接進 oasis_store**（gated：native 可用走 C run-decoder、否則純 Python `run()`）；cellcache 不變。
+- [ ] §7：continuation/sign（§7.2/§7.3）、modal reuse、overflow（>64-bit 回 Python）、(N,4) int32 欄序/dtype/空
+      sentinel byte-identical。全 `test_oasis_*` + 新 `test_native_run` 雙路徑綠。
+- [ ] 每步**先量測再進下一步**（避免再踩 M1 那種「看似該快、實測回歸」）。目標 cell 解碼 ~2.5–4× → 批次 poi 同比例降。
+
+### M3: F17 bbox sweep（互補、無 binary）+ 收尾  [status: planned]
+
+- [ ] **F17**：對**無 S_BOUNDING_BOX 的大檔（檔1 E3B）**做一次性 cell-bbox sweep + 持久 sidecar，讓 ROI prune
+      免解碼（批次 3000 次散落 walk 跨 worker 不再重複「解碼學 bbox」）。純 Python、零 binary，與 M2 疊加。
+      （檔2 有 sbbox → 本來就免解碼剪枝，F17 不影響它。）
+- [ ] 文件：CLAUDE.md（§4 新模組、§6 build/交付說明、§8）、README、SESSION_LOG。
 
 ### M3: 收尾 + 互補的 F17  [status: planned]
 
