@@ -14,6 +14,9 @@ on:
       - ".github/workflows/build-fastdecode.yml"
   workflow_dispatch: {}   # also runnable on demand from the Actions tab
 
+permissions:
+  contents: write          # so the job can commit the built .pyd back to the branch
+
 jobs:
   build-windows-cp39:
     runs-on: windows-latest
@@ -59,3 +62,21 @@ jobs:
           name: oasis_fastdecode-cp39-win_amd64
           path: glas/core/oasis_fastdecode*.pyd
           if-no-files-found: error
+
+      # Locked-down-machine delivery: commit the prebuilt .pyd back to the
+      # branch so it arrives via `git pull` (the artifact zip on blob storage is
+      # blocked by some corporate download policies; git over HTTPS is allowed).
+      # The .pyd path isn't in this workflow's `on.push.paths`, so this commit
+      # does not re-trigger the build (no loop); [skip ci] is belt-and-suspenders.
+      - name: Commit the .pyd into the repo (git-pull delivery)
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f glas/core/oasis_fastdecode.cp39-win_amd64.pyd
+          if git diff --cached --quiet; then
+            echo "no change to the .pyd — nothing to commit"
+          else
+            git commit -m "ci: prebuilt oasis_fastdecode.cp39-win_amd64.pyd [skip ci]"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
