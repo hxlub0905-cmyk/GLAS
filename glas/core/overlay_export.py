@@ -157,16 +157,31 @@ def export_one_image(job, rar, root, poi, cfg, out_dir,
             # same per-layer geometry (fine_align shares the make_mask raster +
             # FOV corner) so they line up pixel-for-pixel.
             gate = fine_align.mask_should_export(refined, score_thr)
-            if export_gray and geoms_fgs and gate:
-                img = fine_align.render_grayscale_from_geoms(
+            # geoms_fgs / geoms_ids are built in lockstep from the SAME per-POI
+            # geom (same order), so when both gray and label are exported the
+            # two rasters are identical — render them from ONE make_mask pass per
+            # POI instead of two. Byte-identical to the separate renderers (§7:
+            # strengthens the F15 gray↔label pixel-for-pixel invariant).
+            gray_img = lbl_img = None
+            if gate and geoms_fgs and export_gray and export_label:
+                geoms_all = [(g, fg, lid)
+                             for (g, fg), (_g, lid) in zip(geoms_fgs, geoms_ids)]
+                gray_img, lbl_img = fine_align.render_gray_and_label_from_geoms(
+                    geoms_all, anchor, W, H, nm_per_px,
+                    c.get("bg_glv", 80), c.get("blur_sigma_px", 1.0))
+            elif gate and export_gray and geoms_fgs:
+                gray_img = fine_align.render_grayscale_from_geoms(
                     geoms_fgs, anchor, W, H, nm_per_px,
                     c.get("bg_glv", 80), c.get("blur_sigma_px", 1.0))
-                name = f"{base}_gray.png"
-                cv2.imwrite(str(out_dir / name), img)
-                row["gray_png"] = name
-            if export_label and geoms_ids and gate:
-                lbl = fine_align.render_label_image(
+            elif gate and export_label and geoms_ids:
+                lbl_img = fine_align.render_label_image(
                     geoms_ids, anchor, W, H, nm_per_px)
+            if gray_img is not None:
+                name = f"{base}_gray.png"
+                cv2.imwrite(str(out_dir / name), gray_img)
+                row["gray_png"] = name
+            if lbl_img is not None:
+                lbl = lbl_img
                 name = f"{base}_label.png"
                 cv2.imwrite(str(out_dir / name), lbl)
                 row["label_png"] = name
@@ -194,18 +209,25 @@ def export_one_image(job, rar, root, poi, cfg, out_dir,
 _GE: dict = {}
 
 
-def _export_pool_init(path, wanted_layers, dtype, bbox_layer, root, poi, cfg,
-                      out_dir, export_raw, export_overlay, export_gray,
-                      export_label, score_thr):
+def _export_pool_init(path, wanted_layers, dtype, bbox_layer, prebuilt_index,
+                      root, poi, cfg, out_dir, export_raw, export_overlay,
+                      export_gray, export_label, score_thr):
     """ProcessPoolExecutor initializer: build the per-process reader + cache the
-    immutable export context. Runs once in each worker process."""
+    immutable export context. Runs once in each worker process.
+
+    ``prebuilt_index`` is the orchestrator reader's ``index_snapshot()`` over the
+    *same file* (F23 M1, now applied to export too): the name-table scan is the
+    dominant per-reader build cost on big files, so each worker skips its own
+    ``scan_cell_offsets`` rescan. It is plain dict/list/int — picklable across
+    the spawn boundary — and ``None`` falls back to a fresh scan."""
     if cv2 is not None:
         try:
             cv2.setNumThreads(1)
         except Exception:  # pragma: no cover - older cv2
             pass
     _GE["rar"] = oasis_random.RandomAccessReader(
-        path, wanted_layers=wanted_layers, dtype=dtype, bbox_layer=bbox_layer)
+        path, wanted_layers=wanted_layers, dtype=dtype, bbox_layer=bbox_layer,
+        prebuilt_index=prebuilt_index)
     _GE["root"] = root
     _GE["poi"] = poi
     _GE["cfg"] = cfg

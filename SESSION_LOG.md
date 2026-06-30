@@ -4,6 +4,41 @@
 
 ---
 
+## [2026-06-30] 效能/流程審查 + 4 個 quick win（export index、共用 raster、ROI coalesce、設定持久化）
+
+**變更類型：** 效能優化 + UX/workflow · **狀態：完成（第一批 quick wins；「大改」另議）**
+
+**動機：** user 反映「解包 oas 跟輸出會很久」，並要 workflow 改進建議。先做一輪全面審查（多 agent
+分區分析 OASIS decode / ROI random access / store-walker / Boolean / export pipeline / cache-parallel +
+UX，逐條對實際碼對抗式驗證），結論：解包瓶頸是純 Python 逐 record varint/dispatch（唯一階梯式解法是
+Cython，屬「大改」）；輸出瓶頸是**跨 pass/process 的重複重算**。本 session 先落地四個低風險、§7 安全、
+立即有感的 quick win，較大的結構改動（export 雙重 walk 融合、Cython decoder…）留待後續另開 plan。
+
+**實作：**
+- **export pool 帶 prebuilt_index（mirror F23）：** `OverlayExportWorker._run_process_pool` 的 initargs
+  加 `rar.index_snapshot()`，`overlay_export._export_pool_init` 新增 `prebuilt_index` 參數並轉給
+  `RandomAccessReader(prebuilt_index=…)`。每個 export worker 免再跑 `scan_cell_offsets`（大檔上最貴的
+  per-reader 建置成本）。§7：index 來自同檔同 reader，建構上即正確。
+- **gray+label 共用單次 make_mask raster：** 新增 `fine_align.render_gray_and_label_from_geoms`（每個
+  POI geom 只 rasterize 一次，gray 填 `fg_glv`+blur、label 填 `label_id`），`overlay_export.export_one_image`
+  在「同時匯出 gray+label」時改走此函式。與分開 render **byte-identical**，且**強化** F15 像素一致不變式。
+- **ROI 點擊 coalesce-to-latest：** 載入中再點別張 defect 不再被靜默丟棄；新 `_roi_pending_pos` 暫存最新
+  請求，`_cleanup_roi` 於前一筆載完後自動補載（與剛載的同點則略過）。避免「看 B 的 SEM 疊 A 的 overlay」。
+- **設定持久化：** PART/CHIP 經 `textActivated`（僅真人選取）存 QSettings、`_populate_parts` 還原（只還原
+  catalog 內的 entry，§7 不引入非 catalog 項、不碰 chip_corner）；各檔案對話框（KLARF/folder/export images/
+  export alignment/cache/OASIS/diagnose）以 `_dlg_start_dir`/`_dlg_remember` 記住上次目錄。
+
+**測試：** 新增 `tests/test_perf_quickwins.py` 12 項（export prebuilt_index 重用+簽章、PART/CHIP 預設/
+還原/非 catalog fallback、ROI coalesce 4 例、dialog last-dir 3 例）+ `tests/test_export_perf.py` 加
+`test_combined_gray_label_matches_separate_renderers`（blur on/off byte-identical + holes）。
+`pytest tests/` **742 passed**（730→742，+12）。
+
+**影響檔案：** `glas/core/overlay_export.py`、`glas/core/fine_align.py`、`glas/app/gds_align_tool.py`、
+`tests/test_perf_quickwins.py`(新)、`tests/test_export_perf.py`、`CLAUDE.md`、`SESSION_LOG.md`。
+**Branch：** claude/project-perf-optimization-86i8yt
+
+---
+
 ## [2026-06-29] [Bxx] Layer overlay 配色擴充：更多顏色 + 不重複（golden-angle fallback）
 
 **變更類型：** bug fix / UX（overlay 配色）· **狀態：完成**

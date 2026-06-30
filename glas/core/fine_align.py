@@ -348,6 +348,42 @@ def render_grayscale_from_geoms(poi_geoms_fgs: list, anchor: tuple,
     return img
 
 
+def render_gray_and_label_from_geoms(poi_geoms: list, anchor: tuple,
+                                     width_px: int, height_px: int,
+                                     nm_per_px: float, bg_glv: int = 80,
+                                     blur_sigma_px: float = 1.0) -> tuple:
+    """Render BOTH the simulated-GLV grayscale and the integer ROI label map
+    from a SINGLE :func:`gds_boolean.make_mask` raster per POI geom.
+
+    ``poi_geoms`` is ``[(geom, fg_glv, label_id), ...]``. The default F15/F24
+    export emits gray *and* label, and they are rasterised from the same
+    hole-preserving geometry with identical FOV corner / size / nm_per_px — so
+    :func:`render_grayscale_from_geoms` and :func:`render_label_image` each ran
+    ``make_mask`` over the very same geom independently (two ``cv2.fillPoly``
+    passes per POI). This computes each per-POI mask once and paints both
+    outputs from it: the grayscale gets ``fg_glv`` (then one Gaussian blur), the
+    label gets ``label_id`` (crisp, no blur). The result is byte-identical to
+    the two separate renderers and *strengthens* the F15 pixel-for-pixel
+    invariant — a single shared raster cannot drift between gray and label.
+    Returns ``(gray, label)``."""
+    img = np.full((height_px, width_px), np.uint8(bg_glv), dtype=np.uint8)
+    lbl = np.zeros((height_px, width_px), dtype=np.uint8)
+    x_min, y_min = _fov_min_corner(anchor, width_px, height_px, nm_per_px)
+    for geom, fg_glv, label_id in poi_geoms:
+        if geom is None or getattr(geom, "is_empty", False):
+            continue
+        m = gds_boolean.make_mask(geom, width_px=width_px, height_px=height_px,
+                                  x_min_nm=x_min, y_min_nm=y_min,
+                                  nm_per_px=nm_per_px)
+        sel = m > 0
+        img[sel] = np.uint8(fg_glv)
+        lbl[sel] = np.uint8(label_id)
+    if blur_sigma_px and blur_sigma_px > 0 and cv2 is not None:
+        k = int(max(1, round(blur_sigma_px * 3))) * 2 + 1
+        img = cv2.GaussianBlur(img, (k, k), float(blur_sigma_px))
+    return img, lbl
+
+
 def _parabola_subpx(res: np.ndarray, bx: int, by: int, axis: int) -> float:
     """Sub-pixel peak offset (∈ [-1, 1]) from a 3-point parabola fit around
     the score-map peak along ``axis`` (0 = x, 1 = y)."""

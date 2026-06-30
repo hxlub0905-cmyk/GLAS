@@ -1672,8 +1672,14 @@ class OverlayExportWorker(QObject):
         kept, like the old path)."""
         n = len(self._jobs)
         rar = self._rar
+        # F23 M1 (extended to export): hand each worker the already-built
+        # name-table index so it skips its own scan_cell_offsets rescan — the
+        # dominant per-reader build cost on big files. Plain dict/list/int over
+        # the same file the workers open, so it is correct by construction and
+        # pickles cleanly into the spawn pool.
         initargs = (str(rar._path), rar._init_wanted, rar._dtype,
-                    rar._bbox_layer, self._root, self._poi, self._cfg,
+                    rar._bbox_layer, rar.index_snapshot(),
+                    self._root, self._poi, self._cfg,
                     str(self._out_dir), self._export_raw, self._export_overlay,
                     self._export_gray, self._export_label, self._score_thr)
         ctx = mp.get_context("spawn")
@@ -3456,6 +3462,10 @@ class PartChipPanel(QFrame):
     changed = pyqtSignal()
     edit_catalog_requested = pyqtSignal()    # M4: developer-mode entry point
 
+    # Persisted last-used selection (catalog ids only — §7-safe).
+    _SETTINGS_PART = "partchip/last_part"
+    _SETTINGS_CHIP = "partchip/last_chip"
+
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setFrameShape(QFrame.Shape.NoFrame)
@@ -3501,6 +3511,11 @@ class PartChipPanel(QFrame):
             "Select the CHIP within the chosen PART. Each CHIP carries its "
             "chip-corner offset, default FOV, and overlay scale.")
         self._chip_cb.currentTextChanged.connect(self._on_chip_changed)
+        # Persist the user's pick across sessions. ``textActivated`` fires only
+        # on a real user selection (never on programmatic / restore changes), so
+        # the default-population signals can't clobber the saved value.
+        self._part_cb.textActivated.connect(self._save_selection)
+        self._chip_cb.textActivated.connect(self._save_selection)
 
         form.addWidget(part_lbl, 0, 0)
         form.addWidget(self._part_cb, 0, 1)
@@ -3667,12 +3682,50 @@ class PartChipPanel(QFrame):
             self._chip_cb.setEnabled(True)
             for pid in sorted(self._catalog):
                 self._part_cb.addItem(pid)
+            # Restore last session's PART before the CHIP dropdown is built
+            # below, so the saved CHIP can be matched within the right PART
+            # (§7-safe: only a catalog entry is ever re-selected, never a
+            # custom chip_corner; an unknown saved pick keeps the default).
+            want_part = str(QSettings("GLAS", "GLAS").value(
+                self._SETTINGS_PART, "", type=str) or "")
+            if want_part and want_part in self._catalog:
+                i = self._part_cb.findText(want_part)
+                if i >= 0:
+                    self._part_cb.setCurrentIndex(i)
             self._status_lbl.setText("")
             self._status_lbl.setStyleSheet(
                 _hint_qss(_FS_MICRO, _TK_TEXT_HINT.name(), pad="4px 0 0 0"))
         self._suppress = False
         # Drive an initial CHIP/badge update once.
         self._on_part_changed(self._part_cb.currentText())
+        # Restore last session's CHIP within the (now restored) PART.
+        self._restore_saved_chip()
+
+    def _restore_saved_chip(self) -> None:
+        """Re-select the CHIP used last session within the current PART (§7-safe:
+        catalog entry only). Falls back to the part's first CHIP when the saved
+        one is absent or the panel is in legacy-snapshot mode."""
+        if not self._catalog or self._legacy_snapshot:
+            return
+        cid = str(QSettings("GLAS", "GLAS").value(
+            self._SETTINGS_CHIP, "", type=str) or "")
+        part = self._catalog.get(self._part_cb.currentText())
+        if not cid or part is None or cid not in part.chips:
+            return
+        j = self._chip_cb.findText(cid)
+        if j >= 0:
+            self._chip_cb.setCurrentIndex(j)
+
+    def _save_selection(self, *_a) -> None:
+        """Persist the current PART/CHIP pick so it survives a restart. Wired to
+        the combos' ``textActivated`` (genuine user selection only), so the
+        default-population / restore signals never overwrite the saved value.
+        Stores catalog ids only — never a custom chip_corner (§7)."""
+        if self._legacy_snapshot:
+            return
+        s = QSettings("GLAS", "GLAS")
+        s.setValue(self._SETTINGS_PART, self._part_cb.currentText())
+        s.setValue(self._SETTINGS_CHIP, self._chip_cb.currentText())
 
     # ── Selection callbacks ─────────────────────────────────────────────
 
@@ -6009,6 +6062,11 @@ class MainWindow(QMainWindow):
         self._roi_thread: Optional[QThread] = None
         self._roi_worker = None
         self._roi_progress = None
+        # Coalesce-to-latest: if the operator clicks another defect while a ROI
+        # load is still running, the newest request is parked here and kicked
+        # from _cleanup_roi — instead of being silently dropped (which used to
+        # leave the new defect's SEM under the previous defect's overlay).
+        self._roi_pending_pos: Optional[tuple] = None
         # F11: whole-chip export worker (set during a running export).
         self._wc_thread: Optional[QThread] = None
         self._wc_worker = None
@@ -6524,16 +6582,30 @@ class MainWindow(QMainWindow):
         cta = self.sem_viewer._cta_btn
         menu.exec(cta.mapToGlobal(cta.rect().bottomLeft()))
 
+    def _dlg_start_dir(self, key: str) -> str:
+        """Last directory the operator used for the ``key`` dialog (fab paths
+        are deep and re-opened many times a shift). Empty until first use."""
+        return str(QSettings("GLAS", "GLAS").value(
+            f"dialogs/{key}", "", type=str) or "")
+
+    def _dlg_remember(self, key: str, chosen: str, *, is_dir: bool = False) -> None:
+        """Remember where the ``key`` dialog landed. ``is_dir`` keeps the chosen
+        directory itself (folder pickers); otherwise the file's parent."""
+        if chosen:
+            d = chosen if is_dir else str(Path(chosen).parent)
+            QSettings("GLAS", "GLAS").setValue(f"dialogs/{key}", d)
+
     def _on_load_klarf(self) -> None:
         # KLARF result files are commonly named <lot>.000 / .001 / … (a
         # numeric "result number" extension), so accept any three-digit
         # extension alongside the named ones.
         path, _ = QFileDialog.getOpenFileName(
-            self, "Load KLARF", "",
+            self, "Load KLARF", self._dlg_start_dir("klarf"),
             "KLARF files (*.klarf *.klf *.txt "
             "*.[0-9][0-9][0-9]);;All files (*)")
         if not path:
             return
+        self._dlg_remember("klarf", path)
         try:
             images = sem_loader.load_klarf(path)
         except Exception as exc:
@@ -6553,9 +6625,11 @@ class MainWindow(QMainWindow):
         self._update_guidance()
 
     def _on_load_folder(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Load image folder", "")
+        path = QFileDialog.getExistingDirectory(
+            self, "Load image folder", self._dlg_start_dir("folder"))
         if not path:
             return
+        self._dlg_remember("folder", path, is_dir=True)
         images = sem_loader.load_folder(path)
         self._sem_images = images
         self.sem_panel.set_images(images)
@@ -6573,12 +6647,22 @@ class MainWindow(QMainWindow):
         # Auto-load the ROI geometry around the clicked defect (option 2).
         # Only on an explicit image click — not on fine-tune / coord edits
         # (which also call _jump_to_image) — so the parser isn't re-run on
-        # every spinbox keystroke. Skipped if a load is already running.
-        if self._rar is not None and self._roi_thread is None \
-                and self._fov_w > 0 and self._fov_h > 0:
+        # every spinbox keystroke.
+        if self._rar is not None and self._fov_w > 0 and self._fov_h > 0:
             pos = self._current_image_gds()
             if pos is not None:
-                self._load_roi_around(*pos)
+                if self._roi_thread is None:
+                    self._roi_pending_pos = None
+                    self._load_roi_around(*pos)
+                else:
+                    # A load is already running — park the latest click and let
+                    # _cleanup_roi pick it up (coalesce-to-latest), rather than
+                    # dropping it. Keeps the displayed overlay matched to the
+                    # selected defect.
+                    self._roi_pending_pos = pos
+                    self._status_cursor.setText(
+                        "ROI busy — loading this defect when the current "
+                        "load finishes")
 
     def _on_coord_changed(self) -> None:
         # F21: PartChipPanel is the source of truth for chip / FOV / scale.
@@ -7278,10 +7362,14 @@ class MainWindow(QMainWindow):
             poi_layer=poi, nm_per_px=self._effective_nm_per_px())
         ext = "csv" if fmt == "csv" else "json"
         flt = "CSV (*.csv)" if fmt == "csv" else "JSON (*.json)"
+        start = str(Path(self._dlg_start_dir("export_align"))
+                    / f"alignment.{ext}") if self._dlg_start_dir(
+                        "export_align") else f"alignment.{ext}"
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export alignment", f"alignment.{ext}", flt)
+            self, "Export alignment", start, flt)
         if not path:
             return
+        self._dlg_remember("export_align", path)
         try:
             if fmt == "csv":
                 write_alignment_csv(path, rows)
@@ -7349,9 +7437,11 @@ class MainWindow(QMainWindow):
             exp_overlay = False
             exp_gray = False
             exp_label = False
-        out_dir = QFileDialog.getExistingDirectory(self, "Export images to…")
+        out_dir = QFileDialog.getExistingDirectory(
+            self, "Export images to…", self._dlg_start_dir("export_images"))
         if not out_dir:
             return
+        self._dlg_remember("export_images", out_dir, is_dir=True)
         jobs = [(im.image_id, self._coarse_gds(im),
                  self._refined.get(im.image_id),
                  str(im.file_path) if im.file_path else "", bool(im.exists))
@@ -7659,6 +7749,15 @@ class MainWindow(QMainWindow):
         if self._roi_thread is not None:
             self._roi_thread.deleteLater()
             self._roi_thread = None
+        # Coalesce-to-latest: a newer defect was clicked while that load ran —
+        # load it now (the thread slot is free again). Skip if it's the same
+        # spot we just finished loading.
+        pending = self._roi_pending_pos
+        self._roi_pending_pos = None
+        if (pending is not None and self._rar is not None
+                and self._fov_w > 0 and self._fov_h > 0
+                and pending != self._roi_center):
+            self._load_roi_around(*pending)
 
     def _on_open_roi(self) -> None:
         """F20: three-page wizard replaces the file-dialog + LayerFilter +
@@ -7952,9 +8051,11 @@ class MainWindow(QMainWindow):
                                     "Load a layout first.")
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export layer cache", "", "Layer cache (*.npz)")
+            self, "Export layer cache", self._dlg_start_dir("cache"),
+            "Layer cache (*.npz)")
         if not path:
             return
+        self._dlg_remember("cache", path)
         if not path.lower().endswith(".npz"):
             path += ".npz"
         raw = [e for e in self._doc.entries if not e.key.synthetic]
@@ -8001,9 +8102,11 @@ class MainWindow(QMainWindow):
                                     "Select at least one layer to export.")
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export OASIS", "", "OASIS (*.oas)")
+            self, "Export OASIS", self._dlg_start_dir("export_oasis"),
+            "OASIS (*.oas)")
         if not path:
             return
+        self._dlg_remember("export_oasis", path)
         if not path.lower().endswith(".oas"):
             path += ".oas"
         if dlg.scope() == "whole":
@@ -8141,9 +8244,11 @@ class MainWindow(QMainWindow):
 
     def _on_load_cache(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
-            self, "Load layer cache", "", "Layer cache (*.npz)")
+            self, "Load layer cache", self._dlg_start_dir("cache"),
+            "Layer cache (*.npz)")
         if not path:
             return
+        self._dlg_remember("cache", path)
         data = gds_layer_cache.cache_load(path)
         if data is None:
             QMessageBox.critical(self, "Invalid cache",
@@ -8274,10 +8379,11 @@ class MainWindow(QMainWindow):
         """F10: scan a chosen .oas and show a copyable diagnostic report
         (record histogram, per-layer counts, decode error context)."""
         path, _ = QFileDialog.getOpenFileName(
-            self, "Diagnose OASIS file", "",
+            self, "Diagnose OASIS file", self._dlg_start_dir("oasis"),
             "OASIS files (*.oas *.oasis);;All files (*)")
         if not path:
             return
+        self._dlg_remember("oasis", path)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             report = oasis_debug.report_file(path)

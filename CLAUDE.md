@@ -160,6 +160,10 @@ worker 內 `cv2.setNumThreads(1)` 避免「多進程 × cv2 多執行緒」overs
 走 in-thread fallback。**F23 常駐 pool**：`fine_align._BatchPool`（session 單例 `batch_pool`）在
 相同 key（path/layers/workers…）下跨多次 Run all 重用同一組 worker，索引透過 `index_snapshot()`
 一次注入（省 K× 重掃 name table）；idle 超過 300s 自動釋放（lease refcount 確保批次中不釋放）。
+**export pool 也吃 index（perf）：** `OverlayExportWorker._run_process_pool` 經 initargs 傳
+`rar.index_snapshot()` 給 `overlay_export._export_pool_init(prebuilt_index=…)`，每個 worker 免再
+`scan_cell_offsets`（同 F23 fine-align）。同時 gray+label 匯出共用單次 `make_mask` raster
+（`fine_align.render_gray_and_label_from_geoms`，與分開 render byte-identical，強化 F15 像素一致不變式）。
 
 ### 5.3 Boolean 引擎（gds_boolean）
 
