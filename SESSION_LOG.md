@@ -4,6 +4,31 @@
 
 ---
 
+## [2026-07-01] [F27 M3b hotfix] flatten 規模上限：大檔 export 卡住 regression 修復
+
+**變更類型：** bug fix（regression）· **狀態：完成（大檔回可用；大檔 native 待 M3c）**
+
+**現象：** user 真檔（E3B 13276 cells）按 Export **卡住無輸出**。根因：`flatten_cell_graph` 攤平的是**整棵可達 cell
+graph 的幾何**（ROI-independent），E3B 要 decode 全 chip（13276 cells）+ 攤平全 chip 單 layer 幾何，每個 pool worker
+各做一次 → 開跑前數十秒~數分鐘沒有任何 `[export-timing]`，體感卡死。合成樹只 2 cells 所以 M3a/b spike 飛快，真檔
+完全不同量級。
+
+**修復：** `flatten_cell_graph` 開頭加**免 decode 的規模預檢**：`len(rar._by_refnum) > _NATIVE_WALK_MAX_CELLS(4000)`
+→ 立即回 None（不碰任何幾何）→ `walk_roi_fast` fall through 到純 Python walk（M1，不卡、有 `[roi]`/`[export-timing]`
+進度）。另把 flatten 的 DFS 改 **iterative**（防深樹 RecursionError）、native-able 偵測改**短路 return None**（poly/rep/
+非D4/name-ref 一遇到就退，不再遍歷）、加 rect 數上限（`_NATIVE_WALK_MAX_RECTS=400000`）。
+
+**測試：** `test_native_walk` +1（over-cap → flatten None 且 `rar._n_loaded==0` 免 decode + walk_roi_fast fallback 仍
+byte-identical）；全 native_walk 10 passed。
+
+**影響：** E3B（>4000 cells）現在走 Python fallback（回 M1 的 ~10min，可用、不卡）；小檔仍 native。**大檔要 native
+需 M3c**（shared/persisted flatten sidecar：全 chip 攤平一次、8 worker 共享，免每 worker 重攤 + 免卡）。
+
+**影響檔案：** `glas/core/oasis_random.py`（flatten 規模上限 + iterative + 短路）、`tests/test_native_walk.py`、
+`docs/plans/F27-native-walk.md`、`SESSION_LOG.md`。**Branch：** claude/project-perf-optimization-86i8yt
+
+---
+
 ## [2026-07-01] [F27 M3b] native subtree walk 接進 export 路徑（合成端到端 95.6×、byte-identical、810 passed）
 
 **變更類型：** 效能（native walk 整合）· **狀態：M3b done；CI 出 v6 待 user 真檔驗；M3c/d（rep/poly）planned**

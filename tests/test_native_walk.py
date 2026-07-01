@@ -169,6 +169,23 @@ def test_flatten_native_able_on_plain_rect(tmp_path):
     assert orx.flatten_cell_graph(rar, 0, 17, 0) is not None
 
 
+def test_flatten_cap_falls_back_without_stall(tmp_path, monkeypatch):
+    # A graph over the cell cap must return None *without decoding* (the
+    # regression: a 13k-cell chip flattened the whole graph and stalled).
+    places = [(x * 40, y * 40) for y in range(5) for x in range(5)]
+    p = tmp_path / "cap.oas"
+    p.write_bytes(T._build_hierarchy(places))
+    rar = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
+    monkeypatch.setattr(orx, "_NATIVE_WALK_MAX_CELLS", 1)
+    assert orx.flatten_cell_graph(rar, 0, 17, 0) is None
+    assert rar._n_loaded == 0        # bailed before touching any geometry
+    # walk_roi_fast still returns the correct rects (via Python fallback)
+    roi = (-50, -50, 40 * 5 + 50, 40 * 5 + 50)
+    on = _walk_m3(p, {(17, 0)}, roi, 17, 0, True)
+    off = _walk_m3(p, {(17, 0)}, roi, 17, 0, False)
+    assert _sorted_rows(on["rects"]) == _sorted_rows(off["rects"])
+
+
 def test_flatten_not_native_able_on_repetition(tmp_path):
     # A single cell whose rect carries a type-2 repetition → not native-able.
     start = (bytes([oas.START]) + T._astr("1.0") + bytes([0])

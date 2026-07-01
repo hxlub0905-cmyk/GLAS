@@ -67,6 +67,13 @@ _FASTW = _FAST if (_FAST is not None and getattr(_FAST, "VERSION", 0) >= 5) \
 # F27 M3: native subtree walk (walk_rects_native) needs VERSION >= 6.
 _FASTWALK = _FAST if (_FAST is not None and getattr(_FAST, "VERSION", 0) >= 6) \
     else None
+# F27 M3b caps: flattening materializes the WHOLE reachable graph's geometry
+# (ROI-independent), so it's only worth it for a small graph. A big production
+# chip (E3B ~13k cells) would pay a multi-second whole-chip decode + array build
+# per worker before any output — so bail to the Python walk above these. (M3c:
+# a shared/persisted flatten will lift this.)
+_NATIVE_WALK_MAX_CELLS = 4000
+_NATIVE_WALK_MAX_RECTS = 400_000
 
 LayerKey = tuple[int, int]
 Bbox = tuple[float, float, float, float]
@@ -1457,41 +1464,57 @@ def flatten_cell_graph(rar: "RandomAccessReader", root: object,
     Those cases keep the (byte-identical) Python walk; the native kernel only
     ever runs on the plain rect / no-rep / single-layer / D4 case.
 
+    Also returns ``None`` (Python fallback) when the graph is too large to
+    flatten cheaply — flattening materializes the *whole* reachable graph's
+    geometry (ROI-independent), which on a 13k-cell production chip is a
+    multi-second whole-chip decode + array build; the batch's Python walk (with
+    its per-cell decode cache) is the right path there until a shared/persisted
+    flatten (M3c) exists. Detection short-circuits (``return None``) the instant
+    it sees a non-native-able record OR crosses a size cap — no wasted work.
+
     Layout (all grid-frame, cell-local): ``(rect_coords (ΣNr,4) f64,
     rect_off (N+1) i64, pl_target (ΣNp) i64, pl_M (ΣNp,4) f64, pl_t (ΣNp,2) f64,
     pl_off (N+1) i64, reach_bbox (N,4) f64, root_index)``."""
     key = (layer, datatype)
+    # Cheap pre-check (no decode): a chip with more indexed cells than the cap
+    # is never worth flattening — bail before touching any geometry so a big
+    # file drops straight to the Python walk with no stall.
+    if len(getattr(rar, "_by_refnum", ()) or ()) > _NATIVE_WALK_MAX_CELLS:
+        return None
     order: list = []
     idx: dict = {}
-    native_able = [True]
-
-    def visit(cid):
+    total_rects = 0
+    # Iterative DFS (no recursion-limit blow-up on deep hierarchies). Each cap
+    # crossing / non-native record returns None immediately so a big or
+    # poly/rep graph bails after decoding at most _NATIVE_WALK_MAX_CELLS cells.
+    stack = [root]
+    while stack:
+        cid = stack.pop()
         if cid in idx:
-            return
+            continue
         idx[cid] = len(order)
         order.append(cid)
+        if len(order) > _NATIVE_WALK_MAX_CELLS:
+            return None
         c = rar.load_cell(cid)
         if c.poly_count(key):
-            native_able[0] = False
-        for i in range(c.rect_count(key)):
-            if c.rect_spec_at(key, i)[4] is not None:   # rect repetition
-                native_able[0] = False
-                break
+            return None                                  # polygon
+        nr = c.rect_count(key)
+        total_rects += nr
+        if total_rects > _NATIVE_WALK_MAX_RECTS:
+            return None
+        for i in range(nr):
+            if c.rect_spec_at(key, i)[4] is not None:    # rect repetition
+                return None
         for pl in c.placements:
             if pl.repetition_type is not None:
-                native_able[0] = False
+                return None                              # placement repetition
             if not isinstance(pl.target, (int, np.integer)):
-                native_able[0] = False                  # name-ref target
-                continue
+                return None                              # name-ref target
             if Transform.from_placement(pl.x, pl.y, pl.angle, pl.flip,
                                         pl.magnification) is None:
-                native_able[0] = False                  # non-D4
-                continue
-            visit(pl.target)
-
-    visit(root)
-    if not native_able[0]:
-        return None
+                return None                              # non-D4
+            stack.append(pl.target)
 
     N = len(order)
     rect_parts: list = []

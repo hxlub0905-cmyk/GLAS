@@ -86,8 +86,14 @@ user 真實痛點＝整包 KLARF（~190 顆 defect）批次 export，實測 ~12�
       True/False 偵測 + rep 檔 fallback 展開正確）；全 `tests/` **810 passed**（native ON）+ native-absent fallback 綠。
       **量測**：合成 2 萬 instance 樹、50 次 walk 共享一 reader（含首次 flatten）：python 61431ms → native 643ms =
       **95.6×**（12.9 ms/walk）。真檔端到端待 CI v6 + user 量（rep/poly 顆走 Python fallback，涵蓋率決定實際降幅）。
-- [ ] **M3c：擴充 repetition（regular grid analytic clip 在 C）+ 多 wanted layer**；arbitrary-list rep 與 poly 仍
-      Python fallback。
+- [!] **M3b hotfix（2026-07-01）：flatten 規模上限**。真檔 E3B（13276 cells）攤平整棵 graph 幾何 → 每 worker 數十秒
+      whole-chip decode，開跑前卡住無輸出。修：`flatten_cell_graph` 免 decode 預檢 `len(rar._by_refnum) > 4000` → 回
+      None（Python fallback）+ iterative DFS + native-able 短路。**現況：大檔走 Python（M1），小檔 native。**
+- [ ] **M3c（大檔 native 的真正解）：shared / persisted flatten**。全 chip 攤平一次（decode 全 chip + CSR），存
+      sidecar（keyed on file mtime+size+layer），8 worker load 共享（免各自重攤 + 免卡）；或 lazy 幾何（只攤 graph
+      結構 + reach_bbox，rect coords 分塊 on-demand）。攤平成本一次分攤到 190 顆 → 端到端才吃得到 M3a 的天花板。
+      解除 `_NATIVE_WALK_MAX_CELLS` 上限。
+- [ ] **M3d：擴充 repetition（regular grid analytic clip 在 C）+ 多 wanted layer**；arbitrary-list rep 仍 Python。
 - [ ] **M3d：擴充 POLYGON**（point-list transform + emit 在 C）。arbitrary repetition / 非 D4 / name-ref 永遠 fallback。
 - [ ] 每階段 byte-identical（native-on vs off 逐位）+ 真檔抽樣；§7「reachable_bbox 用 load_cell_bbox、walk 用
       load_cell」不變式：攤平只用 memo 好的結果，不改剪枝語意。
