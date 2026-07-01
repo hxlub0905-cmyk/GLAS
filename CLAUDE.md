@@ -222,6 +222,9 @@ HMI 風格表達式 → 遞迴下降 parser → AST → shapely 運算。運算�
 
 ### 待辦 (Backlog)
 
+- [B01] 中文路徑無法讀取：含中文的資料夾/檔名（KLARF / layout / 輸出夾）疑似讀不到（Windows cp950 vs UTF-8
+  編碼）。user 目前用「改英文路徑」workaround。需查 `sem_loader` / `cv2.imread`（cv2 對非 ASCII 路徑需
+  `np.fromfile`+`cv2.imdecode`）/ OASIS 開檔 / 匯出寫檔的路徑編碼。中低優先（有 workaround）。
 - [F17] （原 `[F16-B]`，改號避免與「大 cell 解碼快取」F16-B 撞名）S_BOUNDING_BOX 的後續：給「大檔 + 無
   S_BOUNDING_BOX + 無 CE 層」型做一次性 bbox sweep + sidecar 快取。**目前已知三個測試檔都用不到**（會慢的大檔
   都帶 S_BOUNDING_BOX）→ 低優先。F16 方案 A 已完成（`docs/plans/F16-sbbox-roi-prune.md`）。

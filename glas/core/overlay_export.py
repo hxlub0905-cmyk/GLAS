@@ -15,6 +15,8 @@ the template preview.
 """
 from __future__ import annotations
 
+import os
+import time
 from pathlib import Path
 
 import numpy as np
@@ -242,6 +244,37 @@ def align_and_export_one_image(job, rar, root, poi_colored, cfg, out_dir,
             row["status"] = "ok"
         return fa_result, row
 
+    # F26 diagnostic: one timing line per image (gated on the same
+    # GLAS_FA_TIMING / dev-mode switch fine_align uses, so the spawned export
+    # pool workers inherit it). Splits each defect's export into read / walk /
+    # match / raster and records the worker pid + how many cells THIS image
+    # freshly decoded — so a batch shows exactly where its wall-clock goes
+    # (e.g. "walk dominates, decode ~0 after the first image" => the bottleneck
+    # is the walk/raster, not native decode). Off => the perf_counter calls and
+    # the print are skipped entirely.
+    _timing = fine_align._FA_TIMING
+    _t0 = time.perf_counter() if _timing else 0.0
+    _n0 = getattr(rar, "_n_loaded", 0) if _timing else 0
+    _seg = {"read": 0.0, "walk": 0.0, "match": 0.0, "raster": 0.0}
+    _mark = [_t0]
+
+    def _lap(key):
+        if _timing:
+            now = time.perf_counter()
+            _seg[key] = (now - _mark[0]) * 1e3
+            _mark[0] = now
+
+    def _emit():
+        if not _timing:
+            return
+        total = (time.perf_counter() - _t0) * 1e3
+        n_dec = getattr(rar, "_n_loaded", 0) - _n0
+        print(f"[export-timing] pid={os.getpid()} img={image_id}  "
+              f"read={_seg['read']:.0f} walk={_seg['walk']:.0f} "
+              f"match={_seg['match']:.0f} raster={_seg['raster']:.0f}  "
+              f"total={total:.0f}ms  cells_decoded={n_dec}  "
+              f"status={row['status']}", flush=True)
+
     if cancel_cb is not None and cancel_cb():
         return None, row
 
@@ -261,6 +294,7 @@ def align_and_export_one_image(job, rar, root, poi_colored, cfg, out_dir,
         row["status"] = "missing-file"
         fa = ((str(image_id), 0.0, 0.0, 0.0, 0, "missing-file")
               if prior_refined is None else None)
+        _emit()
         return fa, row
 
     base = _safe_name(image_id)
@@ -273,6 +307,7 @@ def align_and_export_one_image(job, rar, root, poi_colored, cfg, out_dir,
     nm_per_px = (c["nm_manual"] if (not c["nm_auto"] and
                  c["nm_manual"] > 0) else c["fov_w"] / max(1, W))
 
+    _lap("read")
     fa_result = None
     refined = prior_refined
 
@@ -306,9 +341,11 @@ def align_and_export_one_image(job, rar, root, poi_colored, cfg, out_dir,
                 geoms_fgs.append((geom, fg_glv))
                 geoms_ids.append((geom, idx + 1))
 
+        _lap("walk")
         if need_align:
             if not poi_layers:
                 # No geometry in this ROI → nothing to match against.
+                _emit()
                 return _finish(None, (str(image_id), 0.0, 0.0, 0.0, 0, "flat"))
             template = fine_align.render_composite_template(
                 poi_layers, coarse, W, H, nm_per_px,
@@ -319,6 +356,7 @@ def align_and_export_one_image(job, rar, root, poi_colored, cfg, out_dir,
             fa_result = (str(image_id), dx, dy, score, int(used_r), "ok")
             refined = (dx, dy, score)
 
+        _lap("match")
         if want_products and refined is not None:
             anchor = (coarse[0] + refined[0], coarse[1] + refined[1])
             if export_overlay and entries:
@@ -356,6 +394,8 @@ def align_and_export_one_image(job, rar, root, poi_colored, cfg, out_dir,
                 cv2.imwrite(str(out_dir / vname), view[:, :, ::-1])
                 row["label_view_png"] = vname
 
+    _lap("raster")
+    _emit()
     return _finish(refined, fa_result)
 
 

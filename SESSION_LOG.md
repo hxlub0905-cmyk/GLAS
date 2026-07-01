@@ -4,6 +4,32 @@
 
 ---
 
+## [2026-07-01] [F26 export 逐顆計時器 + 診斷] Export 融合路徑加 per-image timing；確認 native 對 export 不主導
+
+**變更類型：** 效能診斷（instrumentation）· **狀態：完成**
+
+**現象/診斷：** user 開 dev mode 按 Export 卻看不到 `[fa-timing]`。根因：`[fa-timing]` 只在
+`fine_align._fine_align_image`（「Run fine align」批次）印；**Export 走 F25 融合路徑
+`overlay_export.align_and_export_one_image`，完全沒有 timing**。且 user 的 `[roi]` log 揭露真正瓶頸：E3B
+`S_BOUNDING_BOX=0` + 無 CE 層 → `prune off`，**第一顆 walk 解碼整顆 chip（13352 cells, ~2s），之後全 memoized
+（decode 0.0s）**。整批 192 顆 ON≈11.8min / OFF≈12.3min（~4%，雜訊級；第一顆 decode ON 2.4s > OFF 1.4s 是
+mmap 冷讀 IO 非 CPU）。→ **native 解碼對此 export workload 非主導**（解碼只發生第一顆、且 IO-bound）；瓶頸在
+per-image walk（非解碼部分）+ matchTemplate + rasterize + 寫 5 PNG + IO。
+
+**做法：** `align_and_export_one_image` 加 per-image timing，gated 在**同一個** `fine_align._FA_TIMING`（dev mode
+設、spawn worker 繼承），逐顆印一行 `[export-timing] pid=.. img=<id> read/walk/match/raster total cells_decoded
+status`——拆 read（imread+raw）/ walk（ROI walk）/ match（template+matchTemplate）/ raster（overlay/gray/label
+render+imwrite），記 worker pid 與該顆新解碼 cell 數（`rar._n_loaded` delta，`getattr` 防禦 mock）。try 各 return
+前 emit（missing/flat/main）。off → perf_counter+print 全 skip；byte-identical 由 `test_export_fused` 護欄保。
+
+**測試：** 新增 `test_export_timing.py` 2 例（on→印一行含 img/status/cells_decoded、off→靜默）；
+`test_export_fused`/`f24`/`f13`/`perf_quickwins` 共 47 passed。
+
+**影響檔案：** `glas/core/overlay_export.py`、`tests/test_export_timing.py`、`CLAUDE.md`（§8 記 [B01]）、
+`SESSION_LOG.md`。**Branch：** claude/project-perf-optimization-86i8yt
+
+---
+
 ## [2026-07-01] [F26 量測 ergonomics] `_apply_fa_timing` 尊重外部設的 GLAS_FA_TIMING
 
 **變更類型：** bug fix（量測 ergonomics）· **狀態：完成**
