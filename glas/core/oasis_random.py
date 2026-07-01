@@ -60,6 +60,11 @@ try:
 except Exception:                       # pragma: no cover - no build present
     _FAST = None
 
+# F27 M1: walk helpers (roi_overlap_mask) need VERSION >= 5; keep a separate
+# gate so an older v4 .pyd still accelerates decode but not the walk.
+_FASTW = _FAST if (_FAST is not None and getattr(_FAST, "VERSION", 0) >= 5) \
+    else None
+
 LayerKey = tuple[int, int]
 Bbox = tuple[float, float, float, float]
 
@@ -1266,6 +1271,11 @@ def _roi_overlap_mask(boxes: np.ndarray, roi: Bbox) -> np.ndarray:
     """Boolean mask over (N,4) boxes that overlap ``roi`` (x0,y0,x1,y1)."""
     if boxes.shape[0] == 0:
         return np.zeros((0,), dtype=bool)
+    # F27 M1: native C loop for the hot float64 case (byte-identical), removing
+    # the 5 vectorized numpy ops' per-call dispatch the walk pays every visit.
+    if (_FASTW is not None and boxes.dtype == np.float64
+            and boxes.flags["C_CONTIGUOUS"]):
+        return _FASTW.roi_overlap_mask(boxes, roi[0], roi[1], roi[2], roi[3])
     bx1 = np.minimum(boxes[:, 0], boxes[:, 2])
     by1 = np.minimum(boxes[:, 1], boxes[:, 3])
     bx2 = np.maximum(boxes[:, 0], boxes[:, 2])

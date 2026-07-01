@@ -51,6 +51,15 @@ if str(_HERE) not in sys.path:
 
 import oasis_store  # noqa: E402
 
+# F27 M1: optional native walk helper (transform_rects_d4). Requires the F26
+# native extension at VERSION >= 5; absent → the pure-numpy 2-corner form below.
+try:
+    import oasis_fastdecode as _FASTW  # noqa: E402
+    if getattr(_FASTW, "VERSION", 0) < 5:
+        _FASTW = None
+except Exception:  # pragma: no cover - no build present
+    _FASTW = None
+
 
 # ── Affine transform (uniform scale + D4 + translation) ──────────────────────
 
@@ -152,6 +161,15 @@ class Transform:
         """
         if rects.shape[0] == 0:
             return rects.copy()
+        # F27 M1: native C loop for the hot float64 case (removes per-call numpy
+        # dispatch on the many tiny (1,4)/(K,4) walk calls). Byte-identical to
+        # the numpy 2-corner form below.
+        if (_FASTW is not None and rects.dtype == np.float64
+                and rects.flags["C_CONTIGUOUS"]):
+            m = self.M
+            return _FASTW.transform_rects_d4(
+                rects, m[0, 0], m[0, 1], m[1, 0], m[1, 1],
+                self.t[0], self.t[1])
         n = rects.shape[0]
         # Two diagonal corners: (x1,y1) and (x2,y2). (N, 2, 2).
         corners = np.empty((n, 2, 2), dtype=np.float64)

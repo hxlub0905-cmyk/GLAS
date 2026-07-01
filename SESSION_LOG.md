@@ -4,6 +4,30 @@
 
 ---
 
+## [2026-07-01] [F27 M1] native walk 熱點：transform_rects_d4 + roi_overlap_mask（合成 2.29×、byte-identical）
+
+**變更類型：** 效能（native walk）· **狀態：M1 done；CI 出 v5 待 user 真檔驗**
+
+**做法：** `oasis_fastdecode`（VERSION 4→5）加兩個純 C 函式（`libc.math` floor/ceil、memoryview、無 numpy
+dispatch）：`transform_rects_d4(rects, m00..ty)`（D4 2-corner bbox）+ `roi_overlap_mask(boxes, r0..r3)`（bool）。
+`oasis_walker.Transform.apply_to_rects`（`_FASTW`，VERSION≥5 gate）與 `oasis_random._roi_overlap_mask`（`_FASTW`）
+gated 取用：native 且 float64 C-contiguous 才走 C，否則現有 numpy（M0 2-corner）。decode 的 `_FAST`（VERSION≥4）與
+walk 的 `_FASTW`（≥5）分開 gate，讓舊 v4 .pyd 仍加速 decode 但不碰 walk。
+
+**護欄：** 新 `test_native_walk.py`：transform/mask 對「全 D4×flip×mag + 正常/亂序 corner」vs numpy byte-identical；
+`walk_roi` native-on vs off（全 ROI + tight ROI 剪枝）rects/polys 逐位相同。全 `test_oasis_*`+cellcache+export_fused
+**147 passed**（native ON）。
+
+**量測（合成 2 萬 instance 寬重複樹 walk_roi）：** pure-numpy 2729ms → **native 1190ms = 2.29×**（優於 plan 預期
+1.5–1.7×，因 native 連小陣列 (1,4)/(K,4) 的 numpy dispatch 一起消）。walk 是 export ~90% → 端到端預估 ~2×
+（12min → ~6–7min），待 user 真檔以 `[export-timing]` 驗（walk= 應同比例降）。
+
+**影響檔案：** `glas/core/oasis_fastdecode.pyx`、`glas/core/oasis_walker.py`、`glas/core/oasis_random.py`、
+`tests/test_native_walk.py`（新）、`docs/plans/F27-native-walk.md`、`SESSION_LOG.md`。
+**Branch：** claude/project-perf-optimization-86i8yt（push → CI 編 v5 `.pyd`/`.b64`，user 重抓 unpack 驗證）
+
+---
+
 ## [2026-07-01] [F27 M0] native walk 起步：定位 walk 熱點 + apply_to_rects 2-corner（D4）
 
 **變更類型：** 效能（walk 熱路徑）· **狀態：M0 done；M1 待 user 核准**

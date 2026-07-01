@@ -19,13 +19,14 @@ top of this once the delivery path is confirmed.
 """
 
 import numpy as np
+from libc.math cimport floor, ceil
 
 # Native version tag so callers / the selftest can confirm which build loaded.
 # 1 = varint helpers only (M0); 2 = + decode_rect_run (M2a-core); 3 = rect-run
 # rewinds on a repetition *before* mutating modal state; 4 = decode_rect_run
 # gained the ``started`` flag (continue a known-layer run, stopping on any
-# change) — both required by M2a-integrate's per-cell gobble.
-VERSION = 4
+# change); 5 = + F27 M1 walk helpers (transform_rects_d4 / roi_overlap_mask).
+VERSION = 5
 
 
 def decode_uvarint(const unsigned char[::1] buf, Py_ssize_t pos):
@@ -258,6 +259,73 @@ def decode_rect_run(const unsigned char[::1] buf, Py_ssize_t pos,
                     xy_relative, <long long>rid)
 
 
+def transform_rects_d4(const double[:, ::1] rects,
+                       double m00, double m01, double m10, double m11,
+                       double tx, double ty):
+    """F27 M1: transform ``(N,4)`` rects ``(x1,y1,x2,y2)`` by a D4 affine
+    ``v' = M v + t`` → new axis-aligned bboxes ``(N,4)`` float64, byte-identical
+    to ``oasis_walker.Transform.apply_to_rects`` (the 2-corner D4 form:
+    ``floor(min)`` / ``ceil(max)`` over the two transformed diagonal corners).
+
+    This is the ROI walk's single hottest op (~40% with roi_overlap_mask); a C
+    loop removes the per-call numpy dispatch that dominates the many tiny
+    ``(1,4)`` / ``(K,4)`` calls. D4 only (the sole kind the walk builds)."""
+    cdef Py_ssize_t n = rects.shape[0]
+    out_arr = np.empty((n, 4), dtype=np.float64)
+    cdef double[:, ::1] out = out_arr
+    cdef Py_ssize_t i
+    cdef double x1, y1, x2, y2, ax, ay, bx, by, xmin, xmax, ymin, ymax
+    for i in range(n):
+        x1 = rects[i, 0]; y1 = rects[i, 1]
+        x2 = rects[i, 2]; y2 = rects[i, 3]
+        # corner @ M.T + t, i.e. (m00*cx + m01*cy + tx, m10*cx + m11*cy + ty)
+        ax = m00 * x1 + m01 * y1 + tx
+        ay = m10 * x1 + m11 * y1 + ty
+        bx = m00 * x2 + m01 * y2 + tx
+        by = m10 * x2 + m11 * y2 + ty
+        if ax < bx:
+            xmin = ax; xmax = bx
+        else:
+            xmin = bx; xmax = ax
+        if ay < by:
+            ymin = ay; ymax = by
+        else:
+            ymin = by; ymax = ay
+        out[i, 0] = floor(xmin)
+        out[i, 1] = floor(ymin)
+        out[i, 2] = ceil(xmax)
+        out[i, 3] = ceil(ymax)
+    return out_arr
+
+
+def roi_overlap_mask(const double[:, ::1] boxes,
+                     double r0, double r1, double r2, double r3):
+    """F27 M1: boolean mask over ``(N,4)`` boxes overlapping ROI
+    ``(r0,r1,r2,r3)`` — byte-identical to ``oasis_random._roi_overlap_mask``
+    (normalizes each box's corners, then the 4 interval-overlap tests). Returns
+    a numpy bool array. The C loop removes the per-call numpy dispatch of the
+    5 vectorized ops the walk pays on every visit."""
+    cdef Py_ssize_t n = boxes.shape[0]
+    out_arr = np.empty(n, dtype=np.bool_)
+    cdef unsigned char[::1] out = out_arr
+    cdef Py_ssize_t i
+    cdef double a, b, c, d, bx1, bx2, by1, by2
+    for i in range(n):
+        a = boxes[i, 0]; b = boxes[i, 2]
+        if a < b:
+            bx1 = a; bx2 = b
+        else:
+            bx1 = b; bx2 = a
+        c = boxes[i, 1]; d = boxes[i, 3]
+        if c < d:
+            by1 = c; by2 = d
+        else:
+            by1 = d; by2 = c
+        out[i] = (1 if (bx1 <= r2 and bx2 >= r0 and by1 <= r3 and by2 >= r1)
+                  else 0)
+    return out_arr
+
+
 def selftest():
     """Tiny smoke check so a user can confirm a CI-built .pyd actually loaded
     and runs: ``python -c "import oasis_fastdecode as f; print(f.selftest())"``.
@@ -270,4 +338,13 @@ def selftest():
     assert s == -4 and p == 1, (s, p)
     s, p = decode_svarint(b"\x0b", 0)
     assert s == -5 and p == 1, (s, p)
+    # F27 M1 walk helpers: 90deg CCW of rect (0,0,10,20) -> bbox (-20,0,0,10).
+    r = np.array([[0.0, 0.0, 10.0, 20.0]])
+    o = transform_rects_d4(r, 0.0, -1.0, 1.0, 0.0, 0.0, 0.0)
+    assert (o[0, 0] == -20 and o[0, 1] == 0
+            and o[0, 2] == 0 and o[0, 3] == 10), o
+    m = roi_overlap_mask(np.array([[0.0, 0.0, 5.0, 5.0],
+                                   [100.0, 100.0, 110.0, 110.0]]),
+                         1.0, 1.0, 3.0, 3.0)
+    assert bool(m[0]) and not bool(m[1]), m
     return VERSION

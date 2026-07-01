@@ -37,19 +37,22 @@ user 真實痛點＝整包 KLARF（~190 顆 defect）批次 export，實測 ~12�
 - [x] 合成寬重複樹：2440ms → 2228ms（**~9%**）；`test_oasis_walker`（0/90/180/270+flip+mag+composed）+
       `test_oasis_random` 全綠（byte-identical）。
 
-### M1：native `apply_to_rects_d4` + `roi_overlap_mask`  [status: 待核准]
+### M1：native `apply_to_rects_d4` + `roi_overlap_mask`  [status: done 2026-07-01（合成 2.29×）]
 
 > profile 的最大純數值熱點（~40%）。小陣列（多為 (1,4)/(K,4)）被呼叫 6 萬次/walk，成本是 numpy dispatch
 > overhead，不是計算——native C loop 直接消。
 
-- [ ] `oasis_fastdecode`：`transform_rects_d4(rects(N,4), m00,m01,m10,m11, tx,ty) -> (N,4)`（2-corner、floor/ceil、
-      D4 精確）+ `roi_overlap_mask(boxes(N,4), roi) -> uint8(N)`。純 memoryview + C loop，無 numpy dispatch。
-- [ ] `oasis_walker.Transform.apply_to_rects` / `oasis_random._roi_overlap_mask` gated 取用（native 可用走 C，否則
-      現有 numpy）。VERSION bump。
-- [ ] 護欄：新 `test_native_walk`：native vs numpy 對隨機 D4 M + rects byte-identical；全 `test_oasis_*` 雙路徑綠。
-- [ ] **量測**：合成寬重複樹 walk_roi native vs pure；目標消掉那 40% → walk ~1.5–1.7×。CI 出 v5 `.pyd`/`.b64`，
-      user 下載重量 export（`[export-timing]` 的 walk 應同比例降）。
-- [ ] 決策點：達標 → M2；未達（Python 遞迴框架/其他主導）→ 重估 M3 或改批次化。
+- [x] `oasis_fastdecode`（VERSION 4→5）：`transform_rects_d4(rects(N,4), m00,m01,m10,m11, tx,ty) -> (N,4)`（2-corner、
+      floor/ceil、D4 精確）+ `roi_overlap_mask(boxes(N,4), r0,r1,r2,r3) -> bool(N)`。純 memoryview + C loop、
+      `libc.math` floor/ceil、無 numpy dispatch。selftest 加 90° smoke。
+- [x] `oasis_walker.Transform.apply_to_rects`（`_FASTW`，VERSION≥5）/ `oasis_random._roi_overlap_mask`（`_FASTW`）
+      gated 取用（native 且 float64 C-contig 才走 C，否則現有 numpy）。
+- [x] 護欄：新 `test_native_walk`（transform/mask 對全 D4×flip×mag byte-identical + walk_roi native-on vs off 全 ROI
+      與 tight ROI 逐位相同）；全 `test_oasis_*`+cellcache+export_fused 147 passed（native ON）。
+- [x] **量測**：合成 2 萬 instance 寬重複樹 walk_roi：pure 2729ms → native 1190ms = **2.29×**（優於預期 1.5–1.7×，
+      因 native 連小陣列 dispatch 一起消）。walk 是 export ~90% → 端到端 ~2×（12min→~6–7min）待 user 真檔驗。
+- [ ] CI 出 v5 `.pyd`/`.b64` → user 下載重量一次 export（`[export-timing]` 的 walk 應同比例降）。
+- [ ] 決策點：真檔達標 → 收工或評估 M2/M3；真檔遞迴框架主導 → M3。
 
 ### M2：native per-cell inner（rect emit + placement prune 數值段）  [status: planned]
 
