@@ -169,6 +169,34 @@ def test_flatten_native_able_on_plain_rect(tmp_path):
     assert orx.flatten_cell_graph(rar, 0, 17, 0) is not None
 
 
+def test_prewarm_persists_and_enables_native_over_cap(tmp_path, monkeypatch):
+    # M3c: a graph over the interactive cap stays Python UNTIL a prewarm builds
+    # + persists the whole-chip sidecar; a fresh reader then loads it and goes
+    # native, byte-identical.
+    monkeypatch.setenv("GLAS_CELLCACHE_DIR", str(tmp_path / "wf"))
+    places = [(x * 40, y * 40) for y in range(6) for x in range(6)]
+    p = tmp_path / "pw.oas"
+    p.write_bytes(T._build_hierarchy(places))
+    roi = (-50, -50, 40 * 6 + 50, 40 * 6 + 50)
+    monkeypatch.setattr(orx, "_NATIVE_WALK_MAX_CELLS", 1)   # simulate a big chip
+    saved = orx._FASTWALK
+    orx._FASTWALK = fast
+    try:
+        r0 = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
+        assert orx._flatten_cached(r0, 0, 17, 0) is None    # over-cap -> Python
+        flat = orx.flatten_prewarm(r0, 0, 17, 0)            # ignores cap, persists
+        assert flat is not None
+        r1 = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
+        assert orx._flatten_cached(r1, 0, 17, 0) is not None   # sidecar hit
+        on = orx.walk_roi_fast(r1, 0, roi, 17, 0)
+        orx._FASTWALK = None
+        off = orx.walk_roi_fast(orx.RandomAccessReader(
+            p, wanted_layers={(17, 0)}), 0, roi, 17, 0)
+        assert _sorted_rows(on["rects"]) == _sorted_rows(off["rects"])
+    finally:
+        orx._FASTWALK = saved
+
+
 def test_flatten_cap_falls_back_without_stall(tmp_path, monkeypatch):
     # A graph over the cell cap must return None *without decoding* (the
     # regression: a 13k-cell chip flattened the whole graph and stalled).

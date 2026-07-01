@@ -89,10 +89,16 @@ user 真實痛點＝整包 KLARF（~190 顆 defect）批次 export，實測 ~12�
 - [!] **M3b hotfix（2026-07-01）：flatten 規模上限**。真檔 E3B（13276 cells）攤平整棵 graph 幾何 → 每 worker 數十秒
       whole-chip decode，開跑前卡住無輸出。修：`flatten_cell_graph` 免 decode 預檢 `len(rar._by_refnum) > 4000` → 回
       None（Python fallback）+ iterative DFS + native-able 短路。**現況：大檔走 Python（M1），小檔 native。**
-- [ ] **M3c（大檔 native 的真正解）：shared / persisted flatten**。全 chip 攤平一次（decode 全 chip + CSR），存
-      sidecar（keyed on file mtime+size+layer），8 worker load 共享（免各自重攤 + 免卡）；或 lazy 幾何（只攤 graph
-      結構 + reach_bbox，rect coords 分塊 on-demand）。攤平成本一次分攤到 190 顆 → 端到端才吃得到 M3a 的天花板。
-      解除 `_NATIVE_WALK_MAX_CELLS` 上限。
+- [x] **M3c（大檔 native 的真正解）：shared / persisted flatten** ✓ 2026-07-01：`walkflatten_cache`（sidecar
+      .npz，keyed on file mtime+size + root + layer，共用 cellcache dir，atomic write / mtime 驗證 / 毀損當 miss / 從不
+      raise；`NOT_NATIVE` sentinel 持久化「非 native-able」判定）。`flatten_prewarm(rar, root, layer, dt)`：無視互動
+      cap（`max_cells=200000` OOM guard）build 全 chip flatten + 存 sidecar。`_flatten_cached`：in-process memo →
+      sidecar load → cap-limited build（over-cap **不存**，避免 poison prewarm）。**app（`ExportWorker._run_process_pool`）
+      在啟動 pool 前、於 orchestrator 主進程對每個 raw POI layer `flatten_prewarm` 一次**（`[export] prewarming…` log），
+      pool worker 各 `np.load` sidecar（OS page cache 共享一份）而非各自 decode 全 chip → 免 race、免卡。護欄：
+      `test_native_walk` +1（over-cap 先 Python → prewarm 持久化 → fresh reader sidecar hit 走 native byte-identical）；
+      全 `tests/` 812 passed（native ON）。**端到端**：prewarm decode 全 chip 一次（~15-30s）分攤到整批 + 每顆 native
+      walk <1ms；真檔降幅待 user 量（poly 層仍 Python fallback）。
 - [ ] **M3d：擴充 repetition（regular grid analytic clip 在 C）+ 多 wanted layer**；arbitrary-list rep 仍 Python。
 - [ ] **M3d：擴充 POLYGON**（point-list transform + emit 在 C）。arbitrary repetition / 非 D4 / name-ref 永遠 fallback。
 - [ ] 每階段 byte-identical（native-on vs off 逐位）+ 真檔抽樣；§7「reachable_bbox 用 load_cell_bbox、walk 用

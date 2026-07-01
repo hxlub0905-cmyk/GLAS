@@ -1694,6 +1694,24 @@ class ExportWorker(QObject):
         PNGs on disk are kept)."""
         n = len(self._jobs)
         rar = self._rar
+        # F27 M3c: prewarm the native-walk flatten sidecar ONCE here, in the
+        # orchestrator process, so every pool worker np.loads it (ms) instead of
+        # each decoding the whole chip. Only raw single-layer POIs are
+        # native-able; expr POIs / poly / big-graph layers just skip (their
+        # workers take the identical Python walk). Best-effort — never block the
+        # export on a prewarm failure.
+        if oasis_random._FASTWALK is not None:
+            raw_layers = sorted({(s[1], s[2]) for s, _c, _fg in self._poi
+                                 if s[0] == "raw"})
+            if raw_layers:
+                print(f"[export] prewarming native-walk flatten for "
+                      f"{len(raw_layers)} layer(s)…", flush=True)
+                for (_l, _d) in raw_layers:
+                    try:
+                        oasis_random.flatten_prewarm(rar, self._root, _l, _d)
+                    except Exception:            # noqa: BLE001
+                        pass
+                print("[export] prewarm done", flush=True)
         done = 0
         dropped = False
         rows = []

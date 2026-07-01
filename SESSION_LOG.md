@@ -4,6 +4,37 @@
 
 ---
 
+## [2026-07-01] [F27 M3c] shared/persisted flatten sidecar：讓大檔 export 也走 native walk
+
+**變更類型：** 效能（native walk 大檔化）· **狀態：M3c done；真檔端到端待 user 量**
+
+**動機：** M3b 的 flatten 攤平整棵 graph 幾何，大檔（E3B 13276 cells）每 worker 各 decode 全 chip → 卡住（已 hotfix
+成 cap→Python）。M3c 讓大檔也 native：攤平一次、8 worker 共享。
+
+**做法：**
+- **`walkflatten_cache`（新 module）**：flatten CSR ↔ sidecar `.npz`（keyed on file mtime+size + root + layer，共用
+  cellcache dir）；atomic write、mtime+size 驗證、毀損/schema 不符當 miss、從不 raise；`NOT_NATIVE` sentinel 持久化
+  「非 native-able」判定（poly/rep）避免重 walk。
+- **`flatten_prewarm(rar, root, layer, dt)`**（oasis_random）：無視互動 cap（`max_cells=200000` OOM guard）build 全
+  chip flatten + 存 sidecar。`flatten_cell_graph` 加 `max_cells`/`max_rects` 參數。`_flatten_cached` 改：memo →
+  sidecar load → cap-limited build（**over-cap 不存 sidecar**，否則會 poison 之後的 prewarm）。
+- **app（`ExportWorker._run_process_pool`）**：啟動 pool 前、在 orchestrator 主進程對每個 **raw** POI layer
+  `flatten_prewarm` 一次（`[export] prewarming native-walk flatten…` log）；pool worker 各 `np.load` 同一 sidecar
+  （OS page cache 共享一份實體記憶體）而非各自 decode 全 chip → 免 race、免卡。expr / poly / 超 OOM guard 層 skip
+  （worker 走相同 Python walk）。
+
+**測試：** `test_native_walk` +1（over-cap 先走 Python → prewarm 持久化 sidecar → fresh reader sidecar hit → native
+byte-identical）；全 `tests/` **812 passed**（native ON）。
+
+**端到端：** prewarm decode 全 chip 一次（~15-30s）分攤到整批 + 每顆 native walk <1ms；真檔降幅待 user 量（poly 層
+仍 Python fallback，純 rect 層 native）。**純 Python 改動（未動 .pyx）→ 不觸發 CI，user 重抓 ZIP 即可（v6 .pyd 已在）。**
+
+**影響檔案：** `glas/core/walkflatten_cache.py`（新）、`glas/core/oasis_random.py`（flatten_prewarm + sidecar +
+`_flatten_cached` + max_cells 參數）、`glas/app/gds_align_tool.py`（ExportWorker prewarm）、`tests/test_native_walk.py`、
+`docs/plans/F27-native-walk.md`、`SESSION_LOG.md`。**Branch：** claude/project-perf-optimization-86i8yt
+
+---
+
 ## [2026-07-01] [F27 M3b hotfix] flatten 規模上限：大檔 export 卡住 regression 修復
 
 **變更類型：** bug fix（regression）· **狀態：完成（大檔回可用；大檔 native 待 M3c）**

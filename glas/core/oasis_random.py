@@ -42,6 +42,7 @@ import oasis_streamer as oas      # noqa: E402
 import devlog                      # noqa: E402  (dev-mode coloured tags)
 import layerscan_cache             # noqa: E402  (F12 M3: layer-scan sidecar)
 import cellcache                   # noqa: E402  (F16-B: decoded-cell sidecar)
+import walkflatten_cache           # noqa: E402  (F27 M3c: native-walk flatten sidecar)
 from oasis_store import Placement  # noqa: E402
 from oasis_walker import Transform  # noqa: E402
 
@@ -1454,7 +1455,9 @@ def _clip_grid_offsets(rtype, raw, placed: np.ndarray, T: "Transform",
 
 
 def flatten_cell_graph(rar: "RandomAccessReader", root: object,
-                       layer: int, datatype: int):
+                       layer: int, datatype: int, *,
+                       max_cells: Optional[int] = None,
+                       max_rects: Optional[int] = None):
     """Flatten the ROI-independent cell graph reachable from ``root`` into CSR
     arrays for :func:`oasis_fastdecode.walk_rects_native` (F27 M3).
 
@@ -1476,17 +1479,20 @@ def flatten_cell_graph(rar: "RandomAccessReader", root: object,
     rect_off (N+1) i64, pl_target (ΣNp) i64, pl_M (ΣNp,4) f64, pl_t (ΣNp,2) f64,
     pl_off (N+1) i64, reach_bbox (N,4) f64, root_index)``."""
     key = (layer, datatype)
+    max_cells = _NATIVE_WALK_MAX_CELLS if max_cells is None else max_cells
+    max_rects = _NATIVE_WALK_MAX_RECTS if max_rects is None else max_rects
     # Cheap pre-check (no decode): a chip with more indexed cells than the cap
-    # is never worth flattening — bail before touching any geometry so a big
-    # file drops straight to the Python walk with no stall.
-    if len(getattr(rar, "_by_refnum", ()) or ()) > _NATIVE_WALK_MAX_CELLS:
+    # is never worth flattening interactively — bail before touching any geometry
+    # so a big file drops straight to the Python walk with no stall. A prewarm
+    # (M3c) raises the cap to build the whole-chip sidecar once.
+    if len(getattr(rar, "_by_refnum", ()) or ()) > max_cells:
         return None
     order: list = []
     idx: dict = {}
     total_rects = 0
     # Iterative DFS (no recursion-limit blow-up on deep hierarchies). Each cap
     # crossing / non-native record returns None immediately so a big or
-    # poly/rep graph bails after decoding at most _NATIVE_WALK_MAX_CELLS cells.
+    # poly/rep graph bails after decoding at most ``max_cells`` cells.
     stack = [root]
     while stack:
         cid = stack.pop()
@@ -1494,14 +1500,14 @@ def flatten_cell_graph(rar: "RandomAccessReader", root: object,
             continue
         idx[cid] = len(order)
         order.append(cid)
-        if len(order) > _NATIVE_WALK_MAX_CELLS:
+        if len(order) > max_cells:
             return None
         c = rar.load_cell(cid)
         if c.poly_count(key):
             return None                                  # polygon
         nr = c.rect_count(key)
         total_rects += nr
-        if total_rects > _NATIVE_WALK_MAX_RECTS:
+        if total_rects > max_rects:
             return None
         for i in range(nr):
             if c.rect_spec_at(key, i)[4] is not None:    # rect repetition
@@ -1554,16 +1560,57 @@ def flatten_cell_graph(rar: "RandomAccessReader", root: object,
 
 def _flatten_cached(rar: "RandomAccessReader", root: object,
                     layer: int, datatype: int):
-    """Memoized :func:`flatten_cell_graph` — the flatten is ROI-independent, so
-    one build per (root, layer, datatype) is reused across every defect's ROI
-    (and cached ``None`` means 'not native-able, always use Python')."""
+    """Flatten for :func:`walk_roi_fast`, memoized in-process AND on a shared
+    sidecar (F27 M3c). Order: in-process memo → sidecar (built by a prewarm or a
+    previous session/worker) → cap-limited build. A big chip with no prewarmed
+    sidecar builds cap-limited (returns ``None`` → Python walk); once a prewarm
+    (or the first worker) has persisted the whole-chip sidecar, every other
+    worker/session loads it in ms and goes native."""
     cache = getattr(rar, "_flat_cache", None)
     if cache is None:
         cache = rar._flat_cache = {}
     k = (root, layer, datatype)
-    if k not in cache:
-        cache[k] = flatten_cell_graph(rar, root, layer, datatype)
-    return cache[k]
+    if k in cache:
+        return cache[k]
+    sc = walkflatten_cache.load(rar._path, root, layer, datatype)
+    if sc is walkflatten_cache.NOT_NATIVE:
+        cache[k] = None
+        return None
+    if sc is not None:                       # persisted CSR tuple
+        cache[k] = sc
+        return sc
+    # Miss. A graph over the interactive cap is NOT persisted here — that verdict
+    # ("too big") is a cap artefact, not "not native-able"; persisting it would
+    # poison the sidecar against a later prewarm. Just return None (Python walk).
+    if len(getattr(rar, "_by_refnum", ()) or ()) > _NATIVE_WALK_MAX_CELLS:
+        cache[k] = None
+        return None
+    flat = flatten_cell_graph(rar, root, layer, datatype)   # small graph
+    cache[k] = flat
+    walkflatten_cache.save(rar._path, root, layer, datatype, flat)  # tuple / NOT_NATIVE
+    return flat
+
+
+def flatten_prewarm(rar: "RandomAccessReader", root: object,
+                    layer: int, datatype: int, *,
+                    max_cells: int = 200_000,
+                    max_rects: int = 5_000_000):
+    """F27 M3c: build the whole-chip flatten ONCE (ignoring the interactive
+    cell cap) and persist it to the shared sidecar, so the batch's pool workers
+    each ``np.load`` it instead of decoding the whole chip. Call it in the
+    orchestrator process before launching the export pool. Returns the flat
+    tuple (native-able) or ``None`` (polygon / repetition / non-D4 / over the
+    OOM guard ``max_cells`` / ``max_rects``); either verdict is persisted so
+    workers don't rebuild. Safe to call repeatedly (sidecar hit short-circuits)."""
+    sc = walkflatten_cache.load(rar._path, root, layer, datatype)
+    if sc is walkflatten_cache.NOT_NATIVE:
+        return None
+    if sc is not None:
+        return sc
+    flat = flatten_cell_graph(rar, root, layer, datatype,
+                              max_cells=max_cells, max_rects=max_rects)
+    walkflatten_cache.save(rar._path, root, layer, datatype, flat)
+    return flat
 
 
 def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
