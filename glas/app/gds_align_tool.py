@@ -8319,12 +8319,19 @@ class MainWindow(QMainWindow):
         (``[fa-timing] read / poi(walk+bool) / template / match``, per worker)
         to stdout; OFF → silent. Sets both the in-process flag (the in-thread
         small-batch path) and the ``GLAS_FA_TIMING`` env var (inherited by the
-        spawned pool workers). No env fiddling — it follows dev mode."""
+        spawned pool workers).
+
+        Also honours an *externally* set ``GLAS_FA_TIMING`` (e.g. a timing
+        launcher .bat) even with dev mode off: the env var is managed to
+        *reflect* dev mode, never to clobber an explicit external opt-in — so
+        ``set GLAS_FA_TIMING=1 && python main.py`` prints timing without needing
+        the dev-mode toggle."""
         on = bool(self._dev_mode)
-        fine_align._FA_TIMING = on
+        ext = bool(os.environ.get("GLAS_FA_TIMING"))
+        fine_align._FA_TIMING = on or ext
         if on:
             os.environ["GLAS_FA_TIMING"] = "1"
-        else:
+        elif not ext:
             os.environ.pop("GLAS_FA_TIMING", None)
 
     def _refresh_dev_ui(self) -> None:

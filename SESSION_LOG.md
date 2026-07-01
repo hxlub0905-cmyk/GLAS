@@ -4,6 +4,27 @@
 
 ---
 
+## [2026-07-01] [F26 量測 ergonomics] `_apply_fa_timing` 尊重外部設的 GLAS_FA_TIMING
+
+**變更類型：** bug fix（量測 ergonomics）· **狀態：完成**
+
+**現象：** timing .bat 用 `set GLAS_FA_TIMING=1` 啟動 GUI，但 `MainWindow._apply_fa_timing()` 在 dev mode **關**
+時會 `os.environ.pop("GLAS_FA_TIMING")` → **把外部設的環境變數清掉**，spawn worker 繼承不到 → 不印 timing。等於
+「set 環境變數」這條路被 dev-mode-off 靜默覆蓋，只能靠 dev mode（About 圖示連點 5 下彩蛋）開，對純 .bat 量測不便。
+
+**修復：** `_apply_fa_timing` 改為「env 反映 dev mode，但不覆蓋外部明確 opt-in」：`on = dev_mode`、`ext =
+bool(os.environ.get("GLAS_FA_TIMING"))`、`_FA_TIMING = on or ext`；dev on→set env=1；dev off 且無 ext→pop；dev off
+但有 ext→**保留**。於是 `set GLAS_FA_TIMING=1 && python main.py` 免開 dev mode 就印 timing。向後相容（dev on / dev
+off 無 ext 行為不變）。
+
+**測試：** 新增 `test_fa_timing_env.py` 3 例（unbound method + fake self，免建 Qt window）：dev off+ext→on 且 env 留、
+dev off 無 ext→silent 且 env 清、dev on→on 且 env=1。`pytest` 綠。
+
+**影響檔案：** `glas/app/gds_align_tool.py`、`tests/test_fa_timing_env.py`、`SESSION_LOG.md`。
+**Branch：** claude/project-perf-optimization-86i8yt
+
+---
+
 ## [2026-07-01] [F26 M2a-integrate 測試輔助] 新增 native A/B 量測 .bat + unpack 提示修正
 
 **變更類型：** 工具（測試輔助）· **狀態：完成**
