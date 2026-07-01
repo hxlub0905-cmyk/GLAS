@@ -33,6 +33,12 @@ byte-identical）；全 `tests/` **812 passed**（native ON）。
 `_flatten_cached` + max_cells 參數）、`glas/app/gds_align_tool.py`（ExportWorker prewarm）、`tests/test_native_walk.py`、
 `docs/plans/F27-native-walk.md`、`SESSION_LOG.md`。**Branch：** claude/project-perf-optimization-86i8yt
 
+**追記（同日）：** user 首測無 `[export] prewarming` log、walk 仍 Python → 根因：prewarm 只 cover 單層 raw POI，但
+user 用 **Boolean 表達式 overlay**（expr POI），其綁定層 `{letter: ("raw", layer, dt)}` 未被 prewarm → native 沒生效。
+修：ExportWorker prewarm 改成收集**所有會 walk 的層**（raw POI + expr 的 bindings + recipes bindings），並加明確診斷
+log（`native walk OFF — VERSION < 6` / `prewarm done: X/N layer(s) native-able`），讓 user 一眼看出是 VERSION 問題還是
+涵蓋問題。`test_gds_align_f24`/`export_fused`/`native_walk` 36 passed。
+
 ---
 
 ## [2026-07-01] [F27 M3b hotfix] flatten 規模上限：大檔 export 卡住 regression 修復

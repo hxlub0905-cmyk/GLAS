@@ -1696,22 +1696,42 @@ class ExportWorker(QObject):
         rar = self._rar
         # F27 M3c: prewarm the native-walk flatten sidecar ONCE here, in the
         # orchestrator process, so every pool worker np.loads it (ms) instead of
-        # each decoding the whole chip. Only raw single-layer POIs are
-        # native-able; expr POIs / poly / big-graph layers just skip (their
-        # workers take the identical Python walk). Best-effort — never block the
-        # export on a prewarm failure.
-        if oasis_random._FASTWALK is not None:
-            raw_layers = sorted({(s[1], s[2]) for s, _c, _fg in self._poi
-                                 if s[0] == "raw"})
-            if raw_layers:
-                print(f"[export] prewarming native-walk flatten for "
-                      f"{len(raw_layers)} layer(s)…", flush=True)
-                for (_l, _d) in raw_layers:
-                    try:
-                        oasis_random.flatten_prewarm(rar, self._root, _l, _d)
-                    except Exception:            # noqa: BLE001
-                        pass
-                print("[export] prewarm done", flush=True)
+        # each decoding the whole chip. Covers EVERY layer the walk will touch —
+        # raw POIs AND every ("raw", layer, dt) binding of an expression POI (and
+        # its recipes). Best-effort — never block the export on a prewarm failure.
+        if oasis_random._FASTWALK is None:
+            print("[export] native walk OFF — oasis_fastdecode is missing or "
+                  "VERSION < 6; using the Python walk", flush=True)
+        else:
+            walk_layers: set = set()
+
+            def _add_bindings(b):
+                for v in (b or {}).values():
+                    if (isinstance(v, (tuple, list)) and len(v) >= 3
+                            and v[0] == "raw"):
+                        walk_layers.add((int(v[1]), int(v[2])))
+
+            for s, _c, _fg in self._poi:
+                if s[0] == "raw":
+                    walk_layers.add((int(s[1]), int(s[2])))
+                elif s[0] == "expr":
+                    _add_bindings(s[2] if len(s) > 2 else {})
+                    for rv in ((s[3] if len(s) > 3 else {}) or {}).values():
+                        if isinstance(rv, (tuple, list)) and len(rv) >= 2:
+                            _add_bindings(rv[1])
+            print(f"[export] prewarming native-walk flatten for "
+                  f"{len(walk_layers)} layer(s): {sorted(walk_layers)} …",
+                  flush=True)
+            n_native = 0
+            for (_l, _d) in sorted(walk_layers):
+                try:
+                    if oasis_random.flatten_prewarm(
+                            rar, self._root, _l, _d) is not None:
+                        n_native += 1
+                except Exception:            # noqa: BLE001
+                    pass
+            print(f"[export] prewarm done: {n_native}/{len(walk_layers)} "
+                  f"layer(s) native-able (rest use the Python walk)", flush=True)
         done = 0
         dropped = False
         rows = []
