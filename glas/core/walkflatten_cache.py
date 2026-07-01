@@ -25,12 +25,16 @@ import numpy as np
 
 import cellcache   # reuse the cache-dir resolution
 
-_SCHEMA = 1
+_SCHEMA = 2
 
 # A distinct sentinel from "miss": the graph was flattened and found NOT
 # native-able (polygon / repetition / non-D4 / name-ref) — persist that verdict
-# so callers don't re-walk a big chip only to bail again.
+# (with the reason) so callers don't re-walk a big chip only to bail again.
 NOT_NATIVE = "not-native"
+
+# The reason string from the most recent load() that returned NOT_NATIVE
+# (diagnostic; e.g. "placement repetition (cell 42)").
+last_not_native_reason = ""
 
 
 def _key_path(src: Path, root: object, layer: int, datatype: int) -> Path:
@@ -58,6 +62,9 @@ def load(src, root, layer: int, datatype: int):
             if int(z["mtime"]) != mt or int(z["size"]) != sz:
                 return None
             if not bool(z["native_able"]):
+                global last_not_native_reason
+                last_not_native_reason = (str(z["reason"])
+                                          if "reason" in z.files else "")
                 return NOT_NATIVE
             return (z["rect_coords"], z["rect_off"], z["pl_target"], z["pl_M"],
                     z["pl_t"], z["pl_off"], z["reach_bbox"], int(z["root_index"]))
@@ -65,9 +72,9 @@ def load(src, root, layer: int, datatype: int):
         return None
 
 
-def save(src, root, layer: int, datatype: int, flat) -> bool:
-    """Persist ``flat`` (the CSR tuple, or ``None`` for a non-native verdict).
-    Atomic; never raises (returns False on failure)."""
+def save(src, root, layer: int, datatype: int, flat, reason: str = "") -> bool:
+    """Persist ``flat`` (the CSR tuple, or ``None`` for a non-native verdict
+    with an optional ``reason`` string). Atomic; never raises (returns False)."""
     src = Path(src)
     p = _key_path(src, root, layer, datatype)
     try:
@@ -76,6 +83,7 @@ def save(src, root, layer: int, datatype: int, flat) -> bool:
         fields = {"mtime": np.int64(mt), "size": np.int64(sz)}
         if flat is None:
             fields["native_able"] = np.bool_(False)
+            fields["reason"] = np.array(reason or "")
         else:
             rc, ro, pt, pM, pT, po, rb, ri = flat
             fields.update(native_able=np.bool_(True), rect_coords=rc,

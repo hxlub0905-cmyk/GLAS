@@ -39,6 +39,13 @@ user 用 **Boolean 表達式 overlay**（expr POI），其綁定層 `{letter: ("
 log（`native walk OFF — VERSION < 6` / `prewarm done: X/N layer(s) native-able`），讓 user 一眼看出是 VERSION 問題還是
 涵蓋問題。`test_gds_align_f24`/`export_fused`/`native_walk` 36 passed。
 
+**再追記（同日，定位 not-native）：** user 二測 `prewarm done: 0/4 layer(s) native-able`（VERSION 6 正確、expr 4 層
+`[(6,101),(6,102),(17,0),(206,150)]` 都被 prewarm，但全 not-native → 全 Python）。加**原因診斷**：`flatten_cell_graph`
+每個 `return None` 記 `rar._flatten_reject`（graph too large / polygon / rectangle repetition / placement repetition /
+name-ref / non-D4），`walkflatten_cache` NOT_NATIVE sidecar 存 reason（schema 1→2，舊 not-native cache 失效強制重建一次
+看原因），app prewarm 逐層印 `{l}/{d} not native-able: <reason>`。**推測 E3B（CMP D2DB）是 placement/rect repetition
+（device array）**——那正是 M3d（native 支援 repetition）要做的；待 user 重跑確認每層 reason。
+
 ---
 
 ## [2026-07-01] [F27 M3b hotfix] flatten 規模上限：大檔 export 卡住 regression 修復

@@ -1728,8 +1728,12 @@ class ExportWorker(QObject):
                     if oasis_random.flatten_prewarm(
                             rar, self._root, _l, _d) is not None:
                         n_native += 1
-                except Exception:            # noqa: BLE001
-                    pass
+                    else:
+                        print(f"[export]   {_l}/{_d} not native-able: "
+                              f"{getattr(rar, '_flatten_reject', '?')}",
+                              flush=True)
+                except Exception as _e:      # noqa: BLE001
+                    print(f"[export]   {_l}/{_d} prewarm error: {_e}", flush=True)
             print(f"[export] prewarm done: {n_native}/{len(walk_layers)} "
                   f"layer(s) native-able (rest use the Python walk)", flush=True)
         done = 0

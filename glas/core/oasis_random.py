@@ -1485,7 +1485,10 @@ def flatten_cell_graph(rar: "RandomAccessReader", root: object,
     # is never worth flattening interactively — bail before touching any geometry
     # so a big file drops straight to the Python walk with no stall. A prewarm
     # (M3c) raises the cap to build the whole-chip sidecar once.
+    rar._flatten_reject = None
     if len(getattr(rar, "_by_refnum", ()) or ()) > max_cells:
+        rar._flatten_reject = (f"graph too large "
+                               f"({len(rar._by_refnum)} > {max_cells} cells)")
         return None
     order: list = []
     idx: dict = {}
@@ -1501,27 +1504,36 @@ def flatten_cell_graph(rar: "RandomAccessReader", root: object,
         idx[cid] = len(order)
         order.append(cid)
         if len(order) > max_cells:
+            rar._flatten_reject = f"graph too large (> {max_cells} cells)"
             return None
         c = rar.load_cell(cid)
         if c.poly_count(key):
-            return None                                  # polygon
+            rar._flatten_reject = f"polygon on {layer}/{datatype} (cell {cid!r})"
+            return None
         nr = c.rect_count(key)
         total_rects += nr
         if total_rects > max_rects:
+            rar._flatten_reject = f"too many rects (> {max_rects})"
             return None
         for i in range(nr):
             if c.rect_spec_at(key, i)[4] is not None:    # rect repetition
+                rar._flatten_reject = (f"rectangle repetition on {layer}/"
+                                       f"{datatype} (cell {cid!r})")
                 return None
         for pl in c.placements:
             if pl.repetition_type is not None:
-                return None                              # placement repetition
+                rar._flatten_reject = f"placement repetition (cell {cid!r})"
+                return None
             if not isinstance(pl.target, (int, np.integer)):
-                return None                              # name-ref target
+                rar._flatten_reject = f"name-ref placement target (cell {cid!r})"
+                return None
             if Transform.from_placement(pl.x, pl.y, pl.angle, pl.flip,
                                         pl.magnification) is None:
-                return None                              # non-D4
+                rar._flatten_reject = f"non-D4 placement (cell {cid!r})"
+                return None
             stack.append(pl.target)
 
+    rar._flatten_reject = None
     N = len(order)
     rect_parts: list = []
     rect_off = np.empty(N + 1, dtype=np.int64); rect_off[0] = 0
@@ -1604,12 +1616,16 @@ def flatten_prewarm(rar: "RandomAccessReader", root: object,
     workers don't rebuild. Safe to call repeatedly (sidecar hit short-circuits)."""
     sc = walkflatten_cache.load(rar._path, root, layer, datatype)
     if sc is walkflatten_cache.NOT_NATIVE:
+        rar._flatten_reject = (walkflatten_cache.last_not_native_reason
+                               or "cached: not native-able")
         return None
     if sc is not None:
+        rar._flatten_reject = None
         return sc
     flat = flatten_cell_graph(rar, root, layer, datatype,
                               max_cells=max_cells, max_rects=max_rects)
-    walkflatten_cache.save(rar._path, root, layer, datatype, flat)
+    walkflatten_cache.save(rar._path, root, layer, datatype, flat,
+                           reason=getattr(rar, "_flatten_reject", "") or "")
     return flat
 
 
