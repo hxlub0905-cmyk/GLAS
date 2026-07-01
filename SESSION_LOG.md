@@ -36,6 +36,15 @@ export-timing 再加三個計數器：`reach_new`（本顆新算的 reachable_bb
 `instances`（repetition-instance 展開數）——`walk_roi` 末尾把 `stats.cell_visits`/`instances_visited` 累積到
 `rar._walk_cellvisits_total`/`_walk_visited_total`，export-timing 取 delta。影響檔案追加 `glas/core/oasis_random.py`。
 
+**再追加（同日，定位 walk 內部）：** 第二次量測（30 顆）確認：後續顆 `reach_new=0`（reachable_bbox memo 完美）、
+`cells_decoded≈0`（不解碼）、但 `cellvisits=1.7萬~5.4萬`（≈`instances`，無 repetition 爆炸）→ **瓶頸＝每顆 walk 遍歷
+ROI 內數萬 cell 實例（幾何本質）× 8-worker 記憶體頻寬競爭**（per-visit 0.75ms，單執行緒應 ~0.15ms，膨脹 ~5×）。
+確認 native 解碼與此無關。讀完 walk 熱路徑（`oasis_random.walk` 遞迴 + `Transform.apply_to_rects`/`_roi_overlap_mask`/
+`_clip_grid_offsets`）；micro-bench `Transform.__slots__` 建構無差（364ns，frozen dataclass `object.__setattr__`
+主導）故不加。為定位 30s 內部，walk_roi 再累積 `t_place`/`t_rect`/`t_poly` 到 rar，export-timing 印
+`[walk: place/rect/poly]`（殘差＝遞迴/transform overhead＝只有 native walk 或減 worker 能消）。下一步：user 測
+worker 數（UI「Parallel workers」設 4/2）+ 看 place/rect/poly 分佈，決定 walk 優化方向。
+
 ---
 
 ## [2026-07-01] [F26 量測 ergonomics] `_apply_fa_timing` 尊重外部設的 GLAS_FA_TIMING
