@@ -259,6 +259,9 @@ def _patch_walk(monkeypatch, square=(3000, 3000, 5000, 5000), on_layer=17):
             return {"rects": np.array([list(square)]), "polys": []}
         return {"rects": np.empty((0, 4)), "polys": []}
     monkeypatch.setattr(oasis_random, "walk_roi", fake)
+    # F27 M3: the batch/export path now goes through walk_roi_fast — patch it too
+    # so the fake reader never reaches the native flatten.
+    monkeypatch.setattr(oasis_random, "walk_roi_fast", fake, raising=False)
 
 
 class TestPoiPolysForRoi:

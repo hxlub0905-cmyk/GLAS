@@ -64,6 +64,9 @@ except Exception:                       # pragma: no cover - no build present
 # gate so an older v4 .pyd still accelerates decode but not the walk.
 _FASTW = _FAST if (_FAST is not None and getattr(_FAST, "VERSION", 0) >= 5) \
     else None
+# F27 M3: native subtree walk (walk_rects_native) needs VERSION >= 6.
+_FASTWALK = _FAST if (_FAST is not None and getattr(_FAST, "VERSION", 0) >= 6) \
+    else None
 
 LayerKey = tuple[int, int]
 Bbox = tuple[float, float, float, float]
@@ -1440,6 +1443,106 @@ def _clip_grid_offsets(rtype, raw, placed: np.ndarray, T: "Transform",
     return out
 
 
+# ── F27 M3: native subtree walk (flatten cell graph → walk_rects_native) ──────
+
+
+def flatten_cell_graph(rar: "RandomAccessReader", root: object,
+                       layer: int, datatype: int):
+    """Flatten the ROI-independent cell graph reachable from ``root`` into CSR
+    arrays for :func:`oasis_fastdecode.walk_rects_native` (F27 M3).
+
+    Returns ``None`` — caller falls back to the pure-Python walk — when the
+    subtree is NOT native-able: a POLYGON on ``(layer, datatype)``, any rect or
+    placement repetition, a non-D4 placement, or a name-ref (non-int) target.
+    Those cases keep the (byte-identical) Python walk; the native kernel only
+    ever runs on the plain rect / no-rep / single-layer / D4 case.
+
+    Layout (all grid-frame, cell-local): ``(rect_coords (ΣNr,4) f64,
+    rect_off (N+1) i64, pl_target (ΣNp) i64, pl_M (ΣNp,4) f64, pl_t (ΣNp,2) f64,
+    pl_off (N+1) i64, reach_bbox (N,4) f64, root_index)``."""
+    key = (layer, datatype)
+    order: list = []
+    idx: dict = {}
+    native_able = [True]
+
+    def visit(cid):
+        if cid in idx:
+            return
+        idx[cid] = len(order)
+        order.append(cid)
+        c = rar.load_cell(cid)
+        if c.poly_count(key):
+            native_able[0] = False
+        for i in range(c.rect_count(key)):
+            if c.rect_spec_at(key, i)[4] is not None:   # rect repetition
+                native_able[0] = False
+                break
+        for pl in c.placements:
+            if pl.repetition_type is not None:
+                native_able[0] = False
+            if not isinstance(pl.target, (int, np.integer)):
+                native_able[0] = False                  # name-ref target
+                continue
+            if Transform.from_placement(pl.x, pl.y, pl.angle, pl.flip,
+                                        pl.magnification) is None:
+                native_able[0] = False                  # non-D4
+                continue
+            visit(pl.target)
+
+    visit(root)
+    if not native_able[0]:
+        return None
+
+    N = len(order)
+    rect_parts: list = []
+    rect_off = np.empty(N + 1, dtype=np.int64); rect_off[0] = 0
+    pl_target: list = []
+    pl_M: list = []
+    pl_t: list = []
+    pl_off = np.empty(N + 1, dtype=np.int64); pl_off[0] = 0
+    reach = np.zeros((N, 4), dtype=np.float64)
+    for i, cid in enumerate(order):
+        c = rar.load_cell(cid)
+        nr = c.rect_count(key)
+        rr = (c.rects(key).astype(np.float64) if nr
+              else np.empty((0, 4), dtype=np.float64))
+        rect_parts.append(rr)
+        rect_off[i + 1] = rect_off[i] + rr.shape[0]
+        for pl in c.placements:
+            tf = Transform.from_placement(pl.x, pl.y, pl.angle, pl.flip,
+                                          pl.magnification)
+            pl_target.append(idx[pl.target])
+            pl_M.append((tf.M[0, 0], tf.M[0, 1], tf.M[1, 0], tf.M[1, 1]))
+            pl_t.append((tf.t[0], tf.t[1]))
+        pl_off[i + 1] = len(pl_target)
+        rb = rar.reachable_bbox(cid)
+        if rb is not None:
+            reach[i] = rb
+    rect_coords = (np.ascontiguousarray(np.vstack(rect_parts))
+                   if rect_parts else np.empty((0, 4), dtype=np.float64))
+    pt = np.array(pl_target, dtype=np.int64)
+    pM = (np.ascontiguousarray(np.array(pl_M, dtype=np.float64).reshape(-1, 4))
+          if pl_M else np.empty((0, 4), dtype=np.float64))
+    pT = (np.ascontiguousarray(np.array(pl_t, dtype=np.float64).reshape(-1, 2))
+          if pl_t else np.empty((0, 2), dtype=np.float64))
+    return (rect_coords, rect_off, pt, pM, pT, pl_off,
+            np.ascontiguousarray(reach), idx[root])
+
+
+def _flatten_cached(rar: "RandomAccessReader", root: object,
+                    layer: int, datatype: int):
+    """Memoized :func:`flatten_cell_graph` — the flatten is ROI-independent, so
+    one build per (root, layer, datatype) is reused across every defect's ROI
+    (and cached ``None`` means 'not native-able, always use Python')."""
+    cache = getattr(rar, "_flat_cache", None)
+    if cache is None:
+        cache = rar._flat_cache = {}
+    k = (root, layer, datatype)
+    if k not in cache:
+        cache[k] = flatten_cell_graph(rar, root, layer, datatype)
+    return cache[k]
+
+
 def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
              layer: int, datatype: int, *, max_depth: int = 128,
              cancel_cb=None) -> dict:
@@ -1844,6 +1947,48 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
         for cid, off, m in rar.errors[:8]:
             _dbg(f"  ERROR cell {cid!r} @ {off}: {m}")
     return {"rects": rects, "polys": poly_out, "stats": stats}
+
+
+def walk_roi_fast(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
+                  layer: int, datatype: int, *, max_depth: int = 128,
+                  cancel_cb=None) -> dict:
+    """F27 M3: native-accelerated ``walk_roi`` for the batch/export path.
+
+    When the graph reachable from ``root_id`` is native-able (plain rect /
+    no-rep / single-layer / D4 — :func:`_flatten_cached` returns arrays), the
+    whole ROI descent runs in one ``walk_rects_native`` C call, ~100× the Python
+    walk end-to-end (F27 M3b). The emitted-rect SET is byte-identical to
+    :func:`walk_roi` (order differs — rasterization is order-independent); polys
+    are empty (native-able excludes polygons). Otherwise (no extension, or the
+    subtree has a polygon / repetition / non-D4 / name-ref) it falls straight
+    through to the pure-Python :func:`walk_roi`, so the result is always
+    identical — the native path only ever runs where it is exact.
+
+    Kept separate from ``walk_roi`` (rather than gating inside it) so the walk's
+    diagnostic stats + placement-prep cache — which many callers/tests rely on —
+    stay untouched on the Python path. ``cancel_cb`` is honoured between images
+    by the caller; a native walk is sub-ms so it is not polled mid-walk (the
+    one-time flatten isn't polled either)."""
+    if _FASTWALK is not None:
+        flat = _flatten_cached(rar, root_id, layer, datatype)
+        if flat is not None:
+            rc, ro, pt, pM, pT, po, rb, ri = flat
+            scale = getattr(rar, "_nm_per_grid", 1.0) or 1.0
+            roi = (float(roi_bbox[0]) / scale, float(roi_bbox[1]) / scale,
+                   float(roi_bbox[2]) / scale, float(roi_bbox[3]) / scale)
+            nat = _FASTWALK.walk_rects_native(
+                rc, ro, pt, pM, pT, po, rb, int(ri),
+                float(roi[0]), float(roi[1]), float(roi[2]), float(roi[3]),
+                int(max_depth))
+            if scale != 1.0:
+                nat = nat * scale
+            rects = np.rint(nat).astype(np.int64)
+            st = RoiWalkStats()
+            st.rects_emitted = int(rects.shape[0])
+            st.sbbox_prune = bool(rar._sbbox_by_refnum or rar._sbbox_by_name)
+            return {"rects": rects, "polys": [], "stats": st}
+    return walk_roi(rar, root_id, roi_bbox, layer, datatype,
+                    max_depth=max_depth, cancel_cb=cancel_cb)
 
 
 # ── F12: layer enumeration for files with no LAYERNAME table ─────────────────

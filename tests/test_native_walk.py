@@ -120,3 +120,80 @@ def test_walk_roi_native_matches_pure_partial_roi(tmp_path):
     roi = (300, 300, 460, 460)
     on, off = _walk_both(p, {(17, 0)}, roi, 17, 0)
     assert np.array_equal(on["rects"], off["rects"])
+
+
+# ── M3: full native subtree walk (flatten + walk_rects_native, gated on
+#        walk_roi) must match the pure-Python walk (rect SET; order differs) ────
+if getattr(fast, "VERSION", 0) < 6:
+    pytest.skip("native subtree walk needs VERSION >= 6",
+                allow_module_level=True)
+
+import oasis_streamer as oas  # noqa: E402
+
+
+def _walk_m3(path, wanted, roi, layer, dt, native):
+    saved = orx._FASTWALK
+    orx._FASTWALK = (fast if native else None)
+    try:
+        rar = orx.RandomAccessReader(path, wanted_layers=wanted)
+        return orx.walk_roi_fast(rar, 0, roi, layer, dt)
+    finally:
+        orx._FASTWALK = saved
+
+
+def _sorted_rows(a):
+    return sorted(map(tuple, a.tolist()))
+
+
+@pytest.mark.parametrize("roi", [
+    (-50, -50, 40 * 40 + 50, 30 * 40 + 50),   # all
+    (300, 300, 620, 620),                      # tight (pruning)
+    (10_000_000, 10_000_000, 10_000_100, 10_000_100),  # empty
+])
+def test_walk_roi_m3_native_matches_python(tmp_path, roi):
+    places = [(x * 40, y * 40) for y in range(30) for x in range(40)]
+    p = tmp_path / "m3.oas"
+    p.write_bytes(T._build_hierarchy(places))
+    on = _walk_m3(p, {(17, 0)}, roi, 17, 0, True)
+    off = _walk_m3(p, {(17, 0)}, roi, 17, 0, False)
+    assert on["stats"].rects_emitted == off["stats"].rects_emitted
+    assert _sorted_rows(on["rects"]) == _sorted_rows(off["rects"])
+    assert on["polys"] == [] and off["polys"] == []
+
+
+def test_flatten_native_able_on_plain_rect(tmp_path):
+    places = [(x * 40, y * 40) for y in range(5) for x in range(5)]
+    p = tmp_path / "ok.oas"
+    p.write_bytes(T._build_hierarchy(places))
+    rar = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
+    assert orx.flatten_cell_graph(rar, 0, 17, 0) is not None
+
+
+def test_flatten_not_native_able_on_repetition(tmp_path):
+    # A single cell whose rect carries a type-2 repetition → not native-able.
+    start = (bytes([oas.START]) + T._astr("1.0") + bytes([0])
+             + T._uint(1000) + T._uint(0) + bytes([0] * 12))
+    pn = bytes([oas.PROPNAME_IMP]) + T._astr("S_CELL_OFFSET")
+    cn = bytes([oas.CELLNAME_IMP]) + T._astr("R")
+
+    def prop(off):
+        return (bytes([oas.PROPERTY_NORMAL, 0x16]) + T._uint(0)
+                + T._uint(8) + T._ufix(off, 4))
+
+    rect = (bytes([oas.RECTANGLE, 0x7f]) + T._uint(17) + T._uint(0)
+            + T._uint(10) + T._uint(10) + T._sint(0) + T._sint(0)
+            + bytes([2]) + T._uint(1) + T._uint(100))   # type-2 rep: 3 @ pitch 100
+    cell = bytes([oas.CELL_REFNUM]) + T._uint(0)
+    end = bytes([oas.END]) + T._uint(0)
+    hdr = oas.MAGIC + start + pn + cn + prop(0)
+    off = len(hdr)
+    p = tmp_path / "rep.oas"
+    p.write_bytes(oas.MAGIC + start + pn + cn + prop(off) + cell + rect + end)
+    rar = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
+    assert orx.flatten_cell_graph(rar, 0, 17, 0) is None   # Python fallback
+    # and walk_roi with native on must still equal native off (via fallback)
+    roi = (-100, -100, 1000, 1000)
+    on = _walk_m3(p, {(17, 0)}, roi, 17, 0, True)
+    off = _walk_m3(p, {(17, 0)}, roi, 17, 0, False)
+    assert _sorted_rows(on["rects"]) == _sorted_rows(off["rects"])
+    assert on["rects"].shape[0] == 3   # the repetition expanded (Python path)

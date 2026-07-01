@@ -77,8 +77,15 @@ user 真實痛點＝整包 KLARF（~190 顆 defect）批次 export，實測 ~12�
       `_build_hierarchy`（2 萬 no-rep instance、single leaf rect）：**rect set byte-identical**（native 20000 == python
       20000），**walk_roi 1225ms → native kernel 1ms = 1378×**（排除一次性 flatten）。**決策：≥5× 大幅通過 → 完整 M3
       GO。** 端到端會低不少（flatten 分攤 + 真檔 rep/poly 部分 fallback + 前波 reachable_bbox sweep），但遠勝 M1。
-- [ ] **M3b：接進 walk_roi（gated，rect / no-rep / single wanted-layer / all-D4）**：符合條件的 root 走 native，否則
-      現有 Python。全 `test_oasis_*` 雙路徑綠。
+- [x] **M3b：接進 export 路徑（gated）** ✓ 2026-07-01（合成端到端 95.6×）：`flatten_cell_graph`（DFS 收集 +
+      native-able 偵測：poly/rect-rep/placement-rep/非D4/name-ref → None）+ `_flatten_cached`（memo，ROI-independent，
+      跨 defect/worker 共享）+ `walk_roi_fast`（native-able 走 `walk_rects_native`、否則 fall through 到純 Python
+      `walk_roi`）。**關鍵：native gate 放 `walk_roi_fast`（fine_align._walk_roi_polys 改呼叫它），`walk_roi` 本身
+      維持純 Python 不動** → 所有 walk_roi stats/prep-cache 測試不受影響。VERSION 5→6（`_FASTWALK` gate）。護欄：
+      `test_native_walk` +5（walk_roi_fast native vs Python：full/tight/empty ROI byte-identical rect set + native-able
+      True/False 偵測 + rep 檔 fallback 展開正確）；全 `tests/` **810 passed**（native ON）+ native-absent fallback 綠。
+      **量測**：合成 2 萬 instance 樹、50 次 walk 共享一 reader（含首次 flatten）：python 61431ms → native 643ms =
+      **95.6×**（12.9 ms/walk）。真檔端到端待 CI v6 + user 量（rep/poly 顆走 Python fallback，涵蓋率決定實際降幅）。
 - [ ] **M3c：擴充 repetition（regular grid analytic clip 在 C）+ 多 wanted layer**；arbitrary-list rep 與 poly 仍
       Python fallback。
 - [ ] **M3d：擴充 POLYGON**（point-list transform + emit 在 C）。arbitrary repetition / 非 D4 / name-ref 永遠 fallback。

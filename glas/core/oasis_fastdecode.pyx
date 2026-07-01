@@ -25,8 +25,9 @@ from libc.math cimport floor, ceil
 # 1 = varint helpers only (M0); 2 = + decode_rect_run (M2a-core); 3 = rect-run
 # rewinds on a repetition *before* mutating modal state; 4 = decode_rect_run
 # gained the ``started`` flag (continue a known-layer run, stopping on any
-# change); 5 = + F27 M1 walk helpers (transform_rects_d4 / roi_overlap_mask).
-VERSION = 5
+# change); 5 = + F27 M1 walk helpers (transform_rects_d4 / roi_overlap_mask);
+# 6 = + F27 M3 native subtree walk (walk_rects_native) wired into walk_roi.
+VERSION = 6
 
 
 def decode_uvarint(const unsigned char[::1] buf, Py_ssize_t pos):

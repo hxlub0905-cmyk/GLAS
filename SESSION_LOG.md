@@ -4,6 +4,34 @@
 
 ---
 
+## [2026-07-01] [F27 M3b] native subtree walk 接進 export 路徑（合成端到端 95.6×、byte-identical、810 passed）
+
+**變更類型：** 效能（native walk 整合）· **狀態：M3b done；CI 出 v6 待 user 真檔驗；M3c/d（rep/poly）planned**
+
+**做法：** `oasis_random.flatten_cell_graph(rar, root, layer, dt)`：DFS 收集 root 可達 cell → CSR arrays（per-cell rect
+coords+offsets、placement target/base_M/base_t、reachable_bbox（重用既有 `rar.reachable_bbox`）），同時偵測
+**native-able**（poly / rect-rep / placement-rep / 非 D4 / name-ref target → 回 None）；`_flatten_cached` memo（per
+(root,layer,dt)，ROI-independent → 跨 defect/worker 共享，攤平一次全部重用）。`walk_roi_fast`：native-able 走
+`walk_rects_native`（M3a kernel）、否則 **fall through 到純 Python `walk_roi`**。**關鍵設計：native gate 放
+`walk_roi_fast`（`fine_align._walk_roi_polys` 改呼叫它），`walk_roi` 本身一字未動** → 所有 walk_roi 的 stats /
+placement-prep-cache 測試不受影響（初版把 gate 塞進 walk_roi 曾破壞 7 個 stats/prep 測試，移出後解決）。VERSION 5→6
+（`_FASTWALK` gate；walk kernel 需 ≥6）。
+
+**護欄：** `test_native_walk` +5（walk_roi_fast native vs Python：full/tight/empty ROI rect set byte-identical +
+native-able True/False 偵測 + repetition 檔走 Python fallback 且展開正確）；`test_gds_align_m4b._patch_walk` 補 patch
+`walk_roi_fast`（fake reader 不進 native flatten）。全 `tests/` **810 passed**（native ON）+ native-absent fallback
+（72 passed/1 skip）。
+
+**量測（合成 2 萬 instance 樹、50 次 walk 共享一 reader、含首次 flatten）：** python 61431ms → **native 643ms =
+95.6×**（12.9 ms/walk）。真檔端到端待 CI v6 + user 量——rep/poly 顆走 Python fallback，實際降幅取決於純 rect 涵蓋率。
+
+**影響檔案：** `glas/core/oasis_fastdecode.pyx`（VERSION 6）、`glas/core/oasis_random.py`（flatten + walk_roi_fast +
+`_FASTWALK`）、`glas/core/fine_align.py`（_walk_roi_polys → walk_roi_fast）、`tests/test_native_walk.py`、
+`tests/test_gds_align_m4b.py`、`docs/plans/F27-native-walk.md`、`SESSION_LOG.md`。
+**Branch：** claude/project-perf-optimization-86i8yt（push → CI 編 v6 `.pyd`/`.b64`，user 重抓量真檔）
+
+---
+
 ## [2026-07-01] [F27 M3a] native walk 可行性 spike：C stack-DFS kernel 天花板 1378×、byte-identical
 
 **變更類型：** 效能（native walk spike）· **狀態：M3a done（GO）；M3b 整合待做**
