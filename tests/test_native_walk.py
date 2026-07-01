@@ -268,3 +268,41 @@ def test_flatten_over_expanded_rect_cap_falls_back(tmp_path, monkeypatch):
     monkeypatch.setattr(orx, "_NATIVE_WALK_MAX_RECTS", 100)
     assert orx.flatten_cell_graph(rar, 0, 17, 0) is None
     assert "expanded rects" in (rar._flatten_reject or "")
+
+
+def test_flatten_native_able_with_placement_repetition(tmp_path):
+    # M3d: a PLACEMENT with a type-1 repetition is native-able — it expands (via
+    # repetition_offsets_np) into individual same-cell edges the kernel composes;
+    # native must equal Python. (This was the E3B blocker: "placement repetition
+    # on cell 3".) 3x3 array of a 10x10 rect at pitch 100.
+    p = tmp_path / "prep.oas"
+    p.write_bytes(T._build_big_grid(3, 3, 100))
+    rar = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
+    assert orx.flatten_cell_graph(rar, 0, 17, 0) is not None   # rep expands -> native
+    roi = (-100, -100, 1000, 1000)
+    on = _walk_m3(p, {(17, 0)}, roi, 17, 0, True)
+    off = _walk_m3(p, {(17, 0)}, roi, 17, 0, False)
+    assert _sorted_rows(on["rects"]) == _sorted_rows(off["rects"])
+    assert on["rects"].shape[0] == 9   # the 3x3 = 9 placement instances
+
+
+def test_flatten_partial_roi_with_placement_repetition(tmp_path):
+    # The native expansion still masks per-ROI: a tight ROI over one grid cell
+    # must emit exactly that instance, same as the Python analytic clip.
+    p = tmp_path / "prep.oas"
+    p.write_bytes(T._build_big_grid(5, 5, 1000))    # 25 @ pitch 1000
+    roi = (1900, 1900, 2100, 2100)                  # around the (2000,2000) cell
+    on = _walk_m3(p, {(17, 0)}, roi, 17, 0, True)
+    off = _walk_m3(p, {(17, 0)}, roi, 17, 0, False)
+    assert _sorted_rows(on["rects"]) == _sorted_rows(off["rects"])
+
+
+def test_flatten_over_expanded_placement_cap_falls_back(tmp_path, monkeypatch):
+    # A chip-spanning placement array over the expanded-placement cap must bail
+    # (Python analytic clip), not expand 1M edges into the CSR and OOM.
+    p = tmp_path / "bigprep.oas"
+    p.write_bytes(T._build_big_grid(1000, 1000, 1000))   # 1M placements
+    rar = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
+    monkeypatch.setattr(orx, "_NATIVE_WALK_MAX_PLACEMENTS", 100)
+    assert orx.flatten_cell_graph(rar, 0, 17, 0) is None
+    assert "expanded placements" in (rar._flatten_reject or "")

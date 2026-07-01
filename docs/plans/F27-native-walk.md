@@ -109,7 +109,18 @@ user 真實痛點＝整包 KLARF（~190 顆 defect）批次 export，實測 ~12�
       "expanded rects"）；全 `tests/` 813 passed。**注意**：展開式會失去 Python `_clip_grid_offsets` 的 per-ROI
       repetition 剪枝（native 對全展開 rects 逐個做 ROI mask，C 速仍 sub-ms/ROI，結果 byte-identical）。若真檔某層
       展開 > 5M 落 Python，才需第二刀「in-kernel analytic clip」（把 repetition descriptor 存進 CSR、在 C 剪枝）。
-- [ ] **M3d：多 wanted layer**；arbitrary-list rep 仍 Python（in-kernel analytic clip 為後備方案）。
+- [~] **M3d：placement repetition 走 native（展開式）** ✓ 2026-07-01（第二刀）：真檔 E3B 第一刀後 blocker 從 rect
+      移到 `placement repetition (cell 3)`（4 層全 0/4 native-able）。同法：`flatten_cell_graph` 攤平時把 placement
+      repetition 用 `repetition_offsets_np` 展開成**個別同 cell 的 placement edge**（共用 D4 矩陣、各自平移一個 grid
+      offset），native kernel 照舊 compose（與 walk_roi 每 instance 的 `composed_t = T.M @ (base.t + offset) + T.t`
+      逐位相同，byte-identical）。護欄：新增 `_NATIVE_WALK_MAX_PLACEMENTS`（interactive 2M / prewarm 8M），pre-check 用
+      `repetition_count`（analytic）累加展開後 edge 數、超上限才 fallback（避免 dense die/device array 撐爆 CSR）。
+      **關鍵觀察**：per-ROI walk 訪 32k-53k instance，這些 device array 住在共享 cell（graph 內只出現一次），所以
+      **chip-wide 展開後 edge 數 ≈ 同量級 50-200k**，遠低於 8M cap → E3B 應可 native。若某層真的爆 cap 才需第三刀
+      （in-kernel analytic clip）。護欄：`test_native_walk` +3（placement-rep native-able / partial-ROI mask /
+      over-cap fallback）；全 `tests/` 816 passed。
+- [ ] **M3d：多 wanted layer**；arbitrary-list rep 已可展開（type 10/11 走 `repetition_offsets_np` fallback），
+      唯一硬上限是 cap（超大 array 落 Python）。in-kernel analytic clip 為爆 cap 時的後備方案。
 - [ ] **M3d：擴充 POLYGON**（point-list transform + emit 在 C）。arbitrary repetition / 非 D4 / name-ref 永遠 fallback。
 - [ ] 每階段 byte-identical（native-on vs off 逐位）+ 真檔抽樣；§7「reachable_bbox 用 load_cell_bbox、walk 用
       load_cell」不變式：攤平只用 memo 好的結果，不改剪枝語意。

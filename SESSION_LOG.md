@@ -4,6 +4,39 @@
 
 ---
 
+## [2026-07-01] [F27 M3d 第二刀] placement repetition 走 native（展開式）：解 E3B cell 3 blocker
+
+**變更類型：** 效能（native walk 涵蓋率）· **狀態：第二刀 done；真檔端到端待 user 量**
+
+**動機現象：** rect-repetition（第一刀）修好後，真檔 E3B 四個 export layer 仍全 `0/4 native-able`，reject 改成
+`placement repetition (cell 3)`。`flatten_cell_graph` 舊邏輯一遇 placement repetition 就整棵交回 Python walk → 大檔仍
+吃不到 native。且 export-timing 顯示：即使 reach_bbox 已 memoize（`reach_new=0`），Python walk 仍 **23-34s/image**，因為
+要在 Python 逐個 iterate ~32k-53k placement instance（`instances=32118…49224`）—— 正是 native 要解掉的。
+
+**修復實作：** 移除 placement-repetition 的 exclusion，比照 rect 改**攤平時就地展開**：
+- 用 `oasis_streamer.repetition_offsets_np`（regular grid 向量化、arbitrary-list fallback）把每個 placement 的
+  repetition 展開成 **K 條個別 edge**（同一子 cell、共用 D4 矩陣、各自平移一個 parent-frame grid offset）。K==1 即
+  無 repetition 的原路徑，故對單一 placement byte-identical。native kernel compose 與 walk_roi 每 instance 的
+  `composed_t = T.M @ (base.t + offset) + T.t` 逐位相同。
+- 新增 `_NATIVE_WALK_MAX_PLACEMENTS`（interactive 2M / prewarm 8M）；pre-check 用 `repetition_count`（analytic，不
+  materialize）累加**展開後** edge 數、`> cap` 才 fallback，避免 dense die/device array 撐爆 CSR / 記憶體。
+- build pass 改成 per-placement 向量化累積（`np.full` target / `broadcast_to` 矩陣 / offset 加法），concat 成 CSR。
+
+**取捨與判斷：** 展開式失去 Python `_clip_grid_offsets` 的 per-ROI repetition 剪枝（native 對全展開 edge 逐個做
+reach_bbox mask），但 C 速 sub-ms/ROI 且 byte-identical。**關鍵觀察**：per-ROI 訪 32k-53k instance 的 device array 住
+共享 cell（graph 內只出現一次）→ chip-wide 展開後 edge 數 ≈ 同量級 50-200k，遠低於 8M cap → E3B 應可 native。若某層
+真爆 cap 才需第三刀（in-kernel analytic clip：repetition descriptor 存進 CSR、在 C 剪枝不展開）。
+
+**測試：** `test_native_walk` +3（`placement_repetition` native-able 且 native==Python 9 rects / `partial_roi` 緊 ROI
+只出該 instance / `over_expanded_placement_cap` monkeypatch cap=100 → None + reject 帶 "expanded placements"）；全
+`tests/` **816 passed**。**純 Python 改動（未動 .pyx）→ 不觸發 CI，user 重抓 ZIP 即可（v6 .pyd 已在）。**
+
+**影響檔案：** `glas/core/oasis_random.py`（`flatten_cell_graph` placement-rep 展開 + `_NATIVE_WALK_MAX_PLACEMENTS` +
+`flatten_prewarm` 傳參）、`tests/test_native_walk.py`、`docs/plans/F27-native-walk.md`。
+**Branch：** `claude/project-perf-optimization-86i8yt`。
+
+---
+
 ## [2026-07-01] [F27 M3d] rect repetition 走 native（展開式）：解 E3B cell 13405 blocker
 
 **變更類型：** 效能（native walk 涵蓋率）· **狀態：第一刀 done；真檔端到端待 user 量**

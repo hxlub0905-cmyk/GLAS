@@ -75,6 +75,11 @@ _FASTWALK = _FAST if (_FAST is not None and getattr(_FAST, "VERSION", 0) >= 6) \
 # a shared/persisted flatten will lift this.)
 _NATIVE_WALK_MAX_CELLS = 4000
 _NATIVE_WALK_MAX_RECTS = 400_000
+# Placement repetition is expanded into individual edges at flatten time (M3d),
+# so bound the EXPANDED edge count too — a dense device/die array must not blow
+# up the CSR. Over this, the graph drops to the Python walk (which clips each
+# repetition grid analytically per ROI). Prewarm raises it for the sidecar.
+_NATIVE_WALK_MAX_PLACEMENTS = 2_000_000
 
 LayerKey = tuple[int, int]
 Bbox = tuple[float, float, float, float]
@@ -1457,15 +1462,19 @@ def _clip_grid_offsets(rtype, raw, placed: np.ndarray, T: "Transform",
 def flatten_cell_graph(rar: "RandomAccessReader", root: object,
                        layer: int, datatype: int, *,
                        max_cells: Optional[int] = None,
-                       max_rects: Optional[int] = None):
+                       max_rects: Optional[int] = None,
+                       max_placements: Optional[int] = None):
     """Flatten the ROI-independent cell graph reachable from ``root`` into CSR
     arrays for :func:`oasis_fastdecode.walk_rects_native` (F27 M3).
 
     Returns ``None`` — caller falls back to the pure-Python walk — when the
-    subtree is NOT native-able: a POLYGON on ``(layer, datatype)``, any rect or
-    placement repetition, a non-D4 placement, or a name-ref (non-int) target.
-    Those cases keep the (byte-identical) Python walk; the native kernel only
-    ever runs on the plain rect / no-rep / single-layer / D4 case.
+    subtree is NOT native-able: a POLYGON on ``(layer, datatype)``, a non-D4
+    placement, or a name-ref (non-int) target. Rect AND placement repetition are
+    native-able: both are expanded analytically (``c.rects`` /
+    ``repetition_offsets_np``) into plain rects / individual placement edges the
+    kernel already handles, so the byte-identical native walk covers the common
+    array chip too. Those cases keep the (byte-identical) Python walk; the native
+    kernel runs on the plain-rect / D4 / single-layer case (repetition expanded).
 
     Also returns ``None`` (Python fallback) when the graph is too large to
     flatten cheaply — flattening materializes the *whole* reachable graph's
@@ -1481,6 +1490,8 @@ def flatten_cell_graph(rar: "RandomAccessReader", root: object,
     key = (layer, datatype)
     max_cells = _NATIVE_WALK_MAX_CELLS if max_cells is None else max_cells
     max_rects = _NATIVE_WALK_MAX_RECTS if max_rects is None else max_rects
+    max_placements = (_NATIVE_WALK_MAX_PLACEMENTS if max_placements is None
+                      else max_placements)
     # Cheap pre-check (no decode): a chip with more indexed cells than the cap
     # is never worth flattening interactively — bail before touching any geometry
     # so a big file drops straight to the Python walk with no stall. A prewarm
@@ -1493,6 +1504,7 @@ def flatten_cell_graph(rar: "RandomAccessReader", root: object,
     order: list = []
     idx: dict = {}
     total_rects = 0
+    total_placements = 0
     # Iterative DFS (no recursion-limit blow-up on deep hierarchies). Each cap
     # crossing / non-native record returns None immediately so a big or
     # poly/rep graph bails after decoding at most ``max_cells`` cells.
@@ -1523,9 +1535,6 @@ def flatten_cell_graph(rar: "RandomAccessReader", root: object,
             rar._flatten_reject = f"too many expanded rects (> {max_rects})"
             return None
         for pl in c.placements:
-            if pl.repetition_type is not None:
-                rar._flatten_reject = f"placement repetition (cell {cid!r})"
-                return None
             if not isinstance(pl.target, (int, np.integer)):
                 rar._flatten_reject = f"name-ref placement target (cell {cid!r})"
                 return None
@@ -1533,17 +1542,30 @@ def flatten_cell_graph(rar: "RandomAccessReader", root: object,
                                         pl.magnification) is None:
                 rar._flatten_reject = f"non-D4 placement (cell {cid!r})"
                 return None
+            # Placement repetition is fine: it expands (analytically, via
+            # repetition_offsets_np) into individual same-cell placement edges
+            # the native kernel already composes — bound the EXPANDED edge count
+            # so a chip-spanning array can't blow up the CSR. All instances share
+            # the placement's D4 matrix (angle/flip/mag), so the one non-D4 check
+            # above covers them; repetition_count is analytic (no materialization).
+            total_placements += oas.repetition_count(pl.repetition_type,
+                                                     pl.repetition_raw)
+            if total_placements > max_placements:
+                rar._flatten_reject = (f"too many expanded placements "
+                                       f"(> {max_placements})")
+                return None
             stack.append(pl.target)
 
     rar._flatten_reject = None
     N = len(order)
     rect_parts: list = []
     rect_off = np.empty(N + 1, dtype=np.int64); rect_off[0] = 0
-    pl_target: list = []
-    pl_M: list = []
-    pl_t: list = []
+    pl_tgt_parts: list = []          # per-placement (K,) int64 child indices
+    pl_M_parts: list = []            # per-placement (K,4) f64 D4 matrices
+    pl_t_parts: list = []            # per-placement (K,2) f64 translations
     pl_off = np.empty(N + 1, dtype=np.int64); pl_off[0] = 0
     reach = np.zeros((N, 4), dtype=np.float64)
+    n_edges = 0
     for i, cid in enumerate(order):
         c = rar.load_cell(cid)
         nr = c.rect_count(key)
@@ -1554,20 +1576,35 @@ def flatten_cell_graph(rar: "RandomAccessReader", root: object,
         for pl in c.placements:
             tf = Transform.from_placement(pl.x, pl.y, pl.angle, pl.flip,
                                           pl.magnification)
-            pl_target.append(idx[pl.target])
-            pl_M.append((tf.M[0, 0], tf.M[0, 1], tf.M[1, 0], tf.M[1, 1]))
-            pl_t.append((tf.t[0], tf.t[1]))
-        pl_off[i + 1] = len(pl_target)
+            # Expand this placement's repetition into K individual edges — all
+            # to the same child, sharing the D4 matrix, each translated by a grid
+            # offset (parent frame). K==1 for the no-repetition case, so this is
+            # byte-identical to the old single-edge emit there. The native kernel
+            # composes each edge exactly as walk_roi does per instance
+            # (composed_t = T.M @ (base.t + offset) + T.t).
+            offs = oas.repetition_offsets_np(pl.repetition_type,
+                                             pl.repetition_raw)      # (K,2) f64
+            K = offs.shape[0]
+            pl_tgt_parts.append(np.full(K, idx[pl.target], dtype=np.int64))
+            mrow = np.array([tf.M[0, 0], tf.M[0, 1], tf.M[1, 0], tf.M[1, 1]],
+                            dtype=np.float64)
+            pl_M_parts.append(np.broadcast_to(mrow, (K, 4)).copy())
+            t = np.empty((K, 2), dtype=np.float64)
+            t[:, 0] = tf.t[0] + offs[:, 0]; t[:, 1] = tf.t[1] + offs[:, 1]
+            pl_t_parts.append(t)
+            n_edges += K
+        pl_off[i + 1] = n_edges
         rb = rar.reachable_bbox(cid)
         if rb is not None:
             reach[i] = rb
     rect_coords = (np.ascontiguousarray(np.vstack(rect_parts))
                    if rect_parts else np.empty((0, 4), dtype=np.float64))
-    pt = np.array(pl_target, dtype=np.int64)
-    pM = (np.ascontiguousarray(np.array(pl_M, dtype=np.float64).reshape(-1, 4))
-          if pl_M else np.empty((0, 4), dtype=np.float64))
-    pT = (np.ascontiguousarray(np.array(pl_t, dtype=np.float64).reshape(-1, 2))
-          if pl_t else np.empty((0, 2), dtype=np.float64))
+    pt = (np.concatenate(pl_tgt_parts) if pl_tgt_parts
+          else np.empty(0, dtype=np.int64))
+    pM = (np.ascontiguousarray(np.concatenate(pl_M_parts))
+          if pl_M_parts else np.empty((0, 4), dtype=np.float64))
+    pT = (np.ascontiguousarray(np.concatenate(pl_t_parts))
+          if pl_t_parts else np.empty((0, 2), dtype=np.float64))
     return (rect_coords, rect_off, pt, pM, pT, pl_off,
             np.ascontiguousarray(reach), idx[root])
 
@@ -1608,14 +1645,18 @@ def _flatten_cached(rar: "RandomAccessReader", root: object,
 def flatten_prewarm(rar: "RandomAccessReader", root: object,
                     layer: int, datatype: int, *,
                     max_cells: int = 200_000,
-                    max_rects: int = 5_000_000):
+                    max_rects: int = 5_000_000,
+                    max_placements: int = 8_000_000):
     """F27 M3c: build the whole-chip flatten ONCE (ignoring the interactive
     cell cap) and persist it to the shared sidecar, so the batch's pool workers
     each ``np.load`` it instead of decoding the whole chip. Call it in the
     orchestrator process before launching the export pool. Returns the flat
-    tuple (native-able) or ``None`` (polygon / repetition / non-D4 / over the
-    OOM guard ``max_cells`` / ``max_rects``); either verdict is persisted so
-    workers don't rebuild. Safe to call repeatedly (sidecar hit short-circuits)."""
+    tuple (native-able) or ``None`` (polygon / non-D4 / name-ref / over the OOM
+    guard ``max_cells`` / ``max_rects`` / ``max_placements``); either verdict is
+    persisted so workers don't rebuild. Rect and placement repetition are
+    expanded (M3d), not rejected — the caps bound the expanded totals so a dense
+    array chip that would OOM the CSR falls back to the Python walk instead.
+    Safe to call repeatedly (sidecar hit short-circuits)."""
     sc = walkflatten_cache.load(rar._path, root, layer, datatype)
     if sc is walkflatten_cache.NOT_NATIVE:
         rar._flatten_reject = (walkflatten_cache.last_not_native_reason
@@ -1625,7 +1666,8 @@ def flatten_prewarm(rar: "RandomAccessReader", root: object,
         rar._flatten_reject = None
         return sc
     flat = flatten_cell_graph(rar, root, layer, datatype,
-                              max_cells=max_cells, max_rects=max_rects)
+                              max_cells=max_cells, max_rects=max_rects,
+                              max_placements=max_placements)
     walkflatten_cache.save(rar._path, root, layer, datatype, flat,
                            reason=getattr(rar, "_flatten_reject", "") or "")
     return flat
