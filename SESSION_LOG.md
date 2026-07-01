@@ -4,6 +4,33 @@
 
 ---
 
+## [2026-07-01] [F27 M3a] native walk 可行性 spike：C stack-DFS kernel 天花板 1378×、byte-identical
+
+**變更類型：** 效能（native walk spike）· **狀態：M3a done（GO）；M3b 整合待做**
+
+**背景：** M1 真檔只 1.2×（total 12→10min），因真檔殘差 **94%** ＝walk 遞迴框架本身（每顆 2 萬次遞迴 Python
+overhead），native M1 只碰純數值熱點。user 核准 M3（把整個遞迴 walk 搬 C）。按 plan「先量天花板再進」做 spike。
+
+**做法：** `oasis_fastdecode.walk_rects_native(...)`（VERSION 仍 5，spike 函式尚未接進 production）：吃**攤平的 cell
+graph**（CSR：per-cell rect coords+offsets、placement target/base_M/base_t（K=1 no-rep）、reachable bbox），用
+**explicit-stack DFS**（非遞迴）在 C 裡遍歷——rect emit（2-corner D4 transform + floor/ceil + exact roi mask）、
+placement prune（compose + child reach-bbox transform + mask）、depth-bound cycle 防護。只支援常見情形（rect / no-rep /
+single layer / D4），其餘 M3 後續階段擴充或 Python fallback。
+
+**量測（合成 `_build_hierarchy` 2 萬 no-rep instance、single leaf rect）：** rect set **byte-identical**（native
+20000 == python 20000）；`walk_roi` **1225ms → native kernel 1ms = 1378×**（排除一次性 flatten）。**決策點 ≥5× 大幅
+通過 → 完整 M3 GO。** 端到端會低不少（flatten 分攤 + 真檔 rep/poly 部分 fallback + 前波 reachable_bbox sweep），
+但遠勝 M1。
+
+**下一步 M3b：** `_flatten_cell_graph` 整合進 RandomAccessReader（memo，ROI-independent，可跨 ROI/worker 共享）+
+`walk_roi` gated（符合 rect/no-rep/single-layer/D4 走 native，否則 Python）+ byte-identical 護欄（native-on vs off）+
+真檔量測 → CI 出新 .pyd。fallback 邊界：poly / arbitrary rep / 非 D4 / name-ref 交回 Python。
+
+**影響檔案：** `glas/core/oasis_fastdecode.pyx`（walk_rects_native spike）、`docs/plans/F27-native-walk.md`、
+`SESSION_LOG.md`。**Branch：** claude/project-perf-optimization-86i8yt
+
+---
+
 ## [2026-07-01] [F27 M1] native walk 熱點：transform_rects_d4 + roi_overlap_mask（合成 2.29×、byte-identical）
 
 **變更類型：** 效能（native walk）· **狀態：M1 done；CI 出 v5 待 user 真檔驗**

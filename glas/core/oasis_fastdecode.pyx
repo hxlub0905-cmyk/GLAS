@@ -326,6 +326,110 @@ def roi_overlap_mask(const double[:, ::1] boxes,
     return out_arr
 
 
+def walk_rects_native(const double[:, ::1] rect_coords,
+                      const long long[::1] rect_off,
+                      const long long[::1] pl_target,
+                      const double[:, ::1] pl_M,
+                      const double[:, ::1] pl_t,
+                      const long long[::1] pl_off,
+                      const double[:, ::1] reach_bbox,
+                      long long root_index,
+                      double r0, double r1, double r2, double r3,
+                      int max_depth):
+    """F27 M3a spike: native explicit-stack DFS over a *flattened* cell graph,
+    emitting D4-transformed rects that hit the ROI. Supports only the common
+    case (rect geometry, K=1 no-repetition placements, single wanted layer, D4);
+    the Python walk owns everything else. Byte-identical emitted-rect SET to
+    ``walk_roi`` on that case (order differs — LIFO stack vs recursion — so
+    compare sorted). Proves the ceiling before the full M3 port."""
+    cdef Py_ssize_t out_cap = 1024, out_n = 0
+    out_arr = np.empty((out_cap, 4), dtype=np.float64)
+    cdef double[:, ::1] out = out_arr
+    cdef Py_ssize_t st_cap = 1024, st_n = 0
+    # stack row: ci, m00,m01,m10,m11, t0,t1, depth  (ci/depth carried as double)
+    st_arr = np.empty((st_cap, 8), dtype=np.float64)
+    cdef double[:, ::1] st = st_arr
+    st[0, 0] = root_index
+    st[0, 1] = 1; st[0, 2] = 0; st[0, 3] = 0; st[0, 4] = 1
+    st[0, 5] = 0; st[0, 6] = 0; st[0, 7] = 0
+    st_n = 1
+    cdef Py_ssize_t ci, p, r, child
+    cdef double m00, m01, m10, m11, t0, t1
+    cdef int depth
+    cdef double x1, y1, x2, y2, ax, ay, bx, by, xmin, xmax, ymin, ymax
+    cdef double bm00, bm01, bm10, bm11, bt0, bt1
+    cdef double cm00, cm01, cm10, cm11, ct0, ct1
+    while st_n > 0:
+        st_n -= 1
+        ci = <Py_ssize_t>st[st_n, 0]
+        m00 = st[st_n, 1]; m01 = st[st_n, 2]; m10 = st[st_n, 3]; m11 = st[st_n, 4]
+        t0 = st[st_n, 5]; t1 = st[st_n, 6]; depth = <int>st[st_n, 7]
+        # ── emit this cell's rects (D4 2-corner bbox + exact ROI mask) ──
+        for r in range(rect_off[ci], rect_off[ci + 1]):
+            x1 = rect_coords[r, 0]; y1 = rect_coords[r, 1]
+            x2 = rect_coords[r, 2]; y2 = rect_coords[r, 3]
+            ax = m00 * x1 + m01 * y1 + t0; ay = m10 * x1 + m11 * y1 + t1
+            bx = m00 * x2 + m01 * y2 + t0; by = m10 * x2 + m11 * y2 + t1
+            if ax < bx:
+                xmin = ax; xmax = bx
+            else:
+                xmin = bx; xmax = ax
+            if ay < by:
+                ymin = ay; ymax = by
+            else:
+                ymin = by; ymax = ay
+            xmin = floor(xmin); ymin = floor(ymin)
+            xmax = ceil(xmax); ymax = ceil(ymax)
+            if xmin <= r2 and xmax >= r0 and ymin <= r3 and ymax >= r1:
+                if out_n == out_cap:
+                    out_cap = out_cap * 2
+                    out2 = np.empty((out_cap, 4), dtype=np.float64)
+                    out2[:out_n] = out_arr[:out_n]
+                    out_arr = out2; out = out_arr
+                out[out_n, 0] = xmin; out[out_n, 1] = ymin
+                out[out_n, 2] = xmax; out[out_n, 3] = ymax
+                out_n += 1
+        if depth >= max_depth:
+            continue
+        # ── descend placements (compose transform, prune child by reach bbox) ──
+        for p in range(pl_off[ci], pl_off[ci + 1]):
+            child = <Py_ssize_t>pl_target[p]
+            bm00 = pl_M[p, 0]; bm01 = pl_M[p, 1]
+            bm10 = pl_M[p, 2]; bm11 = pl_M[p, 3]
+            bt0 = pl_t[p, 0]; bt1 = pl_t[p, 1]
+            cm00 = m00 * bm00 + m01 * bm10; cm01 = m00 * bm01 + m01 * bm11
+            cm10 = m10 * bm00 + m11 * bm10; cm11 = m10 * bm01 + m11 * bm11
+            ct0 = m00 * bt0 + m01 * bt1 + t0
+            ct1 = m10 * bt0 + m11 * bt1 + t1
+            x1 = reach_bbox[child, 0]; y1 = reach_bbox[child, 1]
+            x2 = reach_bbox[child, 2]; y2 = reach_bbox[child, 3]
+            ax = cm00 * x1 + cm01 * y1 + ct0; ay = cm10 * x1 + cm11 * y1 + ct1
+            bx = cm00 * x2 + cm01 * y2 + ct0; by = cm10 * x2 + cm11 * y2 + ct1
+            if ax < bx:
+                xmin = ax; xmax = bx
+            else:
+                xmin = bx; xmax = ax
+            if ay < by:
+                ymin = ay; ymax = by
+            else:
+                ymin = by; ymax = ay
+            xmin = floor(xmin); ymin = floor(ymin)
+            xmax = ceil(xmax); ymax = ceil(ymax)
+            if xmin <= r2 and xmax >= r0 and ymin <= r3 and ymax >= r1:
+                if st_n == st_cap:
+                    st_cap = st_cap * 2
+                    st2 = np.empty((st_cap, 8), dtype=np.float64)
+                    st2[:st_n] = st_arr[:st_n]
+                    st_arr = st2; st = st_arr
+                st[st_n, 0] = child
+                st[st_n, 1] = cm00; st[st_n, 2] = cm01
+                st[st_n, 3] = cm10; st[st_n, 4] = cm11
+                st[st_n, 5] = ct0; st[st_n, 6] = ct1
+                st[st_n, 7] = depth + 1
+                st_n += 1
+    return out_arr[:out_n]
+
+
 def selftest():
     """Tiny smoke check so a user can confirm a CI-built .pyd actually loaded
     and runs: ``python -c "import oasis_fastdecode as f; print(f.selftest())"``.

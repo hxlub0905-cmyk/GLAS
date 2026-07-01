@@ -61,12 +61,29 @@ user 真實痛點＝整包 KLARF（~190 顆 defect）批次 export，實測 ~12�
 - [ ] `_clip_grid_offsets` 的 regular-grid analytic clip 也在 C（arbitrary-list fallback 留 Python）。
 - [ ] gated + byte-identical；量測後定 M3。
 
-### M3：native 子樹 walk（攤平 cell graph）  [status: planned / 高風險]
+### M3：native 子樹 walk（攤平 cell graph）  [status: in progress — user 核准 2026-07-01]
 
-- [ ] 把 memo 好的 cell graph（per-cell rect arrays + placement matrices + reachable bbox）攤平成 C 結構，整個
-      ROI 子樹遍歷在一次 native call（消 walk 遞迴的 Python overhead 2.7s）。最大收益、最高風險（要 port 剪枝
-      不變式、repetition、cycle 偵測，且與 §7「CE 邊界 early-stop / reachable_bbox」不變式對齊）。
-- [ ] 全 `test_oasis_*` 雙路徑綠 + 真檔 byte-identical 抽樣。
+> **真檔 M1 結果驅動：** M1 真檔 walk 30s→22s（1.35×，非合成 2.29×），因真檔殘差 **94%**＝walk 遞迴框架本身
+> （每顆 2 萬次遞迴：`walk()` 呼叫 + `_clip_grid_offsets` + `composed_M/t` + `load_cell` memo + `Transform` 建構），
+> native M1 只碰得到純數值熱點。要砍 94% 必須把整個遞迴下降搬 C。目標 walk ~3× → total 12min→~5min。
+>
+> **策略：攤平 + C stack-walk + Python fallback 邊界。** memo 好的 cell graph（ROI-independent）攤平成 CSR C 陣列
+> （一次性 per reader），native 用 explicit stack 做 DFS；native 只吃「能吃的」情形，碰到不支援的（poly、arbitrary
+> repetition、非 D4、name-ref target）就把該子樹交回 Python walk（byte-identical 由 fallback 保證）。每階段先量再進。
+
+- [x] **M3a：可行性 spike（先量天花板）** ✓ 2026-07-01：`oasis_fastdecode.walk_rects_native(rect_coords/off,
+      pl_target/M/t/off, reach_bbox, root, roi, max_depth)` — C explicit-stack DFS（rect emit：2-corner transform +
+      floor/ceil + exact roi mask；placement prune：compose + child reach-bbox transform + mask；depth-bound）。合成
+      `_build_hierarchy`（2 萬 no-rep instance、single leaf rect）：**rect set byte-identical**（native 20000 == python
+      20000），**walk_roi 1225ms → native kernel 1ms = 1378×**（排除一次性 flatten）。**決策：≥5× 大幅通過 → 完整 M3
+      GO。** 端到端會低不少（flatten 分攤 + 真檔 rep/poly 部分 fallback + 前波 reachable_bbox sweep），但遠勝 M1。
+- [ ] **M3b：接進 walk_roi（gated，rect / no-rep / single wanted-layer / all-D4）**：符合條件的 root 走 native，否則
+      現有 Python。全 `test_oasis_*` 雙路徑綠。
+- [ ] **M3c：擴充 repetition（regular grid analytic clip 在 C）+ 多 wanted layer**；arbitrary-list rep 與 poly 仍
+      Python fallback。
+- [ ] **M3d：擴充 POLYGON**（point-list transform + emit 在 C）。arbitrary repetition / 非 D4 / name-ref 永遠 fallback。
+- [ ] 每階段 byte-identical（native-on vs off 逐位）+ 真檔抽樣；§7「reachable_bbox 用 load_cell_bbox、walk 用
+      load_cell」不變式：攤平只用 memo 好的結果，不改剪枝語意。
 
 ---
 
