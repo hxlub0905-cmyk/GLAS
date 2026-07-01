@@ -255,6 +255,14 @@ def align_and_export_one_image(job, rar, root, poi_colored, cfg, out_dir,
     _timing = fine_align._FA_TIMING
     _t0 = time.perf_counter() if _timing else 0.0
     _n0 = getattr(rar, "_n_loaded", 0) if _timing else 0
+    # Extra walk counters (F26 diagnosis): reachable_bbox entries newly computed
+    # this image, cells the walk actually visited, and repetition-instances
+    # visited — so a "walk dominates but decode is ~0" line tells us WHICH:
+    # bbox recompute (reach_new big), whole-tree traversal (cellvisits big), or
+    # repetition blow-up (instances big).
+    _r0 = len(getattr(rar, "_reach_memo", ())) if _timing else 0
+    _cv0 = getattr(rar, "_walk_cellvisits_total", 0) if _timing else 0
+    _iv0 = getattr(rar, "_walk_visited_total", 0) if _timing else 0
     _seg = {"read": 0.0, "walk": 0.0, "match": 0.0, "raster": 0.0}
     _mark = [_t0]
 
@@ -269,11 +277,15 @@ def align_and_export_one_image(job, rar, root, poi_colored, cfg, out_dir,
             return
         total = (time.perf_counter() - _t0) * 1e3
         n_dec = getattr(rar, "_n_loaded", 0) - _n0
+        reach_new = len(getattr(rar, "_reach_memo", ())) - _r0
+        cellvisits = getattr(rar, "_walk_cellvisits_total", 0) - _cv0
+        instances = getattr(rar, "_walk_visited_total", 0) - _iv0
         print(f"[export-timing] pid={os.getpid()} img={image_id}  "
               f"read={_seg['read']:.0f} walk={_seg['walk']:.0f} "
               f"match={_seg['match']:.0f} raster={_seg['raster']:.0f}  "
-              f"total={total:.0f}ms  cells_decoded={n_dec}  "
-              f"status={row['status']}", flush=True)
+              f"total={total:.0f}ms  cells_decoded={n_dec} "
+              f"reach_new={reach_new} cellvisits={cellvisits} "
+              f"instances={instances}  status={row['status']}", flush=True)
 
     if cancel_cb is not None and cancel_cb():
         return None, row

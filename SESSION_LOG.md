@@ -28,6 +28,14 @@ render+imwrite），記 worker pid 與該顆新解碼 cell 數（`rar._n_loaded`
 **影響檔案：** `glas/core/overlay_export.py`、`tests/test_export_timing.py`、`CLAUDE.md`（§8 記 [B01]）、
 `SESSION_LOG.md`。**Branch：** claude/project-perf-optimization-86i8yt
 
+**追加（同日）：** user 實測 192 顆 export → `[export-timing]` 顯示 **walk 完全主導**（每顆 22~74s，
+read/match/raster 全 <2s），且後續顆 `cells_decoded` 僅 4~86（memo 命中、幾乎不解碼）→ **native 解碼與此
+workload 無關，確定擱置 M2b**。前 8 顆（8 worker 各自第一顆）`cells_decoded=13352` → 每 worker 冷啟各做一次
+整棵樹 `reachable_bbox` sweep（8× 重複）。為定位「後續顆 30s 到底是重算 bbox / 遍歷全樹 / repetition 展開」，
+export-timing 再加三個計數器：`reach_new`（本顆新算的 reachable_bbox 數）、`cellvisits`（walk 到達 cell 數）、
+`instances`（repetition-instance 展開數）——`walk_roi` 末尾把 `stats.cell_visits`/`instances_visited` 累積到
+`rar._walk_cellvisits_total`/`_walk_visited_total`，export-timing 取 delta。影響檔案追加 `glas/core/oasis_random.py`。
+
 ---
 
 ## [2026-07-01] [F26 量測 ergonomics] `_apply_fa_timing` 尊重外部設的 GLAS_FA_TIMING

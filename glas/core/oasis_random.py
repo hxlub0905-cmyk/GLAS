@@ -1786,6 +1786,13 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
     stats.t_decode = _decode_prof["total"]
     stats.elapsed_s = time.perf_counter() - _t0
     stats.sbbox_prune = bool(rar._sbbox_by_refnum or rar._sbbox_by_name)
+    # Running per-reader totals so an outer caller (e.g. the F26 export timer)
+    # can read how much *this* image's walk actually traversed — cell visits and
+    # repetition-instance visits — without threading the stats object out.
+    rar._walk_cellvisits_total = (getattr(rar, "_walk_cellvisits_total", 0)
+                                  + stats.cell_visits)
+    rar._walk_visited_total = (getattr(rar, "_walk_visited_total", 0)
+                               + stats.instances_visited)
     n_err = len(rar.errors)
     # Level-1 (--debug) summary: one readable line — where the time went, what
     # the cache did, and whether anything went wrong. Deep per-cell / per-spec

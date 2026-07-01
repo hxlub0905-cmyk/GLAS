@@ -34,7 +34,8 @@ def test_timing_on_emits_one_line(capsys, monkeypatch, tmp_path):
     assert "[export-timing]" in out
     assert "img=D42" in out
     assert "status=missing-file" in out
-    assert "cells_decoded=" in out
+    for field in ("cells_decoded=", "reach_new=", "cellvisits=", "instances="):
+        assert field in out
 
 
 def test_timing_off_is_silent(capsys, monkeypatch, tmp_path):
