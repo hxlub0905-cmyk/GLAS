@@ -4,6 +4,29 @@
 
 ---
 
+## [2026-07-01] [F27 M0] native walk 起步：定位 walk 熱點 + apply_to_rects 2-corner（D4）
+
+**變更類型：** 效能（walk 熱路徑）· **狀態：M0 done；M1 待 user 核准**
+
+**動機/定位：** worker=4 實測確認 worker 數守恆（8 throughput 最好，別下調）。`[walk: place/rect/poly]` 顯示
+walk 30s 內部：place+rect+poly 僅 ~20%，**殘差 80% ＝遞迴下降的 per-instance 數值運算**（E3B＝少 unique cell、
+天量重複 placement，逐 instance 遞迴）。cProfile（合成 2 萬 instance 寬重複樹）定案熱點：**`apply_to_rects`
+（2.65s）+ `_roi_overlap_mask`（1.46s）＝~40%**，純數值適合 native；`walk` 遞迴框架 2.7s 碰 Python 物件難搬。
+user 選「直接攻 native walk」（AskUserQuestion）。
+
+**M0（本次，零風險 down payment）：** walk 的 Transform 全 D4 → `apply_to_rects` 由 4-corner 改 **2 對角點**
+（D4 下 bbox 精確），省一半 corner build + matmul + reduce。合成樹 2440→2228ms（~9%）。既有
+`test_oasis_walker`（0/90/180/270+flip+mag+composed）+ `test_oasis_random` 全綠（byte-identical）。
+
+**M1（待核准）：** 把 `apply_to_rects_d4` + `roi_overlap_mask` 搬進 `oasis_fastdecode`（F26 native 管道），gated +
+byte-identical，消 profile 的 40% → walk ~1.5–1.7×。plan 見 `docs/plans/F27-native-walk.md`（M0✓/M1/M2/M3 分階段，
+每階段先量再進、§7 剪枝不變式不動）。
+
+**影響檔案：** `glas/core/oasis_walker.py`、`docs/plans/F27-native-walk.md`（新）、`SESSION_LOG.md`。
+**Branch：** claude/project-perf-optimization-86i8yt
+
+---
+
 ## [2026-07-01] [F26 export 逐顆計時器 + 診斷] Export 融合路徑加 per-image timing；確認 native 對 export 不主導
 
 **變更類型：** 效能診斷（instrumentation）· **狀態：完成**

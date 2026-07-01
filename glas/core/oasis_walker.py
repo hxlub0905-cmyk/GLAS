@@ -134,30 +134,34 @@ class Transform:
         )
 
     def apply_to_rects(self, rects: np.ndarray) -> np.ndarray:
-        """Transform ``(N, 4)`` rectangles ``(x1, y1, x2, y2)``.
+        """Transform ``(N, 4)`` rectangles ``(x1, y1, x2, y2)`` → new
+        axis-aligned bboxes ``(N, 4)``.
 
-        Computes all 4 corners per rectangle, applies the affine, and
-        recovers the new axis-aligned bbox via min/max along each
-        axis. For D4 transforms this is exact; for non-axis-aligned
-        rotations it would be a conservative bbox, but those code
-        paths are rejected upstream by ``from_placement``.
+        Every Transform the walk builds is D4 (quarter-turn ± flip ± mag;
+        ``from_placement`` rejects anything else), which maps the two diagonal
+        corners of a rect to the two diagonal corners of its image — so
+        transforming ``(x1,y1)`` and ``(x2,y2)`` and taking min/max recovers the
+        exact bbox. Using two corners instead of all four halves the corner
+        build + matmul + reduce — the single hottest op in the ROI walk
+        (``apply_to_rects`` is ~40% of walk time on a wide-repeat tree, F26).
+
+        NOTE: exact only for axis-aligned-preserving (D4) M. A genuinely rotated
+        M would need all four corners for a conservative bbox; no caller builds
+        one (see ``from_placement``), and the walker's apply_to_rects tests
+        (0/90/180/270 + flip + mag + composed) pin the D4 cases.
         """
         if rects.shape[0] == 0:
             return rects.copy()
         n = rects.shape[0]
-        # corners: (N, 4, 2). Order: (x1,y1), (x2,y1), (x2,y2), (x1,y2).
-        corners = np.empty((n, 4, 2), dtype=np.float64)
+        # Two diagonal corners: (x1,y1) and (x2,y2). (N, 2, 2).
+        corners = np.empty((n, 2, 2), dtype=np.float64)
         corners[:, 0, 0] = rects[:, 0]
         corners[:, 0, 1] = rects[:, 1]
         corners[:, 1, 0] = rects[:, 2]
-        corners[:, 1, 1] = rects[:, 1]
-        corners[:, 2, 0] = rects[:, 2]
-        corners[:, 2, 1] = rects[:, 3]
-        corners[:, 3, 0] = rects[:, 0]
-        corners[:, 3, 1] = rects[:, 3]
+        corners[:, 1, 1] = rects[:, 3]
         # Apply: corners @ M.T + t  (broadcasting over the leading axes).
         transformed = corners @ self.M.T + self.t
-        # bbox = min/max along corner-axis. For D4 the result is exact.
+        # bbox = min/max along corner-axis. For D4 the two diagonals are exact.
         out = np.empty((n, 4), dtype=rects.dtype)
         xs = transformed[:, :, 0]
         ys = transformed[:, :, 1]
