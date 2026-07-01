@@ -1793,6 +1793,15 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
                                   + stats.cell_visits)
     rar._walk_visited_total = (getattr(rar, "_walk_visited_total", 0)
                                + stats.instances_visited)
+    # Internal walk breakdown (F26 diagnosis): placement gather+prune vs rect
+    # emit vs poly emit. The remainder (walk time minus these) is recursion /
+    # transform overhead — which is what a native walk would remove.
+    rar._walk_tplace_total = (getattr(rar, "_walk_tplace_total", 0.0)
+                              + stats.t_place)
+    rar._walk_trect_total = (getattr(rar, "_walk_trect_total", 0.0)
+                             + stats.t_rect)
+    rar._walk_tpoly_total = (getattr(rar, "_walk_tpoly_total", 0.0)
+                             + stats.t_poly)
     n_err = len(rar.errors)
     # Level-1 (--debug) summary: one readable line — where the time went, what
     # the cache did, and whether anything went wrong. Deep per-cell / per-spec
