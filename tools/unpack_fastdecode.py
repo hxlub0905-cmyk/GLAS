@@ -49,7 +49,8 @@ def main() -> int:
     print("\nDone. Now verify it imports + matches pure Python:")
     print('  python -c "import sys; sys.path.insert(0,\'glas/core\'); '
           'import oasis_fastdecode as f; print(f.VERSION, f.selftest())"')
-    print("  pytest tests/test_fastdecode.py -v")
+    print("  python -m pytest tests/test_fastdecode.py -v"
+          "   (use 'python -m pytest', not bare 'pytest', if it's not on PATH)")
     print("\nIf antivirus removes the .pyd right after this writes it, that is "
           "the (c) blocker — tell me and we pivot to the no-binary path.")
     return 0

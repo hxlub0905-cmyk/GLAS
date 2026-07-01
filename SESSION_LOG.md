@@ -4,6 +4,30 @@
 
 ---
 
+## [2026-07-01] [F26 M2a-integrate 測試輔助] 新增 native A/B 量測 .bat + unpack 提示修正
+
+**變更類型：** 工具（測試輔助）· **狀態：完成**
+
+**動機：** user 換上 v4 native（`VERSION 4 selftest 4` 已確認生效），要一步一步量測 native 對 poi（解碼）的
+實際加速；但 Windows 上 `pytest` 不在 PATH（`CommandNotFoundException`），且 A/B 對照牽涉「清 cellcache（cold
+decode 才公平）+ 切 native ON/OFF」多步驟易錯。
+
+**做法：** 專案根新增 3 個 .bat（cmd/cp950 安全，訊息用英文避免亂碼）：
+- `1_test_native.bat`：印 native VERSION/selftest + `python -m pytest tests\test_fastdecode.py
+  tests\test_oasis_native_decode.py`（byte-identical 護欄）。
+- `2_timing_native_ON.bat`：設 `GLAS_FA_TIMING=1` + `GLAS_CELLCACHE_DIR=%TEMP%\glas_cache_test`、清該 dir（cold
+  decode）、self-heal（若上次 OFF 留 `.off` 先改回）、印 `_FAST` 確認、啟動 `python main.py`。
+- `3_timing_native_OFF.bat`：把 `.pyd` 改名 `.off`（import 失敗→純 Python fallback）、同樣清 cache、啟動、GUI 關閉後
+  自動改回 `.pyd`。A/B 比 `poi(OFF)/poi(ON)`。
+另把 `tools/unpack_fastdecode.py` 完成提示的 `pytest ...` 改為 `python -m pytest ...`（就是 user 踩到的坑）。
+
+**測試：** `.bat` 內的 `_FAST` 探測 one-liner 本機驗證（ON 印 module）；`py_compile` unpack 工具過。
+
+**影響檔案：** `1_test_native.bat`、`2_timing_native_ON.bat`、`3_timing_native_OFF.bat`（新）、
+`tools/unpack_fastdecode.py`、`SESSION_LOG.md`。**Branch：** claude/project-perf-optimization-86i8yt
+
+---
+
 ## [2026-06-30] [F26 M2a-integrate] native rectangle-run 接進 per-cell 解碼（gated、byte-identical）
 
 **變更類型：** 效能（native 解碼整合）· **狀態：M2a-integrate done；M2b（polygon）next**
