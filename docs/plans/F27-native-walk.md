@@ -99,7 +99,17 @@ user 真實痛點＝整包 KLARF（~190 顆 defect）批次 export，實測 ~12�
       `test_native_walk` +1（over-cap 先 Python → prewarm 持久化 → fresh reader sidecar hit 走 native byte-identical）；
       全 `tests/` 812 passed（native ON）。**端到端**：prewarm decode 全 chip 一次（~15-30s）分攤到整批 + 每顆 native
       walk <1ms；真檔降幅待 user 量（poly 層仍 Python fallback）。
-- [ ] **M3d：擴充 repetition（regular grid analytic clip 在 C）+ 多 wanted layer**；arbitrary-list rep 仍 Python。
+- [~] **M3d：rect repetition 走 native（展開式）** ✓ 2026-07-01（第一刀）：`flatten_cell_graph` 不再一遇 rect
+      repetition 就整棵 graph 交回 Python。改為**攤平時用 `c.rects()` 把 rep 矩形 analytic 展開**成普通矩形存進 CSR，
+      native kernel 照舊處理；唯一新增護欄是**展開後總數上限**（`total_rects` 用 `repetition_count` analytic 估、
+      `> max_rects` 才 fallback），避免 chip-spanning dummy-fill array 撐爆 flatten / 記憶體。真檔 E3B 的 blocker 正是
+      cell 13405 在 4 個 export layer 上的 rect repetition → 這刀讓它們可 native（除非某層展開 > 5M rect，會落 Python）。
+      護欄：`test_native_walk` rename `test_flatten_native_able_with_rect_repetition`（native==Python 3 rects）+ 新增
+      `test_flatten_over_expanded_rect_cap_falls_back`（`_NATIVE_WALK_MAX_RECTS=100` monkeypatch → None + reject 帶
+      "expanded rects"）；全 `tests/` 813 passed。**注意**：展開式會失去 Python `_clip_grid_offsets` 的 per-ROI
+      repetition 剪枝（native 對全展開 rects 逐個做 ROI mask，C 速仍 sub-ms/ROI，結果 byte-identical）。若真檔某層
+      展開 > 5M 落 Python，才需第二刀「in-kernel analytic clip」（把 repetition descriptor 存進 CSR、在 C 剪枝）。
+- [ ] **M3d：多 wanted layer**；arbitrary-list rep 仍 Python（in-kernel analytic clip 為後備方案）。
 - [ ] **M3d：擴充 POLYGON**（point-list transform + emit 在 C）。arbitrary repetition / 非 D4 / name-ref 永遠 fallback。
 - [ ] 每階段 byte-identical（native-on vs off 逐位）+ 真檔抽樣；§7「reachable_bbox 用 load_cell_bbox、walk 用
       load_cell」不變式：攤平只用 memo 好的結果，不改剪枝語意。

@@ -1510,16 +1510,18 @@ def flatten_cell_graph(rar: "RandomAccessReader", root: object,
         if c.poly_count(key):
             rar._flatten_reject = f"polygon on {layer}/{datatype} (cell {cid!r})"
             return None
+        # Rect repetition is fine: it expands (analytically, via c.rects) into
+        # plain rects the native kernel already handles — we just bound the
+        # EXPANDED count so a chip-spanning dummy-fill array can't blow up the
+        # flatten. repetition_count is analytic (no materialization).
         nr = c.rect_count(key)
-        total_rects += nr
-        if total_rects > max_rects:
-            rar._flatten_reject = f"too many rects (> {max_rects})"
-            return None
         for i in range(nr):
-            if c.rect_spec_at(key, i)[4] is not None:    # rect repetition
-                rar._flatten_reject = (f"rectangle repetition on {layer}/"
-                                       f"{datatype} (cell {cid!r})")
-                return None
+            _sp = c.rect_spec_at(key, i)
+            total_rects += (oas.repetition_count(_sp[4], _sp[5])
+                            if _sp[4] is not None else 1)
+        if total_rects > max_rects:
+            rar._flatten_reject = f"too many expanded rects (> {max_rects})"
+            return None
         for pl in c.placements:
             if pl.repetition_type is not None:
                 rar._flatten_reject = f"placement repetition (cell {cid!r})"

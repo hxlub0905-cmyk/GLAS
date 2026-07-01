@@ -214,8 +214,9 @@ def test_flatten_cap_falls_back_without_stall(tmp_path, monkeypatch):
     assert _sorted_rows(on["rects"]) == _sorted_rows(off["rects"])
 
 
-def test_flatten_not_native_able_on_repetition(tmp_path):
-    # A single cell whose rect carries a type-2 repetition → not native-able.
+def test_flatten_native_able_with_rect_repetition(tmp_path):
+    # M3d: a rect with a type-2 repetition is native-able — it expands (via
+    # c.rects) into plain rects the kernel handles; native must equal Python.
     start = (bytes([oas.START]) + T._astr("1.0") + bytes([0])
              + T._uint(1000) + T._uint(0) + bytes([0] * 12))
     pn = bytes([oas.PROPNAME_IMP]) + T._astr("S_CELL_OFFSET")
@@ -235,10 +236,35 @@ def test_flatten_not_native_able_on_repetition(tmp_path):
     p = tmp_path / "rep.oas"
     p.write_bytes(oas.MAGIC + start + pn + cn + prop(off) + cell + rect + end)
     rar = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
-    assert orx.flatten_cell_graph(rar, 0, 17, 0) is None   # Python fallback
-    # and walk_roi with native on must still equal native off (via fallback)
+    assert orx.flatten_cell_graph(rar, 0, 17, 0) is not None   # rep expands -> native
     roi = (-100, -100, 1000, 1000)
     on = _walk_m3(p, {(17, 0)}, roi, 17, 0, True)
     off = _walk_m3(p, {(17, 0)}, roi, 17, 0, False)
     assert _sorted_rows(on["rects"]) == _sorted_rows(off["rects"])
-    assert on["rects"].shape[0] == 3   # the repetition expanded (Python path)
+    assert on["rects"].shape[0] == 3   # the 3-instance repetition
+
+
+def test_flatten_over_expanded_rect_cap_falls_back(tmp_path, monkeypatch):
+    # A huge repetition over the expanded-rect cap must bail (Python), not OOM.
+    start = (bytes([oas.START]) + T._astr("1.0") + bytes([0])
+             + T._uint(1000) + T._uint(0) + bytes([0] * 12))
+    pn = bytes([oas.PROPNAME_IMP]) + T._astr("S_CELL_OFFSET")
+    cn = bytes([oas.CELLNAME_IMP]) + T._astr("R")
+
+    def prop(off):
+        return (bytes([oas.PROPERTY_NORMAL, 0x16]) + T._uint(0)
+                + T._uint(8) + T._ufix(off, 4))
+
+    rect = (bytes([oas.RECTANGLE, 0x7f]) + T._uint(17) + T._uint(0)
+            + T._uint(10) + T._uint(10) + T._sint(0) + T._sint(0)
+            + bytes([2]) + T._uint(998) + T._uint(100))  # 1000 instances
+    cell = bytes([oas.CELL_REFNUM]) + T._uint(0)
+    end = bytes([oas.END]) + T._uint(0)
+    hdr = oas.MAGIC + start + pn + cn + prop(0)
+    off = len(hdr)
+    p = tmp_path / "bigrep.oas"
+    p.write_bytes(oas.MAGIC + start + pn + cn + prop(off) + cell + rect + end)
+    rar = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
+    monkeypatch.setattr(orx, "_NATIVE_WALK_MAX_RECTS", 100)
+    assert orx.flatten_cell_graph(rar, 0, 17, 0) is None
+    assert "expanded rects" in (rar._flatten_reject or "")

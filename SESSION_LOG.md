@@ -4,6 +4,33 @@
 
 ---
 
+## [2026-07-01] [F27 M3d] rect repetition 走 native（展開式）：解 E3B cell 13405 blocker
+
+**變更類型：** 效能（native walk 涵蓋率）· **狀態：第一刀 done；真檔端到端待 user 量**
+
+**動機現象：** M3c prewarm 已跑，但真檔 E3B 四個 export layer 全報 `prewarm done: 0/4 native-able`，reject 原因一致：
+`rectangle repetition on <layer> (cell 13405)`。`flatten_cell_graph` 舊邏輯只要 graph 內任一 cell 在目標 layer 有 rect
+repetition 就整棵交回 Python walk → 大檔完全吃不到 native（仍 ~12min）。
+
+**修復實作：** 移除 rect-repetition 的 exclusion，改成**攤平時就地展開**：
+- 預檢 pass 用 `oasis_streamer.repetition_count`（analytic，不 materialize）累加**展開後**矩形總數，只有 `> max_rects`
+  才 fallback（避免 chip-spanning dummy-fill array 撐爆 flatten / 記憶體）。
+- build pass 本來就用 `c.rects(key)`（analytic 展開 repetition → 普通 `(N,4)`）→ native kernel 無須改動。
+- placement repetition / polygon / 非 D4 / name-ref 仍 fallback（不變）。
+
+**取捨：** 展開式失去 Python `_clip_grid_offsets` 的 per-ROI repetition 剪枝（native 對全展開 rects 逐個做 ROI mask），
+但 C 速仍 sub-ms/ROI 且結果 **byte-identical**。若真檔某層展開 > 5M rect（prewarm cap）會落 Python，屆時才需第二刀
+「in-kernel analytic clip」（repetition descriptor 存進 CSR、在 C 剪枝）。
+
+**測試：** `test_native_walk` rename `test_flatten_native_able_with_rect_repetition`（native==Python 3 rects）+ 新增
+`test_flatten_over_expanded_rect_cap_falls_back`（`_NATIVE_WALK_MAX_RECTS=100` monkeypatch → flatten None + reject 帶
+"expanded rects"）；全 `tests/` **813 passed**。**純 Python 改動（未動 .pyx）→ 不觸發 CI，user 重抓 ZIP 即可（v6 .pyd 已在）。**
+
+**影響檔案：** `glas/core/oasis_random.py`（`flatten_cell_graph` rect-rep 展開）、`tests/test_native_walk.py`、
+`docs/plans/F27-native-walk.md`。**Branch：** `claude/project-perf-optimization-86i8yt`。
+
+---
+
 ## [2026-07-01] [F27 M3c] shared/persisted flatten sidecar：讓大檔 export 也走 native walk
 
 **變更類型：** 效能（native walk 大檔化）· **狀態：M3c done；真檔端到端待 user 量**
