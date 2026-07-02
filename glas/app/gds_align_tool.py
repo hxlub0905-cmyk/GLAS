@@ -512,6 +512,9 @@ def roi_document_from_reader(rar, root, layer_keys, roi_bbox, cancel_cb=None,
     doc.path = rar._path
     doc.format = "OASIS-ROI"
     doc.top_cell_name = str(root)
+    # F27 M7: fresh polygon point-list type histogram for THIS load (debug only;
+    # printed in _on_roi_finished) so it attributes to the ROI just walked.
+    oasis_random.reset_poly_ptype_counts()
     per_layer: list = []
     for idx, (layer, datatype) in enumerate(layer_keys):
         if progress_cb is not None:
@@ -7723,6 +7726,11 @@ class MainWindow(QMainWindow):
               f"decode {t_decode:.1f}s ({cached} from cache, {decoded} decoded) · "
               f"prune {'ON' if sbbox_on else 'off'}"
               + (f" · ⚠ {errs} decode error(s)" if errs else ""), flush=True)
+        # F27 M7: polygon point-list type histogram — tells us whether a native
+        # (Cython) polygon decoder would help this file, and which encodings.
+        if oasis_random.DEBUG and total_polys:
+            print(f"{devlog.tag('roi')} {oasis_random.poly_ptype_summary()}",
+                  flush=True)
         if errs:
             msg += f" · ⚠ {errs} cell decode error(s) — run with --debug"
         if expr_errs:

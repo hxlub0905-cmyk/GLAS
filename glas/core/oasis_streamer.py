@@ -921,6 +921,25 @@ def repetition_offsets_np(rtype: int, raw) -> "np.ndarray":
 
 # ── Point-list (SEMI P39 §7.7.9, used by POLYGON / PATH) ─────────────────────
 
+# F27 M7: opt-in polygon point-list TYPE histogram (diagnostic only). Answers
+# "are this file's polygons rectilinear type 0/1 (which a native fast-path could
+# target cheaply) or the heavier type 2-5?" — so we measure before deciding
+# whether a Cython polygon decoder is worth building. Off by default → the guard
+# short-circuits at zero cost; oasis_random flips it on under debug. Per-process,
+# a plain list; single-threaded per reader. Counting the type never changes the
+# decoded points, so byte-identity is untouched.
+PTYPE_COUNT_ON = False
+_PTYPE_COUNTS = [0, 0, 0, 0, 0, 0]      # index = point-list type 0..5
+
+
+def reset_ptype_counts() -> None:
+    for _i in range(6):
+        _PTYPE_COUNTS[_i] = 0
+
+
+def get_ptype_counts() -> tuple:
+    return tuple(_PTYPE_COUNTS)
+
 
 def decode_point_list(stream: BinaryIO,
                       for_polygon: bool) -> list[tuple[int, int]]:
@@ -946,6 +965,8 @@ def decode_point_list(stream: BinaryIO,
     point (and the implicit closure for type 0/1 polygons).
     """
     ptype = decode_unsigned_int(stream)
+    if for_polygon and PTYPE_COUNT_ON and 0 <= ptype <= 5:
+        _PTYPE_COUNTS[ptype] += 1     # F27 M7 diagnostic histogram (see above)
     n = decode_unsigned_int(stream)
     if n == 0:
         raise OasisFormatError("point-list with zero count")

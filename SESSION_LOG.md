@@ -47,8 +47,17 @@ ROI 的那顆大 cell 仍得整顆 decode；1750 MB 檔 → 數分鐘）。過�
   reader build 的 debug 行與 export 訊息都改印它 → 下次 log 會直接說出 app 內 native 到底是「import failed—DLL/ABI…」還是
   「VERSION < 7」，不用再猜。
 
-**測試：** 新 `tests/test_batched_gate.py`（5：小檔/有 CE/大檔無 CE/**sbbox present→退回**/超大 cap）、
-`tests/test_decode_heartbeat.py`（3）；全 `tests/` **849 passed**。**純 Python，未動 `.pyx` → 免 CI，重抓 ZIP 即可。**
+**M7c（多邊形 native 可行性探針——回答「polygon 能不能也 Cython 加速」前先量）：**
+- native 只加速 RECTANGLE run，POLYGON 兩條路都走 Python（`decode_point_list`）→ 那顆 44995（多邊形大 cell）native 幫不上。
+  要不要為 polygon 做 native，取決於檔案用哪種 point-list 編碼：type 0/1（直角，好加速）vs 2–5（g-delta/曲線，難）。
+- 加一個**純 Python、opt-in、零成本 off** 的直方圖：`oasis_streamer.PTYPE_COUNT_ON` + `_PTYPE_COUNTS`，在 `decode_point_list`
+  讀到 ptype 後（僅 `for_polygon`）計數；`oasis_random` 於 debug 開啟並提供 `reset_poly_ptype_counts` /
+  `poly_ptype_counts` / `poly_ptype_summary`（印各 type 數量 + 直角 0/1 佔比）。互動載入在 `roi_document_from_reader`
+  起頭 reset、`_on_roi_finished` 於 DEBUG 印一行，例：`polygon point-types (10 total): 0·manh-h=7 4·gdelta=3 → rectilinear
+  0/1 = 70% …`。→ 用真數據決定 polygon native 值不值得做、要做哪幾種。計數不改解碼輸出（byte-identity 不變）。
+
+**測試：** 新 `tests/test_batched_gate.py`（5）、`tests/test_decode_heartbeat.py`（3）、`tests/test_poly_ptype_histogram.py`
+（4：計數/PATH 不計/預設關/無多邊形）；全 `tests/` **853 passed**。**純 Python，未動 `.pyx` → 免 CI，重抓 ZIP 即可。**
 
 **影響檔案：** `glas/core/oasis_random.py`（心跳欄位 + `_decode_tick` + load_cell arm/clear + 兩 loop 心跳 + `GLAS_DEBUG`
 alias + `_batched_walk_affordable` gate）、`glas/core/fine_align.py`（`_FA_TIMING` 吃 `GLAS_DEBUG`）、

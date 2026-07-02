@@ -139,6 +139,7 @@ def _env_debug_level() -> int:
 _DEBUG_LEVEL = _env_debug_level()
 DEBUG = _DEBUG_LEVEL >= 1     # level 1: concise per-load summary
 TRACE = _DEBUG_LEVEL >= 2     # level 2: deep per-cell / per-section telemetry
+oas.PTYPE_COUNT_ON = DEBUG    # F27 M7: polygon point-list type histogram (debug only)
 
 
 def set_debug(on: bool, level: int = 1) -> None:
@@ -148,6 +149,41 @@ def set_debug(on: bool, level: int = 1) -> None:
     _DEBUG_LEVEL = (level if on else 0)
     DEBUG = _DEBUG_LEVEL >= 1
     TRACE = _DEBUG_LEVEL >= 2
+    oas.PTYPE_COUNT_ON = DEBUG
+
+
+# ── F27 M7: polygon point-list type histogram (feasibility probe) ────────────
+# A native Cython polygon decoder is only worth building if a file's polygons are
+# the encodings a fast-path can cheaply cover. Types: 0/1 = Manhattan/rectilinear
+# (the common VLSI case, easiest to accelerate); 2 = 2-delta; 3 = 3-delta (octag);
+# 4 = generic g-delta; 5 = curve/velocity (hardest). These delegate to the
+# streamer's per-process counter so callers use one interface.
+_PTYPE_LABELS = {0: "0·manh-h", 1: "1·manh-v", 2: "2·2delta",
+                 3: "3·3delta", 4: "4·gdelta", 5: "5·curve"}
+
+
+def reset_poly_ptype_counts() -> None:
+    oas.reset_ptype_counts()
+
+
+def poly_ptype_counts() -> dict:
+    c = oas.get_ptype_counts()
+    return {i: int(c[i]) for i in range(6)}
+
+
+def poly_ptype_summary() -> str:
+    """One-line histogram of polygon point-list types seen since the last reset,
+    plus what share a rectilinear (type 0/1) native fast-path would cover."""
+    c = oas.get_ptype_counts()
+    total = sum(c)
+    if not total:
+        return "polygon point-types: (no polygons decoded)"
+    parts = " ".join(f"{_PTYPE_LABELS[i]}={c[i]:,}" for i in range(6) if c[i])
+    rectilinear = c[0] + c[1]
+    pct = 100.0 * rectilinear / total
+    return (f"polygon point-types ({total:,} total): {parts}  →  "
+            f"rectilinear 0/1 = {pct:.0f}% "
+            f"(a native fast-path would cover that share; the rest stays Python)")
 
 
 def _dbg(msg: str) -> None:
