@@ -4,6 +4,31 @@
 
 ---
 
+## [2026-07-02] [F27 M3e 診斷結論] 整顆 chip flatten 對「密集 leaf cell」型不可行 + 快速 bail 緩解
+
+**變更類型：** 診斷 + 緩解（非最終解）· **狀態：確認 whole-chip flatten 走不通此型檔，需改架構**
+
+**診斷（靠上一版的 per-cell SLOW log 定位）：** E3B 有**數百顆密集 leaf cell**（refnum ~13xxx），每顆約 **8 萬個
+rects、full decode 要 4-5 秒**。ROI walk 一直很快是因為它用 `load_cell_bbox`（CE 邊界 early-stop）**剪枝**這些 cell、
+從不 full decode 到 FOV 外的；但 whole-chip flatten 的 pass 2 必須 full-decode **每一顆** → 數千萬 rects → 建 CSR 要
+數分鐘、且 CSR 多 GB（每 worker load 會 OOM）。**結論：whole-chip flatten 對「密集 leaf cell」型檔根本不可行**
+（跟合成測試的 1-rect leaf 天差地遠），M3e 的 native 路線在此型檔走不通。時間上限如設計般 abort、安全落 Python
+（無 hang、無回歸，export 仍 ~12min 完成）。
+
+**緩解（減少浪費，非加速）：**
+1. **pass 1 改用 `load_cell_bbox`**（只要 placements 做 DFS + name-ref/非D4 檢查，不需 geometry）→ pass 1 從「full-decode
+   每顆」變得跟 ROI walk 一樣快，密集 cell 不再在 pass 1 拖。
+2. **時間上限 120→60s**；**ExportWorker：某層 budget abort 就 skip 其餘層**（都會一樣 abort）→ 浪費從 ~8min 降到 ~1min。
+
+**真正的解（下一步、待與 user 確認）：** 放棄 whole-chip flatten，改**純 Python 向量化 batched walk**——不建整顆
+CSR，直接在 live graph 上把「同一 cell 的多個 instance」向量化批次處理（取代 per-instance Python 遞迴），直攻 warm walk
+20-32s 的遞迴瓶頸。純 Python（免 CI、免重編），對密集檔一樣有效。
+
+**影響檔案：** `glas/core/oasis_random.py`（pass 1 bbox load + budget 60s）、`glas/app/gds_align_tool.py`（skip-remaining
+on budget abort）、`SESSION_LOG.md`。**Branch：** `claude/project-perf-optimization-86i8yt`。
+
+---
+
 ## [2026-07-02] [F27 M3e hotfix] prewarm 卡死修正：非可剪大 array bail-before-materialize + 進度 log + mixed-cell 向量化
 
 **變更類型：** bug fix（prewarm hang）· **狀態：純 Python，v7 .pyd 不變、不觸發 CI**

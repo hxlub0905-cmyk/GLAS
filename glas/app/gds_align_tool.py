@@ -1723,15 +1723,27 @@ class ExportWorker(QObject):
                   f"{len(walk_layers)} layer(s): {sorted(walk_layers)} …",
                   flush=True)
             n_native = 0
+            _budget_bail = False
             for (_l, _d) in sorted(walk_layers):
+                if _budget_bail:
+                    print(f"[export]   {_l}/{_d} prewarm skipped "
+                          f"(whole-chip flatten too slow on this file)",
+                          flush=True)
+                    continue
                 try:
                     if oasis_random.flatten_prewarm(
                             rar, self._root, _l, _d) is not None:
                         n_native += 1
                     else:
+                        _reason = getattr(rar, '_flatten_reject', '?')
                         print(f"[export]   {_l}/{_d} not native-able: "
-                              f"{getattr(rar, '_flatten_reject', '?')}",
-                              flush=True)
+                              f"{_reason}", flush=True)
+                        # A time-budget abort means the whole-chip flatten is too
+                        # expensive for this file (dense leaf cells) — the other
+                        # layers abort the same way, so skip them and go straight
+                        # to the Python walk instead of burning a minute per layer.
+                        if str(_reason).startswith("prewarm over budget"):
+                            _budget_bail = True
                 except Exception as _e:      # noqa: BLE001
                     print(f"[export]   {_l}/{_d} prewarm error: {_e}", flush=True)
             print(f"[export] prewarm done: {n_native}/{len(walk_layers)} "

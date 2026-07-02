@@ -1567,15 +1567,19 @@ def flatten_cell_graph(rar: "RandomAccessReader", root: object,
             if progress is not None:
                 progress("ABORT " + rar._flatten_reject)
             return None
+        # Pass 1 only needs the PLACEMENTS (DFS order + name-ref/non-D4 check),
+        # NOT the geometry — so use the lightweight bbox load (boundary
+        # early-stop), exactly like the ROI walk's pruning. Full-decoding a dense
+        # ~80k-rect leaf cell here just to read its placements is what made the
+        # whole-chip prewarm crawl.
         _ts = time.perf_counter()
-        c = rar.load_cell(cid)
+        c = rar.load_cell_bbox(cid)
         _dt = time.perf_counter() - _ts
         if _dt > slow_dt:
             slow_dt, slow_cid = _dt, cid
         if progress is not None and _dt > 3.0:
-            progress(f"SLOW cell {cid!r}: {_dt:.0f}s to decode "
-                     f"({c.total_rects()} rects, {c.total_polys()} polys, "
-                     f"{c.placement_count()} placements)")
+            progress(f"SLOW cell {cid!r}: {_dt:.0f}s to bbox-decode "
+                     f"({c.placement_count()} placements)")
         for pl in c.placements:
             if not isinstance(pl.target, (int, np.integer)):
                 rar._flatten_reject = f"name-ref placement target (cell {cid!r})"
@@ -1799,7 +1803,7 @@ def flatten_prewarm(rar: "RandomAccessReader", root: object,
                     max_cells: int = 200_000,
                     max_rects: int = 5_000_000,
                     max_placements: int = 8_000_000,
-                    time_budget_s: float = 120.0):
+                    time_budget_s: float = 60.0):
     """F27 M3c: build the whole-chip flatten ONCE (ignoring the interactive
     cell cap) and persist it to the shared sidecar, so the batch's pool workers
     each ``np.load`` it instead of decoding the whole chip. Call it in the
