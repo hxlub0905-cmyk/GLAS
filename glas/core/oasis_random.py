@@ -43,6 +43,7 @@ import devlog                      # noqa: E402  (dev-mode coloured tags)
 import layerscan_cache             # noqa: E402  (F12 M3: layer-scan sidecar)
 import cellcache                   # noqa: E402  (F16-B: decoded-cell sidecar)
 import walkflatten_cache           # noqa: E402  (F27 M3c: native-walk flatten sidecar)
+import reachcache                  # noqa: E402  (F27 M6: reachable-bbox sidecar)
 from oasis_store import Placement  # noqa: E402
 from oasis_walker import Transform  # noqa: E402
 
@@ -1798,6 +1799,39 @@ def _flatten_cached(rar: "RandomAccessReader", root: object,
     return flat
 
 
+def reach_prewarm(rar: "RandomAccessReader", root: object,
+                  *, compute: bool = True) -> bool:
+    """F27 M6: populate the reader's ``reachable_bbox`` memo for the whole graph
+    reachable from ``root``, sharing it via a sidecar so the ~20-30 s bbox sweep
+    (files with no S_BOUNDING_BOX) is paid ONCE across workers / re-runs instead
+    of per worker per session.
+
+    Loads the sidecar if present; otherwise (``compute=True``) does the full
+    sweep once (``reachable_bbox(root)`` cascades to every reachable cell) and
+    persists it. Returns True if the memo is now populated. Idempotent / safe to
+    call repeatedly; never raises on cache trouble."""
+    memo = getattr(rar, "_reach_memo", None)
+    if memo is None:
+        memo = rar._reach_memo = {}
+    if getattr(rar, "_reach_prewarmed", False) or memo:
+        rar._reach_prewarmed = True
+        return True
+    loaded = reachcache.load(rar._path, root)
+    if loaded is not None:
+        memo.update(loaded)
+        rar._reach_prewarmed = True
+        return True
+    if not compute:
+        return False
+    try:
+        rar.reachable_bbox(root)          # cascades → fills memo for all cells
+        reachcache.save(rar._path, root, rar._reach_memo)
+    except Exception:                     # noqa: BLE001 — best-effort prewarm
+        return False
+    rar._reach_prewarmed = True
+    return True
+
+
 def flatten_prewarm(rar: "RandomAccessReader", root: object,
                     layer: int, datatype: int, *,
                     max_cells: int = 200_000,
@@ -1844,13 +1878,12 @@ def flatten_prewarm(rar: "RandomAccessReader", root: object,
         print(f"[flatten] {layer}/{datatype} built in "
               f"{time.perf_counter() - _t0:.0f}s "
               f"(records: {rc} rect, {po} poly, {pl} placement)", flush=True)
-    # A time-budget abort is a "too slow THIS run" verdict, not a permanent
-    # "not native-able" — do NOT persist it, or a later run (even after the cause
-    # is fixed) would load the cached verdict and never retry. Real non-native
-    # verdicts (name-ref / non-D4 / non-clippable / over-cap) ARE persisted.
-    if not reason.startswith("prewarm over budget"):
-        walkflatten_cache.save(rar._path, root, layer, datatype, flat,
-                               reason=reason)
+    # Persist the verdict (native CSR OR non-native reason) so re-runs skip it.
+    # A time-budget abort on a dense-leaf chip is effectively permanent — the
+    # whole-chip flatten is architecturally too big there (the batched Python
+    # walk handles it instead), so caching "over budget" saves ~20 s every
+    # re-run. The sidecar SCHEMA gates invalidation if the builder ever improves.
+    walkflatten_cache.save(rar._path, root, layer, datatype, flat, reason=reason)
     return flat
 
 
@@ -2426,6 +2459,11 @@ def walk_roi_batched(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
     stats = RoiWalkStats()
     rect_out: list = []
     poly_out: list = []
+    # F27 M6: load the shared reachable-bbox sidecar once (built by the export
+    # orchestrator / a previous run) so this worker skips the ~20-30 s bbox
+    # sweep. compute=False — if there's no sidecar, the normal lazy sweep below
+    # still fills the memo (no regression); only the orchestrator computes+saves.
+    reach_prewarm(rar, root_id, compute=False)
     reachable_bbox = rar.reachable_bbox
 
     # ── topological order (parents before children); skip cycle back-edges ──

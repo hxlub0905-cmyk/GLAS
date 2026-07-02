@@ -4,6 +4,41 @@
 
 ---
 
+## [2026-07-02] [F27 M5+/M6] union 改 numpy 切片 + reachable-bbox sidecar（榨 #1/#2）
+
+**變更類型：** 效能（承 M5 raster Boolean 的後續）· **狀態：本地驗證；待 user 量真檔**
+
+**背景：** M5 raster Boolean 讓真檔 warm 每張從 ~22s → ~5-9s（morph 15s→~1s）。剩下 warm 大頭：raw 幾何 walk ~2.8s +
+**union（fillPoly）~1.9s**；以及 cold 首張的 reach_bbox sweep（~25s/worker）。
+
+**#1 union → numpy 切片（M5+）：**
+- `gds_boolean.raster_layer_mask(rects, polys, …)`：軸對齊矩形用 **numpy 切片 `mask[r0:r1,c0:c1]=fill`** 聯集
+  （取代逐個 `cv2.fillPoly`），非矩形多邊形才走 fillPoly。實測 8000 rect：fillPoly 69ms → 切片 **10ms（7x），且逐位
+  相同（0px 差）**。
+- `resolve_expression_raster` 改吃 `raw_mask_provider`（呼叫端給 mask），`fine_align` 的 provider 直接用
+  `walk_roi_fast` 的 rects 建 mask → **免掉 `_walk_roi_polys` 把 7-14K rect 轉 4 點多邊形的 Python 迴圈**。
+
+**#2 reachable-bbox sidecar（M6）：**
+- 新 `reachcache`（sidecar，keyed on file mtime+size + root，共用 cellcache dir，atomic / 驗證 / 從不 raise）持久化
+  整張 `reach_memo`（{cell: bbox|None}）。無 S_BOUNDING_BOX 的檔（E3B）首張 walk 要掃全 13k cell 的 bbox（~25s），
+  以往每 worker 每 run 重掃。
+- `oasis_random.reach_prewarm(rar, root)`：載 sidecar 或（compute）一次 `reachable_bbox(root)` cascade 掃全圖 + 存。
+  export orchestrator 開 pool 前跑一次（首 run 算+存、re-run 載）；`walk_roi_batched` 開頭 load-only 讓 worker 各自載
+  （無 sidecar 則照舊 lazy 掃，無回歸）。→ **user 反覆重測 E3B 時，cold 首張的 ~25s sweep 省掉**（dense cell 本來就
+  被 cellcache 跨 run 共享）。
+- 順手：`flatten_prewarm` 的 budget-abort **改為持久化**（whole-chip flatten 對 dense-leaf 檔是架構性不可行、不會被
+  code fix 救回，batched walk 已接手）→ re-run 不再每次浪費 ~20s 重試 flatten。
+
+**測試：** 新 `tests/test_reachcache.py`（3：round-trip / stale / prewarm 算+存+載 byte 一致）；raster/export 測試更新為
+`raw_mask_provider` 簽名；全 `tests/` **841 passed**。**純 Python（cv2/numpy），未動 `.pyx` → 免 CI，重抓 ZIP 即可。**
+
+**影響檔案：** `glas/core/gds_boolean.py`（`raster_layer_mask` + `resolve_expression_raster` 改簽名）、
+`glas/core/fine_align.py`（provider 建 mask）、`glas/core/oasis_random.py`（`reach_prewarm` + `reachcache` + budget-abort
+持久化）、`glas/core/reachcache.py`（新）、`glas/app/gds_align_tool.py`（orchestrator reach prewarm）、
+`tests/test_reachcache.py` / `test_gds_boolean_raster.py`。**Branch：** `claude/project-perf-optimization-86i8yt`。
+
+---
+
 ## [2026-07-02] [F27 M5] raster Boolean 引擎：export 的 grow/shrink morphology ~15s → ~0.16s
 
 **變更類型：** 效能（真正的大頭）· **狀態：本地驗證；待 user 量真檔**

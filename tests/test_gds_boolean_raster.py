@@ -44,10 +44,15 @@ def _shapely_mask(expr):
                         nm_per_px=NMPP) > 0
 
 
+def _raw_mask(layer, dt):
+    return gb.polys_to_mask(_raw_polys(layer, dt), width_px=W, height_px=H,
+                            x_min_nm=X0, y_min_nm=Y0, nm_per_px=NMPP)
+
+
 def _raster_mask(expr):
     m = gb.resolve_expression_raster(
-        expr, _BINDS, raw_poly_provider=_raw_polys, recipe_provider=lambda n: None,
-        width_px=W, height_px=H, x_min_nm=X0, y_min_nm=Y0, nm_per_px=NMPP)
+        expr, _BINDS, raw_mask_provider=_raw_mask, recipe_provider=lambda n: None,
+        nm_per_px=NMPP)
     return m > 0
 
 
@@ -78,9 +83,8 @@ def test_mask_to_geometry_preserves_hole():
     # re-rasterizing must reproduce (approximately) the same footprint.
     r = _raster_mask("A - B")
     m = gb.resolve_expression_raster(
-        "A - B", _BINDS, raw_poly_provider=_raw_polys,
-        recipe_provider=lambda n: None, width_px=W, height_px=H,
-        x_min_nm=X0, y_min_nm=Y0, nm_per_px=NMPP)
+        "A - B", _BINDS, raw_mask_provider=_raw_mask,
+        recipe_provider=lambda n: None, nm_per_px=NMPP)
     geom = gb.mask_to_geometry(m, x_min_nm=X0, y_min_nm=Y0, nm_per_px=NMPP,
                                invert_y=False)
     assert not geom.is_empty

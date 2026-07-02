@@ -493,23 +493,33 @@ def poi_polys_and_geometry_for_roi(rar, root, roi_bbox, poi_spec,
     x0, y0, x1, y1 = roi_bbox
 
     if nm_per_px and nm_per_px > 0:
-        # ── raster Boolean (M5): raw walk → cv2 morphology/bitwise → geom ──
-        def raw_poly_provider(layer: int, datatype: int):
-            _t = time.perf_counter()
-            ps = _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb)
-            _acc("_t_bwalk", time.perf_counter() - _t)
-            return ps
+        # ── raster Boolean (M5): raw walk → rasterize (slice rects) → cv2
+        # morphology/bitwise → geom. The raw rects go straight into a numpy
+        # slice-fill (raster_layer_mask), skipping both the rect→poly conversion
+        # and per-poly fillPoly (M5+: union ~1.9s → ~0.2s). ──
         wpx = max(1, int(round((x1 - x0) / nm_per_px)))
         hpx = max(1, int(round((y1 - y0) / nm_per_px)))
-        _w0 = getattr(rar, "_t_bwalk", 0.0)
+
+        def raw_mask_provider(layer: int, datatype: int):
+            _t = time.perf_counter()
+            res = oasis_random.walk_roi_fast(rar, root, roi_bbox, layer,
+                                             datatype, cancel_cb=cancel_cb)
+            _acc("_t_bwalk", time.perf_counter() - _t)
+            _t = time.perf_counter()
+            m = gds_boolean.raster_layer_mask(
+                res["rects"], res["polys"], width_px=wpx, height_px=hpx,
+                x_min_nm=x0, y_min_nm=y0, nm_per_px=nm_per_px, invert_y=False)
+            _acc("_t_bunion", time.perf_counter() - _t)
+            return m
+
+        _w0 = getattr(rar, "_t_bwalk", 0.0); _u0 = getattr(rar, "_t_bunion", 0.0)
         _t = time.perf_counter()
         mask = gds_boolean.resolve_expression_raster(
-            expr, bindings, raw_poly_provider=raw_poly_provider,
-            recipe_provider=lambda n: recipes.get(n),
-            width_px=wpx, height_px=hpx, x_min_nm=x0, y_min_nm=y0,
-            nm_per_px=nm_per_px, invert_y=False)
+            expr, bindings, raw_mask_provider=raw_mask_provider,
+            recipe_provider=lambda n: recipes.get(n), nm_per_px=nm_per_px)
         _acc("_t_bmorph", (time.perf_counter() - _t)
-             - (getattr(rar, "_t_bwalk", 0.0) - _w0))
+             - (getattr(rar, "_t_bwalk", 0.0) - _w0)
+             - (getattr(rar, "_t_bunion", 0.0) - _u0))
         _t = time.perf_counter()
         geom = gds_boolean.mask_to_geometry(
             mask, x_min_nm=x0, y_min_nm=y0, nm_per_px=nm_per_px, invert_y=False)

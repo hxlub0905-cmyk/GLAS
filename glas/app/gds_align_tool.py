@@ -1748,6 +1748,20 @@ class ExportWorker(QObject):
                     print(f"[export]   {_l}/{_d} prewarm error: {_e}", flush=True)
             print(f"[export] prewarm done: {n_native}/{len(walk_layers)} "
                   f"layer(s) native-able (rest use the Python walk)", flush=True)
+        # F27 M6: prewarm the reachable-bbox sidecar ONCE (this orchestrator
+        # process), so every pool worker loads it instead of re-sweeping the
+        # ~20-30 s per-cell bbox map. First run computes + persists; re-runs load
+        # it in ms. Best-effort — never block the export on it.
+        try:
+            import time as _time
+            _rt = _time.perf_counter()
+            if oasis_random.reach_prewarm(rar, self._root):
+                print(f"[export] reach-bbox map ready in "
+                      f"{_time.perf_counter() - _rt:.0f}s "
+                      f"({len(getattr(rar, '_reach_memo', ()))} cells; "
+                      f"shared with workers)", flush=True)
+        except Exception as _e:      # noqa: BLE001
+            print(f"[export] reach prewarm skipped: {_e}", flush=True)
         done = 0
         dropped = False
         rows = []

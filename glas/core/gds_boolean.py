@@ -686,6 +686,49 @@ def polys_to_mask(polys, *, width_px: int, height_px: int,
     return mask
 
 
+def raster_layer_mask(rects, polys, *, width_px: int, height_px: int,
+                      x_min_nm: float, y_min_nm: float, nm_per_px: float,
+                      invert_y: bool = True, fill: int = 255) -> np.ndarray:
+    """Rasterize a raw layer's geometry to a uint8 mask, fast. Axis-aligned
+    rects (the bulk of production geometry) are filled by numpy SLICING
+    (``mask[r0:r1, c0:c1] = fill``) instead of ``cv2.fillPoly`` — ~10x cheaper on
+    a dense FOV and it unions idempotently. Non-rectangular polys (if any) still
+    go through fillPoly (each on its own, so overlaps union). Same coordinate
+    mapping as :func:`make_mask` / :func:`polys_to_mask`."""
+    if not _CV2_OK:  # pragma: no cover
+        raise BooleanExprError("opencv (cv2) is required for raster Boolean")
+    mask = np.zeros((height_px, width_px), dtype=np.uint8)
+    arr = None if rects is None else np.asarray(rects, dtype=np.float64)
+    if arr is not None and arr.size:
+        x1 = np.minimum(arr[:, 0], arr[:, 2]); x2 = np.maximum(arr[:, 0], arr[:, 2])
+        y1 = np.minimum(arr[:, 1], arr[:, 3]); y2 = np.maximum(arr[:, 1], arr[:, 3])
+        c0 = np.round((x1 - x_min_nm) / nm_per_px).astype(np.int64)
+        c1 = np.round((x2 - x_min_nm) / nm_per_px).astype(np.int64)
+        if invert_y:
+            r0 = np.round((height_px - 1) - (y2 - y_min_nm) / nm_per_px).astype(np.int64)
+            r1 = np.round((height_px - 1) - (y1 - y_min_nm) / nm_per_px).astype(np.int64)
+        else:
+            r0 = np.round((y1 - y_min_nm) / nm_per_px).astype(np.int64)
+            r1 = np.round((y2 - y_min_nm) / nm_per_px).astype(np.int64)
+        c0 = np.clip(c0, 0, width_px); c1 = np.clip(c1 + 1, 0, width_px)
+        r0 = np.clip(r0, 0, height_px); r1 = np.clip(r1 + 1, 0, height_px)
+        for i in range(arr.shape[0]):
+            if c1[i] > c0[i] and r1[i] > r0[i]:
+                mask[r0[i]:r1[i], c0[i]:c1[i]] = fill
+    if polys:
+        for p in polys:
+            a = np.asarray(p, dtype=float)
+            if a.shape[0] < 3:
+                continue
+            cols = (a[:, 0] - x_min_nm) / nm_per_px
+            rows = (a[:, 1] - y_min_nm) / nm_per_px
+            if invert_y:
+                rows = (height_px - 1) - rows
+            pts = np.column_stack([cols, rows]).round().astype(np.int32)
+            cv2.fillPoly(mask, [pts], int(fill))
+    return mask
+
+
 def evaluate_raster(ast: object, masks: Mapping[str, np.ndarray], *,
                     nm_per_px: float) -> np.ndarray:
     """Evaluate ``ast`` against per-layer uint8 masks (255=inside), returning a
@@ -728,28 +771,24 @@ def evaluate_raster(ast: object, masks: Mapping[str, np.ndarray], *,
 
 
 def resolve_expression_raster(expr: str, bindings: Mapping[str, tuple], *,
-                              raw_poly_provider, recipe_provider,
-                              width_px: int, height_px: int,
-                              x_min_nm: float, y_min_nm: float,
-                              nm_per_px: float, invert_y: bool = True,
+                              raw_mask_provider, recipe_provider,
+                              nm_per_px: float,
                               _cache: Optional[dict] = None,
                               _visiting: Optional[set] = None) -> np.ndarray:
     """Raster analogue of :func:`resolve_expression`: evaluate ``expr`` directly
-    into a uint8 mask. ``raw_poly_provider(layer, datatype) -> [poly (n,2) nm]``
-    supplies a raw layer's walked polygons (rasterized here via
-    :func:`polys_to_mask`); ``recipe_provider(name) -> (expr, bindings)`` handles
+    into a uint8 mask. ``raw_mask_provider(layer, datatype) -> uint8 mask``
+    supplies a raw layer's rasterized geometry (the caller builds it — usually
+    via :func:`raster_layer_mask` on the walked rects/polys, so all masks share
+    one FOV pixel grid); ``recipe_provider(name) -> (expr, bindings)`` handles
     nested synthetic layers (evaluated recursively into masks, memoized)."""
     cache = {} if _cache is None else _cache
     visiting = set() if _visiting is None else _visiting
     _, ast = parse_expression(expr)
-    rparams = dict(width_px=width_px, height_px=height_px, x_min_nm=x_min_nm,
-                   y_min_nm=y_min_nm, nm_per_px=nm_per_px, invert_y=invert_y)
     masks: dict[str, np.ndarray] = {}
     for letter, raw_val in bindings.items():
         val = normalize_binding(raw_val)
         if val[0] == "raw":
-            masks[letter] = polys_to_mask(
-                raw_poly_provider(val[1], val[2]), **rparams)
+            masks[letter] = raw_mask_provider(val[1], val[2])
             continue
         name = val[1]
         if name in cache:
@@ -763,9 +802,9 @@ def resolve_expression_raster(expr: str, bindings: Mapping[str, tuple], *,
                 f"binding references unknown synthetic layer {name!r}")
         visiting.add(name)
         m = resolve_expression_raster(
-            rec[0], rec[1], raw_poly_provider=raw_poly_provider,
-            recipe_provider=recipe_provider, _cache=cache, _visiting=visiting,
-            **rparams)
+            rec[0], rec[1], raw_mask_provider=raw_mask_provider,
+            recipe_provider=recipe_provider, nm_per_px=nm_per_px,
+            _cache=cache, _visiting=visiting)
         visiting.discard(name)
         cache[name] = m
         masks[letter] = m
