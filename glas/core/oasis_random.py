@@ -53,14 +53,36 @@ from oasis_walker import Transform  # noqa: E402
 # whole RECTANGLE runs in one C call instead of per-record Python varint loops.
 # Absent → the pure-Python path below runs unchanged. The two MUST stay
 # byte-identical (CLAUDE.md §7); test_oasis_native_decode pins them together.
+# F27 M7: capture WHY native is off. A bare `except: _FAST=None` hid the real
+# cause — so `python -c "import oasis_fastdecode"` could succeed while the full
+# app silently fell back to the (much slower) Python decode with no explanation.
+# native_status() surfaces the captured reason in the debug log + export message.
+_FAST_OFF_REASON = None
 try:
     import oasis_fastdecode as _FAST   # noqa: E402
-    if getattr(_FAST, "VERSION", 0) < 4:
+    _v = getattr(_FAST, "VERSION", 0)
+    if _v < 4:
         # <4 lacks the rewind-before-modal invariant + the started flag that
         # _decode_at_native's per-run gobble relies on; fall back to Python.
+        _FAST_OFF_REASON = f"extension VERSION {_v} < 4 (too old); using Python decode"
         _FAST = None
-except Exception:                       # pragma: no cover - no build present
+except Exception as _exc:               # pragma: no cover - no build present
+    _FAST_OFF_REASON = f"import failed — {type(_exc).__name__}: {_exc}"
     _FAST = None
+
+
+def native_status() -> str:
+    """One-line human summary of the native extension state, for perf triage.
+    Answers 'is native decode/walk on, and if not, exactly why' — so a debug log
+    shows it instead of us guessing (F27 M7)."""
+    if _FAST is None:
+        return f"native OFF — {_FAST_OFF_REASON or 'extension not built'}"
+    v = getattr(_FAST, "VERSION", 0)
+    parts = [f"native ON — oasis_fastdecode VERSION {v}",
+             f"decode={'yes' if _FAST is not None else 'no'}",
+             f"walk_helpers={'yes' if _FASTW is not None else 'no (need v5)'}",
+             f"flatten_walk={'yes' if _FASTWALK is not None else 'no (need v7)'}"]
+    return " · ".join(parts)
 
 # F27 M1: walk helpers (roi_overlap_mask) need VERSION >= 5; keep a separate
 # gate so an older v4 .pyd still accelerates decode but not the walk.
@@ -738,6 +760,7 @@ class RandomAccessReader:
         _dbg(f"RandomAccessReader: {len(self._by_refnum):,} offsets indexed "
              f"from {self._path.name} (wanted={wanted_layers} "
              f"bbox_layer={bbox_layer})")
+        _dbg(native_status())    # F27 M7: is native decode/walk on, and if not, why
 
     def clone(self) -> "RandomAccessReader":
         """An independent reader over the same file/filter (F6 M3).
@@ -2492,13 +2515,25 @@ _BATCHED_WALK_MAX_CELLS = 100_000
 
 
 def _batched_walk_affordable(rar: "RandomAccessReader") -> bool:
-    """Is a whole-graph topo build cheap enough to run the batched walk? Yes when
-    a CE ``bbox_layer`` lets ``load_cell_bbox`` early-stop (E3B), or the chip is
-    small enough that a full-decode topo is still cheap. No on a big no-CE file
-    (the 1750 MB LTV chip) — there the topo build would decode the whole file, so
-    the caller uses the ROI-pruned recursive walk instead."""
+    """Is a whole-graph topo build cheap enough to run the batched walk? The
+    batched walk orders every reachable cell via ``load_cell_bbox``, which only
+    early-stops when a **real** CE boundary layer is present in the file.
+
+    - **S_BOUNDING_BOX present** → ``walk_roi``'s ``reachable_bbox`` is already
+      decode-free and optimal, and the topo build is only overhead — *worse*, on
+      a file whose configured ``bbox_layer`` is ABSENT (the 1750 MB LTV chip:
+      ``bbox_layer=108/250`` set, but the file has no such geometry, so
+      ``load_cell_bbox`` decodes each cell to its end), it would full-decode
+      thousands of cells just to build the order. So prefer ``walk_roi``.
+    - **No S_BOUNDING_BOX** (E3B) → the topo build IS the intended acceleration,
+      affordable when a CE ``bbox_layer`` early-stops or the chip is small.
+
+    Keying on sbbox — not merely on ``bbox_layer is not None`` — is what stops the
+    LTV chip (bbox_layer configured but CE-less) from running the topo scan."""
     n = len(getattr(rar, "_by_refnum", ()) or ())
     if n > _BATCHED_WALK_MAX_CELLS:
+        return False
+    if getattr(rar, "_sbbox_by_refnum", None) or getattr(rar, "_sbbox_by_name", None):
         return False
     if getattr(rar, "_bbox_layer", None) is not None:
         return True

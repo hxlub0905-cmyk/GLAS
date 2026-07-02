@@ -1701,8 +1701,13 @@ class ExportWorker(QObject):
         # raw POIs AND every ("raw", layer, dt) binding of an expression POI (and
         # its recipes). Best-effort — never block the export on a prewarm failure.
         if oasis_random._FASTWALK is None:
-            print("[export] native walk OFF — oasis_fastdecode is missing or "
-                  "VERSION < 6; using the Python walk", flush=True)
+            # F27 M7: report the ACTUAL reason (real import error / stale version)
+            # instead of the old misleading "missing or VERSION < 6" guess. If the
+            # extension imported fine but this big chip just isn't native-able,
+            # native_status() says so; if native truly failed to load in the app,
+            # it prints the swallowed import error so we can fix it.
+            print(f"[export] native flatten walk OFF — {oasis_random.native_status()}; "
+                  "using the pruned Python walk", flush=True)
         else:
             walk_layers: set = set()
 

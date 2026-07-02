@@ -35,8 +35,20 @@ ROI 的那顆大 cell 仍得整顆 decode；1750 MB 檔 → 數分鐘）。過�
   benchmark 非日常所需），新增單一 `debug.bat`（`set GLAS_DEBUG=1` + 印 native VERSION/selftest + 啟動 + 說明該看什麼）。
 - 刪 `GLAS_Operator_SOP.pptx` / `GLAS_操作SOP_繁中.pptx`（SOP，user 已另存）。
 
-**測試：** 新 `tests/test_batched_gate.py`（4：小檔/有 CE/大檔無 CE/超大 cap）、`tests/test_decode_heartbeat.py`（3：載完清
-乾淨 / tick 記數 / 心跳下 walk 仍正確）；全 `tests/` **848 passed**。**純 Python，未動 `.pyx` → 免 CI，重抓 ZIP 即可。**
+**M7b（真檔 log 修正——user 用 `debug.bat` 跑 LTV 貼回 log 後）：**
+- **gate bug（export 30k-cell 掃描洪流）：** 真 log 顯示 export 仍狂掃 `[roi] … N cells scanned so far` 到 30,000+ cell。
+  根因：`_batched_walk_affordable` 原本 `_bbox_layer is not None → True`，但這檔 `bbox_layer=(108,250)` 是「有設定」卻
+  「檔內根本沒這層」→ `load_cell_bbox` 無 CE 邊界可 early-stop、整顆解碼 → batched 的 topo build 全檔掃。**改為以 sbbox
+  為準**：有 S_BOUNDING_BOX 時 `walk_roi` 本來就 decode-free 剪枝、最佳，batched 純屬額外開銷（且此檔會災難性全解碼）→
+  一律退回 `walk_roi`；無 sbbox（E3B）才走 batched。互動路徑本就用 `walk_roi`、不受影響。
+- **native 為何 OFF 的診斷：** log 出現 `[export] native walk OFF — oasis_fastdecode is missing or VERSION < 6`，但
+  `debug.bat` 開頭 `python -c` 明明印 VERSION 7 → app 內 `_FAST` 竟是 None。原 `except Exception: _FAST=None` **把真正的
+  import 錯誤吞掉**。新增 `_FAST_OFF_REASON` 捕捉原因 + `native_status()`（印 native ON/OFF 與確切原因/各 gate 狀態），
+  reader build 的 debug 行與 export 訊息都改印它 → 下次 log 會直接說出 app 內 native 到底是「import failed—DLL/ABI…」還是
+  「VERSION < 7」，不用再猜。
+
+**測試：** 新 `tests/test_batched_gate.py`（5：小檔/有 CE/大檔無 CE/**sbbox present→退回**/超大 cap）、
+`tests/test_decode_heartbeat.py`（3）；全 `tests/` **849 passed**。**純 Python，未動 `.pyx` → 免 CI，重抓 ZIP 即可。**
 
 **影響檔案：** `glas/core/oasis_random.py`（心跳欄位 + `_decode_tick` + load_cell arm/clear + 兩 loop 心跳 + `GLAS_DEBUG`
 alias + `_batched_walk_affordable` gate）、`glas/core/fine_align.py`（`_FA_TIMING` 吃 `GLAS_DEBUG`）、

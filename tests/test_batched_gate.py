@@ -19,25 +19,37 @@ import oasis_random as orx           # noqa: E402
 
 
 class _Fake:
-    """Only the two attributes the gate reads."""
-    def __init__(self, n_cells: int, bbox_layer) -> None:
+    """Only the attributes the gate reads."""
+    def __init__(self, n_cells: int, bbox_layer, *, sbbox: bool = False) -> None:
         self._by_refnum = {i: None for i in range(n_cells)}
         self._bbox_layer = bbox_layer
+        self._sbbox_by_refnum = {0: (0, 0, 1, 1)} if sbbox else {}
+        self._sbbox_by_name = {}
 
 
-def test_small_no_ce_is_affordable():
-    # Small chip, no CE bbox_layer: a full-decode topo build is still cheap.
+def test_small_no_sbbox_no_ce_is_affordable():
+    # Small chip, no sbbox, no CE bbox_layer: full-decode topo build still cheap.
     assert orx._batched_walk_affordable(_Fake(100, None)) is True
 
 
-def test_ce_layer_makes_it_affordable_even_when_large():
-    # A CE bbox_layer lets load_cell_bbox early-stop, so a large chip is fine.
+def test_no_sbbox_ce_layer_makes_it_affordable_even_when_large():
+    # No sbbox but a CE bbox_layer lets load_cell_bbox early-stop (the E3B case).
     assert orx._batched_walk_affordable(_Fake(50_000, (108, 250))) is True
 
 
-def test_big_no_ce_is_not_affordable():
-    # The LTV case: many cells, no CE -> topo build would decode the whole file.
+def test_big_no_sbbox_no_ce_is_not_affordable():
+    # Many cells, no sbbox, no CE -> topo build would decode the whole file.
     assert orx._batched_walk_affordable(_Fake(44_997, None)) is False
+
+
+def test_sbbox_present_is_never_affordable():
+    # THE LTV bug: sbbox present + bbox_layer configured but CE absent. walk_roi
+    # is already decode-free-pruned; the batched topo build would full-decode
+    # thousands of cells. Must fall back to walk_roi regardless of bbox_layer.
+    assert orx._batched_walk_affordable(
+        _Fake(44_997, (108, 250), sbbox=True)) is False
+    assert orx._batched_walk_affordable(
+        _Fake(500, (108, 250), sbbox=True)) is False
 
 
 def test_huge_cell_count_never_affordable():
