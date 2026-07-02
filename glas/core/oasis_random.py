@@ -1505,7 +1505,7 @@ def flatten_cell_graph(rar: "RandomAccessReader", root: object,
                        max_cells: Optional[int] = None,
                        max_rects: Optional[int] = None,
                        max_placements: Optional[int] = None,
-                       progress=None):
+                       progress=None, deadline: Optional[float] = None):
     """Flatten the ROI-independent cell graph reachable from ``root`` into CSR
     arrays for :func:`oasis_fastdecode.walk_native` (F27 M3e — robust hybrid).
 
@@ -1540,9 +1540,14 @@ def flatten_cell_graph(rar: "RandomAccessReader", root: object,
                                f"({len(rar._by_refnum)} > {max_cells} cells)")
         return None
     # ── pass 1: DFS order + validate the graph (name-ref / non-D4 bail) ──
+    if progress is not None:
+        progress(f"build start ({len(getattr(rar, '_by_refnum', ()) or ())} "
+                 f"cells indexed)")
     order: list = []
     idx: dict = {}
     stack = [root]
+    slow_cid = None
+    slow_dt = 0.0
     while stack:
         cid = stack.pop()
         if cid in idx:
@@ -1552,9 +1557,25 @@ def flatten_cell_graph(rar: "RandomAccessReader", root: object,
         if len(order) > max_cells:
             rar._flatten_reject = f"graph too large (> {max_cells} cells)"
             return None
-        if progress is not None and len(order) % 2000 == 0:
-            progress("pass1-decode", len(order), None)
+        if progress is not None and len(order) % 500 == 0:
+            progress(f"pass1-decode {len(order)} cells "
+                     f"(slowest so far: {slow_cid!r} {slow_dt:.0f}s)")
+        if deadline is not None and time.perf_counter() > deadline:
+            rar._flatten_reject = (f"prewarm over budget in pass1 at "
+                                   f"{len(order)} cells; slowest cell "
+                                   f"{slow_cid!r} took {slow_dt:.0f}s")
+            if progress is not None:
+                progress("ABORT " + rar._flatten_reject)
+            return None
+        _ts = time.perf_counter()
         c = rar.load_cell(cid)
+        _dt = time.perf_counter() - _ts
+        if _dt > slow_dt:
+            slow_dt, slow_cid = _dt, cid
+        if progress is not None and _dt > 3.0:
+            progress(f"SLOW cell {cid!r}: {_dt:.0f}s to decode "
+                     f"({c.total_rects()} rects, {c.total_polys()} polys, "
+                     f"{c.placement_count()} placements)")
         for pl in c.placements:
             if not isinstance(pl.target, (int, np.integer)):
                 rar._flatten_reject = f"name-ref placement target (cell {cid!r})"
@@ -1564,6 +1585,8 @@ def flatten_cell_graph(rar: "RandomAccessReader", root: object,
                 rar._flatten_reject = f"non-D4 placement (cell {cid!r})"
                 return None
             stack.append(pl.target)
+    if progress is not None:
+        progress(f"pass1 done ({len(order)} cells); building CSR")
 
     # ── pass 2: build the CSR (grids stay 1 record; arbitrary reps expand) ──
     N = len(order)
@@ -1579,8 +1602,17 @@ def flatten_cell_graph(rar: "RandomAccessReader", root: object,
     reach = np.zeros((N, 4), dtype=np.float64)
     n_rect = n_poly = n_pl = 0
     for i, cid in enumerate(order):
-        if progress is not None and i and i % 2000 == 0:
-            progress("pass2-build", i, N)
+        if progress is not None and i and i % 500 == 0:
+            progress(f"pass2-build {i}/{N} cells "
+                     f"({n_rect} rect, {n_poly} poly, {n_pl} pl records)")
+        if deadline is not None and i and i % 200 == 0 \
+                and time.perf_counter() > deadline:
+            rar._flatten_reject = (f"prewarm over budget in pass2 at "
+                                   f"{i}/{N} cells ({n_rect} rect, {n_poly} "
+                                   f"poly, {n_pl} pl records so far)")
+            if progress is not None:
+                progress("ABORT " + rar._flatten_reject)
+            return None
         c = rar.load_cell(cid)
         # rects — plain (no-rep) rects are built vectorized (the common bulk;
         # keeps parity with the old c.rects() build: grid_flag=0, n1=n2=1); only
@@ -1766,17 +1798,20 @@ def flatten_prewarm(rar: "RandomAccessReader", root: object,
                     layer: int, datatype: int, *,
                     max_cells: int = 200_000,
                     max_rects: int = 5_000_000,
-                    max_placements: int = 8_000_000):
+                    max_placements: int = 8_000_000,
+                    time_budget_s: float = 120.0):
     """F27 M3c: build the whole-chip flatten ONCE (ignoring the interactive
     cell cap) and persist it to the shared sidecar, so the batch's pool workers
     each ``np.load`` it instead of decoding the whole chip. Call it in the
     orchestrator process before launching the export pool. Returns the flat
     tuple (native-able) or ``None`` (non-D4 / name-ref / a non-clippable rep over
-    the guard / over the OOM caps); either verdict is persisted so workers don't
-    rebuild. Regular-grid repetition stays 1 record (clipped in-kernel, M3e), so
-    a dense array chip does NOT expand; only a genuinely non-clippable large
-    array bails to the Python walk. Emits coarse ``[flatten]`` progress so a big
-    chip shows movement. Safe to call repeatedly (sidecar hit short-circuits)."""
+    the guard / over the OOM caps / over ``time_budget_s``); either verdict is
+    persisted so workers don't rebuild. Regular-grid repetition stays 1 record
+    (clipped in-kernel, M3e), so a dense array chip does NOT expand; only a
+    genuinely non-clippable large array bails to the Python walk. Emits
+    ``[flatten]`` progress (per-phase, per-cell timing, slow-cell alerts) so a
+    big chip shows movement, and aborts after ``time_budget_s`` with a
+    diagnostic reject rather than hanging. Safe to call repeatedly."""
     sc = walkflatten_cache.load(rar._path, root, layer, datatype)
     if sc is walkflatten_cache.NOT_NATIVE:
         rar._flatten_reject = (walkflatten_cache.last_not_native_reason
@@ -1786,26 +1821,32 @@ def flatten_prewarm(rar: "RandomAccessReader", root: object,
         rar._flatten_reject = None
         return sc
     # Building the whole-chip flatten is the one genuinely slow step (a full
-    # decode + CSR build). Emit coarse progress so a big chip shows movement
-    # instead of looking hung, and time each phase so a slow build is diagnosable.
+    # decode + CSR build). Emit progress so a big chip shows movement instead of
+    # looking hung, and time-bound it so a pathological chip aborts (Python walk)
+    # with a diagnostic instead of hanging for many minutes.
     _t0 = time.perf_counter()
 
-    def _prog(phase, i, n):
-        el = time.perf_counter() - _t0
-        tot = f"/{n}" if n else ""
-        print(f"[flatten] {layer}/{datatype} {phase} {i}{tot} cells "
-              f"({el:.0f}s)", flush=True)
+    def _prog(msg):
+        print(f"[flatten] {layer}/{datatype} {msg} "
+              f"({time.perf_counter() - _t0:.0f}s)", flush=True)
 
     flat = flatten_cell_graph(rar, root, layer, datatype,
                               max_cells=max_cells, max_rects=max_rects,
-                              max_placements=max_placements, progress=_prog)
+                              max_placements=max_placements, progress=_prog,
+                              deadline=_t0 + time_budget_s)
+    reason = getattr(rar, "_flatten_reject", "") or ""
     if flat is not None:
         rc, po, pl = flat[0].shape[0], flat[4].shape[0], flat[7].shape[0]
         print(f"[flatten] {layer}/{datatype} built in "
               f"{time.perf_counter() - _t0:.0f}s "
               f"(records: {rc} rect, {po} poly, {pl} placement)", flush=True)
-    walkflatten_cache.save(rar._path, root, layer, datatype, flat,
-                           reason=getattr(rar, "_flatten_reject", "") or "")
+    # A time-budget abort is a "too slow THIS run" verdict, not a permanent
+    # "not native-able" — do NOT persist it, or a later run (even after the cause
+    # is fixed) would load the cached verdict and never retry. Real non-native
+    # verdicts (name-ref / non-D4 / non-clippable / over-cap) ARE persisted.
+    if not reason.startswith("prewarm over budget"):
+        walkflatten_cache.save(rar._path, root, layer, datatype, flat,
+                               reason=reason)
     return flat
 
 

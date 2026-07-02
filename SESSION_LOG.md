@@ -17,9 +17,13 @@ bail 後，這是第一次真的攤平整顆 330MB chip，撞到前幾版一直�
    `_grid_axes` 認不得（arbitrary list / skew）且 `count > _REP_EXPAND_MAX(4096)` → 直接回 bail，**絕不呼叫
    `repetition_offsets_np`**（原本會 materialize 百萬 offset；polygon 更慘，每個 offset 一次 `base.copy()` → 卡死）。
    flatten 三處（rect/poly/placement）收到 bail 就整棵回 Python，reject 帶 `type=T count=N (cell X)` 供診斷。
-2. **進度 log**：`flatten_prewarm` 傳 `progress` callback，`flatten_cell_graph` 每 2000 cell 印
-   `[flatten] L/D pass1-decode i cells (Xs)` / `pass2-build i/N cells (Xs)`，完成印 record 數（rect/poly/placement）。
-   大 chip 不再「看起來當掉」，且可分辨慢在 decode（pass1）還是 build（pass2）。
+2. **進度 log + 硬性時間上限（診斷 + 防再卡死）**：`flatten_prewarm` 傳 `progress` callback + `deadline`
+   （`time_budget_s=120`）。`flatten_cell_graph`：pass 1 進入時**立刻**印 `build start (N cells indexed)`（證明新碼
+   有跑）、每 500 cell 印 `pass1-decode i cells (slowest so far …)`、**per-cell 計時**（單 cell decode > 3s 立刻印
+   `SLOW cell X: Ns to decode (R rects, P polys, K placements)` 抓兇手）、pass1→pass2 轉換印、pass 2 每 500 cell 印
+   record 數。**超過 budget → abort（回 None，reject 帶「over budget in passN at i cells; slowest cell X took Ts」，
+   印 ABORT）**，該層落 Python 但**永不再 15min 空等**。budget abort 是「這次太慢」非「永久不可 native」→ **不寫
+   sidecar**（修好後下次會重試，不會被毒化）。第一次 user 重測完全沒看到 `[flatten]` log → 疑似 ZIP 沒更新到 hotfix。
 3. **mixed-cell 向量化**：plain rect 一律走向量化 block（`rt<0` mask），只有「有 repetition 的那幾筆」走 per-record
    分類 → 一個 cell 有 10 萬 plain rect + 一筆 array 時，不會退化成 10 萬次 Python 迴圈。
 
