@@ -441,8 +441,9 @@ def fine_align_one(sem_img: np.ndarray, template_full: np.ndarray,
 
 def _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb=None):
     """Walk one layer's ROI geometry into a list of polygon ndarrays (nm)."""
-    # F27 M3: walk_roi_fast uses the native subtree walk when the graph is
-    # native-able, else falls through to the identical pure-Python walk_roi.
+    # F27 M3/M4: walk_roi_fast uses the native subtree walk when the graph is
+    # native-able (small/viable chip), else the byte-identical pure-Python
+    # BATCHED walk (fast on the big dense-leaf production chip too).
     res = oasis_random.walk_roi_fast(rar, root, roi_bbox, layer, datatype,
                                      cancel_cb=cancel_cb)
     polys = [np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float64)

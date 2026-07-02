@@ -4,6 +4,39 @@
 
 ---
 
+## [2026-07-02] [F27 M4] pure-Python batched walk：大檔 warm walk 100-214x（免 CI、免重編）
+
+**變更類型：** 效能（大檔真正的解）· **狀態：本地實測 100-214x byte-identical；待 user 量真檔**
+
+**動機：** M3e 的 whole-chip flatten 對 E3B 不可行（數百顆密集 leaf cell、多 GB CSR）。真正瓶頸是 warm walk 逐 instance
+的 Python 遞迴（3-5 萬個 instance → ~20-32s/張）。改**不建 CSR、不動 `.pyx` 的純 Python 向量化 batched walk**。
+
+**做法（`oasis_random.walk_roi_batched`）：**
+- **拓樸序**逐 cell 處理一次（parents-first，DFS post-order 反轉；cache 於 `rar._batch_topo`，ROI-independent 整批共用）。
+- transform 以 **segment `(M, ts)`** 表示（共用 D4 矩陣、ts 為 (K,2) 平移陣列）。emit 與 no-rep descent 對整個 ts
+  陣列**向量化**（一次 numpy op 取代 K 次 Python 遞迴呼叫）；segment 數受 graph 邊數（非 instance 數）約束。
+- no-rep placement 依 `(child, base_M)` 分組 → 合併成單一 child segment（`np.nonzero(hit)` 一次攤平）；rep placement
+  用既有 `_clip_grid_offsets` 逐 parent 剪裁後併成一段（byte-identical）；plain-rect leaf emit 走向量化
+  `_emit_plain_rects_seg`（chunked 控記憶體）；rep-rect / polygon cell 走逐 instance `_emit_cell_geom`（數量少）。
+- 與 `walk_roi` **逐位相同**（結果集；rects+polys sorted 比對）。`walk_roi_fast` 的 fallback 從 `walk_roi` 改走
+  `walk_roi_batched`（native-able 小檔仍走 C kernel walk_native）。
+
+**實測（本地合成）：** ARRAY（repetition 陣列，E3B 型）**214x**（1017→5ms）、DISTINCT（3 萬獨立 placement）**120x**
+（1392→12ms），皆 byte-identical。對應真檔 20-32s/張 warm walk → 預期 ~0.1-0.3s。
+
+**測試：** 新 `tests/test_walk_batched.py`（flat / big-grid / small-grid / rect-rep / polygon 對 `walk_roi` 逐位一致，
+純 Python 不 skip）；全 `tests/` **825 passed**。
+
+**交付：純 Python，未動 `.pyx` → 不觸發 CI、不用重編。** user 重抓 ZIP 拿新 `oasis_random.py` 即可（v7 `.pyd` 沿用或
+甚至沒有 `.pyd` 都行——batched 不需 native）。prewarm budget 降 20s（dense 檔快速 bail → 直接落 batched 快路徑）。
+
+**影響檔案：** `glas/core/oasis_random.py`（`walk_roi_batched` + `_emit_cell_geom` / `_emit_plain_rects_seg` /
+`_batch_place_prep` helpers + `walk_roi_fast` 改 fallback + topo cache + prewarm budget 20s）、
+`glas/core/fine_align.py`（註解）、`tests/test_walk_batched.py`、`docs/plans/F27-native-walk.md`。
+**Branch：** `claude/project-perf-optimization-86i8yt`。
+
+---
+
 ## [2026-07-02] [F27 M3e 診斷結論] 整顆 chip flatten 對「密集 leaf cell」型不可行 + 快速 bail 緩解
 
 **變更類型：** 診斷 + 緩解（非最終解）· **狀態：確認 whole-chip flatten 走不通此型檔，需改架構**

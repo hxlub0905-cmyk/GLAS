@@ -136,6 +136,20 @@ user 真實痛點＝整包 KLARF（~190 顆 defect）批次 export，實測 ~12�
       walk 30k overlapping instance：native 1.9ms vs Python 1177ms = 612x**（flatten 一次分攤）。CSR 亦加 all-plain-rect
       向量化快路徑（免 per-record 迴圈，保 prewarm build 速度）。**需 CI 重編 v7 `.pyd`**（動了 `.pyx`）→ user 重抓 ZIP
       + `python tools/unpack_fastdecode.py`；舊 v6 `.pyd` 下 `_FASTWALK` 為 None → 安全走 Python（不會壞、只是沒加速）。
+- [x] **M4：pure-Python batched walk（大檔真正的解）** ✓ 2026-07-02：真檔 E3B 打臉 whole-chip flatten——有數百顆
+      密集 leaf cell（每顆 ~8 萬 rects、full-decode 4-5s），攤平整顆要數分鐘 + 多 GB CSR（OOM）。改**不建 CSR、不動
+      `.pyx`**：`walk_roi_batched`（`oasis_random`）用**拓樸序**逐 cell 處理一次（parents-first），transform 以
+      **segment `(M, ts)`**（共用 D4 矩陣）表示，emit 與 no-rep descent 對整個 instance 陣列**向量化**（一次 numpy op
+      取代 K 次 Python 遞迴），segment 數受 graph 邊數（非 instance 數）約束。no-rep placement 依 `(child, base_M)`
+      分組合併成單一 child segment；rep placement 用既有 `_clip_grid_offsets` 逐 parent 剪裁（byte-identical）；plain-rect
+      leaf 的 emit 走向量化 `_emit_plain_rects_seg`（chunked 控記憶體）。與 `walk_roi` 逐位相同（結果集，rects+polys 皆
+      sorted 比對）。**實測**：ARRAY（rep 陣列，E3B 型）**214x**（1017→5ms）、DISTINCT（3 萬個獨立 placement）**120x**
+      （1392→12ms）。`walk_roi_fast` 的 fallback 從 `walk_roi` 改走 `walk_roi_batched`（native-able 小檔仍走 C kernel）。
+      拓樸序 cache 於 `rar._batch_topo`（ROI-independent 整批共用）。護欄：新 `tests/test_walk_batched.py`（5 例：flat/
+      grid/small-grid/rect-rep/polygon 對 walk_roi 逐位一致，純 Python 不 skip）；全 `tests/` **825 passed**。**純 Python →
+      免 CI、免重編、免重抓 .pyd（v7 沿用或無 .pyd 皆可）**。prewarm budget 降 20s（dense 檔快速 bail 落 batched）。
+- [ ] **M4 後續（可選）**：batched 的 poly/rep-rect emit 也向量化（目前 rep-rect/poly cell 走 per-instance，數量少）；
+      cold 首張的 reach_bbox sweep 跨 worker 共享（省每 worker ~28s 冷啟）。
 - [ ] **M3e 後續：多 wanted layer**（一次 walk 多層）。arbitrary/skew rep 已展開，唯一硬上限是 over-cap → Python。
 - [ ] 每階段 byte-identical（native-on vs off 逐位）+ 真檔抽樣；§7「reachable_bbox 用 load_cell_bbox、walk 用
       load_cell」不變式：攤平只用 memo 好的結果，不改剪枝語意。
