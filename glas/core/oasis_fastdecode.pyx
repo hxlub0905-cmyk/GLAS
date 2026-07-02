@@ -19,15 +19,19 @@ top of this once the delivery path is confirmed.
 """
 
 import numpy as np
-from libc.math cimport floor, ceil
+from libc.math cimport floor, ceil, rint
 
 # Native version tag so callers / the selftest can confirm which build loaded.
 # 1 = varint helpers only (M0); 2 = + decode_rect_run (M2a-core); 3 = rect-run
 # rewinds on a repetition *before* mutating modal state; 4 = decode_rect_run
 # gained the ``started`` flag (continue a known-layer run, stopping on any
 # change); 5 = + F27 M1 walk helpers (transform_rects_d4 / roi_overlap_mask);
-# 6 = + F27 M3 native subtree walk (walk_rects_native) wired into walk_roi.
-VERSION = 6
+# 6 = + F27 M3 native subtree walk (walk_rects_native) wired into walk_roi;
+# 7 = + F27 M3e robust hybrid walk (walk_native): in-kernel analytic repetition
+#     clip (regular grids stay 1 record, never expanded) for rects/placements
+#     AND polygon emit — so a production array chip walks natively without
+#     materializing the whole chip.
+VERSION = 7
 
 
 def decode_uvarint(const unsigned char[::1] buf, Py_ssize_t pos):
@@ -431,6 +435,339 @@ def walk_rects_native(const double[:, ::1] rect_coords,
     return out_arr[:out_n]
 
 
+# ── F27 M3e: robust hybrid native walk with in-kernel analytic repetition clip ─
+#
+# The M3a/M3b kernel above requires the *whole* reachable graph to be plain-rect
+# / no-repetition. A production array chip is never that: regular-grid fill
+# arrays span millions of instances (can't expand), and some layers carry
+# polygons. ``walk_native`` handles those in-kernel:
+#
+#   * regular-grid repetition (types 1/2/3 + orthogonal 8) stays ONE record with
+#     an axis descriptor; the kernel clips the grid to the ROI analytically
+#     (``_axis_range`` == oasis_random._axis_index_range) and only visits the
+#     handful of instances that can overlap — never materializing the array;
+#   * arbitrary-list / bounded reps are pre-expanded (in the flatten) into plain
+#     records (grid_flag=0), matching walk_roi's full-materialize-then-mask;
+#   * polygons are transformed + emitted natively (point-list round + bbox mask).
+#
+# Byte-identical emitted-rect/poly SET to walk_roi (order differs; compare
+# sorted). grid_flag distinguishes a clippable grid (axis-cull applies, exactly
+# as _clip_grid_offsets) from a plain record (single instance, no cull) so the
+# survivor set matches walk_roi record-for-record.
+
+cdef inline void _roi_local(double m00, double m01, double m10, double m11,
+                            double t0, double t1,
+                            double r0, double r1, double r2, double r3,
+                            double* out):
+    """Map root-frame ROI corners into the local frame of transform (M,t) as an
+    axis-aligned bbox (== oasis_random._roi_to_local). det != 0 for D4·mag."""
+    cdef double det = m00 * m11 - m01 * m10
+    cdef double inv = 1.0 / det
+    cdef double rx0 = r0, ry0 = r1, rx1 = r2, ry1 = r3
+    cdef double xmin = 1e300, ymin = 1e300, xmax = -1e300, ymax = -1e300
+    cdef double cx, cy, lx, ly
+    cdef int k
+    cdef double vx, vy
+    for k in range(4):
+        if k == 0:
+            vx = rx0; vy = ry0
+        elif k == 1:
+            vx = rx1; vy = ry0
+        elif k == 2:
+            vx = rx1; vy = ry1
+        else:
+            vx = rx0; vy = ry1
+        cx = vx - t0; cy = vy - t1
+        lx = (cx * m11 - cy * m01) * inv
+        ly = (-cx * m10 + cy * m00) * inv
+        if lx < xmin: xmin = lx
+        if lx > xmax: xmax = lx
+        if ly < ymin: ymin = ly
+        if ly > ymax: ymax = ly
+    out[0] = xmin; out[1] = ymin; out[2] = xmax; out[3] = ymax
+
+
+cdef inline void _axis_range(long long n, double step, double lo, double hi,
+                             long long* pi0, long long* pi1):
+    """Inclusive grid-index range whose instance i*step can bring the object into
+    [lo,hi] (padded one index each side); i0>i1 == empty. Exact port of
+    oasis_random._axis_index_range so the survivor set is byte-identical."""
+    cdef double a, b, tmp
+    if n <= 1 or step == 0.0:
+        if lo <= 0.0 and 0.0 <= hi:
+            pi0[0] = 0; pi1[0] = n - 1
+        else:
+            pi0[0] = 1; pi1[0] = 0
+        return
+    a = lo / step; b = hi / step
+    if step < 0.0:
+        tmp = a; a = b; b = tmp
+    a = floor(a) - 1.0
+    if a < 0.0:
+        a = 0.0
+    b = ceil(b) + 1.0
+    if b > <double>(n - 1):
+        b = <double>(n - 1)
+    pi0[0] = <long long>a
+    pi1[0] = <long long>b
+
+
+def walk_native(const double[:, ::1] rect,
+                const long long[::1] rect_off,
+                const double[:, ::1] poly_pts,
+                const long long[::1] poly_ptoff,
+                const double[:, ::1] poly_meta,
+                const long long[::1] poly_off,
+                const long long[::1] pl_target,
+                const double[:, ::1] pl_data,
+                const long long[::1] pl_off,
+                const double[:, ::1] reach_bbox,
+                long long root_index,
+                double r0, double r1, double r2, double r3,
+                int max_depth):
+    """F27 M3e kernel. Arrays are cell-local grid-frame CSR (see
+    oasis_random.flatten_cell_graph). Column layout:
+      rect[r]  : x1,y1,x2,y2, grid_flag, n1,v1x,v1y, n2,v2x,v2y   (11)
+      pl_data[p]: m00,m01,m10,m11, t0,t1, grid_flag, n1,v1x,v1y, n2,v2x,v2y (13)
+      poly_meta[q]: grid_flag, n1,v1x,v1y, n2,v2x,v2y             (7)
+                   points for poly q are poly_pts[poly_ptoff[q]:poly_ptoff[q+1]]
+    Returns (rects (Nr,4) f64, poly_pts_out (Npp,2) f64, poly_out_off (Np+1) i64).
+    """
+    cdef Py_ssize_t out_cap = 1024, out_n = 0
+    out_arr = np.empty((out_cap, 4), dtype=np.float64)
+    cdef double[:, ::1] out = out_arr
+    # polygon output: flat points + per-polygon offsets
+    cdef Py_ssize_t pp_cap = 1024, pp_n = 0
+    pp_arr = np.empty((pp_cap, 2), dtype=np.float64)
+    cdef double[:, ::1] ppo = pp_arr
+    cdef Py_ssize_t po_cap = 256, po_n = 1
+    po_arr = np.empty(po_cap, dtype=np.int64)
+    cdef long long[::1] poo = po_arr
+    poo[0] = 0
+    cdef Py_ssize_t st_cap = 1024, st_n = 0
+    st_arr = np.empty((st_cap, 8), dtype=np.float64)
+    cdef double[:, ::1] st = st_arr
+    st[0, 0] = root_index
+    st[0, 1] = 1; st[0, 2] = 0; st[0, 3] = 0; st[0, 4] = 1
+    st[0, 5] = 0; st[0, 6] = 0; st[0, 7] = 0
+    st_n = 1
+    cdef Py_ssize_t ci, r, q, p, child, k, pt0, pt1, kk
+    cdef double m00, m01, m10, m11, t0, t1
+    cdef int depth
+    cdef double x1, y1, x2, y2, ax, ay, bx, by, xmin, xmax, ymin, ymax
+    cdef double bm00, bm01, bm10, bm11, bt0, bt1
+    cdef double cm00, cm01, cm10, cm11, ct0, ct1
+    cdef double flag, n1d, v1x, v1y, n2d, v2x, v2y
+    cdef long long n1, n2, i0a, i1a, i0b, i1b, ia, ib
+    cdef double px0, px1, py0, py1, dx, dy, gx, gy, pxx, pyy
+    cdef double rl[4]
+    while st_n > 0:
+        st_n -= 1
+        ci = <Py_ssize_t>st[st_n, 0]
+        m00 = st[st_n, 1]; m01 = st[st_n, 2]; m10 = st[st_n, 3]; m11 = st[st_n, 4]
+        t0 = st[st_n, 5]; t1 = st[st_n, 6]; depth = <int>st[st_n, 7]
+        _roi_local(m00, m01, m10, m11, t0, t1, r0, r1, r2, r3, rl)
+        # ── rects ──
+        for r in range(rect_off[ci], rect_off[ci + 1]):
+            x1 = rect[r, 0]; y1 = rect[r, 1]; x2 = rect[r, 2]; y2 = rect[r, 3]
+            flag = rect[r, 4]
+            if flag == 0.0:
+                i0a = 0; i1a = 0; i0b = 0; i1b = 0
+                v1x = 0; v1y = 0; v2x = 0; v2y = 0
+            else:
+                n1 = <long long>rect[r, 5]; v1x = rect[r, 6]; v1y = rect[r, 7]
+                n2 = <long long>rect[r, 8]; v2x = rect[r, 9]; v2y = rect[r, 10]
+                px0 = x1 if x1 < x2 else x2; px1 = x1 if x1 > x2 else x2
+                py0 = y1 if y1 < y2 else y2; py1 = y1 if y1 > y2 else y2
+                if v1x != 0.0:
+                    _axis_range(n1, v1x, rl[0] - px1, rl[2] - px0, &i0a, &i1a)
+                elif v1y != 0.0:
+                    _axis_range(n1, v1y, rl[1] - py1, rl[3] - py0, &i0a, &i1a)
+                else:
+                    i0a = 0; i1a = n1 - 1
+                if v2x != 0.0:
+                    _axis_range(n2, v2x, rl[0] - px1, rl[2] - px0, &i0b, &i1b)
+                elif v2y != 0.0:
+                    _axis_range(n2, v2y, rl[1] - py1, rl[3] - py0, &i0b, &i1b)
+                else:
+                    i0b = 0; i1b = n2 - 1
+                if i0a > i1a or i0b > i1b:
+                    continue
+            ia = i0a
+            while ia <= i1a:
+                ib = i0b
+                while ib <= i1b:
+                    dx = ia * v1x + ib * v2x; dy = ia * v1y + ib * v2y
+                    ax = m00 * (x1 + dx) + m01 * (y1 + dy) + t0
+                    ay = m10 * (x1 + dx) + m11 * (y1 + dy) + t1
+                    bx = m00 * (x2 + dx) + m01 * (y2 + dy) + t0
+                    by = m10 * (x2 + dx) + m11 * (y2 + dy) + t1
+                    if ax < bx:
+                        xmin = ax; xmax = bx
+                    else:
+                        xmin = bx; xmax = ax
+                    if ay < by:
+                        ymin = ay; ymax = by
+                    else:
+                        ymin = by; ymax = ay
+                    xmin = floor(xmin); ymin = floor(ymin)
+                    xmax = ceil(xmax); ymax = ceil(ymax)
+                    if xmin <= r2 and xmax >= r0 and ymin <= r3 and ymax >= r1:
+                        if out_n == out_cap:
+                            out_cap = out_cap * 2
+                            out2 = np.empty((out_cap, 4), dtype=np.float64)
+                            out2[:out_n] = out_arr[:out_n]
+                            out_arr = out2; out = out_arr
+                        out[out_n, 0] = xmin; out[out_n, 1] = ymin
+                        out[out_n, 2] = xmax; out[out_n, 3] = ymax
+                        out_n += 1
+                    ib += 1
+                ia += 1
+        # ── polygons ──
+        for q in range(poly_off[ci], poly_off[ci + 1]):
+            pt0 = poly_ptoff[q]; pt1 = poly_ptoff[q + 1]
+            flag = poly_meta[q, 0]
+            if flag == 0.0:
+                i0a = 0; i1a = 0; i0b = 0; i1b = 0
+                v1x = 0; v1y = 0; v2x = 0; v2y = 0
+            else:
+                n1 = <long long>poly_meta[q, 1]; v1x = poly_meta[q, 2]; v1y = poly_meta[q, 3]
+                n2 = <long long>poly_meta[q, 4]; v2x = poly_meta[q, 5]; v2y = poly_meta[q, 6]
+                # base poly bbox (cell frame)
+                px0 = 1e300; px1 = -1e300; py0 = 1e300; py1 = -1e300
+                for k in range(pt0, pt1):
+                    pxx = poly_pts[k, 0]; pyy = poly_pts[k, 1]
+                    if pxx < px0: px0 = pxx
+                    if pxx > px1: px1 = pxx
+                    if pyy < py0: py0 = pyy
+                    if pyy > py1: py1 = pyy
+                if v1x != 0.0:
+                    _axis_range(n1, v1x, rl[0] - px1, rl[2] - px0, &i0a, &i1a)
+                elif v1y != 0.0:
+                    _axis_range(n1, v1y, rl[1] - py1, rl[3] - py0, &i0a, &i1a)
+                else:
+                    i0a = 0; i1a = n1 - 1
+                if v2x != 0.0:
+                    _axis_range(n2, v2x, rl[0] - px1, rl[2] - px0, &i0b, &i1b)
+                elif v2y != 0.0:
+                    _axis_range(n2, v2y, rl[1] - py1, rl[3] - py0, &i0b, &i1b)
+                else:
+                    i0b = 0; i1b = n2 - 1
+                if i0a > i1a or i0b > i1b:
+                    continue
+            ia = i0a
+            while ia <= i1a:
+                ib = i0b
+                while ib <= i1b:
+                    dx = ia * v1x + ib * v2x; dy = ia * v1y + ib * v2y
+                    # transform + round points; bbox over rounded points
+                    xmin = 1e300; ymin = 1e300; xmax = -1e300; ymax = -1e300
+                    for k in range(pt0, pt1):
+                        gx = poly_pts[k, 0] + dx; gy = poly_pts[k, 1] + dy
+                        ax = rint(m00 * gx + m01 * gy + t0)
+                        ay = rint(m10 * gx + m11 * gy + t1)
+                        if ax < xmin: xmin = ax
+                        if ax > xmax: xmax = ax
+                        if ay < ymin: ymin = ay
+                        if ay > ymax: ymax = ay
+                    if xmin <= r2 and xmax >= r0 and ymin <= r3 and ymax >= r1:
+                        # grow point buffer if needed
+                        if pp_n + (pt1 - pt0) > pp_cap:
+                            while pp_n + (pt1 - pt0) > pp_cap:
+                                pp_cap = pp_cap * 2
+                            pp2 = np.empty((pp_cap, 2), dtype=np.float64)
+                            pp2[:pp_n] = pp_arr[:pp_n]
+                            pp_arr = pp2; ppo = pp_arr
+                        for k in range(pt0, pt1):
+                            gx = poly_pts[k, 0] + dx; gy = poly_pts[k, 1] + dy
+                            ppo[pp_n, 0] = rint(m00 * gx + m01 * gy + t0)
+                            ppo[pp_n, 1] = rint(m10 * gx + m11 * gy + t1)
+                            pp_n += 1
+                        if po_n == po_cap:
+                            po_cap = po_cap * 2
+                            po2 = np.empty(po_cap, dtype=np.int64)
+                            po2[:po_n] = po_arr[:po_n]
+                            po_arr = po2; poo = po_arr
+                        poo[po_n] = pp_n
+                        po_n += 1
+                    ib += 1
+                ia += 1
+        if depth >= max_depth:
+            continue
+        # ── placements ──
+        for p in range(pl_off[ci], pl_off[ci + 1]):
+            child = <Py_ssize_t>pl_target[p]
+            bm00 = pl_data[p, 0]; bm01 = pl_data[p, 1]
+            bm10 = pl_data[p, 2]; bm11 = pl_data[p, 3]
+            bt0 = pl_data[p, 4]; bt1 = pl_data[p, 5]
+            flag = pl_data[p, 6]
+            x1 = reach_bbox[child, 0]; y1 = reach_bbox[child, 1]
+            x2 = reach_bbox[child, 2]; y2 = reach_bbox[child, 3]
+            if flag == 0.0:
+                i0a = 0; i1a = 0; i0b = 0; i1b = 0
+                v1x = 0; v1y = 0; v2x = 0; v2y = 0
+            else:
+                n1 = <long long>pl_data[p, 7]; v1x = pl_data[p, 8]; v1y = pl_data[p, 9]
+                n2 = <long long>pl_data[p, 10]; v2x = pl_data[p, 11]; v2y = pl_data[p, 12]
+                # placed = base applied to child reach bbox (cell frame), bbox
+                ax = bm00 * x1 + bm01 * y1 + bt0; ay = bm10 * x1 + bm11 * y1 + bt1
+                bx = bm00 * x2 + bm01 * y2 + bt0; by = bm10 * x2 + bm11 * y2 + bt1
+                px0 = ax if ax < bx else bx; px1 = ax if ax > bx else bx
+                py0 = ay if ay < by else by; py1 = ay if ay > by else by
+                if v1x != 0.0:
+                    _axis_range(n1, v1x, rl[0] - px1, rl[2] - px0, &i0a, &i1a)
+                elif v1y != 0.0:
+                    _axis_range(n1, v1y, rl[1] - py1, rl[3] - py0, &i0a, &i1a)
+                else:
+                    i0a = 0; i1a = n1 - 1
+                if v2x != 0.0:
+                    _axis_range(n2, v2x, rl[0] - px1, rl[2] - px0, &i0b, &i1b)
+                elif v2y != 0.0:
+                    _axis_range(n2, v2y, rl[1] - py1, rl[3] - py0, &i0b, &i1b)
+                else:
+                    i0b = 0; i1b = n2 - 1
+                if i0a > i1a or i0b > i1b:
+                    continue
+            ia = i0a
+            while ia <= i1a:
+                ib = i0b
+                while ib <= i1b:
+                    dx = ia * v1x + ib * v2x; dy = ia * v1y + ib * v2y
+                    # composed = T ∘ (base translated by (dx,dy))
+                    cm00 = m00 * bm00 + m01 * bm10; cm01 = m00 * bm01 + m01 * bm11
+                    cm10 = m10 * bm00 + m11 * bm10; cm11 = m10 * bm01 + m11 * bm11
+                    ct0 = m00 * (bt0 + dx) + m01 * (bt1 + dy) + t0
+                    ct1 = m10 * (bt0 + dx) + m11 * (bt1 + dy) + t1
+                    # exact prune: child reach bbox in root coords vs ROI
+                    ax = cm00 * x1 + cm01 * y1 + ct0; ay = cm10 * x1 + cm11 * y1 + ct1
+                    bx = cm00 * x2 + cm01 * y2 + ct0; by = cm10 * x2 + cm11 * y2 + ct1
+                    if ax < bx:
+                        xmin = ax; xmax = bx
+                    else:
+                        xmin = bx; xmax = ax
+                    if ay < by:
+                        ymin = ay; ymax = by
+                    else:
+                        ymin = by; ymax = ay
+                    xmin = floor(xmin); ymin = floor(ymin)
+                    xmax = ceil(xmax); ymax = ceil(ymax)
+                    if xmin <= r2 and xmax >= r0 and ymin <= r3 and ymax >= r1:
+                        if st_n == st_cap:
+                            st_cap = st_cap * 2
+                            st2 = np.empty((st_cap, 8), dtype=np.float64)
+                            st2[:st_n] = st_arr[:st_n]
+                            st_arr = st2; st = st_arr
+                        st[st_n, 0] = child
+                        st[st_n, 1] = cm00; st[st_n, 2] = cm01
+                        st[st_n, 3] = cm10; st[st_n, 4] = cm11
+                        st[st_n, 5] = ct0; st[st_n, 6] = ct1
+                        st[st_n, 7] = depth + 1
+                        st_n += 1
+                    ib += 1
+                ia += 1
+    return out_arr[:out_n], pp_arr[:pp_n], po_arr[:po_n]
+
+
 def selftest():
     """Tiny smoke check so a user can confirm a CI-built .pyd actually loaded
     and runs: ``python -c "import oasis_fastdecode as f; print(f.selftest())"``.
@@ -452,4 +789,24 @@ def selftest():
                                    [100.0, 100.0, 110.0, 110.0]]),
                          1.0, 1.0, 3.0, 3.0)
     assert bool(m[0]) and not bool(m[1]), m
+    # F27 M3e walk_native smoke: root cell with one plain rect + a 3x1 grid rect
+    # (type-2, pitch 100). ROI covers all -> 1 + 3 = 4 rects, no polys.
+    rect = np.array([
+        [0.0, 0.0, 10.0, 10.0, 0, 1, 0, 0, 1, 0, 0],       # plain rect
+        [0.0, 0.0, 10.0, 10.0, 1, 3, 100, 0, 1, 0, 0],     # 3 @ pitch 100 (x)
+    ], dtype=np.float64)
+    rect_off = np.array([0, 2], dtype=np.int64)
+    empty_pts = np.empty((0, 2), dtype=np.float64)
+    empty_ptoff = np.array([0], dtype=np.int64)
+    empty_meta = np.empty((0, 7), dtype=np.float64)
+    zero_off = np.array([0, 0], dtype=np.int64)
+    empty_pl_t = np.empty((0,), dtype=np.int64)
+    empty_pl_d = np.empty((0, 13), dtype=np.float64)
+    reach = np.array([[0.0, 0.0, 210.0, 10.0]], dtype=np.float64)
+    rr, ppts, poff = walk_native(
+        rect, rect_off, empty_pts, empty_ptoff, empty_meta, zero_off,
+        empty_pl_t, empty_pl_d, zero_off, reach, 0,
+        -50.0, -50.0, 1000.0, 1000.0, 128)
+    assert rr.shape[0] == 4, rr
+    assert ppts.shape[0] == 0 and poff.shape[0] == 1, (ppts, poff)
     return VERSION

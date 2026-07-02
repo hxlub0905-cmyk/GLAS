@@ -4,6 +4,46 @@
 
 ---
 
+## [2026-07-01] [F27 M3e] robust hybrid native walk：in-kernel analytic clip + polygon emit（VERSION 7）
+
+**變更類型：** 效能（native walk 涵蓋率，架構級）· **狀態：本地驗證完成；待 CI 出 v7 .pyd + user 量**
+
+**動機現象：** M3d 的「展開式」被真檔 E3B 打臉——四個 export layer reject 各異：`polygon on 6/101`、
+`too many expanded rects (>5M) 6/102`、`too many expanded placements (>8M) 17/0 & 206/150`。晶片真的有百萬級
+regular-grid 陣列 + 一個 polygon 層 → 展開必然爆 cap 落 Python（仍 ~12min）。且 timing 證實：即使 reach_bbox 全
+memoize，Python walk 仍 20-32s/張，全花在逐個 iterate 3-5 萬個 placement instance 的 Python 遞迴框架。
+
+**修復實作（把 analytic clip 移進 C）：** 新 kernel `walk_native`（`.pyx` VERSION 6→7）：
+- **regular grid（type 1/2/3 + 正交 8）留 1 筆 CSR record + axis 描述子**，kernel 內 `_axis_range`（逐位等於
+  `oasis_random._axis_index_range`）+ `_roi_local`（等於 `_roi_to_local`）把 grid analytic 剪到 ROI，只訪與 FOV
+  相交的 instance，**永不展開整晶片**（解 >5M/>8M 爆量）。
+- **arbitrary-list / skew rep（10/11、非正交 8、4-7）**在 flatten 展開成 plain record（bounded），與 walk_roi
+  「full-materialize-then-mask」一致。
+- **POLYGON** 原生 emit（point-list transform + `rint`〔== `np.round` 半數進偶〕+ bbox ROI mask）→ 解 polygon 層。
+- CSR 每筆帶 `grid_flag`：clippable-grid 套 axis-cull、plain 走單 instance 不 cull，故 survivor set 與 walk_roi
+  record-for-record byte-identical。flatten 只在 name-ref / 非 D4 / 非可剪超大 array（over cap）才整棵 bail。
+- `flatten_cell_graph` 重寫成 v7 CSR（11 元 tuple）；`walk_roi_fast` 改叫 `walk_native` 並回傳 polys；
+  `walkflatten_cache` schema 2→3（欄位集改變）+ 用 `_CSR_FIELDS` 統一 load/save；`_FASTWALK` gate 升 VERSION>=7。
+  另加 all-plain-rect 向量化快路徑保 prewarm build 速度。
+
+**本地驗證（關鍵：sandbox 有 Cython+gcc，可編 Linux `.so` 先驗，免燒 CI round-trip）：**
+- `python setup.py build_ext --inplace` → VERSION 7、selftest 過。
+- `test_native_walk` **18 passed**（grid rect/placement 各留 1 record + tight-ROI analytic clip、polygon native==
+  Python、non-clippable over-cap fallback、partial-ROI mask）；全 `tests/` **819 passed**。
+- **warm walk 效能**：30k 個重疊 instance，native `walk_native` **1.9ms** vs Python walk_roi **1177ms** = **612x**
+  （flatten 一次分攤；byte-identical set）。對應 E3B 的 20-32s/張 → 預期 ~30-50ms/張。
+
+**取捨/風險：** 展開式（M3d 兩刀）被取代——真檔證明行不通，但小檔仍受益、無回歸。**動了 `.pyx` → 需 CI 重編 v7
+`.pyd`**；user 重抓 ZIP + `python tools/unpack_fastdecode.py`。舊 v6 `.pyd` 下 `_FASTWALK`=None → walk_roi_fast 安全
+落 Python（不壞、只是沒加速）。float 決定性：`floor`/`ceil`/`rint` 對齊 numpy；D4×mag 的 2x2 逆為精確值。
+
+**影響檔案：** `glas/core/oasis_fastdecode.pyx`（`walk_native` + `_roi_local`/`_axis_range` helpers + selftest）、
+`glas/core/oasis_random.py`（`flatten_cell_graph` v7 CSR + `_rep_desc` + `walk_roi_fast` + gate）、
+`glas/core/walkflatten_cache.py`（schema 3 + `_CSR_FIELDS`）、`tests/test_native_walk.py`、`docs/plans/F27-native-walk.md`。
+**Branch：** `claude/project-perf-optimization-86i8yt`。
+
+---
+
 ## [2026-07-01] [F27 M3d 第二刀] placement repetition 走 native（展開式）：解 E3B cell 3 blocker
 
 **變更類型：** 效能（native walk 涵蓋率）· **狀態：第二刀 done；真檔端到端待 user 量**

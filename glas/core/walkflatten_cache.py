@@ -25,11 +25,18 @@ import numpy as np
 
 import cellcache   # reuse the cache-dir resolution
 
-_SCHEMA = 2
+# Schema 3 (F27 M3e): the CSR gained grid descriptors (analytic repetition clip)
+# + polygon arrays, so its field set changed — bump to invalidate v2 sidecars.
+_SCHEMA = 3
+
+# The named arrays of the flat CSR tuple, in order. Kept as a single list so
+# load()/save() can't drift apart when the CSR layout changes.
+_CSR_FIELDS = ("rect", "rect_off", "poly_pts", "poly_ptoff", "poly_meta",
+               "poly_off", "pl_target", "pl_data", "pl_off", "reach_bbox")
 
 # A distinct sentinel from "miss": the graph was flattened and found NOT
-# native-able (polygon / repetition / non-D4 / name-ref) — persist that verdict
-# (with the reason) so callers don't re-walk a big chip only to bail again.
+# native-able (non-D4 / name-ref / a non-clippable array over the cap) — persist
+# that verdict (with the reason) so callers don't re-walk a big chip to bail.
 NOT_NATIVE = "not-native"
 
 # The reason string from the most recent load() that returned NOT_NATIVE
@@ -66,8 +73,7 @@ def load(src, root, layer: int, datatype: int):
                 last_not_native_reason = (str(z["reason"])
                                           if "reason" in z.files else "")
                 return NOT_NATIVE
-            return (z["rect_coords"], z["rect_off"], z["pl_target"], z["pl_M"],
-                    z["pl_t"], z["pl_off"], z["reach_bbox"], int(z["root_index"]))
+            return tuple([z[f] for f in _CSR_FIELDS] + [int(z["root_index"])])
     except Exception:            # noqa: BLE001 — a bad cache is just a miss
         return None
 
@@ -85,10 +91,10 @@ def save(src, root, layer: int, datatype: int, flat, reason: str = "") -> bool:
             fields["native_able"] = np.bool_(False)
             fields["reason"] = np.array(reason or "")
         else:
-            rc, ro, pt, pM, pT, po, rb, ri = flat
-            fields.update(native_able=np.bool_(True), rect_coords=rc,
-                          rect_off=ro, pl_target=pt, pl_M=pM, pl_t=pT,
-                          pl_off=po, reach_bbox=rb, root_index=np.int64(ri))
+            fields["native_able"] = np.bool_(True)
+            for name, arr in zip(_CSR_FIELDS, flat[:len(_CSR_FIELDS)]):
+                fields[name] = arr
+            fields["root_index"] = np.int64(flat[-1])
         fd, tmp = tempfile.mkstemp(suffix=".npz", dir=str(p.parent))
         os.close(fd)
         tmp_npz = tmp if tmp.endswith(".npz") else tmp + ".npz"

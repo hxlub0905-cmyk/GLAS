@@ -29,6 +29,7 @@ import oasis_walker as owk        # noqa: E402
 import oasis_random as orx        # noqa: E402
 from oasis_walker import Transform  # noqa: E402
 import test_oasis_random as T      # noqa: E402
+import test_oasis_store as S        # noqa: E402
 
 
 # All D4 transforms the walk can build: 0/90/180/270 × flip × a couple mags.
@@ -214,9 +215,9 @@ def test_flatten_cap_falls_back_without_stall(tmp_path, monkeypatch):
     assert _sorted_rows(on["rects"]) == _sorted_rows(off["rects"])
 
 
-def test_flatten_native_able_with_rect_repetition(tmp_path):
-    # M3d: a rect with a type-2 repetition is native-able — it expands (via
-    # c.rects) into plain rects the kernel handles; native must equal Python.
+def _rect_rep_oas(nx: int, pitch: int) -> bytes:
+    """A single root cell R with one 10x10 rect carrying a type-2 (x-axis)
+    repetition of ``nx`` instances at ``pitch``."""
     start = (bytes([oas.START]) + T._astr("1.0") + bytes([0])
              + T._uint(1000) + T._uint(0) + bytes([0] * 12))
     pn = bytes([oas.PROPNAME_IMP]) + T._astr("S_CELL_OFFSET")
@@ -228,15 +229,23 @@ def test_flatten_native_able_with_rect_repetition(tmp_path):
 
     rect = (bytes([oas.RECTANGLE, 0x7f]) + T._uint(17) + T._uint(0)
             + T._uint(10) + T._uint(10) + T._sint(0) + T._sint(0)
-            + bytes([2]) + T._uint(1) + T._uint(100))   # type-2 rep: 3 @ pitch 100
+            + bytes([2]) + T._uint(nx - 2) + T._uint(pitch))   # type-2: nx @ pitch
     cell = bytes([oas.CELL_REFNUM]) + T._uint(0)
     end = bytes([oas.END]) + T._uint(0)
     hdr = oas.MAGIC + start + pn + cn + prop(0)
     off = len(hdr)
+    return oas.MAGIC + start + pn + cn + prop(off) + cell + rect + end
+
+
+def test_flatten_native_able_with_rect_repetition(tmp_path):
+    # M3e: a rect with a type-2 repetition is native-able — it stays ONE grid
+    # record clipped in-kernel; native must equal Python.
     p = tmp_path / "rep.oas"
-    p.write_bytes(oas.MAGIC + start + pn + cn + prop(off) + cell + rect + end)
+    p.write_bytes(_rect_rep_oas(3, 100))   # 3 @ pitch 100
     rar = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
-    assert orx.flatten_cell_graph(rar, 0, 17, 0) is not None   # rep expands -> native
+    flat = orx.flatten_cell_graph(rar, 0, 17, 0)
+    assert flat is not None
+    assert flat[0].shape[0] == 1          # ONE grid record, not 3 expanded rects
     roi = (-100, -100, 1000, 1000)
     on = _walk_m3(p, {(17, 0)}, roi, 17, 0, True)
     off = _walk_m3(p, {(17, 0)}, roi, 17, 0, False)
@@ -244,41 +253,33 @@ def test_flatten_native_able_with_rect_repetition(tmp_path):
     assert on["rects"].shape[0] == 3   # the 3-instance repetition
 
 
-def test_flatten_over_expanded_rect_cap_falls_back(tmp_path, monkeypatch):
-    # A huge repetition over the expanded-rect cap must bail (Python), not OOM.
-    start = (bytes([oas.START]) + T._astr("1.0") + bytes([0])
-             + T._uint(1000) + T._uint(0) + bytes([0] * 12))
-    pn = bytes([oas.PROPNAME_IMP]) + T._astr("S_CELL_OFFSET")
-    cn = bytes([oas.CELLNAME_IMP]) + T._astr("R")
-
-    def prop(off):
-        return (bytes([oas.PROPERTY_NORMAL, 0x16]) + T._uint(0)
-                + T._uint(8) + T._ufix(off, 4))
-
-    rect = (bytes([oas.RECTANGLE, 0x7f]) + T._uint(17) + T._uint(0)
-            + T._uint(10) + T._uint(10) + T._sint(0) + T._sint(0)
-            + bytes([2]) + T._uint(998) + T._uint(100))  # 1000 instances
-    cell = bytes([oas.CELL_REFNUM]) + T._uint(0)
-    end = bytes([oas.END]) + T._uint(0)
-    hdr = oas.MAGIC + start + pn + cn + prop(0)
-    off = len(hdr)
+def test_big_rect_grid_stays_native_and_clips(tmp_path):
+    # M3e core win: a 1000-instance rect array is ONE grid record (never
+    # expanded), and a tight ROI clips it analytically in-kernel to a couple of
+    # instances — byte-identical to the Python analytic clip.
     p = tmp_path / "bigrep.oas"
-    p.write_bytes(oas.MAGIC + start + pn + cn + prop(off) + cell + rect + end)
+    p.write_bytes(_rect_rep_oas(1000, 100))   # x in [0, 99910]
     rar = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
-    monkeypatch.setattr(orx, "_NATIVE_WALK_MAX_RECTS", 100)
-    assert orx.flatten_cell_graph(rar, 0, 17, 0) is None
-    assert "expanded rects" in (rar._flatten_reject or "")
+    flat = orx.flatten_cell_graph(rar, 0, 17, 0)
+    assert flat is not None
+    assert flat[0].shape[0] == 1              # 1 grid record for 1000 instances
+    roi = (49900, -50, 50100, 50)             # around instance ~500 (x=50000)
+    on = _walk_m3(p, {(17, 0)}, roi, 17, 0, True)
+    off = _walk_m3(p, {(17, 0)}, roi, 17, 0, False)
+    assert _sorted_rows(on["rects"]) == _sorted_rows(off["rects"])
+    assert 0 < on["rects"].shape[0] < 10      # clipped, not all 1000
 
 
 def test_flatten_native_able_with_placement_repetition(tmp_path):
-    # M3d: a PLACEMENT with a type-1 repetition is native-able — it expands (via
-    # repetition_offsets_np) into individual same-cell edges the kernel composes;
-    # native must equal Python. (This was the E3B blocker: "placement repetition
-    # on cell 3".) 3x3 array of a 10x10 rect at pitch 100.
+    # M3e: a PLACEMENT with a type-1 repetition is native-able — it stays ONE
+    # grid record clipped in-kernel. (This was the E3B blocker: "placement
+    # repetition on cell 3".) 3x3 array of a 10x10 rect at pitch 100.
     p = tmp_path / "prep.oas"
     p.write_bytes(T._build_big_grid(3, 3, 100))
     rar = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
-    assert orx.flatten_cell_graph(rar, 0, 17, 0) is not None   # rep expands -> native
+    flat = orx.flatten_cell_graph(rar, 0, 17, 0)
+    assert flat is not None
+    assert flat[7].shape[0] == 1          # ONE grid placement record (pl_data)
     roi = (-100, -100, 1000, 1000)
     on = _walk_m3(p, {(17, 0)}, roi, 17, 0, True)
     off = _walk_m3(p, {(17, 0)}, roi, 17, 0, False)
@@ -286,9 +287,25 @@ def test_flatten_native_able_with_placement_repetition(tmp_path):
     assert on["rects"].shape[0] == 9   # the 3x3 = 9 placement instances
 
 
+def test_big_placement_grid_stays_native_and_clips(tmp_path):
+    # M3e: a 1M-instance placement array is ONE grid record; a tight ROI clips
+    # it in-kernel to the handful of instances that overlap — same as Python.
+    p = tmp_path / "bigprep.oas"
+    p.write_bytes(T._build_big_grid(1000, 1000, 1000))   # 1M placements
+    rar = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
+    flat = orx.flatten_cell_graph(rar, 0, 17, 0)
+    assert flat is not None
+    assert flat[7].shape[0] == 1              # 1 grid record for 1M placements
+    roi = (1900, 1900, 2100, 2100)            # around the (2000,2000) instance
+    on = _walk_m3(p, {(17, 0)}, roi, 17, 0, True)
+    off = _walk_m3(p, {(17, 0)}, roi, 17, 0, False)
+    assert _sorted_rows(on["rects"]) == _sorted_rows(off["rects"])
+    assert 0 < on["rects"].shape[0] < 10      # clipped, not all 1M
+
+
 def test_flatten_partial_roi_with_placement_repetition(tmp_path):
-    # The native expansion still masks per-ROI: a tight ROI over one grid cell
-    # must emit exactly that instance, same as the Python analytic clip.
+    # The in-kernel clip still masks per-ROI: a tight ROI over one grid cell must
+    # emit exactly that instance, same as the Python analytic clip.
     p = tmp_path / "prep.oas"
     p.write_bytes(T._build_big_grid(5, 5, 1000))    # 25 @ pitch 1000
     roi = (1900, 1900, 2100, 2100)                  # around the (2000,2000) cell
@@ -297,12 +314,61 @@ def test_flatten_partial_roi_with_placement_repetition(tmp_path):
     assert _sorted_rows(on["rects"]) == _sorted_rows(off["rects"])
 
 
-def test_flatten_over_expanded_placement_cap_falls_back(tmp_path, monkeypatch):
-    # A chip-spanning placement array over the expanded-placement cap must bail
-    # (Python analytic clip), not expand 1M edges into the CSR and OOM.
-    p = tmp_path / "bigprep.oas"
-    p.write_bytes(T._build_big_grid(1000, 1000, 1000))   # 1M placements
+def _polygon_oas(deltas, ax, ay) -> bytes:
+    """Root cell R with one POLYGON on layer 17/0 (point-list 2-delta)."""
+    start = (bytes([oas.START]) + T._astr("1.0") + bytes([0])
+             + T._uint(1000) + T._uint(0) + bytes([0] * 12))
+    pn = bytes([oas.PROPNAME_IMP]) + T._astr("S_CELL_OFFSET")
+    cn = bytes([oas.CELLNAME_IMP]) + T._astr("R")
+
+    def prop(off):
+        return (bytes([oas.PROPERTY_NORMAL, 0x16]) + T._uint(0)
+                + T._uint(8) + T._ufix(off, 4))
+
+    poly = S._polygon_2delta(17, 0, deltas, ax, ay)
+    cell = bytes([oas.CELL_REFNUM]) + T._uint(0)
+    end = bytes([oas.END]) + T._uint(0)
+    hdr = oas.MAGIC + start + pn + cn + prop(0)
+    off = len(hdr)
+    return oas.MAGIC + start + pn + cn + prop(off) + cell + poly + end
+
+
+def test_native_able_polygon_matches_python(tmp_path):
+    # M3e: polygons are emitted natively now (no whole-graph bail). The native
+    # point-list transform (round-half-to-even + bbox ROI mask) must be
+    # byte-identical to walk_roi's apply_to_points path.
+    p = tmp_path / "poly.oas"
+    p.write_bytes(_polygon_oas([(100, 0), (0, 100), (-100, 0), (0, -100)], 0, 0))
     rar = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
+    assert orx.flatten_cell_graph(rar, 0, 17, 0) is not None   # polygon != bail
+    roi = (-200, -200, 400, 400)
+    on = _walk_m3(p, {(17, 0)}, roi, 17, 0, True)
+    off = _walk_m3(p, {(17, 0)}, roi, 17, 0, False)
+    assert on["rects"].shape[0] == 0 and off["rects"].shape[0] == 0
+    assert len(on["polys"]) == len(off["polys"]) == 1
+    assert _sorted_rows(on["polys"][0]) == _sorted_rows(off["polys"][0])
+
+
+def test_native_polygon_missing_roi_not_emitted(tmp_path):
+    # A polygon whose bbox misses the ROI must not be emitted — same cull as
+    # walk_roi (native and Python both empty).
+    p = tmp_path / "poly.oas"
+    p.write_bytes(_polygon_oas([(100, 0), (0, 100), (-100, 0), (0, -100)], 0, 0))
+    roi = (10_000, 10_000, 10_100, 10_100)
+    on = _walk_m3(p, {(17, 0)}, roi, 17, 0, True)
+    off = _walk_m3(p, {(17, 0)}, roi, 17, 0, False)
+    assert len(on["polys"]) == len(off["polys"]) == 0
+
+
+def test_non_clippable_rep_over_cap_falls_back(tmp_path, monkeypatch):
+    # A repetition the kernel can't clip analytically (forced here by stubbing
+    # _grid_axes to None, as an arbitrary-list / skew rep would be) must be
+    # materialized — and if that would exceed the cap, the whole flatten bails to
+    # the Python walk rather than expanding a chip-spanning array into the CSR.
+    p = tmp_path / "arb.oas"
+    p.write_bytes(T._build_big_grid(20, 20, 100))    # 400 placements
+    rar = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
+    monkeypatch.setattr(orx, "_grid_axes", lambda rt, rr: None)  # force 'expand'
     monkeypatch.setattr(orx, "_NATIVE_WALK_MAX_PLACEMENTS", 100)
     assert orx.flatten_cell_graph(rar, 0, 17, 0) is None
     assert "expanded placements" in (rar._flatten_reject or "")

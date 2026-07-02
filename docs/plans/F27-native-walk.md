@@ -118,10 +118,25 @@ user 真實痛點＝整包 KLARF（~190 顆 defect）批次 export，實測 ~12�
       **關鍵觀察**：per-ROI walk 訪 32k-53k instance，這些 device array 住在共享 cell（graph 內只出現一次），所以
       **chip-wide 展開後 edge 數 ≈ 同量級 50-200k**，遠低於 8M cap → E3B 應可 native。若某層真的爆 cap 才需第三刀
       （in-kernel analytic clip）。護欄：`test_native_walk` +3（placement-rep native-able / partial-ROI mask /
-      over-cap fallback）；全 `tests/` 816 passed。
-- [ ] **M3d：多 wanted layer**；arbitrary-list rep 已可展開（type 10/11 走 `repetition_offsets_np` fallback），
-      唯一硬上限是 cap（超大 array 落 Python）。in-kernel analytic clip 為爆 cap 時的後備方案。
-- [ ] **M3d：擴充 POLYGON**（point-list transform + emit 在 C）。arbitrary repetition / 非 D4 / name-ref 永遠 fallback。
+      over-cap fallback）；全 `tests/` 816 passed。**（M3d 兩刀被 M3e 取代——真檔證明展開式行不通）**
+- [x] **M3e：robust hybrid（in-kernel analytic clip + polygon emit）** ✓ 2026-07-01：真檔 E3B 打臉展開式——四層
+      reject 各異：`polygon on 6/101`、`too many expanded rects (>5M) 6/102`、`too many expanded placements (>8M)
+      17/0 & 206/150`。晶片真的有百萬級 regular-grid 陣列 + polygon 層 → 展開必爆。改**把 analytic clip 移進 C
+      kernel**（VERSION 7，新 `walk_native`）：
+      - **regular grid（type 1/2/3 + orthogonal 8）留 1 筆 CSR record + axis descriptor**，kernel 內用
+        `_axis_range`（== `oasis_random._axis_index_range` 逐位）+ `_roi_local`（== `_roi_to_local`）把 grid analytic
+        剪到 ROI，只訪與 FOV 相交的 instance，**永不展開整晶片**；
+      - **arbitrary-list / skew（type 10/11、非正交 8、4-7）**在 flatten 展開成 plain record（bounded），與 walk_roi
+        「full-materialize-then-mask」一致；
+      - **POLYGON** 原生 emit（point-list transform + `rint`（== `np.round` 半數進偶）+ bbox ROI mask）。
+      CSR 每筆帶 `grid_flag` 區分 clippable-grid（套 axis-cull）vs plain（單 instance、不 cull），故 survivor set 與
+      walk_roi record-for-record 一致。flatten 只在 name-ref / 非 D4 / 非可剪超大 array（over cap）才整棵 bail。
+      **本地驗證**（Cython 可在 sandbox 編 `.so`）：`test_native_walk` 18 passed（grid rect/placement 留 1 record +
+      tight-ROI clip、polygon native==Python、non-clippable over-cap fallback）；全 `tests/` **819 passed**；**warm
+      walk 30k overlapping instance：native 1.9ms vs Python 1177ms = 612x**（flatten 一次分攤）。CSR 亦加 all-plain-rect
+      向量化快路徑（免 per-record 迴圈，保 prewarm build 速度）。**需 CI 重編 v7 `.pyd`**（動了 `.pyx`）→ user 重抓 ZIP
+      + `python tools/unpack_fastdecode.py`；舊 v6 `.pyd` 下 `_FASTWALK` 為 None → 安全走 Python（不會壞、只是沒加速）。
+- [ ] **M3e 後續：多 wanted layer**（一次 walk 多層）。arbitrary/skew rep 已展開，唯一硬上限是 over-cap → Python。
 - [ ] 每階段 byte-identical（native-on vs off 逐位）+ 真檔抽樣；§7「reachable_bbox 用 load_cell_bbox、walk 用
       load_cell」不變式：攤平只用 memo 好的結果，不改剪枝語意。
 
