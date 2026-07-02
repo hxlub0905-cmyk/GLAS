@@ -464,11 +464,22 @@ def poi_polys_and_geometry_for_roi(rar, root, roi_bbox, poi_spec,
     complement) once rasterised into a mask. The mask path therefore needs the
     geometry, not the rings. Returns ``(polys, geom)`` so one ROI walk feeds
     both the overlay (polys) and the mask (geom)."""
+    # F27 M4 diagnosis: split the "walk" phase into oasis-walk / shapely-union /
+    # boolean-morphology so the export timing shows WHERE the time goes (on a
+    # dense FOV the shapely Boolean/morphology, not the geometry walk, dominates).
+    def _acc(attr, dt):
+        setattr(rar, attr, getattr(rar, attr, 0.0) + dt)
+
     kind = poi_spec[0]
     if kind == "raw":
         _, layer, datatype = poi_spec
+        _t = time.perf_counter()
         polys = _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb)
-        return polys, gds_boolean.polys_to_geometry(polys)
+        _acc("_t_bwalk", time.perf_counter() - _t)
+        _t = time.perf_counter()
+        geom = gds_boolean.polys_to_geometry(polys)
+        _acc("_t_bunion", time.perf_counter() - _t)
+        return polys, geom
     # expression POI
     expr, bindings = poi_spec[1], poi_spec[2]
     recipes = poi_spec[3] if len(poi_spec) > 3 else {}
@@ -476,14 +487,28 @@ def poi_polys_and_geometry_for_roi(rar, root, roi_bbox, poi_spec,
     cx, cy, w, h = (x0 + x1) / 2.0, (y0 + y1) / 2.0, (x1 - x0), (y1 - y0)
 
     def raw_provider(layer: int, datatype: int):
+        _t = time.perf_counter()
         ps = _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb)
-        return gds_boolean.polys_to_geometry(ps)
+        _acc("_t_bwalk", time.perf_counter() - _t)
+        _t = time.perf_counter()
+        g = gds_boolean.polys_to_geometry(ps)
+        _acc("_t_bunion", time.perf_counter() - _t)
+        return g
 
+    _w0 = getattr(rar, "_t_bwalk", 0.0); _u0 = getattr(rar, "_t_bunion", 0.0)
+    _t = time.perf_counter()
     geom = gds_boolean.resolve_expression(
         expr, bindings, raw_provider=raw_provider,
         recipe_provider=lambda n: recipes.get(n),
         fov_bbox=gds_boolean.fov_box(cx, cy, w, h))
-    return gds_boolean.geometry_to_polygons(geom), geom
+    # morphology/boolean = resolve total minus the walk+union it triggered
+    _acc("_t_bmorph", (time.perf_counter() - _t)
+         - (getattr(rar, "_t_bwalk", 0.0) - _w0)
+         - (getattr(rar, "_t_bunion", 0.0) - _u0))
+    _t = time.perf_counter()
+    out = gds_boolean.geometry_to_polygons(geom)
+    _acc("_t_bunion", time.perf_counter() - _t)
+    return out, geom
 
 
 def poi_polys_for_roi(rar, root, roi_bbox, poi_spec, cancel_cb=None):

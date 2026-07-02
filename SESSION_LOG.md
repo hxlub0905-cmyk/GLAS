@@ -4,6 +4,29 @@
 
 ---
 
+## [2026-07-02] [F27 M4 診斷續] 真檔證實瓶頸是 shapely Boolean/morphology，非幾何 walk（加 bool 分段計時）
+
+**變更類型：** 診斷計時（安全、純 Python）· **狀態：待 user 重跑確認 union vs morph 佔比**
+
+**現象/修正認知：** user 重跑真檔，batched walk 確實生效（`cellvisits` 32K→~340），但 warm `walk=` 仍 ~20-30s。關鍵：
+`img=19959` 完全 warm（`cells_decoded=0 reach_new=0`）仍 `walk=22710ms`，而 oasis walk（`place+rect`）只有 ~2.3s →
+**~20s 不在 walk 內，而是 `walk=` 這段包住的 shapely Boolean 運算**（`poi_polys_and_geometry_for_roi` →
+`polys_to_geometry` union + `resolve_expression` 的 grow/shrink morphology）。**先前把這 ~20s 誤判成「per-instance
+遞迴」**——實際遞迴很便宜（~數秒），batched walk 只省下那幾秒；真正 bottleneck 一直是 user 的 Boolean overlay
+（`[(A > W:10) & B] < H:10` 之類）的 shapely 形態學/聯集。
+
+**做法：** 在 `fine_align.poi_polys_and_geometry_for_roi` 加三個 rar 累計器 `_t_bwalk`（raw 幾何 walk）/ `_t_bunion`
+（`polys_to_geometry` + `geometry_to_polygons`）/ `_t_bmorph`（`resolve_expression` 扣掉其觸發的 walk+union＝純 boolean/
+morphology）；`overlay_export` 的 `[export-timing]` 多印 `[bool: walk=.. union=.. morph=..]`（gated on timing）。
+下一步靠這行確認 union 還是 morph 主導，才知道要優化哪個 shapely 路徑（或改 raster-based Boolean）。
+
+**測試：** 全 `tests/` **825 passed**。**純 Python，未動 `.pyx` → 免 CI、免重編，重抓 ZIP 即可。**
+
+**影響檔案：** `glas/core/fine_align.py`（bool 分段計時）、`glas/core/overlay_export.py`（印 `[bool: …]`）、`SESSION_LOG.md`。
+**Branch：** `claude/project-perf-optimization-86i8yt`。
+
+---
+
 ## [2026-07-02] [F27 M4] pure-Python batched walk：大檔 warm walk 100-214x（免 CI、免重編）
 
 **變更類型：** 效能（大檔真正的解）· **狀態：本地實測 100-214x byte-identical；待 user 量真檔**

@@ -266,6 +266,9 @@ def align_and_export_one_image(job, rar, root, poi_colored, cfg, out_dir,
     _tp0 = getattr(rar, "_walk_tplace_total", 0.0) if _timing else 0.0
     _tr0 = getattr(rar, "_walk_trect_total", 0.0) if _timing else 0.0
     _tpo0 = getattr(rar, "_walk_tpoly_total", 0.0) if _timing else 0.0
+    _bw0 = getattr(rar, "_t_bwalk", 0.0) if _timing else 0.0
+    _bu0 = getattr(rar, "_t_bunion", 0.0) if _timing else 0.0
+    _bm0 = getattr(rar, "_t_bmorph", 0.0) if _timing else 0.0
     _seg = {"read": 0.0, "walk": 0.0, "match": 0.0, "raster": 0.0}
     _mark = [_t0]
 
@@ -286,6 +289,9 @@ def align_and_export_one_image(job, rar, root, poi_colored, cfg, out_dir,
         tplace = (getattr(rar, "_walk_tplace_total", 0.0) - _tp0) * 1e3
         trect = (getattr(rar, "_walk_trect_total", 0.0) - _tr0) * 1e3
         tpoly = (getattr(rar, "_walk_tpoly_total", 0.0) - _tpo0) * 1e3
+        bwalk = (getattr(rar, "_t_bwalk", 0.0) - _bw0) * 1e3
+        bunion = (getattr(rar, "_t_bunion", 0.0) - _bu0) * 1e3
+        bmorph = (getattr(rar, "_t_bmorph", 0.0) - _bm0) * 1e3
         print(f"[export-timing] pid={os.getpid()} img={image_id}  "
               f"read={_seg['read']:.0f} walk={_seg['walk']:.0f} "
               f"match={_seg['match']:.0f} raster={_seg['raster']:.0f}  "
@@ -293,6 +299,7 @@ def align_and_export_one_image(job, rar, root, poi_colored, cfg, out_dir,
               f"reach_new={reach_new} cellvisits={cellvisits} "
               f"instances={instances}  "
               f"[walk: place={tplace:.0f} rect={trect:.0f} poly={tpoly:.0f}]  "
+              f"[bool: walk={bwalk:.0f} union={bunion:.0f} morph={bmorph:.0f}]  "
               f"status={row['status']}", flush=True)
 
     if cancel_cb is not None and cancel_cb():
