@@ -54,6 +54,7 @@ import os
 import re
 import sys
 import threading
+import time
 import traceback
 from concurrent.futures import CancelledError, ProcessPoolExecutor
 from dataclasses import dataclass, field
@@ -7654,10 +7655,22 @@ class MainWindow(QMainWindow):
         lines = [f"Loading GDS ROI… ({layer_txt})",
                  f"{loaded:,} cell(s) loaded" + (f", {cached:,} from cache"
                                                  if cached else "")]
-        # First load of the big flat merge cell is the slow part; once cached it
-        # (and every nearby ROI) is fast. Make that explicit so the wait reads
-        # as expected rather than stuck.
-        if cached == 0 and loaded < 3:
+        # F27 M7: live intra-cell decode heartbeat. A single giant flat cell can
+        # take minutes to decode; show its record count + elapsed so the wait
+        # reads as progress rather than a hang.
+        dcell = getattr(self._rar, "_decode_cell", None)
+        if dcell is not None:
+            drecs = getattr(self._rar, "_decode_records", 0)
+            dt = max(0.0, time.perf_counter()
+                     - getattr(self._rar, "_decode_t0", 0.0))
+            lines.append(f"Decoding cell {dcell!r}: {drecs:,} records "
+                         f"({dt:.0f}s)…")
+            lines.append("First load of a large cell may take minutes; "
+                         "later ROIs reuse the cache.")
+        elif cached == 0 and loaded < 3:
+            # First load of the big flat merge cell is the slow part; once cached
+            # it (and every nearby ROI) is fast. Make that explicit so the wait
+            # reads as expected rather than stuck.
             lines.append("Decoding a large cell (first time may take minutes; "
                          "later ROIs reuse the cache).")
         lines.append("Cancellable.")
@@ -8535,17 +8548,29 @@ def main() -> int:
         qInstallMessageHandler(_qt_msg_filter)
     except Exception:
         pass
+    # One debug switch (F27 M7): `--debug` (or GLAS_DEBUG=1 / debug.bat) turns on
+    # EVERYTHING useful for diagnosing a slow / stuck load — concise ROI
+    # summaries, the intra-cell decode heartbeat, and export/fine-align stage
+    # timing — so one run gives enough to triage without back-and-forth. GLAS_DEBUG
+    # env is honoured directly by the core modules at import; here we also light
+    # up export timing and echo what to look for. `--trace` stays as a hidden
+    # extra-verbose alias (level 2) for the rare deep dive.
+    _dbg_on = ("--debug" in sys.argv or "--trace" in sys.argv
+               or oasis_random._env_debug_level() >= 1)
     if "--trace" in sys.argv:
         oasis_random.set_debug(True, level=2)
         sys.argv = [a for a in sys.argv if a != "--trace"]
-        print(f"{devlog.tag('gds-align', stream=sys.stderr)} trace mode ON "
-              "(level 2: deep per-cell telemetry)", file=sys.stderr, flush=True)
     elif "--debug" in sys.argv:
         oasis_random.set_debug(True, level=1)
         sys.argv = [a for a in sys.argv if a != "--debug"]
-        print(f"{devlog.tag('gds-align', stream=sys.stderr)} debug mode ON "
-              "(concise ROI summaries; use --trace for full detail)",
-              file=sys.stderr, flush=True)
+    if _dbg_on:
+        # One switch lights export/fine-align timing too (and the spawned pool
+        # workers inherit GLAS_FA_TIMING from the env).
+        os.environ["GLAS_FA_TIMING"] = "1"
+        fine_align._FA_TIMING = True
+        print(f"{devlog.tag('gds-align', stream=sys.stderr)} debug mode ON — "
+              "ROI load summaries + decode heartbeat + export timing. Watch for "
+              "[roi] and [export-timing] lines.", file=sys.stderr, flush=True)
     app = QApplication(sys.argv)
 
     app.setApplicationName("GLAS")

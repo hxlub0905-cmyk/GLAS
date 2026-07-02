@@ -101,7 +101,12 @@ class WalkCancelled(Exception):
     """Raised inside walk_roi when the caller's cancel_cb returns True."""
 
 def _env_debug_level() -> int:
-    v = os.environ.get("MMH_GDS_DEBUG", "").lower()
+    # GLAS_DEBUG is the single debug switch (F27 M7); MMH_GDS_DEBUG stays as a
+    # back-compat alias so old launchers keep working. Either one, value 1 = the
+    # one debug mode (concise ROI summaries + decode heartbeat + export timing),
+    # 2 = deep per-cell trace (rarely needed).
+    v = (os.environ.get("GLAS_DEBUG")
+         or os.environ.get("MMH_GDS_DEBUG") or "").lower()
     if v in ("2", "trace", "verbose", "all"):
         return 2
     if v in ("1", "true", "yes", "on"):
@@ -720,6 +725,16 @@ class RandomAccessReader:
         self.errors: list[tuple] = []
         self._n_loaded = 0
         self._n_cache_hits = 0   # cells served from the on-disk decode cache
+        # F27 M7: live intra-cell decode heartbeat. A single giant flat cell can
+        # take minutes to fully decode; without a sub-cell heartbeat the ROI load
+        # looks hung ("Loading GDS ROI…" with no motion). The decode loop stamps
+        # these; the UI progress tick + the DEBUG console heartbeat read them
+        # (plain int/float attrs — safe to read from the UI thread). _decode_cell
+        # is None whenever no cell decode is in flight.
+        self._decode_cell = None
+        self._decode_records = 0
+        self._decode_t0 = 0.0
+        self._decode_hb_t = 0.0
         _dbg(f"RandomAccessReader: {len(self._by_refnum):,} offsets indexed "
              f"from {self._path.name} (wanted={wanted_layers} "
              f"bbox_layer={bbox_layer})")
@@ -831,6 +846,12 @@ class RandomAccessReader:
             self._memo[cell_id] = content
             return content
 
+        # F27 M7: arm the decode heartbeat so a minutes-long single-cell decode
+        # shows live progress (record count + elapsed) on the console and to the
+        # UI progress poller, instead of a frozen "Loading GDS ROI…".
+        self._decode_cell = cell_id
+        self._decode_records = 0
+        self._decode_t0 = self._decode_hb_t = time.perf_counter()
         try:
             content = self._decode_at(offset)
         except oas.OasisFormatError as exc:
@@ -855,8 +876,25 @@ class RandomAccessReader:
                 if cellcache.save(self._path, cell_id, self._init_wanted, content):
                     _dbg(f"cached decoded cell {cell_id!r} "
                          f"({nrec:,} records) → sidecar (next session loads fast)")
+        finally:
+            self._decode_cell = None
         self._memo[cell_id] = content
         return content
+
+    def _decode_tick(self, nrec: int) -> None:
+        """Intra-cell decode heartbeat — called every ~16k records from the
+        decode loop so a giant single-cell decode shows live progress instead of
+        a frozen ROI dialog. Non-semantic (never touches decoded geometry): it
+        updates the counter the UI poller reads and, under DEBUG, prints a
+        throttled (~2 s) console line. Cheap: one clock read + a rare print."""
+        self._decode_records = nrec
+        if not DEBUG:
+            return
+        now = time.perf_counter()
+        if now - self._decode_hb_t >= 2.0:
+            self._decode_hb_t = now
+            _dbg(f"  … decoding cell {self._decode_cell!r}: {nrec:,} records, "
+                 f"{now - self._decode_t0:.0f}s elapsed")
 
     def load_cell_bbox(self, cell_id: object) -> CellContent:
         """Lightweight load for the ``reachable_bbox`` prune pass: when a
@@ -1057,7 +1095,13 @@ class RandomAccessReader:
         # Placement positionally.
         _rk = _pk = None
         _rlist = _plist = None
+        _nrec = 0
+        _next_tick = 1 << 14                  # F27 M7: heartbeat every ~16k recs
         for rid, payload in reader.iter_records():
+            _nrec += 1
+            if _nrec >= _next_tick:
+                self._decode_tick(_nrec)
+                _next_tick = _nrec + (1 << 14)
             if rid == oas.RECTANGLE:
                 if payload.get("filtered_out"):
                     continue
@@ -1155,12 +1199,18 @@ class RandomAccessReader:
             f._pos = new_pos
             return rects
 
+        _nrec = 0
+        _next_tick = 1 << 14                  # F27 M7: heartbeat every ~16k recs
         for rid, payload in reader.iter_records():
+            _nrec += 1
+            if _nrec >= _next_tick:
+                self._decode_tick(_nrec)
+                _next_tick = _nrec + (1 << 14)
             if rid == oas.RECTANGLE:
                 if payload.get("filtered_out"):
                     # Still gobble (at C speed) so the cursor skips the whole
                     # filtered run without a per-rect Python loop; drop output.
-                    _gobble()
+                    _nrec += _gobble().shape[0]
                     continue
                 key = (payload["layer"], payload["datatype"])
                 blk = rcol_blocks.get(key)
@@ -1177,6 +1227,7 @@ class RandomAccessReader:
                     _obj1(payload.get("repetition_raw"))))
                 rects = _gobble()           # the rest of this run, in C
                 n = rects.shape[0]
+                _nrec += n
                 if n:
                     # native rects carry no repetition: rt all -1, rr all None.
                     # np.empty(object) is already None-initialized — no fill.
@@ -2433,6 +2484,27 @@ def _batch_place_prep(rar, content, cid, reachable_bbox):
     return prep
 
 
+# The batched walk's topo build reads EVERY reachable cell's placements; on a
+# big file with no CE bbox_layer (load_cell_bbox can't early-stop) that decodes
+# the whole multi-GB file. Over this many cells, or with no cheap placement
+# read, fall back to the ROI-pruned walk_roi (see walk_roi_fast).
+_BATCHED_WALK_MAX_CELLS = 100_000
+
+
+def _batched_walk_affordable(rar: "RandomAccessReader") -> bool:
+    """Is a whole-graph topo build cheap enough to run the batched walk? Yes when
+    a CE ``bbox_layer`` lets ``load_cell_bbox`` early-stop (E3B), or the chip is
+    small enough that a full-decode topo is still cheap. No on a big no-CE file
+    (the 1750 MB LTV chip) — there the topo build would decode the whole file, so
+    the caller uses the ROI-pruned recursive walk instead."""
+    n = len(getattr(rar, "_by_refnum", ()) or ())
+    if n > _BATCHED_WALK_MAX_CELLS:
+        return False
+    if getattr(rar, "_bbox_layer", None) is not None:
+        return True
+    return n <= _NATIVE_WALK_MAX_CELLS
+
+
 def walk_roi_batched(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
                      layer: int, datatype: int, *, max_depth: int = 128,
                      cancel_cb=None) -> dict:
@@ -2709,9 +2781,19 @@ def walk_roi_fast(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
             return {"rects": rects, "polys": polys, "stats": st}
     # No native flatten (big / dense chip, or extension absent): use the
     # pure-Python BATCHED walk (F27 M4), which is byte-identical to walk_roi but
-    # ~100-200x faster on the warm production walk (no per-instance recursion).
-    return walk_roi_batched(rar, root_id, roi_bbox, layer, datatype,
-                            max_depth=max_depth, cancel_cb=cancel_cb)
+    # ~100-200x faster on the warm production walk (no per-instance recursion) —
+    # BUT only when its topo-order build is affordable. That build reads every
+    # reachable cell's placements via load_cell_bbox, which only early-stops when
+    # a CE bbox_layer is configured; without one (a no-108/250 file) it
+    # full-decodes every cell, so on a big no-CE chip it would decode the whole
+    # multi-GB file just to build the order. There, fall back to the ROI-pruned
+    # recursive walk_roi (which prunes decode via the sbbox / CE reach and only
+    # touches the few cells near the FOV).
+    if _batched_walk_affordable(rar):
+        return walk_roi_batched(rar, root_id, roi_bbox, layer, datatype,
+                                max_depth=max_depth, cancel_cb=cancel_cb)
+    return walk_roi(rar, root_id, roi_bbox, layer, datatype,
+                    max_depth=max_depth, cancel_cb=cancel_cb)
 
 
 # ── F12: layer enumeration for files with no LAYERNAME table ─────────────────

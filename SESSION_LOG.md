@@ -4,6 +4,48 @@
 
 ---
 
+## [2026-07-02] [F27 M7] 單一 debug 模式 + 解碼心跳 + export-path batched gate + 清理
+
+**變更類型：** 診斷 ergonomics + bug fix（大檔 ROI walk「看似卡住」）· **狀態：本地驗證（848 passed）；待 user 量真檔**
+
+**背景（user 回報的新症狀）：** 換到更大的 `LTV_EBI_area_CMG_CMP_D2DB_250930_FILTERK.oas`（1750 MB、44,997 cells、
+全帶 S_BOUNDING_BOX、layer 17/101 6/0 206/150、**無 CE 108/250**）後，互動式 ROI 載入卡在「Loading GDS ROI…」不動。
+
+**診斷（先確認不是 F27 回歸）：** 互動載入走 `_roi_entry → oasis_random.walk_roi`（**非** `walk_roi_fast`）；`git diff` 證實
+`walk_roi` / `reachable_bbox` / `load_cell` 從 F27 前到現在 **逐字未改**（所有 hunk 都是新增函式），解碼本來就走 native
+（`_decode_at → _decode_at_native`）。→ 不是回歸，是**單一巨大 flat cell 首次全解碼**（sbbox 剪枝免解碼，但真正落在
+ROI 的那顆大 cell 仍得整顆 decode；1750 MB 檔 → 數分鐘）。過程中無任何 console／dialog 動靜 → 看似當掉。
+
+**修復：**
+1. **解碼心跳（M7 主體）：** `RandomAccessReader` 新增 `_decode_cell/_decode_records/_decode_t0/_decode_hb_t`；`load_cell`
+   在 decode 前後 arm/clear（`finally` 保證清乾淨、不留 stale）。兩條 decode loop（native + py）每 ~16k records 呼
+   `_decode_tick()` 更新計數，DEBUG 下每 ~2s 印一行 `[roi] … decoding cell <id>: N records, Ts elapsed`。UI 的
+   `_tick_roi_progress` 也顯示「Decoding cell X: N records (Ts)…」。→ 慢但在動 vs 真卡住，一眼可辨。**非語意**（不動解碼
+   輸出，native↔py byte-identical 護欄照過）。
+2. **export-path batched gate：** `walk_roi_fast` 新增 `_batched_walk_affordable(rar)`——無 CE bbox_layer 時
+   `walk_roi_batched` 的 topo build 會用 `load_cell_bbox` 全解碼整檔，故大檔無 CE 時退回 ROI-pruned `walk_roi`（有 CE 或
+   小檔才走 batched）。修掉此檔 **匯出**時會卡在 topo build 的問題（互動路徑本來就用 walk_roi、不受影響）。
+
+**單一 debug 模式（user 要求把 .bat / --debug / --trace 收斂成一個）：**
+- `GLAS_DEBUG=1` 成為唯一開關（`MMH_GDS_DEBUG` 留作 back-compat alias），一次點亮 ROI 摘要 + 解碼心跳 + export/fa 計時
+  （`fine_align._FA_TIMING` 於 import 與 main() 同時吃 `GLAS_DEBUG`；spawned worker 由 env 繼承）。
+- `main()` 的 `--debug` 現在「一鍵全開」並印出該看哪些行（`[roi]` / `[export-timing]`）；`--trace`（level 2）留作隱藏的
+  深度模式。
+- **檔案清理：** 刪 `1_test_native.bat` / `2_timing_native_ON.bat` / `3_timing_native_OFF.bat`（native 加速已定案、A/B
+  benchmark 非日常所需），新增單一 `debug.bat`（`set GLAS_DEBUG=1` + 印 native VERSION/selftest + 啟動 + 說明該看什麼）。
+- 刪 `GLAS_Operator_SOP.pptx` / `GLAS_操作SOP_繁中.pptx`（SOP，user 已另存）。
+
+**測試：** 新 `tests/test_batched_gate.py`（4：小檔/有 CE/大檔無 CE/超大 cap）、`tests/test_decode_heartbeat.py`（3：載完清
+乾淨 / tick 記數 / 心跳下 walk 仍正確）；全 `tests/` **848 passed**。**純 Python，未動 `.pyx` → 免 CI，重抓 ZIP 即可。**
+
+**影響檔案：** `glas/core/oasis_random.py`（心跳欄位 + `_decode_tick` + load_cell arm/clear + 兩 loop 心跳 + `GLAS_DEBUG`
+alias + `_batched_walk_affordable` gate）、`glas/core/fine_align.py`（`_FA_TIMING` 吃 `GLAS_DEBUG`）、
+`glas/app/gds_align_tool.py`（`_tick_roi_progress` 心跳顯示 + `main()` 單一 debug 開關 + `import time`）、`debug.bat`（新）、
+刪 3 個舊 .bat + 2 個 pptx、`tests/test_batched_gate.py` / `test_decode_heartbeat.py`（新）。
+**Branch：** `claude/project-perf-optimization-86i8yt`。
+
+---
+
 ## [2026-07-02] [F27 M5+/M6] union 改 numpy 切片 + reachable-bbox sidecar（榨 #1/#2）
 
 **變更類型：** 效能（承 M5 raster Boolean 的後續）· **狀態：本地驗證；待 user 量真檔**

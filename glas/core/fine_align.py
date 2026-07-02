@@ -585,7 +585,11 @@ def poi_polys_for_roi(rar, root, roi_bbox, poi_spec, cancel_cb=None,
 # (cv2.matchTemplate). Lets us see where a real batch actually spends its time
 # instead of guessing. Off → the four perf_counter() calls are the only cost
 # (nanoseconds), so the production path is unaffected.
-_FA_TIMING = bool(os.environ.get("GLAS_FA_TIMING"))
+# F27 M7: the single debug switch (GLAS_DEBUG / debug.bat) lights this up too, so
+# one flag covers ROI + export timing; spawned workers inherit whichever env is set.
+_FA_TIMING = bool(os.environ.get("GLAS_FA_TIMING")
+                  or os.environ.get("GLAS_DEBUG")
+                  or os.environ.get("MMH_GDS_DEBUG"))
 try:
     _FA_TIMING_EVERY = max(1, int(os.environ.get("GLAS_FA_TIMING_EVERY", "25")))
 except ValueError:
