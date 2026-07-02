@@ -137,7 +137,8 @@ def export_one_image(job, rar, root, poi, cfg, out_dir,
                 # ``polys`` (exterior rings) stroke the overlay; ``geom`` keeps
                 # Boolean interior holes for the grayscale/label fill (F15).
                 polys, geom = fine_align.poi_polys_and_geometry_for_roi(
-                    rar, root, roi, spec, cancel_cb=cancel_cb)
+                    rar, root, roi, spec, cancel_cb=cancel_cb,
+                    nm_per_px=nm_per_px)
                 if polys:
                     entries.append((polys, color))
                 if geom is not None and not geom.is_empty:
@@ -356,10 +357,12 @@ def align_and_export_one_image(job, rar, root, poi_colored, cfg, out_dir,
         for idx, (spec, color, fg_glv) in enumerate(poi_colored):
             if need_geom:
                 polys, geom = fine_align.poi_polys_and_geometry_for_roi(
-                    rar, root, roi, spec, cancel_cb=cancel_cb)
+                    rar, root, roi, spec, cancel_cb=cancel_cb,
+                    nm_per_px=nm_per_px)
             else:
                 polys = fine_align.poi_polys_for_roi(
-                    rar, root, roi, spec, cancel_cb=cancel_cb)
+                    rar, root, roi, spec, cancel_cb=cancel_cb,
+                    nm_per_px=nm_per_px)
                 geom = None
             if polys:
                 entries.append((polys, color))

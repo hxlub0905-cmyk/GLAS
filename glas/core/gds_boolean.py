@@ -643,6 +643,176 @@ def make_mask(
     return mask
 
 
+# ── Raster Boolean (F27 M5): evaluate the whole expression in pixel space ────
+#
+# The export product IS a uint8 raster (gray/label via make_mask). The shapely
+# path unions the raw rects then does directional morphology (grow/shrink) in
+# VECTOR space — the Minkowski-sum-of-every-edge dilation is O(edges) + a giant
+# unary_union, ~15 s on a dense FOV. In raster space the same ops are cv2 calls:
+# grow/shrink -> dilate/erode with an axis kernel, & | - ~ -> bitwise ops, a raw
+# layer -> fillPoly. ~10 ms total. The result differs from the vector-then-
+# rasterize mask only at the sub-pixel boundary (morphology is quantized to the
+# pixel grid), which is exactly the resolution the product is emitted at anyway.
+
+
+def polys_to_mask(polys, *, width_px: int, height_px: int,
+                  x_min_nm: float, y_min_nm: float, nm_per_px: float,
+                  invert_y: bool = True, fill: int = 255) -> np.ndarray:
+    """Rasterize a list of ``(n, 2)`` nm polygon rings into a uint8 mask using
+    the SAME coordinate mapping as :func:`make_mask` (so a raster-evaluated
+    expression lands pixel-aligned with the gray/label products). Overlapping
+    polys fill idempotently (union); raw-layer rings are filled solid."""
+    if not _CV2_OK:  # pragma: no cover
+        raise BooleanExprError("opencv (cv2) is required for raster Boolean")
+    mask = np.zeros((height_px, width_px), dtype=np.uint8)
+    if not polys:
+        return mask
+    parts = []
+    for p in polys:
+        a = np.asarray(p, dtype=float)
+        if a.shape[0] < 3:
+            continue
+        cols = (a[:, 0] - x_min_nm) / nm_per_px
+        rows = (a[:, 1] - y_min_nm) / nm_per_px
+        if invert_y:
+            rows = (height_px - 1) - rows
+        parts.append(np.column_stack([cols, rows]).round().astype(np.int32))
+    # NOTE: cv2.fillPoly on a LIST applies the even-odd rule, so overlapping
+    # raw rects would cancel into holes. Fill each polygon on its own so the
+    # result is their UNION (idempotent over-paint) — this is the raw layer's
+    # geometry. (Batched into one call per polygon; a 4-pt rect fill is ~µs.)
+    for part in parts:
+        cv2.fillPoly(mask, [part], int(fill))
+    return mask
+
+
+def evaluate_raster(ast: object, masks: Mapping[str, np.ndarray], *,
+                    nm_per_px: float) -> np.ndarray:
+    """Evaluate ``ast`` against per-layer uint8 masks (255=inside), returning a
+    uint8 mask. Byte-mirror of :func:`evaluate` in pixel space: ``~`` ->
+    bitwise_not (the mask IS the FOV), ``& | -`` -> bitwise ops, grow/shrink ->
+    cv2.dilate/erode with an axis-aligned kernel sized ``round(amount/nm_per_px)``
+    pixels per side (W -> X/columns, H -> Y/rows)."""
+    if not _CV2_OK:  # pragma: no cover
+        raise BooleanExprError("opencv (cv2) is required for raster Boolean")
+
+    def ev(n: object) -> np.ndarray:
+        if isinstance(n, Ref):
+            m = masks.get(n.name)
+            if m is None:
+                raise BooleanExprError(f"layer {n.name!r} is not bound")
+            return m
+        if isinstance(n, Not):
+            return cv2.bitwise_not(ev(n.child))
+        if isinstance(n, Morph):
+            m = ev(n.child)
+            npx = int(round(n.amount / nm_per_px)) if nm_per_px > 0 else 0
+            if npx <= 0:
+                return m
+            ksize = (1, 2 * npx + 1) if n.label == "W" else (2 * npx + 1, 1)
+            kernel = np.ones(ksize, dtype=np.uint8)
+            return (cv2.dilate(m, kernel) if n.sign > 0
+                    else cv2.erode(m, kernel))
+        if isinstance(n, BinOp):
+            a, b = ev(n.left), ev(n.right)
+            if n.op == "&":
+                return cv2.bitwise_and(a, b)
+            if n.op == "|":
+                return cv2.bitwise_or(a, b)
+            if n.op == "-":
+                return cv2.bitwise_and(a, cv2.bitwise_not(b))
+            raise BooleanExprError(f"unknown binary op {n.op!r}")
+        raise BooleanExprError(f"unknown AST node {n!r}")
+
+    return ev(ast)
+
+
+def resolve_expression_raster(expr: str, bindings: Mapping[str, tuple], *,
+                              raw_poly_provider, recipe_provider,
+                              width_px: int, height_px: int,
+                              x_min_nm: float, y_min_nm: float,
+                              nm_per_px: float, invert_y: bool = True,
+                              _cache: Optional[dict] = None,
+                              _visiting: Optional[set] = None) -> np.ndarray:
+    """Raster analogue of :func:`resolve_expression`: evaluate ``expr`` directly
+    into a uint8 mask. ``raw_poly_provider(layer, datatype) -> [poly (n,2) nm]``
+    supplies a raw layer's walked polygons (rasterized here via
+    :func:`polys_to_mask`); ``recipe_provider(name) -> (expr, bindings)`` handles
+    nested synthetic layers (evaluated recursively into masks, memoized)."""
+    cache = {} if _cache is None else _cache
+    visiting = set() if _visiting is None else _visiting
+    _, ast = parse_expression(expr)
+    rparams = dict(width_px=width_px, height_px=height_px, x_min_nm=x_min_nm,
+                   y_min_nm=y_min_nm, nm_per_px=nm_per_px, invert_y=invert_y)
+    masks: dict[str, np.ndarray] = {}
+    for letter, raw_val in bindings.items():
+        val = normalize_binding(raw_val)
+        if val[0] == "raw":
+            masks[letter] = polys_to_mask(
+                raw_poly_provider(val[1], val[2]), **rparams)
+            continue
+        name = val[1]
+        if name in cache:
+            masks[letter] = cache[name]
+            continue
+        if name in visiting:
+            raise BooleanExprError(f"circular reference to {name!r}")
+        rec = recipe_provider(name)
+        if rec is None:
+            raise BooleanExprError(
+                f"binding references unknown synthetic layer {name!r}")
+        visiting.add(name)
+        m = resolve_expression_raster(
+            rec[0], rec[1], raw_poly_provider=raw_poly_provider,
+            recipe_provider=recipe_provider, _cache=cache, _visiting=visiting,
+            **rparams)
+        visiting.discard(name)
+        cache[name] = m
+        masks[letter] = m
+    return evaluate_raster(ast, masks, nm_per_px=nm_per_px)
+
+
+def mask_to_geometry(mask: np.ndarray, *, x_min_nm: float, y_min_nm: float,
+                     nm_per_px: float, invert_y: bool = False) -> "BaseGeometry":
+    """Vectorize a uint8 mask back into a shapely geometry (in nm root coords),
+    preserving holes. Inverse of :func:`polys_to_mask` — lets the raster Boolean
+    result re-enter the existing geom-based export pipeline (make_mask / overlay
+    / template) unchanged. Uses ``cv2.findContours`` with a 2-level hierarchy so
+    an outer boundary keeps its interior holes (Boolean subtraction / shrink)."""
+    _require_shapely()
+    if not _CV2_OK:  # pragma: no cover
+        raise BooleanExprError("opencv (cv2) is required for raster Boolean")
+    res = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    cnts, hier = (res[0], res[1]) if len(res) == 2 else (res[1], res[2])
+    if not cnts or hier is None:
+        return Polygon()
+    hier = hier[0]
+    h_px = mask.shape[0]
+
+    def to_nm(c: np.ndarray) -> np.ndarray:
+        pts = c.reshape(-1, 2).astype(float)
+        xs = x_min_nm + pts[:, 0] * nm_per_px
+        rows = (h_px - 1 - pts[:, 1]) if invert_y else pts[:, 1]
+        ys = y_min_nm + rows * nm_per_px
+        return np.column_stack([xs, ys])
+
+    polys = []
+    for i, c in enumerate(cnts):
+        if hier[i][3] != -1 or len(c) < 3:      # a hole (has parent) / degenerate
+            continue
+        holes = []
+        ch = hier[i][2]                          # first child = first hole
+        while ch != -1:
+            if len(cnts[ch]) >= 3:
+                holes.append(to_nm(cnts[ch]))
+            ch = hier[ch][0]                     # next sibling hole
+        polys.append(Polygon(to_nm(c), holes))
+    if not polys:
+        return Polygon()
+    g = polys[0] if len(polys) == 1 else unary_union(polys)
+    return g if g.is_valid else g.buffer(0)
+
+
 # ── One-shot convenience ─────────────────────────────────────────────
 
 

@@ -4,6 +4,40 @@
 
 ---
 
+## [2026-07-02] [F27 M5] raster Boolean 引擎：export 的 grow/shrink morphology ~15s → ~0.16s
+
+**變更類型：** 效能（真正的大頭）· **狀態：本地驗證；待 user 量真檔**
+
+**動機：** M4 的 `[bool: …]` 分段計時證實 warm 每張 ~20s 裡 **morph ~14-18s + union ~4-6s** 是大頭（幾何 walk 只 ~2s）。
+morphology 慢的根因：`gds_boolean._dilate_axis` 把 union 後幾何的**每條邊掃成平行四邊形再 unary_union**，dense FOV 上是
+O(edges) + 巨型 union（~15s），shrink 還做兩次。
+
+**做法（raster Boolean，`gds_boolean` 新增）：** 因為 export 產物本來就是 pixel raster（gray/label 走 `make_mask` →
+`cv2.fillPoly`），把整個 Boolean 表達式改在 raster 空間算：
+- `polys_to_mask`：raw 層多邊形 → uint8 mask（**逐個 fillPoly** 取聯集，避免 cv2 list-fillPoly 的 even-odd 讓重疊
+  矩形互相抵消成洞——這是實作時抓到的 bug）。
+- `evaluate_raster`：`~`→bitwise_not（mask 即 FOV）、`& | -`→bitwise、grow/shrink→`cv2.dilate/erode`（軸向 kernel，
+  `round(n/nm_per_px)` px/側，W→X、H→Y）。
+- `resolve_expression_raster`：比照 shapely 版遞迴解 bindings/recipes，但產 mask。
+- `mask_to_geometry`：`cv2.findContours(RETR_CCOMP)` 把結果 mask 還原成**保留洞**的 shapely geom（nm root 座標），
+  讓下游 pipeline（make_mask / overlay / template）**原封不動**。
+- `fine_align.poi_polys_and_geometry_for_roi(... nm_per_px=)`：expr POI 且有 nm_per_px（export 路徑）→ 走 raster；
+  raw POI 與 interactive canvas（無 nm_per_px）仍走 shapely（畫布保持精確向量）。
+
+**實測：** dense FOV（每層 8000 rect）`[(A>W:10)&B]<H:10`：shapely 1511ms → raster **160ms**（真檔 shapely ~15s →
+預期 ~0.16s，**~90x**）。與 shapely 比對：set 運算逐位相同；morphology / user 的 expr 邊界差 <~5%（像素量化，user 已
+接受非 byte-identical）。**注意**：純減法（`A - B`）在 dense 重疊幾何上因兩側各 ~1px 膨脹相減放大，差異較大（~40%）；
+user 的 expr 無此型。
+
+**測試：** 新 `tests/test_gds_boolean_raster.py`（13 例：set 運算逐位、morphology/composed <3% 邊界差、mask↔geom
+round-trip）；全 `tests/` **838 passed**。**純 Python（cv2）、未動 `.pyx` → 免 CI、免重編，重抓 ZIP 即可。**
+
+**影響檔案：** `glas/core/gds_boolean.py`（`polys_to_mask`/`evaluate_raster`/`resolve_expression_raster`/
+`mask_to_geometry`）、`glas/core/fine_align.py`（expr POI 走 raster）、`glas/core/overlay_export.py`（傳 nm_per_px）、
+`tests/test_gds_boolean_raster.py`。**Branch：** `claude/project-perf-optimization-86i8yt`。
+
+---
+
 ## [2026-07-02] [F27 M4 診斷續] 真檔證實瓶頸是 shapely Boolean/morphology，非幾何 walk（加 bool 分段計時）
 
 **變更類型：** 診斷計時（安全、純 Python）· **狀態：待 user 重跑確認 union vs morph 佔比**

@@ -453,7 +453,7 @@ def _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb=None):
 
 
 def poi_polys_and_geometry_for_roi(rar, root, roi_bbox, poi_spec,
-                                   cancel_cb=None):
+                                   cancel_cb=None, nm_per_px=None):
     """POI outline polygons *and* the hole-preserving resolved geometry for a
     ROI, from a single walk (F13). ``poi_spec`` is ``('raw', layer, datatype)``
     or ``('expr', expr_text, bindings[, recipes])``.
@@ -463,7 +463,14 @@ def poi_polys_and_geometry_for_roi(rar, root, roi_bbox, poi_spec,
     overlay outlines but would *fill* Boolean interior exclusions (subtraction /
     complement) once rasterised into a mask. The mask path therefore needs the
     geometry, not the rings. Returns ``(polys, geom)`` so one ROI walk feeds
-    both the overlay (polys) and the mask (geom)."""
+    both the overlay (polys) and the mask (geom).
+
+    F27 M5: when ``nm_per_px`` is given, an EXPRESSION POI is evaluated in RASTER
+    space (``resolve_expression_raster`` — cv2 dilate/erode/bitwise) instead of
+    shapely, then vectorized back to a hole-preserving geom for the unchanged
+    downstream pipeline. On a dense FOV the shapely grow/shrink morphology is
+    ~15 s; the raster equivalent is ~10 ms (pixel-identical at the export
+    resolution). Raw POIs stay on the (already cheap) shapely union path."""
     # F27 M4 diagnosis: split the "walk" phase into oasis-walk / shapely-union /
     # boolean-morphology so the export timing shows WHERE the time goes (on a
     # dense FOV the shapely Boolean/morphology, not the geometry walk, dominates).
@@ -484,6 +491,33 @@ def poi_polys_and_geometry_for_roi(rar, root, roi_bbox, poi_spec,
     expr, bindings = poi_spec[1], poi_spec[2]
     recipes = poi_spec[3] if len(poi_spec) > 3 else {}
     x0, y0, x1, y1 = roi_bbox
+
+    if nm_per_px and nm_per_px > 0:
+        # ── raster Boolean (M5): raw walk → cv2 morphology/bitwise → geom ──
+        def raw_poly_provider(layer: int, datatype: int):
+            _t = time.perf_counter()
+            ps = _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb)
+            _acc("_t_bwalk", time.perf_counter() - _t)
+            return ps
+        wpx = max(1, int(round((x1 - x0) / nm_per_px)))
+        hpx = max(1, int(round((y1 - y0) / nm_per_px)))
+        _w0 = getattr(rar, "_t_bwalk", 0.0)
+        _t = time.perf_counter()
+        mask = gds_boolean.resolve_expression_raster(
+            expr, bindings, raw_poly_provider=raw_poly_provider,
+            recipe_provider=lambda n: recipes.get(n),
+            width_px=wpx, height_px=hpx, x_min_nm=x0, y_min_nm=y0,
+            nm_per_px=nm_per_px, invert_y=False)
+        _acc("_t_bmorph", (time.perf_counter() - _t)
+             - (getattr(rar, "_t_bwalk", 0.0) - _w0))
+        _t = time.perf_counter()
+        geom = gds_boolean.mask_to_geometry(
+            mask, x_min_nm=x0, y_min_nm=y0, nm_per_px=nm_per_px, invert_y=False)
+        out = gds_boolean.geometry_to_polygons(geom)
+        _acc("_t_bunion", time.perf_counter() - _t)
+        return out, geom
+
+    # shapely path (interactive canvas / no raster resolution given)
     cx, cy, w, h = (x0 + x1) / 2.0, (y0 + y1) / 2.0, (x1 - x0), (y1 - y0)
 
     def raw_provider(layer: int, datatype: int):
@@ -511,7 +545,8 @@ def poi_polys_and_geometry_for_roi(rar, root, roi_bbox, poi_spec,
     return out, geom
 
 
-def poi_polys_for_roi(rar, root, roi_bbox, poi_spec, cancel_cb=None):
+def poi_polys_for_roi(rar, root, roi_bbox, poi_spec, cancel_cb=None,
+                      nm_per_px=None):
     """POI polygons (nm, root coords) for a given ROI, for batch fine align
     (plan M4b "Run all") and overlay outlines. ``poi_spec`` is
     ``('raw', layer, datatype)`` or ``('expr', expr_text, bindings[, recipes])``;
@@ -529,7 +564,7 @@ def poi_polys_for_roi(rar, root, roi_bbox, poi_spec, cancel_cb=None):
         _, layer, datatype = poi_spec
         return _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb)
     return poi_polys_and_geometry_for_roi(
-        rar, root, roi_bbox, poi_spec, cancel_cb)[0]
+        rar, root, roi_bbox, poi_spec, cancel_cb, nm_per_px=nm_per_px)[0]
 
 
 # ── Optional per-stage timing (diagnostic) ───────────────────────────────────
