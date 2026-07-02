@@ -372,3 +372,22 @@ def test_non_clippable_rep_over_cap_falls_back(tmp_path, monkeypatch):
     monkeypatch.setattr(orx, "_NATIVE_WALK_MAX_PLACEMENTS", 100)
     assert orx.flatten_cell_graph(rar, 0, 17, 0) is None
     assert "expanded placements" in (rar._flatten_reject or "")
+
+
+def test_large_non_clippable_rep_bails_before_materializing(tmp_path, monkeypatch):
+    # A large non-clippable rep must bail via the analytic repetition_count guard
+    # BEFORE repetition_offsets_np materializes it (else a big polygon/placement
+    # array would hang the flatten materializing millions of offsets/copies).
+    p = tmp_path / "arb.oas"
+    p.write_bytes(T._build_big_grid(20, 20, 100))    # 400 placements
+    rar = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
+    monkeypatch.setattr(orx, "_grid_axes", lambda rt, rr: None)  # force non-grid
+    monkeypatch.setattr(orx, "_REP_EXPAND_MAX", 10)  # 400 > 10 -> bail, no expand
+    calls = {"n": 0}
+    real = orx.oas.repetition_offsets_np
+    monkeypatch.setattr(orx.oas, "repetition_offsets_np",
+                        lambda rt, rr: (calls.__setitem__("n", calls["n"] + 1)
+                                        or real(rt, rr)))
+    assert orx.flatten_cell_graph(rar, 0, 17, 0) is None
+    assert "non-clippable placement repetition" in (rar._flatten_reject or "")
+    assert calls["n"] == 0            # never materialized the offsets

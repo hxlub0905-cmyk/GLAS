@@ -1460,6 +1460,14 @@ def _clip_grid_offsets(rtype, raw, placed: np.ndarray, T: "Transform",
     return out
 
 
+# A non-clippable repetition (arbitrary list / skew lattice) is materialized
+# into individual records — but only if it's small. A LARGE non-clippable array
+# would blow up (and, for polygons, do millions of point-array copies) — so bail
+# the whole graph to the Python walk instead. repetition_count is analytic, so
+# this decision is made WITHOUT ever materializing the offsets.
+_REP_EXPAND_MAX = 4096
+
+
 def _rep_desc(rtype, raw):
     """Classify a repetition for the native CSR (F27 M3e):
 
@@ -1469,9 +1477,12 @@ def _rep_desc(rtype, raw):
       clip analytically (types 1/2/3 + orthogonal 8). Stays ONE CSR record no
       matter how many instances, so a chip-spanning array never expands. The
       second axis is ``(1, 0, 0)`` for the 1-D grids (2/3).
-    * ``('expand', offsets (K, 2))`` — an arbitrary list / skew lattice the
-      kernel can't clip; materialize its offsets (bounded) so the flatten emits
-      K plain records, matching walk_roi's full-materialize-then-mask.
+    * ``('expand', offsets (K, 2))`` — a *small* arbitrary list / skew lattice
+      the kernel can't clip; materialize its offsets so the flatten emits K plain
+      records, matching walk_roi's full-materialize-then-mask.
+    * ``('bail', rtype, count)`` — a *large* non-clippable repetition; expanding
+      it would blow the CSR / hang, so the caller bails the whole graph to the
+      Python walk (which clips it analytically). ``count`` is analytic.
     """
     if rtype is None:
         return (None,)
@@ -1480,6 +1491,9 @@ def _rep_desc(rtype, raw):
         n1, v1x, v1y = axes[0]
         n2, v2x, v2y = axes[1] if len(axes) > 1 else (1, 0, 0)
         return ('grid', n1, v1x, v1y, n2, v2x, v2y)
+    cnt = oas.repetition_count(rtype, raw)          # analytic — no materialize
+    if cnt > _REP_EXPAND_MAX:
+        return ('bail', rtype, cnt)
     return ('expand', oas.repetition_offsets_np(rtype, raw))
 
 
@@ -1490,7 +1504,8 @@ def flatten_cell_graph(rar: "RandomAccessReader", root: object,
                        layer: int, datatype: int, *,
                        max_cells: Optional[int] = None,
                        max_rects: Optional[int] = None,
-                       max_placements: Optional[int] = None):
+                       max_placements: Optional[int] = None,
+                       progress=None):
     """Flatten the ROI-independent cell graph reachable from ``root`` into CSR
     arrays for :func:`oasis_fastdecode.walk_native` (F27 M3e — robust hybrid).
 
@@ -1537,6 +1552,8 @@ def flatten_cell_graph(rar: "RandomAccessReader", root: object,
         if len(order) > max_cells:
             rar._flatten_reject = f"graph too large (> {max_cells} cells)"
             return None
+        if progress is not None and len(order) % 2000 == 0:
+            progress("pass1-decode", len(order), None)
         c = rar.load_cell(cid)
         for pl in c.placements:
             if not isinstance(pl.target, (int, np.integer)):
@@ -1562,23 +1579,54 @@ def flatten_cell_graph(rar: "RandomAccessReader", root: object,
     reach = np.zeros((N, 4), dtype=np.float64)
     n_rect = n_poly = n_pl = 0
     for i, cid in enumerate(order):
+        if progress is not None and i and i % 2000 == 0:
+            progress("pass2-build", i, N)
         c = rar.load_cell(cid)
-        # rects — vectorized fast path when the cell has no rect repetition on
-        # this layer (the common bulk; keeps parity with the old c.rects() build:
-        # grid_flag=0, n1=n2=1). Only cells with a repeated rect take the slower
-        # per-record classification (grid record kept 1 row, arbitrary expanded).
+        # rects — plain (no-rep) rects are built vectorized (the common bulk;
+        # keeps parity with the old c.rects() build: grid_flag=0, n1=n2=1); only
+        # the (few) repeated rects take the per-record classification (a grid
+        # record stays 1 row, an arbitrary rep expands, a huge non-clippable one
+        # bails). Splitting plain from repeated keeps a cell with 100k plain rects
+        # + one array from degrading into a 100k-iteration Python loop.
         nr = c.rect_count(key)
         rcol = getattr(c, "_rcol", None)
         rcol = rcol.get(key) if rcol is not None else None
-        if nr and rcol is not None and not bool((np.asarray(rcol[1]) >= 0).any()):
-            blk = np.zeros((nr, 11), dtype=np.float64)
-            blk[:, 0:4] = np.asarray(rcol[0], dtype=np.float64)
-            blk[:, 5] = 1.0; blk[:, 8] = 1.0
-            rect_blocks.append(blk); n_rect += nr
-            if n_rect > max_rects:
-                rar._flatten_reject = f"too many expanded rects (> {max_rects})"
-                return None
-        elif nr:
+        if nr and rcol is not None:
+            coords, rt_arr, _rr = rcol
+            rt_arr = np.asarray(rt_arr)
+            plain = rt_arr < 0
+            n_plain = int(plain.sum())
+            if n_plain:
+                blk = np.zeros((n_plain, 11), dtype=np.float64)
+                blk[:, 0:4] = np.asarray(coords)[plain].astype(np.float64)
+                blk[:, 5] = 1.0; blk[:, 8] = 1.0
+                rect_blocks.append(blk); n_rect += n_plain
+            rep_rows: list = []
+            for j in np.flatnonzero(~plain):
+                x1, y1, x2, y2, rt, rr = c.rect_spec_at(key, int(j))
+                d = _rep_desc(rt, rr)
+                if d[0] == 'grid':
+                    _, n1, v1x, v1y, n2, v2x, v2y = d
+                    rep_rows.append((x1, y1, x2, y2, 1,
+                                     n1, v1x, v1y, n2, v2x, v2y))
+                elif d[0] == 'expand':
+                    for dx, dy in d[1]:
+                        rep_rows.append((x1 + dx, y1 + dy, x2 + dx, y2 + dy,
+                                         0, 1, 0, 0, 1, 0, 0))
+                elif d[0] == 'bail':
+                    rar._flatten_reject = (f"non-clippable rect repetition "
+                                           f"type={d[1]} count={d[2]} "
+                                           f"(cell {cid!r})")
+                    return None
+                if n_rect + len(rep_rows) > max_rects:
+                    rar._flatten_reject = (f"too many expanded rects "
+                                           f"(> {max_rects})")
+                    return None
+            if rep_rows:
+                rect_blocks.append(np.array(rep_rows,
+                                            dtype=np.float64).reshape(-1, 11))
+                n_rect += len(rep_rows)
+        elif nr:                              # non-columnar fallback (rare)
             rows: list = []
             for j in range(nr):
                 x1, y1, x2, y2, rt, rr = c.rect_spec_at(key, j)
@@ -1590,6 +1638,11 @@ def flatten_cell_graph(rar: "RandomAccessReader", root: object,
                 elif d[0] == 'grid':
                     _, n1, v1x, v1y, n2, v2x, v2y = d
                     rows.append((x1, y1, x2, y2, 1, n1, v1x, v1y, n2, v2x, v2y))
+                elif d[0] == 'bail':
+                    rar._flatten_reject = (f"non-clippable rect repetition "
+                                           f"type={d[1]} count={d[2]} "
+                                           f"(cell {cid!r})")
+                    return None
                 else:
                     rows.append((x1, y1, x2, y2, 0, 1, 0, 0, 1, 0, 0))
                 if n_rect + len(rows) > max_rects:
@@ -1615,6 +1668,10 @@ def flatten_cell_graph(rar: "RandomAccessReader", root: object,
                 poly_pts_parts.append(base)
                 poly_ptoff.append(poly_ptoff[-1] + base.shape[0])
                 poly_meta_rows.append((1, n1, v1x, v1y, n2, v2x, v2y)); n_poly += 1
+            elif d[0] == 'bail':
+                rar._flatten_reject = (f"non-clippable polygon repetition "
+                                       f"type={d[1]} count={d[2]} (cell {cid!r})")
+                return None
             else:
                 poly_pts_parts.append(base)
                 poly_ptoff.append(poly_ptoff[-1] + base.shape[0])
@@ -1641,6 +1698,10 @@ def flatten_cell_graph(rar: "RandomAccessReader", root: object,
                 pl_target_list.append(tgt)
                 pl_data_rows.append((m00, m01, m10, m11, x, y, 1,
                                      n1, v1x, v1y, n2, v2x, v2y)); n_pl += 1
+            elif d[0] == 'bail':
+                rar._flatten_reject = (f"non-clippable placement repetition "
+                                       f"type={d[1]} count={d[2]} (cell {cid!r})")
+                return None
             else:
                 pl_target_list.append(tgt)
                 pl_data_rows.append((m00, m01, m10, m11, x, y,
@@ -1710,12 +1771,12 @@ def flatten_prewarm(rar: "RandomAccessReader", root: object,
     cell cap) and persist it to the shared sidecar, so the batch's pool workers
     each ``np.load`` it instead of decoding the whole chip. Call it in the
     orchestrator process before launching the export pool. Returns the flat
-    tuple (native-able) or ``None`` (polygon / non-D4 / name-ref / over the OOM
-    guard ``max_cells`` / ``max_rects`` / ``max_placements``); either verdict is
-    persisted so workers don't rebuild. Rect and placement repetition are
-    expanded (M3d), not rejected — the caps bound the expanded totals so a dense
-    array chip that would OOM the CSR falls back to the Python walk instead.
-    Safe to call repeatedly (sidecar hit short-circuits)."""
+    tuple (native-able) or ``None`` (non-D4 / name-ref / a non-clippable rep over
+    the guard / over the OOM caps); either verdict is persisted so workers don't
+    rebuild. Regular-grid repetition stays 1 record (clipped in-kernel, M3e), so
+    a dense array chip does NOT expand; only a genuinely non-clippable large
+    array bails to the Python walk. Emits coarse ``[flatten]`` progress so a big
+    chip shows movement. Safe to call repeatedly (sidecar hit short-circuits)."""
     sc = walkflatten_cache.load(rar._path, root, layer, datatype)
     if sc is walkflatten_cache.NOT_NATIVE:
         rar._flatten_reject = (walkflatten_cache.last_not_native_reason
@@ -1724,9 +1785,25 @@ def flatten_prewarm(rar: "RandomAccessReader", root: object,
     if sc is not None:
         rar._flatten_reject = None
         return sc
+    # Building the whole-chip flatten is the one genuinely slow step (a full
+    # decode + CSR build). Emit coarse progress so a big chip shows movement
+    # instead of looking hung, and time each phase so a slow build is diagnosable.
+    _t0 = time.perf_counter()
+
+    def _prog(phase, i, n):
+        el = time.perf_counter() - _t0
+        tot = f"/{n}" if n else ""
+        print(f"[flatten] {layer}/{datatype} {phase} {i}{tot} cells "
+              f"({el:.0f}s)", flush=True)
+
     flat = flatten_cell_graph(rar, root, layer, datatype,
                               max_cells=max_cells, max_rects=max_rects,
-                              max_placements=max_placements)
+                              max_placements=max_placements, progress=_prog)
+    if flat is not None:
+        rc, po, pl = flat[0].shape[0], flat[4].shape[0], flat[7].shape[0]
+        print(f"[flatten] {layer}/{datatype} built in "
+              f"{time.perf_counter() - _t0:.0f}s "
+              f"(records: {rc} rect, {po} poly, {pl} placement)", flush=True)
     walkflatten_cache.save(rar._path, root, layer, datatype, flat,
                            reason=getattr(rar, "_flatten_reject", "") or "")
     return flat

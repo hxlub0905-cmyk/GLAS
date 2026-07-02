@@ -4,6 +4,40 @@
 
 ---
 
+## [2026-07-02] [F27 M3e hotfix] prewarm 卡死修正：非可剪大 array bail-before-materialize + 進度 log + mixed-cell 向量化
+
+**變更類型：** bug fix（prewarm hang）· **狀態：純 Python，v7 .pyd 不變、不觸發 CI**
+
+**現象：** user 拿到 v7 .pyd（`selftest 7 7`）後，export 卡在 `[export] prewarming … 4 layer(s)` 超過 15min 不動。
+M3c/M3d 的 prewarm 都在 pass 1 遇 polygon/rep 早早 bail（0/4），**從未真正 build 過整顆 E3B 的 CSR**；M3e 拿掉那些
+bail 後，這是第一次真的攤平整顆 330MB chip，撞到前幾版一直繞過的成本。
+
+**三個修法：**
+1. **非可剪 repetition：bail 前先用 analytic `repetition_count` 擋**。`_rep_desc` 新增 `('bail', type, count)`：
+   `_grid_axes` 認不得（arbitrary list / skew）且 `count > _REP_EXPAND_MAX(4096)` → 直接回 bail，**絕不呼叫
+   `repetition_offsets_np`**（原本會 materialize 百萬 offset；polygon 更慘，每個 offset 一次 `base.copy()` → 卡死）。
+   flatten 三處（rect/poly/placement）收到 bail 就整棵回 Python，reject 帶 `type=T count=N (cell X)` 供診斷。
+2. **進度 log**：`flatten_prewarm` 傳 `progress` callback，`flatten_cell_graph` 每 2000 cell 印
+   `[flatten] L/D pass1-decode i cells (Xs)` / `pass2-build i/N cells (Xs)`，完成印 record 數（rect/poly/placement）。
+   大 chip 不再「看起來當掉」，且可分辨慢在 decode（pass1）還是 build（pass2）。
+3. **mixed-cell 向量化**：plain rect 一律走向量化 block（`rt<0` mask），只有「有 repetition 的那幾筆」走 per-record
+   分類 → 一個 cell 有 10 萬 plain rect + 一筆 array 時，不會退化成 10 萬次 Python 迴圈。
+
+**測試：** `test_native_walk` +1（`test_large_non_clippable_rep_bails_before_materializing`：monkeypatch
+`_grid_axes→None` + `_REP_EXPAND_MAX=10`，斷言 flatten None + reject "non-clippable placement repetition" **且
+`repetition_offsets_np` 呼叫次數 0**）；全 `tests/` **820 passed**。**未動 `.pyx` → v7 .pyd 不變、CI 不重編，user 重抓
+ZIP 拿新 `oasis_random.py` 即可（.pyd 沿用）。**
+
+**下一步靠診斷輸出：** user 重跑後看 `[flatten]` log —— 若 4 層都 build 完 → 4/4 native + 快；若某層印
+`non-clippable … type=T count=N` → 那型 array 要擴 `_grid_axes`（把 T 納入 analytic clip）；若 pass1/pass2 crawl →
+是 decode/build 本身慢，再據數字優化。
+
+**影響檔案：** `glas/core/oasis_random.py`（`_rep_desc` bail guard + `_REP_EXPAND_MAX` + flatten 三處 bail + progress +
+mixed-cell 向量化 + `flatten_prewarm` progress）、`tests/test_native_walk.py`、`docs/plans/F27-native-walk.md`。
+**Branch：** `claude/project-perf-optimization-86i8yt`。
+
+---
+
 ## [2026-07-01] [F27 M3e] robust hybrid native walk：in-kernel analytic clip + polygon emit（VERSION 7）
 
 **變更類型：** 效能（native walk 涵蓋率，架構級）· **狀態：本地驗證完成；待 CI 出 v7 .pyd + user 量**
