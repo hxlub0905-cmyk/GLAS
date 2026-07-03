@@ -227,6 +227,20 @@ def save(src, cell_id, wanted_layers, content) -> bool:
         return False
 
 
+def cached_size(src, cell_id, wanted_layers) -> int:
+    """Byte size of the on-disk sidecar for ``(src, cell_id, wanted_layers)``, or
+    0 if there is none. A cheap (stat-only, no decode/load) proxy for how much RAM
+    ``np.load`` of this cell will allocate — the sidecar is an uncompressed
+    ``.npz`` so its size ≈ the decoded array bytes. Used to cap export worker
+    count so N per-worker copies of a giant merge cell fit in memory (F27 M7m).
+    Never raises."""
+    try:
+        p = _key_path(Path(src), cell_id, wanted_layers)
+        return p.stat().st_size if p.exists() else 0
+    except Exception:
+        return 0
+
+
 def load_prep(src, cell_id):
     """Return the cached placement-prune precompute for ``(src, cell_id)`` or
     ``None``. Tuple shape matches ``CellContent._place_prep``:

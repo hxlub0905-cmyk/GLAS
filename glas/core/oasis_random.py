@@ -851,19 +851,14 @@ class RandomAccessReader:
     def has_offsets(self) -> bool:
         return bool(self._by_refnum)
 
-    def find_giant_cells(self, *, min_bytes: int = 20_000_000,
-                         max_return: int = 4) -> list:
-        """Cell ids whose ENCODED BYTE SPAN is huge — the giant merge cells that
-        dominate decode time (F27 M7j). The span is the gap to the next cell
-        offset in the file, a direct decode-cost proxy that needs no decoding
-        (unlike sbbox area, which a cheap container can also have). Names are
-        preferred over refnums so the returned id matches how the ROI walk reaches
-        a merge cell (by name), keeping the cellcache key aligned. Largest-first,
-        only spans >= ``min_bytes``, capped at ``max_return``.
-
-        Used by the export orchestrator to decode these ONCE up front so the pool
-        workers load them from the sidecar instead of all cold-decoding the same
-        multi-hundred-MB cell at once and thrashing memory."""
+    def _giant_cells_with_spans(self, *, min_bytes: int = 20_000_000,
+                                max_return: int = 4) -> list:
+        """``[(cell_id, encoded_byte_span), …]`` largest-first for cells whose
+        span (gap to the next cell offset) is >= ``min_bytes``, capped at
+        ``max_return``. The span needs no decoding and is a direct decode-cost /
+        memory proxy (unlike sbbox area, which a cheap container can also have).
+        Names win over refnums so the id matches how the ROI walk reaches a merge
+        cell (by name), keeping the cellcache key aligned."""
         off_to_id: dict[int, object] = {}
         for rn, off in self._by_refnum.items():
             off_to_id.setdefault(off, rn)
@@ -881,7 +876,45 @@ class RandomAccessReader:
             end = offs[i + 1] if i + 1 < len(offs) else filesize
             spans.append((end - off, off_to_id[off]))
         spans.sort(key=lambda t: t[0], reverse=True)
-        return [cid for span, cid in spans if span >= min_bytes][:max_return]
+        return [(cid, span) for span, cid in spans
+                if span >= min_bytes][:max_return]
+
+    def find_giant_cells(self, *, min_bytes: int = 20_000_000,
+                         max_return: int = 4) -> list:
+        """Cell ids whose ENCODED BYTE SPAN is huge — the giant merge cells that
+        dominate decode time (F27 M7j). See :meth:`_giant_cells_with_spans`.
+
+        Used by the export orchestrator to decode these ONCE up front so the pool
+        workers load them from the sidecar instead of all cold-decoding the same
+        multi-hundred-MB cell at once and thrashing memory."""
+        return [cid for cid, _span in self._giant_cells_with_spans(
+            min_bytes=min_bytes, max_return=max_return)]
+
+    def giant_cell_estimate_bytes(self) -> int:
+        """Estimated peak DECODED bytes of the largest giant merge cell — i.e.
+        how much RAM one export worker's ``np.load`` of it from the sidecar will
+        allocate. Prefers the exact on-disk sidecar size (uncompressed .npz ≈ the
+        decoded array bytes); when the cell isn't cached yet (the very first cold
+        run) falls back to the encoded byte span. 0 when the file has no giant
+        cell. Used to cap export worker count so N per-worker copies fit in the
+        machine's RAM (F27 M7m) — the cap self-tunes per tool, no hard-coded size.
+        Never raises."""
+        try:
+            pairs = self._giant_cells_with_spans()
+        except Exception:                 # noqa: BLE001
+            return 0
+        best = 0
+        for cid, span in pairs:
+            try:
+                sz = cellcache.cached_size(
+                    self._path, self.cache_key_for(cid), self._init_wanted)
+            except Exception:             # noqa: BLE001
+                sz = 0
+            if sz <= 0:
+                sz = int(span)            # cold run: encoded span (lower bound)
+            if sz > best:
+                best = sz
+        return best
 
     def layer_display_name(self, layer: int, datatype: int) -> str:
         """OASIS LAYERNAME for ``(layer, datatype)``, or "" (F3 M2)."""

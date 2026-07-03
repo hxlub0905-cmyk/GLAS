@@ -4,6 +4,30 @@
 
 ---
 
+## [2026-07-03] [F27 M7k 驗證 + M7m 基礎設施] 大 cell 只解一次已證實；第一波真因 = 記憶體 thrashing
+
+**變更類型：** 驗證 + 效能基礎設施（RAM-aware worker cap，尚未接線）· **狀態：M7k 已用真檔證實；M7m 函式+測試就緒（562 passed），接線待 user 決定批次取捨**
+
+**M7k 驗證（user 清空快取後跑 run1 冷 / run2 重開）：** ✅ **成立**。
+- run2 重開後（RAM 全清、只能靠磁碟 sidecar）：互動載入 **361s → 36s**、`6/0 decode 15.4s (2 cached, 510 decoded)`（giant 是那「2 cached」）、**全程零解碼心跳**、export `pre-decoding [giant]` 秒過。
+- 證明那顆 10.8M-record 大 cell（refnum 44995 = name `_2_gri_yank_top`）**全域只解一次（run1 那次），之後互動／export／跨 session 全部從磁碟共用**（offset-key 跨 session 命中）。
+
+**第一波 export 仍 ~400–510s／張的真因（新定位）：** **不是** giant cell（它已快取），而是**記憶體 thrashing**。證據：同樣的工作在單行程互動下快 **11–19×**（互動解 510 cell=15.4s vs export worker 433 cell=167s；互動 `17/101` emit 120k inst=9.3s vs export=176s），且 export 的 geom 時間在各張間忽高忽低（51/92/117/176/196s，inst 數卻一樣）——記憶體爭用的指紋。**機制：** 每個 worker 第一張時各自 `np.load` 一份完整 giant cell（幾百 MB，cellcache 存 `.npz` 非共享）+ 冷解 433 child cell + materialize，**8 worker 同時做 → 峰值 RAM 爆 → paging**。只發生在「每 worker 第一張」（前 ~8 張），之後 memo 暖了 ~7s/張。正是交接 §6 早預告的「記憶體 N×」風險兌現。
+
+**M7m 基礎設施（已寫、已測、未接線）：** 為「RAM-aware 自動壓 export worker 數」備好純函式，**跨機自動偵測、免寫死**（user 會在不同 tool 跑）：
+- `fine_align.available_ram_bytes()`：偵測本機可用實體 RAM（psutil → Windows `GlobalMemoryStatusEx` → POSIX `sysconf` → `/proc/meminfo`，全 fallback、不 raise）。
+- `fine_align.ram_capped_worker_count(auto, giant_bytes, avail, factor, fraction)`：算「N 份 giant 塞得下幾個 worker」；無 giant／RAM 未知／已 1 → 原樣返回；不低於 1；`GLAS_EXPORT_RAM_FRACTION`(0.6)／`GLAS_EXPORT_WORKER_MEM_FACTOR`(2.5) 可調。
+- `cellcache.cached_size()`：giant sidecar `.npz` 檔案大小（≈ 解碼後 array bytes）當 RAM 估算 proxy。
+- `oasis_random`：`find_giant_cells` 抽出 `_giant_cells_with_spans`（帶 span）；新增 `giant_cell_estimate_bytes()`（有 sidecar 用實際大小、冷跑用 byte 跨距）。
+
+**未接線原因（取捨待 user 定）：** 「硬壓 worker 數」對**小批大賺、大批反虧**（後段 1000+ 輕量張是 worker×吞吐，8→4 減半；交叉點 ~200–300 張）。故 app 端接線**暫還原**（零行為變更、無回歸），待 user 回覆「批次大小 + 開頭卡的困擾度」再定案：小批→硬壓；大批→ramp-up 分批暖機或不動。
+
+**測試：** 新 `tests/test_export_ram_cap.py`（12：cap 數學／RAM 偵測 int|None／sidecar size／find_giant_cells 重構不變式／env 覆寫）；全核心 **562 passed**（2 failed 為容器缺 libEGL、與改動無關）。**純 Python → 免 CI。**
+
+**影響檔案：** `glas/core/fine_align.py`（`available_ram_bytes` / `ram_capped_worker_count` / `_env_float`）、`glas/core/oasis_random.py`（`_giant_cells_with_spans` / `giant_cell_estimate_bytes`）、`glas/core/cellcache.py`（`cached_size`）、`tests/test_export_ram_cap.py`（新）。**Branch：** `claude/code-review-handoff-65xwf4`（PR #18）。
+
+---
+
 ## [2026-07-03] [F27 M7l] --debug log 精簡（心跳 15s + 慢層才印）
 
 **變更類型：** 診斷 ergonomics（log 可讀性）· **狀態：本地驗證（550 core passed；GUI 測試因容器缺 libEGL 無法載，與改動無關）**
