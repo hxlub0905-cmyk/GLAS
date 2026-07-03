@@ -141,9 +141,11 @@ sem_loader 載 KLARF（die-corner XREL/YREL）→ 選 PART/CHIP（PartChipPanel 
 → oasis_random ROI walk 載入該處 geometry → SemViewer 半透明 overlay
 → 手動拖動（AlignmentDeltaPanel · Set Offset 折進 δ）或 FineAlignPanel
   cv2.matchTemplate 自動 refine（單張 Run 確認幾張即可）
-→ 「Export all」一鍵（F24，取代舊「Run all images」）：只補跑 `_refined` 裡還沒有的影像
-  （已跑的複用、deterministic 不重算；`images_needing_fine_align`），完成後接既有匯出對話框；
-  全部已跑則直接開對話框。補跑被 cancel/fail 則不匯出（`_export_after_fa` 旗標）。
+→ 「Export…」一鍵（F25，**單一按鈕 + 單一路徑**，取代 F24「Export all」+ 工具列「Export Alignment」）：
+  開跑前先選匯出選項（格式 / 產物 / 影像 / 輸出夾）→ 對**所有被選影像**做一次 pass：未對位的補跑
+  matchTemplate、已對位的沿用 `_refined`，**ROI 只 walk 一次**就同時對位 + rasterize 產物（取代舊
+  「fine-align pass 再 export pass」walk 兩次）。完成後寫 alignment CSV/JSON；cancel/fail 不寫半套
+  （`_export_pending`）。
 → 匯出 per-image offset CSV/JSON（schema mmh-gds-alignment-v1，image_id join key）
   + 影像匯出：模擬 GLV 灰階圖 `<id>_gray.png` + ROI label map `<id>_label.png`（F15，
   同一組 per-layer 幾何 rasterize、gray 套 blur / label 不 blur、像素網格一致，下游
@@ -152,14 +154,21 @@ sem_loader 載 KLARF（die-corner XREL/YREL）→ 選 PART/CHIP（PartChipPanel 
   帶 label_map + label_view_png 欄
 ```
 
-**並行模型（F8/F14/F23）：** batch fine-align（`FineAlignAllWorker`）與 image 匯出
-（`OverlayExportWorker`，含 raw/overlay/gray/label）的 per-image 工作都是獨立的，跑在 spawn-based `ProcessPoolExecutor`
-（compute 抽到 Qt-free 的 `fine_align` / `overlay_export`，worker 各自重建 reader）。worker 數
-由 `fine_align.batch_worker_count`（UI「Parallel workers」override；0=auto=每核一個 cap 16）決定，
-worker 內 `cv2.setNumThreads(1)` 避免「多進程 × cv2 多執行緒」oversubscription。小批 / raw-only
-走 in-thread fallback。**F23 常駐 pool**：`fine_align._BatchPool`（session 單例 `batch_pool`）在
-相同 key（path/layers/workers…）下跨多次 Run all 重用同一組 worker，索引透過 `index_snapshot()`
-一次注入（省 K× 重掃 name table）；idle 超過 300s 自動釋放（lease refcount 確保批次中不釋放）。
+**並行模型（F8/F14/F23/F25）：** 匯出走**單一融合 worker** `ExportWorker`（F25，取代舊
+`OverlayExportWorker`）：per-image task 由 Qt-free 的 `overlay_export.align_and_export_one_image`
+walk ROI **一次**，就同時對位（未對位才 matchTemplate）+ rasterize raw/overlay/gray/label，與舊
+「`_fine_align_image` 再 `export_one_image`」兩函式組合 **byte-identical**（`test_export_fused.py`
+護欄）。fresh 對位結果 stream 回 `_refined` / batch panel，已對位影像沿用不重算。worker 數由
+`fine_align.batch_worker_count`（UI「Parallel workers」override；0=auto=每核一個 cap 16）決定，
+worker 內 `cv2.setNumThreads(1)` 避免「多進程 × cv2 多執行緒」oversubscription。小批 / CSV-only /
+無 walk 走 in-thread fallback。F13 子集 re-run 仍走 `FineAlignAllWorker`（純對位）。
+**F23 常駐 pool（融合後 export 也共用）：** `fine_align._BatchPool`（session 單例 `batch_pool`）keyed
+on reader identity；`_pool_init` 只建 reader（context 隨 task），對位用 `_pool_task`、匯出用
+`overlay_export._afe_pool_task`（reader 由 `fine_align.pool_reader()` 取得），兩者共用同一組暖 worker，
+index 透過 `index_snapshot()` 注入省 K× 重掃 name table；idle 超過 300s 自動釋放（lease refcount 確保
+批次中不釋放）。export 不再自建冷 pool（F24 的 fine-align→export 雙冷啟消失）。同時 gray+label 匯出共用
+單次 `make_mask` raster（`fine_align.render_gray_and_label_from_geoms`，與分開 render byte-identical，
+強化 F15 像素一致不變式）。
 
 ### 5.3 Boolean 引擎（gds_boolean）
 
@@ -213,6 +222,9 @@ HMI 風格表達式 → 遞迴下降 parser → AST → shapely 運算。運算�
 
 ### 待辦 (Backlog)
 
+- [B01] 中文路徑無法讀取：含中文的資料夾/檔名（KLARF / layout / 輸出夾）疑似讀不到（Windows cp950 vs UTF-8
+  編碼）。user 目前用「改英文路徑」workaround。需查 `sem_loader` / `cv2.imread`（cv2 對非 ASCII 路徑需
+  `np.fromfile`+`cv2.imdecode`）/ OASIS 開檔 / 匯出寫檔的路徑編碼。中低優先（有 workaround）。
 - [F17] （原 `[F16-B]`，改號避免與「大 cell 解碼快取」F16-B 撞名）S_BOUNDING_BOX 的後續：給「大檔 + 無
   S_BOUNDING_BOX + 無 CE 層」型做一次性 bbox sweep + sidecar 快取。**目前已知三個測試檔都用不到**（會慢的大檔
   都帶 S_BOUNDING_BOX）→ 低優先。F16 方案 A 已完成（`docs/plans/F16-sbbox-roi-prune.md`）。

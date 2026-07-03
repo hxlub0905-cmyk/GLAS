@@ -42,8 +42,71 @@ import oasis_streamer as oas      # noqa: E402
 import devlog                      # noqa: E402  (dev-mode coloured tags)
 import layerscan_cache             # noqa: E402  (F12 M3: layer-scan sidecar)
 import cellcache                   # noqa: E402  (F16-B: decoded-cell sidecar)
+import walkflatten_cache           # noqa: E402  (F27 M3c: native-walk flatten sidecar)
+import reachcache                  # noqa: E402  (F27 M6: reachable-bbox sidecar)
 from oasis_store import Placement  # noqa: E402
 from oasis_walker import Transform  # noqa: E402
+
+# F26 M2a-integrate: optional native rectangle-run decoder. When the compiled
+# extension is present (a CI-built .pyd dropped into glas/core, or a local
+# build_ext), per-cell decode (_decode_at — the batch ROI-walk hot path) gobbles
+# whole RECTANGLE runs in one C call instead of per-record Python varint loops.
+# Absent → the pure-Python path below runs unchanged. The two MUST stay
+# byte-identical (CLAUDE.md §7); test_oasis_native_decode pins them together.
+# F27 M7: capture WHY native is off. A bare `except: _FAST=None` hid the real
+# cause — so `python -c "import oasis_fastdecode"` could succeed while the full
+# app silently fell back to the (much slower) Python decode with no explanation.
+# native_status() surfaces the captured reason in the debug log + export message.
+_FAST_OFF_REASON = None
+try:
+    import oasis_fastdecode as _FAST   # noqa: E402
+    _v = getattr(_FAST, "VERSION", 0)
+    if _v < 4:
+        # <4 lacks the rewind-before-modal invariant + the started flag that
+        # _decode_at_native's per-run gobble relies on; fall back to Python.
+        _FAST_OFF_REASON = f"extension VERSION {_v} < 4 (too old); using Python decode"
+        _FAST = None
+except Exception as _exc:               # pragma: no cover - no build present
+    _FAST_OFF_REASON = f"import failed — {type(_exc).__name__}: {_exc}"
+    _FAST = None
+
+
+def native_status() -> str:
+    """One-line human summary of the native extension state, for perf triage.
+    Answers 'is native decode/walk on, and if not, exactly why' — so a debug log
+    shows it instead of us guessing (F27 M7)."""
+    if _FAST is None:
+        return f"native OFF — {_FAST_OFF_REASON or 'extension not built'}"
+    v = getattr(_FAST, "VERSION", 0)
+    parts = [f"native ON — oasis_fastdecode VERSION {v}",
+             f"decode={'yes' if _FAST is not None else 'no'}",
+             f"walk_helpers={'yes' if _FASTW is not None else 'no (need v5)'}",
+             f"flatten_walk={'yes' if _FASTWALK is not None else 'no (need v7)'}"]
+    return " · ".join(parts)
+
+# F27 M1: walk helpers (roi_overlap_mask) need VERSION >= 5; keep a separate
+# gate so an older v4 .pyd still accelerates decode but not the walk.
+_FASTW = _FAST if (_FAST is not None and getattr(_FAST, "VERSION", 0) >= 5) \
+    else None
+# F27 M3e: robust hybrid native walk (walk_native — in-kernel analytic
+# repetition clip + polygon emit) needs VERSION >= 7. An older v6 .pyd only had
+# the plain-rect walk_rects_native (all-or-nothing flatten), which a production
+# array chip always bailed out of; require v7 so walk_roi_fast only takes the
+# native path when the kernel can actually handle grids/polys.
+_FASTWALK = _FAST if (_FAST is not None and getattr(_FAST, "VERSION", 0) >= 7) \
+    else None
+# F27 M3b caps: flattening materializes the WHOLE reachable graph's geometry
+# (ROI-independent), so it's only worth it for a small graph. A big production
+# chip (E3B ~13k cells) would pay a multi-second whole-chip decode + array build
+# per worker before any output — so bail to the Python walk above these. (M3c:
+# a shared/persisted flatten will lift this.)
+_NATIVE_WALK_MAX_CELLS = 4000
+_NATIVE_WALK_MAX_RECTS = 400_000
+# Placement repetition is expanded into individual edges at flatten time (M3d),
+# so bound the EXPANDED edge count too — a dense device/die array must not blow
+# up the CSR. Over this, the graph drops to the Python walk (which clips each
+# repetition grid analytically per ROI). Prewarm raises it for the sidecar.
+_NATIVE_WALK_MAX_PLACEMENTS = 2_000_000
 
 LayerKey = tuple[int, int]
 Bbox = tuple[float, float, float, float]
@@ -60,7 +123,12 @@ class WalkCancelled(Exception):
     """Raised inside walk_roi when the caller's cancel_cb returns True."""
 
 def _env_debug_level() -> int:
-    v = os.environ.get("MMH_GDS_DEBUG", "").lower()
+    # GLAS_DEBUG is the single debug switch (F27 M7); MMH_GDS_DEBUG stays as a
+    # back-compat alias so old launchers keep working. Either one, value 1 = the
+    # one debug mode (concise ROI summaries + decode heartbeat + export timing),
+    # 2 = deep per-cell trace (rarely needed).
+    v = (os.environ.get("GLAS_DEBUG")
+         or os.environ.get("MMH_GDS_DEBUG") or "").lower()
     if v in ("2", "trace", "verbose", "all"):
         return 2
     if v in ("1", "true", "yes", "on"):
@@ -71,6 +139,7 @@ def _env_debug_level() -> int:
 _DEBUG_LEVEL = _env_debug_level()
 DEBUG = _DEBUG_LEVEL >= 1     # level 1: concise per-load summary
 TRACE = _DEBUG_LEVEL >= 2     # level 2: deep per-cell / per-section telemetry
+oas.PTYPE_COUNT_ON = DEBUG    # F27 M7: polygon point-list type histogram (debug only)
 
 
 def set_debug(on: bool, level: int = 1) -> None:
@@ -80,6 +149,41 @@ def set_debug(on: bool, level: int = 1) -> None:
     _DEBUG_LEVEL = (level if on else 0)
     DEBUG = _DEBUG_LEVEL >= 1
     TRACE = _DEBUG_LEVEL >= 2
+    oas.PTYPE_COUNT_ON = DEBUG
+
+
+# ── F27 M7: polygon point-list type histogram (feasibility probe) ────────────
+# A native Cython polygon decoder is only worth building if a file's polygons are
+# the encodings a fast-path can cheaply cover. Types: 0/1 = Manhattan/rectilinear
+# (the common VLSI case, easiest to accelerate); 2 = 2-delta; 3 = 3-delta (octag);
+# 4 = generic g-delta; 5 = curve/velocity (hardest). These delegate to the
+# streamer's per-process counter so callers use one interface.
+_PTYPE_LABELS = {0: "0·manh-h", 1: "1·manh-v", 2: "2·2delta",
+                 3: "3·3delta", 4: "4·gdelta", 5: "5·curve"}
+
+
+def reset_poly_ptype_counts() -> None:
+    oas.reset_ptype_counts()
+
+
+def poly_ptype_counts() -> dict:
+    c = oas.get_ptype_counts()
+    return {i: int(c[i]) for i in range(6)}
+
+
+def poly_ptype_summary() -> str:
+    """One-line histogram of polygon point-list types seen since the last reset,
+    plus what share a rectilinear (type 0/1) native fast-path would cover."""
+    c = oas.get_ptype_counts()
+    total = sum(c)
+    if not total:
+        return "polygon point-types: (no polygons decoded)"
+    parts = " ".join(f"{_PTYPE_LABELS[i]}={c[i]:,}" for i in range(6) if c[i])
+    rectilinear = c[0] + c[1]
+    pct = 100.0 * rectilinear / total
+    return (f"polygon point-types ({total:,} total): {parts}  →  "
+            f"rectilinear 0/1 = {pct:.0f}% "
+            f"(a native fast-path would cover that share; the rest stays Python)")
 
 
 def _dbg(msg: str) -> None:
@@ -561,6 +665,35 @@ def _analytic_bbox(rect_specs: dict, poly_specs: dict) -> Optional[Bbox]:
     return _union_bbox(boxes)
 
 
+def _obj1(v) -> np.ndarray:
+    """A length-1 object array holding ``v`` verbatim. Built element-wise so a
+    tuple ``v`` is stored as a single cell (``np.array([v], object)`` would make
+    a 2-D array when ``v`` is an equal-length tuple)."""
+    a = np.empty(1, dtype=object)
+    a[0] = v
+    return a
+
+
+def _analytic_bbox_columnar(rcol: dict, poly_specs: dict) -> Optional[Bbox]:
+    """Same analytic cell bbox as :func:`_analytic_bbox`, but reading the
+    columnar rectangle form ``rcol[key] = (coords (N,4), rt (N,), rr (N,))`` the
+    native decode path (F26 M2a) produces. Identical result: ``_ext_from_columnar``
+    grows each row by exactly the extent :func:`repetition_extent` would, and a
+    union of per-key min/max equals a union of every per-rect box."""
+    boxes: list = []
+    for coords, rt, rr in rcol.values():
+        if coords.shape[0]:
+            ext = _ext_from_columnar(coords.astype(np.float64), rt, rr)
+            boxes.append((ext[:, 0].min(), ext[:, 1].min(),
+                          ext[:, 2].max(), ext[:, 3].max()))
+    for specs in poly_specs.values():
+        for base, rt, rr in specs:
+            ex0, ey0, ex1, ey1 = oas.repetition_extent(rt, rr)
+            boxes.append((base[:, 0].min() + ex0, base[:, 1].min() + ey0,
+                          base[:, 0].max() + ex1, base[:, 1].max() + ey1))
+    return _union_bbox(boxes)
+
+
 class RandomAccessReader:
     """Seek-and-decode a single cell at a time, memoized.
 
@@ -650,9 +783,21 @@ class RandomAccessReader:
         self.errors: list[tuple] = []
         self._n_loaded = 0
         self._n_cache_hits = 0   # cells served from the on-disk decode cache
+        # F27 M7: live intra-cell decode heartbeat. A single giant flat cell can
+        # take minutes to fully decode; without a sub-cell heartbeat the ROI load
+        # looks hung ("Loading GDS ROI…" with no motion). The decode loop stamps
+        # these; the UI progress tick + the DEBUG console heartbeat read them
+        # (plain int/float attrs — safe to read from the UI thread). _decode_cell
+        # is None whenever no cell decode is in flight.
+        self._decode_cell = None
+        self._decode_records = 0
+        self._decode_t0 = 0.0
+        self._decode_hb_t = 0.0
+        self._records_decoded_total = 0   # F27 M7i: cumulative fresh-decoded recs
         _dbg(f"RandomAccessReader: {len(self._by_refnum):,} offsets indexed "
              f"from {self._path.name} (wanted={wanted_layers} "
              f"bbox_layer={bbox_layer})")
+        _dbg(native_status())    # F27 M7: is native decode/walk on, and if not, why
 
     def clone(self) -> "RandomAccessReader":
         """An independent reader over the same file/filter (F6 M3).
@@ -696,6 +841,38 @@ class RandomAccessReader:
     def has_offsets(self) -> bool:
         return bool(self._by_refnum)
 
+    def find_giant_cells(self, *, min_bytes: int = 20_000_000,
+                         max_return: int = 4) -> list:
+        """Cell ids whose ENCODED BYTE SPAN is huge — the giant merge cells that
+        dominate decode time (F27 M7j). The span is the gap to the next cell
+        offset in the file, a direct decode-cost proxy that needs no decoding
+        (unlike sbbox area, which a cheap container can also have). Names are
+        preferred over refnums so the returned id matches how the ROI walk reaches
+        a merge cell (by name), keeping the cellcache key aligned. Largest-first,
+        only spans >= ``min_bytes``, capped at ``max_return``.
+
+        Used by the export orchestrator to decode these ONCE up front so the pool
+        workers load them from the sidecar instead of all cold-decoding the same
+        multi-hundred-MB cell at once and thrashing memory."""
+        off_to_id: dict[int, object] = {}
+        for rn, off in self._by_refnum.items():
+            off_to_id.setdefault(off, rn)
+        for nm, off in self._by_name.items():
+            off_to_id[off] = nm           # a name wins (the walk reaches by name)
+        if not off_to_id:
+            return []
+        offs = sorted(off_to_id)
+        try:
+            filesize = len(self._reader._f._buf)
+        except Exception:                 # noqa: BLE001
+            filesize = offs[-1]
+        spans = []
+        for i, off in enumerate(offs):
+            end = offs[i + 1] if i + 1 < len(offs) else filesize
+            spans.append((end - off, off_to_id[off]))
+        spans.sort(key=lambda t: t[0], reverse=True)
+        return [cid for span, cid in spans if span >= min_bytes][:max_return]
+
     def layer_display_name(self, layer: int, datatype: int) -> str:
         """OASIS LAYERNAME for ``(layer, datatype)``, or "" (F3 M2)."""
         return resolve_layer_name(self._layernames, layer, datatype)
@@ -711,6 +888,14 @@ class RandomAccessReader:
         if isinstance(cell_id, str):
             return self._by_name.get(cell_id)
         return None
+
+    def cache_key_for(self, cell_id: object) -> object:
+        """Canonical cross-reader on-disk cache key for a cell — its byte OFFSET,
+        so the SAME cell reached by refnum (44995) from one walk and by name
+        ('iMerge_Top') from another shares one sidecar instead of caching (and
+        decoding) it twice (F27 M7k). Falls back to the id for an unknown cell."""
+        off = self.offset_for(cell_id)
+        return off if off is not None else cell_id
 
     def sbbox_for(self, cell_id: object) -> Optional[Bbox]:
         """S_BOUNDING_BOX *complete* bbox (cid-local grid frame) for
@@ -731,16 +916,23 @@ class RandomAccessReader:
         :class:`CellContent` if the cell has no known offset."""
         if cell_id in self._memo:
             return self._memo[cell_id]
+        offset = self.offset_for(cell_id)
+        # F27 M7k: key the on-disk sidecar by the cell's byte OFFSET, not the
+        # cell_id string. The SAME cell is reached by refnum (44995) from one
+        # walk and by name ('iMerge_Top') from another; both resolve to one
+        # offset, so an offset key makes the interactive load and the export
+        # SHARE one sidecar instead of decoding the giant merge cell twice.
+        # (offset_for maps refnum/name/bytes → the same int; None = unknown cell.)
+        ckey = offset if offset is not None else cell_id
         # F16-B: a big flat merge cell costs minutes to decode; reuse a sidecar
         # from a previous session if the source file is unchanged.
-        cached = cellcache.load(self._path, cell_id, self._init_wanted)
+        cached = cellcache.load(self._path, ckey, self._init_wanted)
         if cached is not None:
             self._memo[cell_id] = cached
             self._n_loaded += 1
             self._n_cache_hits += 1
             _trace(f"load_cell {cell_id!r}: served from on-disk cache")
             return cached
-        offset = self.offset_for(cell_id)
         if offset is None:
             _dbg(f"load_cell {cell_id!r}: no offset (unknown cell)")
             content = CellContent()
@@ -761,6 +953,12 @@ class RandomAccessReader:
             self._memo[cell_id] = content
             return content
 
+        # F27 M7: arm the decode heartbeat so a minutes-long single-cell decode
+        # shows live progress (record count + elapsed) on the console and to the
+        # UI progress poller, instead of a frozen "Loading GDS ROI…".
+        self._decode_cell = cell_id
+        self._decode_records = 0
+        self._decode_t0 = self._decode_hb_t = time.perf_counter()
         try:
             content = self._decode_at(offset)
         except oas.OasisFormatError as exc:
@@ -781,12 +979,35 @@ class RandomAccessReader:
             # F16-B: persist big cells so the next session loads them in seconds.
             nrec = (content.placement_count() + content.total_rects()
                     + content.total_polys())
+            # F27 M7i: cumulative FRESHLY-decoded record count (cache hits excluded
+            # — those are cheap). The export warm loop watches its per-image delta
+            # to know when it has decoded (and sidecar-cached) the giant merge cell,
+            # so the pool workers load it instead of all cold-decoding it at once.
+            self._records_decoded_total = (
+                getattr(self, "_records_decoded_total", 0) + nrec)
             if nrec >= cellcache.min_records():
-                if cellcache.save(self._path, cell_id, self._init_wanted, content):
+                if cellcache.save(self._path, ckey, self._init_wanted, content):
                     _dbg(f"cached decoded cell {cell_id!r} "
                          f"({nrec:,} records) → sidecar (next session loads fast)")
+        finally:
+            self._decode_cell = None
         self._memo[cell_id] = content
         return content
+
+    def _decode_tick(self, nrec: int) -> None:
+        """Intra-cell decode heartbeat — called every ~16k records from the
+        decode loop so a giant single-cell decode shows live progress instead of
+        a frozen ROI dialog. Non-semantic (never touches decoded geometry): it
+        updates the counter the UI poller reads and, under DEBUG, prints a
+        throttled (~2 s) console line. Cheap: one clock read + a rare print."""
+        self._decode_records = nrec
+        if not DEBUG:
+            return
+        now = time.perf_counter()
+        if now - self._decode_hb_t >= 2.0:
+            self._decode_hb_t = now
+            _dbg(f"  … decoding cell {self._decode_cell!r}: {nrec:,} records, "
+                 f"{now - self._decode_t0:.0f}s elapsed")
 
     def load_cell_bbox(self, cell_id: object) -> CellContent:
         """Lightweight load for the ``reachable_bbox`` prune pass: when a
@@ -965,6 +1186,11 @@ class RandomAccessReader:
                            _placements=placements, bbox=bbox)
 
     def _decode_at(self, offset: int) -> CellContent:
+        if _FAST is not None:
+            return self._decode_at_native(offset)
+        return self._decode_at_py(offset)
+
+    def _decode_at_py(self, offset: int) -> CellContent:
         reader = self._reader
         f = reader._f
         f.clear_substreams()
@@ -982,7 +1208,13 @@ class RandomAccessReader:
         # Placement positionally.
         _rk = _pk = None
         _rlist = _plist = None
+        _nrec = 0
+        _next_tick = 1 << 14                  # F27 M7: heartbeat every ~16k recs
         for rid, payload in reader.iter_records():
+            _nrec += 1
+            if _nrec >= _next_tick:
+                self._decode_tick(_nrec)
+                _next_tick = _nrec + (1 << 14)
             if rid == oas.RECTANGLE:
                 if payload.get("filtered_out"):
                     continue
@@ -1033,6 +1265,132 @@ class RandomAccessReader:
         return CellContent(rect_specs=rect_specs, poly_specs=poly_specs,
                            _placements=placements,
                            bbox=_analytic_bbox(rect_specs, poly_specs))
+
+    def _decode_at_native(self, offset: int) -> CellContent:
+        """F26 M2a-integrate: native-accelerated twin of :meth:`_decode_at_py`.
+
+        Same generator drive (so PLACEMENT §22.6 / POLYGON / CELL / CBLOCK
+        handling stays in the proven pure-Python decoders), but every time a
+        RECTANGLE is yielded we hand the cursor to ``decode_rect_run`` to gobble
+        the *rest* of that same-(layer, datatype) run in one C call — bulk
+        ``(N,4)`` array instead of a Python varint loop + per-rect tuple. Rects
+        land in the columnar ``_rcol`` form (which every CellContent accessor
+        already prefers); the result is byte-identical to ``_decode_at_py``
+        (test_oasis_native_decode pins the two paths together)."""
+        reader = self._reader
+        modal = reader._modal
+        run = _FAST.decode_rect_run
+        filtered_out = reader._layer_filtered_out
+        f = reader._f
+        f.clear_substreams()
+        f.seek(int(offset))
+
+        rcol_blocks: dict[LayerKey, list] = {}   # key -> [(coords, rt, rr), …]
+        poly_specs: dict[LayerKey, list] = {}
+        placements: list = []
+        seen_cell_header = False
+        _pk = None
+        _plist = None
+
+        def _gobble():
+            # Decode the run of same-(layer,dt) rects after the just-yielded
+            # one; write the advanced modal + cursor back so the generator
+            # resumes correctly. Returns the (N,4) int64 array (no repetition —
+            # decode_rect_run rewinds before a repeated/foreign record).
+            # started=1: the modal layer IS this run's layer, so a first rect on
+            # a different layer stops immediately — the gobbled rects are all on
+            # (modal.layer, modal.datatype), never the next run's layer.
+            new_pos, rects, lay, dtp, w, h, gx, gy, xyrel, _stop = run(
+                f._buf, f._pos, modal.layer, modal.datatype,
+                modal.geometry_w, modal.geometry_h,
+                modal.geometry_x, modal.geometry_y,
+                1 if modal.xy_relative else 0, 1)
+            modal.layer = lay; modal.datatype = dtp
+            modal.geometry_w = w; modal.geometry_h = h
+            modal.geometry_x = gx; modal.geometry_y = gy
+            modal.xy_relative = bool(xyrel)
+            f._pos = new_pos
+            return rects
+
+        _nrec = 0
+        _next_tick = 1 << 14                  # F27 M7: heartbeat every ~16k recs
+        for rid, payload in reader.iter_records():
+            _nrec += 1
+            if _nrec >= _next_tick:
+                self._decode_tick(_nrec)
+                _next_tick = _nrec + (1 << 14)
+            if rid == oas.RECTANGLE:
+                if payload.get("filtered_out"):
+                    # Still gobble (at C speed) so the cursor skips the whole
+                    # filtered run without a per-rect Python loop; drop output.
+                    _nrec += _gobble().shape[0]
+                    continue
+                key = (payload["layer"], payload["datatype"])
+                blk = rcol_blocks.get(key)
+                if blk is None:
+                    blk = rcol_blocks[key] = []
+                x1 = payload["x"]; y1 = payload["y"]
+                rt0 = payload.get("repetition_type")
+                # The generator already decoded this first rect (it may carry a
+                # repetition); store it as a 1-row block in stream order.
+                blk.append((
+                    np.array([[x1, y1, x1 + payload["width"],
+                               y1 + payload["height"]]], dtype=np.int64),
+                    np.array([-1 if rt0 is None else rt0], dtype=np.int16),
+                    _obj1(payload.get("repetition_raw"))))
+                rects = _gobble()           # the rest of this run, in C
+                n = rects.shape[0]
+                _nrec += n
+                if n:
+                    # native rects carry no repetition: rt all -1, rr all None.
+                    # np.empty(object) is already None-initialized — no fill.
+                    blk.append((np.asarray(rects, dtype=np.int64),
+                                np.full(n, -1, dtype=np.int16),
+                                np.empty(n, dtype=object)))
+            elif rid == oas.POLYGON:
+                if payload.get("filtered_out"):
+                    continue
+                pts = payload.get("points") or []
+                if not pts:
+                    continue
+                pkey = (payload["layer"], payload["datatype"])
+                if pkey != _pk:
+                    _plist = poly_specs.get(pkey)
+                    if _plist is None:
+                        _plist = poly_specs[pkey] = []
+                    _pk = pkey
+                ax = payload["x"]; ay = payload["y"]
+                base = np.asarray(pts, dtype=self._dtype)
+                base[:, 0] += ax
+                base[:, 1] += ay
+                _plist.append((base, payload.get("repetition_type"),
+                               payload.get("repetition_raw")))
+            elif rid in (oas.PLACEMENT_NOMAG, oas.PLACEMENT_MAG):
+                placements.append(Placement(
+                    payload["cell_ref"], payload["cell_ref_kind"],
+                    payload["x"], payload["y"], float(payload["angle"]),
+                    float(payload["magnification"]), bool(payload["flip"]),
+                    payload.get("repetition_type"), [],
+                    payload.get("repetition_raw")))
+            elif rid in (oas.CELL_REFNUM, oas.CELL_NAME):
+                if seen_cell_header:
+                    break                  # next cell -> our cell is done
+                seen_cell_header = True
+            elif rid == oas.END:
+                break
+
+        # Concatenate each key's stream-ordered blocks into one columnar entry.
+        rcol: dict = {}
+        for key, blocks in rcol_blocks.items():
+            if len(blocks) == 1:
+                rcol[key] = blocks[0]
+            else:
+                rcol[key] = (np.vstack([b[0] for b in blocks]),
+                             np.concatenate([b[1] for b in blocks]),
+                             np.concatenate([b[2] for b in blocks]))
+        return CellContent(rect_specs={}, poly_specs=poly_specs,
+                           _placements=placements, _rcol=rcol,
+                           bbox=_analytic_bbox_columnar(rcol, poly_specs))
 
 
 # ── M3.5c: top-down ROI walker ───────────────────────────────────────────────
@@ -1098,6 +1456,11 @@ def _roi_overlap_mask(boxes: np.ndarray, roi: Bbox) -> np.ndarray:
     """Boolean mask over (N,4) boxes that overlap ``roi`` (x0,y0,x1,y1)."""
     if boxes.shape[0] == 0:
         return np.zeros((0,), dtype=bool)
+    # F27 M1: native C loop for the hot float64 case (byte-identical), removing
+    # the 5 vectorized numpy ops' per-call dispatch the walk pays every visit.
+    if (_FASTW is not None and boxes.dtype == np.float64
+            and boxes.flags["C_CONTIGUOUS"]):
+        return _FASTW.roi_overlap_mask(boxes, roi[0], roi[1], roi[2], roi[3])
     bx1 = np.minimum(boxes[:, 0], boxes[:, 2])
     by1 = np.minimum(boxes[:, 1], boxes[:, 3])
     bx2 = np.maximum(boxes[:, 0], boxes[:, 2])
@@ -1260,6 +1623,432 @@ def _clip_grid_offsets(rtype, raw, placed: np.ndarray, T: "Transform",
     for g in grids[1:]:                                          # cartesian sum
         out = (out[:, None, :] + g[None, :, :]).reshape(-1, 2)
     return out
+
+
+# A non-clippable repetition (arbitrary list / skew lattice) is materialized
+# into individual records — but only if it's small. A LARGE non-clippable array
+# would blow up (and, for polygons, do millions of point-array copies) — so bail
+# the whole graph to the Python walk instead. repetition_count is analytic, so
+# this decision is made WITHOUT ever materializing the offsets.
+_REP_EXPAND_MAX = 4096
+
+
+def _rep_desc(rtype, raw):
+    """Classify a repetition for the native CSR (F27 M3e):
+
+    * ``(None,)`` — no repetition (a single instance; the kernel emits it
+      plainly with no axis-cull, matching walk_roi's no-rep path).
+    * ``('grid', n1, v1x, v1y, n2, v2x, v2y)`` — a regular grid the kernel can
+      clip analytically (types 1/2/3 + orthogonal 8). Stays ONE CSR record no
+      matter how many instances, so a chip-spanning array never expands. The
+      second axis is ``(1, 0, 0)`` for the 1-D grids (2/3).
+    * ``('expand', offsets (K, 2))`` — a *small* arbitrary list / skew lattice
+      the kernel can't clip; materialize its offsets so the flatten emits K plain
+      records, matching walk_roi's full-materialize-then-mask.
+    * ``('bail', rtype, count)`` — a *large* non-clippable repetition; expanding
+      it would blow the CSR / hang, so the caller bails the whole graph to the
+      Python walk (which clips it analytically). ``count`` is analytic.
+    """
+    if rtype is None:
+        return (None,)
+    axes = _grid_axes(rtype, raw)
+    if axes is not None:
+        n1, v1x, v1y = axes[0]
+        n2, v2x, v2y = axes[1] if len(axes) > 1 else (1, 0, 0)
+        return ('grid', n1, v1x, v1y, n2, v2x, v2y)
+    cnt = oas.repetition_count(rtype, raw)          # analytic — no materialize
+    if cnt > _REP_EXPAND_MAX:
+        return ('bail', rtype, cnt)
+    return ('expand', oas.repetition_offsets_np(rtype, raw))
+
+
+# ── F27 M3: native subtree walk (flatten cell graph → walk_rects_native) ──────
+
+
+def flatten_cell_graph(rar: "RandomAccessReader", root: object,
+                       layer: int, datatype: int, *,
+                       max_cells: Optional[int] = None,
+                       max_rects: Optional[int] = None,
+                       max_placements: Optional[int] = None,
+                       progress=None, deadline: Optional[float] = None):
+    """Flatten the ROI-independent cell graph reachable from ``root`` into CSR
+    arrays for :func:`oasis_fastdecode.walk_native` (F27 M3e — robust hybrid).
+
+    Rect / placement / polygon **repetition** is native-able: a regular grid
+    (types 1/2/3 + orthogonal 8) stays ONE record with an axis descriptor and is
+    clipped to the ROI *analytically in the kernel* (never materialized), so a
+    chip-spanning million-instance fill array does not blow up the flatten.
+    Arbitrary-list / skew reps are materialized (bounded) into plain records, and
+    POLYGONS are emitted natively. So the native walk now covers the common
+    production array chip — not just plain no-rep graphs.
+
+    Returns ``None`` (caller falls back to the byte-identical pure-Python walk)
+    ONLY for the genuinely non-native cases: a name-ref (non-int) placement
+    target, a non-D4 placement, the graph exceeding ``max_cells``, or an
+    arbitrary/skew rep whose materialization would exceed ``max_rects`` /
+    ``max_placements`` (a pathological non-clippable large array — rare).
+
+    Column layout (all grid-frame, cell-local):
+      ``rect (ΣR,11)``   : x1,y1,x2,y2, grid_flag, n1,v1x,v1y, n2,v2x,v2y
+      ``pl_data (ΣP,13)``: m00,m01,m10,m11, t0,t1, grid_flag, n1,v1x,v1y,n2,v2x,v2y
+      ``poly_meta (ΣQ,7)``: grid_flag, n1,v1x,v1y, n2,v2x,v2y  (points via ptoff)
+    Returned tuple: ``(rect, rect_off, poly_pts, poly_ptoff, poly_meta, poly_off,
+    pl_target, pl_data, pl_off, reach_bbox, root_index)``."""
+    key = (layer, datatype)
+    max_cells = _NATIVE_WALK_MAX_CELLS if max_cells is None else max_cells
+    max_rects = _NATIVE_WALK_MAX_RECTS if max_rects is None else max_rects
+    max_placements = (_NATIVE_WALK_MAX_PLACEMENTS if max_placements is None
+                      else max_placements)
+    rar._flatten_reject = None
+    if len(getattr(rar, "_by_refnum", ()) or ()) > max_cells:
+        rar._flatten_reject = (f"graph too large "
+                               f"({len(rar._by_refnum)} > {max_cells} cells)")
+        return None
+    # ── pass 1: DFS order + validate the graph (name-ref / non-D4 bail) ──
+    if progress is not None:
+        progress(f"build start ({len(getattr(rar, '_by_refnum', ()) or ())} "
+                 f"cells indexed)")
+    order: list = []
+    idx: dict = {}
+    stack = [root]
+    slow_cid = None
+    slow_dt = 0.0
+    while stack:
+        cid = stack.pop()
+        if cid in idx:
+            continue
+        idx[cid] = len(order)
+        order.append(cid)
+        if len(order) > max_cells:
+            rar._flatten_reject = f"graph too large (> {max_cells} cells)"
+            return None
+        if progress is not None and len(order) % 500 == 0:
+            progress(f"pass1-decode {len(order)} cells "
+                     f"(slowest so far: {slow_cid!r} {slow_dt:.0f}s)")
+        if deadline is not None and time.perf_counter() > deadline:
+            rar._flatten_reject = (f"prewarm over budget in pass1 at "
+                                   f"{len(order)} cells; slowest cell "
+                                   f"{slow_cid!r} took {slow_dt:.0f}s")
+            if progress is not None:
+                progress("ABORT " + rar._flatten_reject)
+            return None
+        # Pass 1 only needs the PLACEMENTS (DFS order + name-ref/non-D4 check),
+        # NOT the geometry — so use the lightweight bbox load (boundary
+        # early-stop), exactly like the ROI walk's pruning. Full-decoding a dense
+        # ~80k-rect leaf cell here just to read its placements is what made the
+        # whole-chip prewarm crawl.
+        _ts = time.perf_counter()
+        c = rar.load_cell_bbox(cid)
+        _dt = time.perf_counter() - _ts
+        if _dt > slow_dt:
+            slow_dt, slow_cid = _dt, cid
+        if progress is not None and _dt > 3.0:
+            progress(f"SLOW cell {cid!r}: {_dt:.0f}s to bbox-decode "
+                     f"({c.placement_count()} placements)")
+        for pl in c.placements:
+            if not isinstance(pl.target, (int, np.integer)):
+                rar._flatten_reject = f"name-ref placement target (cell {cid!r})"
+                return None
+            if Transform.from_placement(pl.x, pl.y, pl.angle, pl.flip,
+                                        pl.magnification) is None:
+                rar._flatten_reject = f"non-D4 placement (cell {cid!r})"
+                return None
+            stack.append(pl.target)
+    if progress is not None:
+        progress(f"pass1 done ({len(order)} cells); building CSR")
+
+    # ── pass 2: build the CSR (grids stay 1 record; arbitrary reps expand) ──
+    N = len(order)
+    rect_blocks: list = []
+    rect_off = np.empty(N + 1, dtype=np.int64); rect_off[0] = 0
+    poly_pts_parts: list = []
+    poly_ptoff: list = [0]
+    poly_meta_rows: list = []
+    poly_off = np.empty(N + 1, dtype=np.int64); poly_off[0] = 0
+    pl_target_list: list = []
+    pl_data_rows: list = []
+    pl_off = np.empty(N + 1, dtype=np.int64); pl_off[0] = 0
+    reach = np.zeros((N, 4), dtype=np.float64)
+    n_rect = n_poly = n_pl = 0
+    for i, cid in enumerate(order):
+        if progress is not None and i and i % 500 == 0:
+            progress(f"pass2-build {i}/{N} cells "
+                     f"({n_rect} rect, {n_poly} poly, {n_pl} pl records)")
+        if deadline is not None and i and i % 200 == 0 \
+                and time.perf_counter() > deadline:
+            rar._flatten_reject = (f"prewarm over budget in pass2 at "
+                                   f"{i}/{N} cells ({n_rect} rect, {n_poly} "
+                                   f"poly, {n_pl} pl records so far)")
+            if progress is not None:
+                progress("ABORT " + rar._flatten_reject)
+            return None
+        c = rar.load_cell(cid)
+        # rects — plain (no-rep) rects are built vectorized (the common bulk;
+        # keeps parity with the old c.rects() build: grid_flag=0, n1=n2=1); only
+        # the (few) repeated rects take the per-record classification (a grid
+        # record stays 1 row, an arbitrary rep expands, a huge non-clippable one
+        # bails). Splitting plain from repeated keeps a cell with 100k plain rects
+        # + one array from degrading into a 100k-iteration Python loop.
+        nr = c.rect_count(key)
+        rcol = getattr(c, "_rcol", None)
+        rcol = rcol.get(key) if rcol is not None else None
+        if nr and rcol is not None:
+            coords, rt_arr, _rr = rcol
+            rt_arr = np.asarray(rt_arr)
+            plain = rt_arr < 0
+            n_plain = int(plain.sum())
+            if n_plain:
+                blk = np.zeros((n_plain, 11), dtype=np.float64)
+                blk[:, 0:4] = np.asarray(coords)[plain].astype(np.float64)
+                blk[:, 5] = 1.0; blk[:, 8] = 1.0
+                rect_blocks.append(blk); n_rect += n_plain
+            rep_rows: list = []
+            for j in np.flatnonzero(~plain):
+                x1, y1, x2, y2, rt, rr = c.rect_spec_at(key, int(j))
+                d = _rep_desc(rt, rr)
+                if d[0] == 'grid':
+                    _, n1, v1x, v1y, n2, v2x, v2y = d
+                    rep_rows.append((x1, y1, x2, y2, 1,
+                                     n1, v1x, v1y, n2, v2x, v2y))
+                elif d[0] == 'expand':
+                    for dx, dy in d[1]:
+                        rep_rows.append((x1 + dx, y1 + dy, x2 + dx, y2 + dy,
+                                         0, 1, 0, 0, 1, 0, 0))
+                elif d[0] == 'bail':
+                    rar._flatten_reject = (f"non-clippable rect repetition "
+                                           f"type={d[1]} count={d[2]} "
+                                           f"(cell {cid!r})")
+                    return None
+                if n_rect + len(rep_rows) > max_rects:
+                    rar._flatten_reject = (f"too many expanded rects "
+                                           f"(> {max_rects})")
+                    return None
+            if rep_rows:
+                rect_blocks.append(np.array(rep_rows,
+                                            dtype=np.float64).reshape(-1, 11))
+                n_rect += len(rep_rows)
+        elif nr:                              # non-columnar fallback (rare)
+            rows: list = []
+            for j in range(nr):
+                x1, y1, x2, y2, rt, rr = c.rect_spec_at(key, j)
+                d = _rep_desc(rt, rr)
+                if d[0] == 'expand':
+                    for dx, dy in d[1]:
+                        rows.append((x1 + dx, y1 + dy, x2 + dx, y2 + dy,
+                                     0, 1, 0, 0, 1, 0, 0))
+                elif d[0] == 'grid':
+                    _, n1, v1x, v1y, n2, v2x, v2y = d
+                    rows.append((x1, y1, x2, y2, 1, n1, v1x, v1y, n2, v2x, v2y))
+                elif d[0] == 'bail':
+                    rar._flatten_reject = (f"non-clippable rect repetition "
+                                           f"type={d[1]} count={d[2]} "
+                                           f"(cell {cid!r})")
+                    return None
+                else:
+                    rows.append((x1, y1, x2, y2, 0, 1, 0, 0, 1, 0, 0))
+                if n_rect + len(rows) > max_rects:
+                    rar._flatten_reject = (f"too many expanded rects "
+                                           f"(> {max_rects})")
+                    return None
+            rect_blocks.append(np.array(rows, dtype=np.float64).reshape(-1, 11))
+            n_rect += len(rows)
+        rect_off[i + 1] = n_rect
+        # polygons
+        for j in range(c.poly_count(key)):
+            base, rt, rr = c.poly_spec_at(key, j)
+            base = np.asarray(base, dtype=np.float64)
+            d = _rep_desc(rt, rr)
+            if d[0] == 'expand':
+                for dx, dy in d[1]:
+                    s = base.copy(); s[:, 0] += dx; s[:, 1] += dy
+                    poly_pts_parts.append(s)
+                    poly_ptoff.append(poly_ptoff[-1] + s.shape[0])
+                    poly_meta_rows.append((0, 1, 0, 0, 1, 0, 0)); n_poly += 1
+            elif d[0] == 'grid':
+                _, n1, v1x, v1y, n2, v2x, v2y = d
+                poly_pts_parts.append(base)
+                poly_ptoff.append(poly_ptoff[-1] + base.shape[0])
+                poly_meta_rows.append((1, n1, v1x, v1y, n2, v2x, v2y)); n_poly += 1
+            elif d[0] == 'bail':
+                rar._flatten_reject = (f"non-clippable polygon repetition "
+                                       f"type={d[1]} count={d[2]} (cell {cid!r})")
+                return None
+            else:
+                poly_pts_parts.append(base)
+                poly_ptoff.append(poly_ptoff[-1] + base.shape[0])
+                poly_meta_rows.append((0, 1, 0, 0, 1, 0, 0)); n_poly += 1
+            if n_poly > max_rects:
+                rar._flatten_reject = f"too many expanded polys (> {max_rects})"
+                return None
+        poly_off[i + 1] = n_poly
+        # placements
+        for pl in c.placements:
+            tf = Transform.from_placement(pl.x, pl.y, pl.angle, pl.flip,
+                                          pl.magnification)
+            m00, m01, m10, m11 = (tf.M[0, 0], tf.M[0, 1], tf.M[1, 0], tf.M[1, 1])
+            x, y = float(tf.t[0]), float(tf.t[1])
+            tgt = idx[pl.target]
+            d = _rep_desc(pl.repetition_type, pl.repetition_raw)
+            if d[0] == 'expand':
+                for dx, dy in d[1]:
+                    pl_target_list.append(tgt)
+                    pl_data_rows.append((m00, m01, m10, m11, x + dx, y + dy,
+                                         0, 1, 0, 0, 1, 0, 0)); n_pl += 1
+            elif d[0] == 'grid':
+                _, n1, v1x, v1y, n2, v2x, v2y = d
+                pl_target_list.append(tgt)
+                pl_data_rows.append((m00, m01, m10, m11, x, y, 1,
+                                     n1, v1x, v1y, n2, v2x, v2y)); n_pl += 1
+            elif d[0] == 'bail':
+                rar._flatten_reject = (f"non-clippable placement repetition "
+                                       f"type={d[1]} count={d[2]} (cell {cid!r})")
+                return None
+            else:
+                pl_target_list.append(tgt)
+                pl_data_rows.append((m00, m01, m10, m11, x, y,
+                                     0, 1, 0, 0, 1, 0, 0)); n_pl += 1
+            if n_pl > max_placements:
+                rar._flatten_reject = (f"too many expanded placements "
+                                       f"(> {max_placements})")
+                return None
+        pl_off[i + 1] = n_pl
+        rb = rar.reachable_bbox(cid)
+        if rb is not None:
+            reach[i] = rb
+
+    rect = (np.ascontiguousarray(np.vstack(rect_blocks))
+            if rect_blocks else np.empty((0, 11), dtype=np.float64))
+    poly_pts = (np.ascontiguousarray(np.vstack(poly_pts_parts))
+                if poly_pts_parts else np.empty((0, 2), dtype=np.float64))
+    poly_ptoff_a = np.array(poly_ptoff, dtype=np.int64)
+    poly_meta = (np.ascontiguousarray(np.array(poly_meta_rows, dtype=np.float64))
+                 if poly_meta_rows else np.empty((0, 7), dtype=np.float64))
+    pl_target = np.array(pl_target_list, dtype=np.int64)
+    pl_data = (np.ascontiguousarray(np.array(pl_data_rows, dtype=np.float64))
+               if pl_data_rows else np.empty((0, 13), dtype=np.float64))
+    return (rect, rect_off, poly_pts, poly_ptoff_a, poly_meta, poly_off,
+            pl_target, pl_data, pl_off, np.ascontiguousarray(reach), idx[root])
+
+
+def _flatten_cached(rar: "RandomAccessReader", root: object,
+                    layer: int, datatype: int):
+    """Flatten for :func:`walk_roi_fast`, memoized in-process AND on a shared
+    sidecar (F27 M3c). Order: in-process memo → sidecar (built by a prewarm or a
+    previous session/worker) → cap-limited build. A big chip with no prewarmed
+    sidecar builds cap-limited (returns ``None`` → Python walk); once a prewarm
+    (or the first worker) has persisted the whole-chip sidecar, every other
+    worker/session loads it in ms and goes native."""
+    cache = getattr(rar, "_flat_cache", None)
+    if cache is None:
+        cache = rar._flat_cache = {}
+    k = (root, layer, datatype)
+    if k in cache:
+        return cache[k]
+    sc = walkflatten_cache.load(rar._path, root, layer, datatype)
+    if sc is walkflatten_cache.NOT_NATIVE:
+        cache[k] = None
+        return None
+    if sc is not None:                       # persisted CSR tuple
+        cache[k] = sc
+        return sc
+    # Miss. A graph over the interactive cap is NOT persisted here — that verdict
+    # ("too big") is a cap artefact, not "not native-able"; persisting it would
+    # poison the sidecar against a later prewarm. Just return None (Python walk).
+    if len(getattr(rar, "_by_refnum", ()) or ()) > _NATIVE_WALK_MAX_CELLS:
+        cache[k] = None
+        return None
+    flat = flatten_cell_graph(rar, root, layer, datatype)   # small graph
+    cache[k] = flat
+    walkflatten_cache.save(rar._path, root, layer, datatype, flat)  # tuple / NOT_NATIVE
+    return flat
+
+
+def reach_prewarm(rar: "RandomAccessReader", root: object,
+                  *, compute: bool = True) -> bool:
+    """F27 M6: populate the reader's ``reachable_bbox`` memo for the whole graph
+    reachable from ``root``, sharing it via a sidecar so the ~20-30 s bbox sweep
+    (files with no S_BOUNDING_BOX) is paid ONCE across workers / re-runs instead
+    of per worker per session.
+
+    Loads the sidecar if present; otherwise (``compute=True``) does the full
+    sweep once (``reachable_bbox(root)`` cascades to every reachable cell) and
+    persists it. Returns True if the memo is now populated. Idempotent / safe to
+    call repeatedly; never raises on cache trouble."""
+    memo = getattr(rar, "_reach_memo", None)
+    if memo is None:
+        memo = rar._reach_memo = {}
+    if getattr(rar, "_reach_prewarmed", False) or memo:
+        rar._reach_prewarmed = True
+        return True
+    loaded = reachcache.load(rar._path, root)
+    if loaded is not None:
+        memo.update(loaded)
+        rar._reach_prewarmed = True
+        return True
+    if not compute:
+        return False
+    try:
+        rar.reachable_bbox(root)          # cascades → fills memo for all cells
+        reachcache.save(rar._path, root, rar._reach_memo)
+    except Exception:                     # noqa: BLE001 — best-effort prewarm
+        return False
+    rar._reach_prewarmed = True
+    return True
+
+
+def flatten_prewarm(rar: "RandomAccessReader", root: object,
+                    layer: int, datatype: int, *,
+                    max_cells: int = 200_000,
+                    max_rects: int = 5_000_000,
+                    max_placements: int = 8_000_000,
+                    time_budget_s: float = 20.0):
+    """F27 M3c: build the whole-chip flatten ONCE (ignoring the interactive
+    cell cap) and persist it to the shared sidecar, so the batch's pool workers
+    each ``np.load`` it instead of decoding the whole chip. Call it in the
+    orchestrator process before launching the export pool. Returns the flat
+    tuple (native-able) or ``None`` (non-D4 / name-ref / a non-clippable rep over
+    the guard / over the OOM caps / over ``time_budget_s``); either verdict is
+    persisted so workers don't rebuild. Regular-grid repetition stays 1 record
+    (clipped in-kernel, M3e), so a dense array chip does NOT expand; only a
+    genuinely non-clippable large array bails to the Python walk. Emits
+    ``[flatten]`` progress (per-phase, per-cell timing, slow-cell alerts) so a
+    big chip shows movement, and aborts after ``time_budget_s`` with a
+    diagnostic reject rather than hanging. Safe to call repeatedly."""
+    sc = walkflatten_cache.load(rar._path, root, layer, datatype)
+    if sc is walkflatten_cache.NOT_NATIVE:
+        rar._flatten_reject = (walkflatten_cache.last_not_native_reason
+                               or "cached: not native-able")
+        return None
+    if sc is not None:
+        rar._flatten_reject = None
+        return sc
+    # Building the whole-chip flatten is the one genuinely slow step (a full
+    # decode + CSR build). Emit progress so a big chip shows movement instead of
+    # looking hung, and time-bound it so a pathological chip aborts (Python walk)
+    # with a diagnostic instead of hanging for many minutes.
+    _t0 = time.perf_counter()
+
+    def _prog(msg):
+        print(f"[flatten] {layer}/{datatype} {msg} "
+              f"({time.perf_counter() - _t0:.0f}s)", flush=True)
+
+    flat = flatten_cell_graph(rar, root, layer, datatype,
+                              max_cells=max_cells, max_rects=max_rects,
+                              max_placements=max_placements, progress=_prog,
+                              deadline=_t0 + time_budget_s)
+    reason = getattr(rar, "_flatten_reject", "") or ""
+    if flat is not None:
+        rc, po, pl = flat[0].shape[0], flat[4].shape[0], flat[7].shape[0]
+        print(f"[flatten] {layer}/{datatype} built in "
+              f"{time.perf_counter() - _t0:.0f}s "
+              f"(records: {rc} rect, {po} poly, {pl} placement)", flush=True)
+    # Persist the verdict (native CSR OR non-native reason) so re-runs skip it.
+    # A time-budget abort on a dense-leaf chip is effectively permanent — the
+    # whole-chip flatten is architecturally too big there (the batched Python
+    # walk handles it instead), so caching "over budget" saves ~20 s every
+    # re-run. The sidecar SCHEMA gates invalidation if the builder ever improves.
+    walkflatten_cache.save(rar._path, root, layer, datatype, flat, reason=reason)
+    return flat
 
 
 def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
@@ -1493,7 +2282,7 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
             # Reuse a persisted gather from a previous session/worker (it is ROI-
             # and layer-independent), so a batch worker skips the ~tens-of-seconds
             # build entirely (F16-B M7).
-            prep = cellcache.load_prep(rar._path, cid)
+            prep = cellcache.load_prep(rar._path, rar.cache_key_for(cid))
             if prep is not None:
                 content._place_prep = prep
         if prep is None:
@@ -1553,7 +2342,7 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
                     arb_skip, unk_skip)
             content._place_prep = prep
             if _big:                          # persist for next session/worker
-                cellcache.save_prep(rar._path, cid, prep)
+                cellcache.save_prep(rar._path, rar.cache_key_for(cid), prep)
         (base_M, base_t, placed_all, arr_local, rcount, valid,
          arb_skip, unk_skip) = prep
         stats.placements_scanned += N
@@ -1618,6 +2407,33 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
     stats.t_decode = _decode_prof["total"]
     stats.elapsed_s = time.perf_counter() - _t0
     stats.sbbox_prune = bool(rar._sbbox_by_refnum or rar._sbbox_by_name)
+    # Running per-reader totals so an outer caller (e.g. the F26 export timer)
+    # can read how much *this* image's walk actually traversed — cell visits and
+    # repetition-instance visits — without threading the stats object out.
+    rar._walk_cellvisits_total = (getattr(rar, "_walk_cellvisits_total", 0)
+                                  + stats.cell_visits)
+    rar._walk_visited_total = (getattr(rar, "_walk_visited_total", 0)
+                               + stats.instances_visited)
+    # Internal walk breakdown (F26 diagnosis): placement gather+prune vs rect
+    # emit vs poly emit. The remainder (walk time minus these) is recursion /
+    # transform overhead — which is what a native walk would remove.
+    rar._walk_tplace_total = (getattr(rar, "_walk_tplace_total", 0.0)
+                              + stats.t_place)
+    rar._walk_trect_total = (getattr(rar, "_walk_trect_total", 0.0)
+                             + stats.t_rect)
+    rar._walk_tpoly_total = (getattr(rar, "_walk_tpoly_total", 0.0)
+                             + stats.t_poly)
+    # F27 M7h diagnosis: how many rect-array instances the walk had to MATERIALIZE
+    # (expand offsets for) vs how few it emitted. arrays_materialized/instances_
+    # materialized ≫ output means a giant repetition array is being expanded just
+    # to keep a handful near the FOV — the fixable "geom dominates" case; ~equal
+    # means the emit cost is genuinely proportional to output (a dense flat cell).
+    rar._walk_arrmat_total = (getattr(rar, "_walk_arrmat_total", 0)
+                              + stats.arrays_materialized)
+    rar._walk_instmat_total = (getattr(rar, "_walk_instmat_total", 0)
+                               + stats.instances_materialized)
+    rar._walk_maxk_total = max(getattr(rar, "_walk_maxk_total", 0),
+                               stats.max_array_k)
     n_err = len(rar.errors)
     # Level-1 (--debug) summary: one readable line — where the time went, what
     # the cache did, and whether anything went wrong. Deep per-cell / per-spec
@@ -1628,6 +2444,9 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
          f"place {stats.t_place:.1f}s | "
          f"geom {stats.t_rect + stats.t_poly:.1f}s | "
          f"out {stats.rects_emitted}r {stats.polys_emitted}p"
+         + (f" | mat {stats.arrays_materialized}arr/"
+            f"{stats.instances_materialized}inst maxk={stats.max_array_k}"
+            if stats.instances_materialized else "")
          + (f" | ⚠ {n_err} decode error(s)" if n_err else ""))
     if _decode_prof["cell"] is not None:
         _trace(f"  slowest decode: cell {_decode_prof['cell']!r} "
@@ -1650,6 +2469,486 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
         for cid, off, m in rar.errors[:8]:
             _dbg(f"  ERROR cell {cid!r} @ {off}: {m}")
     return {"rects": rects, "polys": poly_out, "stats": stats}
+
+
+def _emit_cell_geom(content, key, T: "Transform", roi: Bbox,
+                    rect_out: list, poly_out: list) -> None:
+    """Emit ``content``'s own geometry on ``key`` under transform ``T`` that hits
+    ``roi`` (grid frame). Byte-identical to :func:`walk_roi`'s inline emit — the
+    single source of the emit math is duplicated here (not shared) only to keep
+    ``walk_roi`` untouched; the batched walk and the recursive walk must agree
+    rect-for-rect / poly-for-poly (guarded by test_walk_batched)."""
+    if content.rect_count(key):
+        base_bb, ext_bb = content.rect_arrays(key)
+        keep = _roi_overlap_mask(T.apply_to_rects(ext_bb), roi)
+        parts = []
+        for i in np.flatnonzero(keep):
+            x1, y1, x2, y2, rt, rr = content.rect_spec_at(key, int(i))
+            oa = _clip_grid_offsets(rt, rr, base_bb[i], T, roi)
+            if oa.shape[0] == 0:
+                continue
+            a = np.empty((oa.shape[0], 4), dtype=np.float64)
+            a[:, 0] = x1 + oa[:, 0]; a[:, 1] = y1 + oa[:, 1]
+            a[:, 2] = x2 + oa[:, 0]; a[:, 3] = y2 + oa[:, 1]
+            parts.append(a)
+        if parts:
+            allr = parts[0] if len(parts) == 1 else np.concatenate(parts)
+            r = T.apply_to_rects(allr)
+            m = _roi_overlap_mask(r, roi)
+            if m.any():
+                rect_out.append(r[m])
+    if content.poly_count(key):
+        base_bb, ext_bb = content.poly_arrays(key)
+        keep = _roi_overlap_mask(T.apply_to_rects(ext_bb), roi)
+        for i in np.flatnonzero(keep):
+            base, rt, rr = content.poly_spec_at(key, int(i))
+            oa = _clip_grid_offsets(rt, rr, base_bb[i], T, roi)
+            basef = base.astype(np.float64)
+            for dx, dy in oa:
+                s = basef.copy()
+                s[:, 0] += dx; s[:, 1] += dy
+                tp = T.apply_to_points(s)
+                bb = np.array([[tp[:, 0].min(), tp[:, 1].min(),
+                                tp[:, 0].max(), tp[:, 1].max()]])
+                if _roi_overlap_mask(bb, roi)[0]:
+                    poly_out.append(tp)
+
+
+def _emit_plain_rects_seg(coords: np.ndarray, M: np.ndarray, ts: np.ndarray,
+                          roi: Bbox, rect_out: list) -> None:
+    """Vectorized emit of a cell's PLAIN (no-repetition) rects for a whole
+    segment: transform every rect by ``M`` (shared) + each of the K translations
+    ``ts`` at once, floor/ceil to a bbox, ROI-mask, emit survivors. Byte-identical
+    to :func:`_emit_cell_geom`'s plain-rect path (``apply_to_rects`` + ROI mask)
+    done per instance — this just does the K instances in one numpy op, which is
+    the whole point (a leaf placed 40k times is one array op, not 40k calls)."""
+    R = coords.shape[0]
+    if R == 0:
+        return
+    c1 = coords[:, :2]; c2 = coords[:, 2:]          # (R,2) each
+    Mc1 = c1 @ M.T; Mc2 = c2 @ M.T                  # (R,2), M only
+    K = ts.shape[0]
+    # Chunk over instances so (K,R,·) temporaries stay bounded on a dense leaf.
+    step = max(1, 1_000_000 // max(R, 1))
+    for k0 in range(0, K, step):
+        tk = ts[k0:k0 + step]                       # (k,2)
+        ax = Mc1[None, :, :] + tk[:, None, :]       # (k,R,2)
+        bx = Mc2[None, :, :] + tk[:, None, :]
+        xmin = np.floor(np.minimum(ax[:, :, 0], bx[:, :, 0]))
+        xmax = np.ceil(np.maximum(ax[:, :, 0], bx[:, :, 0]))
+        ymin = np.floor(np.minimum(ax[:, :, 1], bx[:, :, 1]))
+        ymax = np.ceil(np.maximum(ax[:, :, 1], bx[:, :, 1]))
+        m = ((xmin <= roi[2]) & (xmax >= roi[0])
+             & (ymin <= roi[3]) & (ymax >= roi[1]))     # (k,R)
+        if m.any():
+            out = np.stack([xmin, ymin, xmax, ymax], axis=-1)[m]   # (S,4)
+            rect_out.append(out)
+
+
+def _batch_place_prep(rar, content, cid, reachable_bbox):
+    """Build (or reuse) the ROI-independent per-cell placement gather used by the
+    batched descent — the same tuple ``walk_roi`` caches on the CellContent. Kept
+    byte-identical to walk_roi's builder."""
+    prep = content._place_prep
+    N = content.placement_count()
+    _big = N >= cellcache.min_records()
+    if prep is None and _big:
+        prep = cellcache.load_prep(rar._path, rar.cache_key_for(cid))
+        if prep is not None:
+            content._place_prep = prep
+    if prep is None:
+        placements = content.placements
+        base_M = np.zeros((N, 2, 2), dtype=np.float64)
+        base_t = np.zeros((N, 2), dtype=np.float64)
+        cb_arr = np.zeros((N, 4), dtype=np.float64)
+        ext = np.zeros((N, 4), dtype=np.float64)
+        rcount = np.ones(N, dtype=np.int64)
+        valid = np.zeros(N, dtype=bool)
+        arb_skip = unk_skip = 0
+        for i, pl in enumerate(placements):
+            rt, rr = pl.repetition_type, pl.repetition_raw
+            rc = oas.repetition_count(rt, rr)
+            rcount[i] = rc
+            a = pl.angle % 360.0
+            q = int(round(a / 90.0))
+            if abs(a - q * 90.0) > 0.01:
+                arb_skip += rc
+                continue
+            cb = reachable_bbox(pl.target)
+            if cb is None:
+                unk_skip += 1
+                continue
+            m00, m01, m10, m11 = _D4_ROT[q % 4]
+            if pl.flip:
+                m01, m11 = -m01, -m11
+            mag = pl.magnification
+            if mag != 1.0:
+                m00 *= mag; m01 *= mag; m10 *= mag; m11 *= mag
+            base_M[i, 0, 0] = m00; base_M[i, 0, 1] = m01
+            base_M[i, 1, 0] = m10; base_M[i, 1, 1] = m11
+            base_t[i, 0] = pl.x; base_t[i, 1] = pl.y
+            cb_arr[i] = cb
+            ex = oas.repetition_extent(rt, rr)
+            ext[i, 0] = ex[0]; ext[i, 1] = ex[1]
+            ext[i, 2] = ex[2]; ext[i, 3] = ex[3]
+            valid[i] = True
+        corners = np.empty((N, 4, 2), dtype=np.float64)
+        corners[:, 0, 0] = cb_arr[:, 0]; corners[:, 0, 1] = cb_arr[:, 1]
+        corners[:, 1, 0] = cb_arr[:, 2]; corners[:, 1, 1] = cb_arr[:, 1]
+        corners[:, 2, 0] = cb_arr[:, 2]; corners[:, 2, 1] = cb_arr[:, 3]
+        corners[:, 3, 0] = cb_arr[:, 0]; corners[:, 3, 1] = cb_arr[:, 3]
+        tc = np.einsum('nij,nkj->nki', base_M, corners) + base_t[:, None, :]
+        px, py = tc[:, :, 0], tc[:, :, 1]
+        placed_all = np.empty((N, 4), dtype=np.float64)
+        placed_all[:, 0] = px.min(axis=1); placed_all[:, 1] = py.min(axis=1)
+        placed_all[:, 2] = px.max(axis=1); placed_all[:, 3] = py.max(axis=1)
+        arr_local = placed_all + ext
+        prep = (base_M, base_t, placed_all, arr_local, rcount, valid,
+                arb_skip, unk_skip)
+        content._place_prep = prep
+        if _big:
+            cellcache.save_prep(rar._path, rar.cache_key_for(cid), prep)
+    return prep
+
+
+# The batched walk's topo build reads EVERY reachable cell's placements; on a
+# big file with no CE bbox_layer (load_cell_bbox can't early-stop) that decodes
+# the whole multi-GB file. Over this many cells, or with no cheap placement
+# read, fall back to the ROI-pruned walk_roi (see walk_roi_fast).
+_BATCHED_WALK_MAX_CELLS = 100_000
+
+
+def _batched_walk_affordable(rar: "RandomAccessReader") -> bool:
+    """Is a whole-graph topo build cheap enough to run the batched walk? The
+    batched walk orders every reachable cell via ``load_cell_bbox``, which only
+    early-stops when a **real** CE boundary layer is present in the file.
+
+    - **S_BOUNDING_BOX present** → ``walk_roi``'s ``reachable_bbox`` is already
+      decode-free and optimal, and the topo build is only overhead — *worse*, on
+      a file whose configured ``bbox_layer`` is ABSENT (the 1750 MB LTV chip:
+      ``bbox_layer=108/250`` set, but the file has no such geometry, so
+      ``load_cell_bbox`` decodes each cell to its end), it would full-decode
+      thousands of cells just to build the order. So prefer ``walk_roi``.
+    - **No S_BOUNDING_BOX** (E3B) → the topo build IS the intended acceleration,
+      affordable when a CE ``bbox_layer`` early-stops or the chip is small.
+
+    Keying on sbbox — not merely on ``bbox_layer is not None`` — is what stops the
+    LTV chip (bbox_layer configured but CE-less) from running the topo scan."""
+    n = len(getattr(rar, "_by_refnum", ()) or ())
+    if n > _BATCHED_WALK_MAX_CELLS:
+        return False
+    if getattr(rar, "_sbbox_by_refnum", None) or getattr(rar, "_sbbox_by_name", None):
+        return False
+    if getattr(rar, "_bbox_layer", None) is not None:
+        return True
+    return n <= _NATIVE_WALK_MAX_CELLS
+
+
+def native_flatten_worthwhile(rar: "RandomAccessReader") -> bool:
+    """Should the export bother prewarming the native-walk flatten? No on a big
+    S_BOUNDING_BOX chip: there ``walk_roi_fast`` uses the sbbox-pruned
+    ``walk_roi`` (the lazy ``_flatten_cached`` rejects a >``_NATIVE_WALK_MAX_CELLS``
+    graph anyway), and the whole-chip flatten is architecturally non-viable — a
+    giant merge cell aborts the prewarm only after ~90 s spent discovering
+    nothing (the 1750 MB LTV chip). Small graphs and no-sbbox chips (E3B) still
+    prewarm as before."""
+    n = len(getattr(rar, "_by_refnum", ()) or ())
+    has_sbbox = bool(getattr(rar, "_sbbox_by_refnum", None)
+                     or getattr(rar, "_sbbox_by_name", None))
+    if has_sbbox and n > _NATIVE_WALK_MAX_CELLS:
+        return False
+    return True
+
+
+def walk_roi_batched(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
+                     layer: int, datatype: int, *, max_depth: int = 128,
+                     cancel_cb=None) -> dict:
+    """F27 M4: pure-Python **batched** walk — same result SET as :func:`walk_roi`
+    (order differs; compare sorted), no native extension, no whole-chip flatten.
+
+    ``walk_roi`` descends per instance: a leaf cell placed 30k times makes 30k
+    recursive ``walk()`` calls (Transform object + cell re-setup each) — that
+    per-instance Python overhead is the ~20-30s of a warm production walk. This
+    version instead processes each cell ONCE, parents-first (topological), with a
+    list of *segments* ``(M, ts)`` — the instances reaching it, grouped by shared
+    D4 matrix. Emit and the no-repetition descent then vectorize over the whole
+    instance array of a segment (one numpy op instead of K Python calls), and the
+    number of segments is bounded by graph edges, not instances. Repetition and
+    polygon math are the exact walk_roi helpers, so the output is identical."""
+    def _check_cancel():
+        if cancel_cb is not None and cancel_cb():
+            raise WalkCancelled()
+    key = (layer, datatype)
+    scale = getattr(rar, "_nm_per_grid", 1.0) or 1.0
+    roi = (float(roi_bbox[0]) / scale, float(roi_bbox[1]) / scale,
+           float(roi_bbox[2]) / scale, float(roi_bbox[3]) / scale)
+    _t0 = time.perf_counter()
+    stats = RoiWalkStats()
+    rect_out: list = []
+    poly_out: list = []
+    # F27 M6: load the shared reachable-bbox sidecar once (built by the export
+    # orchestrator / a previous run) so this worker skips the ~20-30 s bbox
+    # sweep. compute=False — if there's no sidecar, the normal lazy sweep below
+    # still fills the memo (no regression); only the orchestrator computes+saves.
+    reach_prewarm(rar, root_id, compute=False)
+    reachable_bbox = rar.reachable_bbox
+
+    # ── topological order (parents before children); skip cycle back-edges ──
+    # ROI-independent (the whole reachable graph from root), so build it once per
+    # reader+root and reuse across every image's walk.
+    topo_cache = getattr(rar, "_batch_topo", None)
+    if topo_cache is None:
+        topo_cache = rar._batch_topo = {}
+    order = topo_cache.get(root_id)
+    if order is None:
+        order = []
+        seen: set = set()
+        onpath: set = set()
+        stack = [(root_id, False)]
+        while stack:
+            cid, done = stack.pop()
+            if done:
+                onpath.discard(cid)
+                order.append(cid)
+                continue
+            if cid in seen:
+                continue
+            seen.add(cid); onpath.add(cid)
+            stack.append((cid, True))
+            cb = rar.load_cell_bbox(cid)
+            for pl in cb.placements:
+                tgt = pl.target
+                if not isinstance(tgt, (int, np.integer)):
+                    continue
+                if tgt in onpath:        # cycle back-edge — walk_roi skips via visiting
+                    continue
+                if tgt not in seen:
+                    stack.append((tgt, False))
+        order.reverse()
+        topo_cache[root_id] = order
+
+    # segments per cell: list of (M (2,2) f64, ts (K,2) f64); depth per cell
+    xf: dict = {root_id: [(np.eye(2, dtype=np.float64),
+                           np.zeros((1, 2), dtype=np.float64))]}
+    depth_of: dict = {root_id: 0}
+
+    for cid in order:
+        segs = xf.pop(cid, None)
+        if not segs:
+            continue
+        _check_cancel()
+        depth = depth_of.get(cid, 0)
+        content = rar.load_cell(cid)
+        stats.cell_visits += 1
+        # ── emit geometry for every instance of every segment ──
+        nr = content.rect_count(key)
+        npoly = content.poly_count(key)
+        if nr or npoly:
+            _ts = time.perf_counter()
+            # Common case — a cell whose geometry on this layer is only PLAIN
+            # rects (no repetition, no polygons): emit the whole segment
+            # vectorized. Otherwise (repeated rects / polygons) fall to the exact
+            # per-instance emit (byte-identical, but slower — those cells are few).
+            rcol = getattr(content, "_rcol", None)
+            rcol = rcol.get(key) if rcol is not None else None
+            plain_coords = None
+            if npoly == 0 and rcol is not None:
+                _co, _rt, _rr = rcol
+                if not bool((np.asarray(_rt) >= 0).any()):
+                    plain_coords = np.asarray(_co, dtype=np.float64)
+            if plain_coords is not None:
+                for M, ts in segs:
+                    _emit_plain_rects_seg(plain_coords, M, ts, roi, rect_out)
+            else:
+                for M, ts in segs:
+                    for j in range(ts.shape[0]):
+                        _emit_cell_geom(content, key, Transform(M=M, t=ts[j]),
+                                        roi, rect_out, poly_out)
+            stats.t_rect += time.perf_counter() - _ts
+        if depth >= max_depth:
+            continue
+        N = content.placement_count()
+        if not N:
+            continue
+        _ts_pl = time.perf_counter()
+        prep = _batch_place_prep(rar, content, cid, reachable_bbox)
+        base_M, base_t, placed_all, arr_local, rcount, valid, _as, _us = prep
+        vidx = np.flatnonzero(valid)
+        if vidx.size == 0:
+            stats.t_place += time.perf_counter() - _ts_pl
+            continue
+        # Per-cell placement structure (built once, reused for every segment):
+        # NO-REP placements grouped by (child, base_M) so many distinct edges to
+        # the same child collapse into ONE vectorized child segment; REP
+        # placements listed for the per-parent analytic-clip loop.
+        grp = getattr(content, "_batch_groups", None)
+        if grp is None:
+            tgts = []; reps = []
+            for n in vidx:
+                pl = content.placement_at(int(n))
+                tgts.append(pl.target)
+                reps.append((pl.repetition_type, pl.repetition_raw))
+            norep = rcount[vidx] == 1
+            gd: dict = {}
+            rep_pos: list = []
+            for vi in range(vidx.size):
+                if norep[vi]:
+                    n = int(vidx[vi])
+                    gk = (tgts[vi], base_M[n].tobytes())
+                    gd.setdefault(gk, []).append(vi)
+                else:
+                    rep_pos.append(vi)
+            norep_groups = []
+            for (tg, _mb), members in gd.items():
+                mem = np.array(members, dtype=np.int64)
+                bM = base_M[int(vidx[mem[0]])].copy()
+                norep_groups.append((tg, bM, mem))
+            all_children = list({t for t in tgts})
+            grp = (tgts, reps, norep_groups, rep_pos, all_children)
+            content._batch_groups = grp
+        tgts, reps, norep_groups, rep_pos, all_children = grp
+        # corners of each valid placed bbox (for the no-rep vectorized prune)
+        Pv = placed_all[vidx]                       # (V,4)
+        c1 = Pv[:, :2]; c2 = Pv[:, 2:]              # (V,2) each
+        base_t_v = base_t[vidx]                     # (V,2)
+        for M, ts in segs:
+            K = ts.shape[0]
+            child_depth = depth + 1
+            # No-rep prune, vectorized over K instances × V placements. rootb =
+            # apply_to_rects(placed) under (M, ts[k]); overlap == survive
+            # (arr_local == placed for no-rep, so this is walk_roi's exact test).
+            Mc1 = c1 @ M.T; Mc2 = c2 @ M.T          # (V,2), M only
+            ax = Mc1[None, :, :] + ts[:, None, :]   # (K,V,2)
+            bx = Mc2[None, :, :] + ts[:, None, :]
+            xmin = np.floor(np.minimum(ax[:, :, 0], bx[:, :, 0]))
+            xmax = np.ceil(np.maximum(ax[:, :, 0], bx[:, :, 0]))
+            ymin = np.floor(np.minimum(ax[:, :, 1], bx[:, :, 1]))
+            ymax = np.ceil(np.maximum(ax[:, :, 1], bx[:, :, 1]))
+            hit = ((xmin <= roi[2]) & (xmax >= roi[0])
+                   & (ymin <= roi[3]) & (ymax >= roi[1]))   # (K,V)
+            Mbt = base_t_v @ M.T                    # (V,2): M @ base_t
+            for tg, bM, mem in norep_groups:
+                # all (parent k, placement g) that survive, in one shot
+                kk, gg = np.nonzero(hit[:, mem])         # (S,), (S,)
+                if kk.size == 0:
+                    continue
+                cts = Mbt[mem][gg] + ts[kk]              # (S,2)
+                stats.instances_visited += int(kk.size)
+                xf.setdefault(tg, []).append((M @ bM, cts))
+            for vi in rep_pos:
+                n = int(vidx[vi]); child = tgts[vi]
+                rt, rr = reps[vi]; placed = placed_all[n]
+                cM = M @ base_M[n]
+                parts = []
+                for k in range(K):
+                    Tk = Transform(M=M, t=ts[k])
+                    oa = _clip_grid_offsets(rt, rr, placed, Tk, roi)
+                    if oa.shape[0] == 0:
+                        continue
+                    plb = np.empty((oa.shape[0], 4), dtype=np.float64)
+                    plb[:, 0] = placed[0] + oa[:, 0]
+                    plb[:, 1] = placed[1] + oa[:, 1]
+                    plb[:, 2] = placed[2] + oa[:, 0]
+                    plb[:, 3] = placed[3] + oa[:, 1]
+                    mask = _roi_overlap_mask(Tk.apply_to_rects(plb), roi)
+                    sel = np.flatnonzero(mask)
+                    if sel.size == 0:
+                        continue
+                    place_ts = base_t[n] + oa[sel]           # (s,2)
+                    cts = place_ts @ M.T + ts[k]             # (s,2)
+                    parts.append(cts)
+                if parts:
+                    allc = parts[0] if len(parts) == 1 else np.concatenate(parts)
+                    stats.instances_visited += int(allc.shape[0])
+                    xf.setdefault(child, []).append((cM, allc))
+            for child in all_children:
+                if child not in depth_of or depth_of[child] > child_depth:
+                    depth_of[child] = child_depth
+        stats.t_place += time.perf_counter() - _ts_pl
+
+    rects = (np.concatenate(rect_out)
+             if rect_out else np.empty((0, 4), dtype=np.float64))
+    if scale != 1.0:
+        rects = rects * scale
+        poly_out = [p * scale for p in poly_out]
+    rects = np.rint(rects).astype(np.int64)
+    poly_out = [np.rint(p).astype(np.int64) for p in poly_out]
+    stats.rects_emitted = int(rects.shape[0])
+    stats.polys_emitted = len(poly_out)
+    stats.elapsed_s = time.perf_counter() - _t0
+    stats.sbbox_prune = bool(rar._sbbox_by_refnum or rar._sbbox_by_name)
+    rar._walk_cellvisits_total = (getattr(rar, "_walk_cellvisits_total", 0)
+                                  + stats.cell_visits)
+    rar._walk_visited_total = (getattr(rar, "_walk_visited_total", 0)
+                               + stats.instances_visited)
+    rar._walk_tplace_total = (getattr(rar, "_walk_tplace_total", 0.0)
+                              + stats.t_place)
+    rar._walk_trect_total = (getattr(rar, "_walk_trect_total", 0.0)
+                             + stats.t_rect)
+    return {"rects": rects, "polys": poly_out, "stats": stats}
+
+
+def walk_roi_fast(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
+                  layer: int, datatype: int, *, max_depth: int = 128,
+                  cancel_cb=None) -> dict:
+    """F27 M3e: native-accelerated ``walk_roi`` for the batch/export path.
+
+    When the graph reachable from ``root_id`` is native-able (D4 placements, no
+    name-refs — :func:`_flatten_cached` returns arrays), the whole ROI descent
+    runs in one ``walk_native`` C call. Regular-grid rect/placement/polygon
+    repetition is clipped to the ROI analytically inside the kernel (never
+    materialized), and polygons are emitted natively — so a production array chip
+    walks natively, ~100× the Python walk (F27 M3b/M3e). The emitted rect + poly
+    SET is byte-identical to :func:`walk_roi` (order differs — rasterization is
+    order-independent). Otherwise (no extension, or the subtree has a non-D4
+    placement / name-ref / a pathological non-clippable array over the cap) it
+    falls straight through to the pure-Python :func:`walk_roi`, so the result is
+    always identical — the native path only ever runs where it is exact.
+
+    Kept separate from ``walk_roi`` (rather than gating inside it) so the walk's
+    diagnostic stats + placement-prep cache — which many callers/tests rely on —
+    stay untouched on the Python path. ``cancel_cb`` is honoured between images
+    by the caller; a native walk is sub-ms so it is not polled mid-walk (the
+    one-time flatten isn't polled either)."""
+    if _FASTWALK is not None:
+        flat = _flatten_cached(rar, root_id, layer, datatype)
+        if flat is not None:
+            (rect, rect_off, poly_pts, poly_ptoff, poly_meta, poly_off,
+             pl_target, pl_data, pl_off, rb, ri) = flat
+            scale = getattr(rar, "_nm_per_grid", 1.0) or 1.0
+            roi = (float(roi_bbox[0]) / scale, float(roi_bbox[1]) / scale,
+                   float(roi_bbox[2]) / scale, float(roi_bbox[3]) / scale)
+            nat, ppts, poo = _FASTWALK.walk_native(
+                rect, rect_off, poly_pts, poly_ptoff, poly_meta, poly_off,
+                pl_target, pl_data, pl_off, rb, int(ri),
+                float(roi[0]), float(roi[1]), float(roi[2]), float(roi[3]),
+                int(max_depth))
+            if scale != 1.0:
+                nat = nat * scale
+                ppts = ppts * scale
+            rects = np.rint(nat).astype(np.int64)
+            polys = [np.rint(ppts[poo[k]:poo[k + 1]]).astype(np.int64)
+                     for k in range(poo.shape[0] - 1)]
+            st = RoiWalkStats()
+            st.rects_emitted = int(rects.shape[0])
+            st.polys_emitted = len(polys)
+            st.sbbox_prune = bool(rar._sbbox_by_refnum or rar._sbbox_by_name)
+            return {"rects": rects, "polys": polys, "stats": st}
+    # No native flatten (big / dense chip, or extension absent): use the
+    # pure-Python BATCHED walk (F27 M4), which is byte-identical to walk_roi but
+    # ~100-200x faster on the warm production walk (no per-instance recursion) —
+    # BUT only when its topo-order build is affordable. That build reads every
+    # reachable cell's placements via load_cell_bbox, which only early-stops when
+    # a CE bbox_layer is configured; without one (a no-108/250 file) it
+    # full-decodes every cell, so on a big no-CE chip it would decode the whole
+    # multi-GB file just to build the order. There, fall back to the ROI-pruned
+    # recursive walk_roi (which prunes decode via the sbbox / CE reach and only
+    # touches the few cells near the FOV).
+    if _batched_walk_affordable(rar):
+        return walk_roi_batched(rar, root_id, roi_bbox, layer, datatype,
+                                max_depth=max_depth, cancel_cb=cancel_cb)
+    return walk_roi(rar, root_id, roi_bbox, layer, datatype,
+                    max_depth=max_depth, cancel_cb=cancel_cb)
 
 
 # ── F12: layer enumeration for files with no LAYERNAME table ─────────────────

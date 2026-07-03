@@ -407,7 +407,9 @@ class TestRectRepetition:
         p.write_bytes(oas.MAGIC + start + pn + cn + prop(off) + cell + rect + end)
         rar = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
         cc = rar.load_cell(0)
-        assert len(cc.rect_specs[(17, 0)]) == 1          # one spec, not 1M rects
+        # one spec, not 1M rects (rect_count works for either the tuple-list
+        # backing or the native columnar _rcol backing — both stay lazy).
+        assert cc.rect_count((17, 0)) == 1
         assert cc.bbox == (0, 0, 999010, 999010)         # analytic extent
         assert cc.rects((17, 0)).shape == (1_000_000, 4)  # lazy materialization
 

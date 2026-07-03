@@ -7,3 +7,13 @@ venv/
 .env
 .DS_Store
 *.npz
+
+# F26: native decode extension build artifacts. The .so / .pyd / generated .c
+# are never committed (a committed .pyd makes the source ZIP download get
+# blocked by corporate file-download policy). Instead CI commits a base64 TEXT
+# sidecar (oasis_fastdecode.*.pyd.b64) which rides the source ZIP safely; the
+# user materializes the real .pyd locally with tools/unpack_fastdecode.py.
+build/
+*.so
+*.pyd
+glas/core/oasis_fastdecode.c

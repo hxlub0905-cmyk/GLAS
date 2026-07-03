@@ -2,7 +2,8 @@
 export) + the human-viewable colourised label preview (``label_view_png``).
 
 The pure helpers (``images_needing_fine_align`` / ``colorize_label_map``) need
-only numpy; the ``_on_export_all`` wiring tests additionally need PyQt6.
+only numpy; the ``_on_export`` wiring tests additionally need PyQt6 (F25 folded
+the old two-button "Export all" into the single unified Export path).
 """
 from __future__ import annotations
 
@@ -98,10 +99,11 @@ class TestColorizeLabelMap:
         assert view.max() > 0 and tuple(view[1, 1]) == (0, 180, 255)
 
 
-# ── _on_export_all wiring (PyQt6) ────────────────────────────────────────────
+# ── _on_export wiring (PyQt6) — F25 single unified Export path ────────────────
 
 try:
-    from PyQt6.QtWidgets import QApplication, QMessageBox
+    from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
+    from PyQt6.QtWidgets import QDialog
 except Exception:  # pragma: no cover
     pytest.skip("PyQt6 unavailable", allow_module_level=True)
 
@@ -133,85 +135,140 @@ def mw(qapp, tmp_path, monkeypatch):
     w.close()
 
 
-class TestOnExportAll:
+def _patch_export_dialog(monkeypatch, sel, accepted=True):
+    """Stub AlignmentExportDialog so _on_export's options come from ``sel``
+    (fmt, ids, raw, overlay, gray, label, score_thr) without a real modal."""
+    code = (QDialog.DialogCode.Accepted if accepted
+            else QDialog.DialogCode.Rejected)
 
-    def test_no_images_does_nothing(self, mw, monkeypatch):
-        launched = []
-        monkeypatch.setattr(mw, "_launch_fa",
-                            lambda *a: launched.append(a))
-        mw._sem_images = []
-        mw._on_export_all()
-        assert launched == []
+    class _Dlg:
+        def __init__(self, *a, **k):
+            pass
 
-    def test_all_run_exports_directly(self, mw, monkeypatch):
-        exported, launched = [], []
-        monkeypatch.setattr(mw, "_on_export_alignment",
-                            lambda: exported.append(True))
-        monkeypatch.setattr(mw, "_launch_fa", lambda *a: launched.append(a))
-        mw._sem_images = [_img("D1", 1.0, 2.0)]
-        mw._refined = {"D1": (0.0, 0.0, 0.9)}
-        mw._on_export_all()
-        assert exported == [True] and launched == []
-        assert mw._export_after_fa is False   # straight export, no batch
+        def exec(self):
+            return code
 
-    def test_only_un_run_images_launched(self, mw, monkeypatch):
-        captured = {}
+        def selected(self):
+            return sel
+
+    monkeypatch.setattr(gat, "AlignmentExportDialog", _Dlg)
+
+
+class TestOnExport:
+
+    def _stub_common(self, mw, monkeypatch):
         monkeypatch.setattr(mw, "_enter_batch_workspace", lambda: None)
         monkeypatch.setattr(mw, "_refresh_batch_panel", lambda *a, **k: None)
-        monkeypatch.setattr(mw, "_poi_specs", lambda: ["spec"])
+        monkeypatch.setattr(mw, "_poi_specs_colored", lambda: ["spec"])
         monkeypatch.setattr(mw, "_coarse_gds", lambda im: (0.0, 0.0))
         monkeypatch.setattr(mw.batch_panel, "set_rerun_defaults",
                             lambda *a, **k: None)
-        monkeypatch.setattr(mw, "_launch_fa",
-                            lambda specs, jobs, cfg: captured.update(jobs=jobs))
+        monkeypatch.setattr(gat.QFileDialog, "getSaveFileName",
+                            staticmethod(lambda *a, **k: ("/tmp/a.csv", "")))
+        monkeypatch.setattr(gat.QFileDialog, "getExistingDirectory",
+                            staticmethod(lambda *a, **k: "/tmp/out"))
+
+    def test_no_images_does_nothing(self, mw, monkeypatch):
+        launched = []
+        monkeypatch.setattr(mw, "_launch_export",
+                            lambda *a: launched.append(a))
+        mw._sem_images = []
+        mw._on_export()
+        assert launched == []
+
+    def test_dialog_cancel_aborts(self, mw, monkeypatch):
+        launched = []
+        monkeypatch.setattr(mw, "_launch_export",
+                            lambda *a: launched.append(a))
+        _patch_export_dialog(monkeypatch, sel=None, accepted=False)
+        mw._sem_images = [_img("D1", 1.0, 2.0)]
+        mw._on_export()
+        assert launched == []
+
+    def test_unified_pass_covers_all_selected_with_prior_refined(
+            self, mw, monkeypatch):
+        captured = {}
+        self._stub_common(mw, monkeypatch)
+        monkeypatch.setattr(
+            mw, "_launch_export",
+            lambda specs, jobs, cfg, out_dir, *a: captured.update(
+                jobs=jobs, out_dir=out_dir))
         mw._rar = object()
         mw._roi_root = "root"
         mw._fov_w = mw._fov_h = 1000.0
-        mw._sem_images = [_img("D1", 1.0, 2.0), _img("D2", 3.0, 4.0),
-                          _img("D3")]                       # D3 has no coords
-        mw._refined = {"D1": (0.0, 0.0, 0.9)}               # D1 already run
-        mw._on_export_all()
-        assert [j[0] for j in captured["jobs"]] == ["D2"]   # only the un-run one
-        assert mw._export_after_fa is True
+        mw._sem_images = [_img("D1", 1.0, 2.0), _img("D2", 3.0, 4.0)]
+        mw._refined = {"D1": (0.5, 0.6, 0.9)}            # D1 already aligned
+        # overlay product requested → an output dir is picked.
+        _patch_export_dialog(monkeypatch, sel=(
+            "csv", {"D1", "D2"}, False, True, False, False, 0.0))
+        mw._on_export()
+        # ALL selected images are jobs (one walk each), carrying prior_refined.
+        assert [j[0] for j in captured["jobs"]] == ["D1", "D2"]
+        assert captured["jobs"][0][2] == (0.5, 0.6, 0.9)   # D1 reuse
+        assert captured["jobs"][1][2] is None              # D2 un-run
+        assert captured["out_dir"] == "/tmp/out"
+        assert mw._export_pending is not None
 
-    def test_finish_hands_off_to_export(self, mw, monkeypatch):
-        exported = []
-        monkeypatch.setattr(mw, "_on_export_alignment",
-                            lambda: exported.append(True))
+    def test_raw_only_requests_output_dir(self, mw, monkeypatch):
+        # Raw-only export is an image product → an output dir must be picked
+        # (regression: raw used to skip the dir and land PNGs in the CWD), but
+        # it needs no POI / OASIS (no walk).
+        captured = {}
+        self._stub_common(mw, monkeypatch)
+        monkeypatch.setattr(mw, "_launch_export",
+                            lambda specs, jobs, cfg, out_dir, *a:
+                            captured.update(out_dir=out_dir, specs=specs))
+        mw._sem_images = [_img("D1", 1.0, 2.0)]
+        mw._refined = {"D1": (0.0, 0.0, 0.9)}            # aligned → no walk
+        _patch_export_dialog(monkeypatch, sel=(
+            "csv", {"D1"}, True, False, False, False, 0.0))   # raw only
+        mw._on_export()
+        assert captured["out_dir"] == "/tmp/out"         # dir WAS requested
+        assert captured["specs"] == []                   # no POI needed
+
+    def test_csv_only_skips_output_dir(self, mw, monkeypatch):
+        captured = {}
+        self._stub_common(mw, monkeypatch)
+        # No image products → getExistingDirectory must NOT be needed; make it
+        # raise so the test fails if _on_export asks for an output dir.
+        monkeypatch.setattr(gat.QFileDialog, "getExistingDirectory",
+                            staticmethod(lambda *a, **k: (_ for _ in ()).throw(
+                                AssertionError("should not pick a dir"))))
+        monkeypatch.setattr(mw, "_launch_export",
+                            lambda specs, jobs, cfg, out_dir, *a:
+                            captured.update(out_dir=out_dir))
+        mw._sem_images = [_img("D1", 1.0, 2.0)]
+        mw._refined = {"D1": (0.0, 0.0, 0.9)}            # already aligned
+        _patch_export_dialog(monkeypatch, sel=(
+            "csv", {"D1"}, False, False, False, False, 0.0))
+        mw._on_export()
+        assert captured["out_dir"] == ""
+
+    def test_finish_writes_alignment_manifest_and_clears_pending(
+            self, mw, monkeypatch):
+        wrote = []
         monkeypatch.setattr(mw, "_refresh_overview_defects", lambda: None)
         monkeypatch.setattr(mw, "_refresh_batch_panel", lambda *a, **k: None)
-
-        class _FakeTimer:
-            @staticmethod
-            def singleShot(_ms, fn):
-                fn()
-        monkeypatch.setattr(gat, "QTimer", _FakeTimer)
+        monkeypatch.setattr(
+            mw, "_write_alignment_manifest",
+            lambda images, fmt, path: wrote.append((fmt, path)) or path)
         mw._current_sem = None
-        mw._export_after_fa = True
-        mw._on_fa_finished(3)
-        assert exported == [True] and mw._export_after_fa is False
+        mw._export_pending = {"images": [_img("D1", 1.0, 2.0)],
+                              "fmt": "csv", "path": "/tmp/a.csv"}
+        mw._on_export_finished(1, "")
+        assert wrote == [("csv", "/tmp/a.csv")]
+        assert mw._export_pending is None
 
-    def test_finish_without_flag_does_not_export(self, mw, monkeypatch):
-        exported = []
-        monkeypatch.setattr(mw, "_on_export_alignment",
-                            lambda: exported.append(True))
-        monkeypatch.setattr(mw, "_refresh_overview_defects", lambda: None)
-        monkeypatch.setattr(mw, "_refresh_batch_panel", lambda *a, **k: None)
-        mw._current_sem = None
-        mw._export_after_fa = False
-        mw._on_fa_finished(3)
-        assert exported == []
-
-    def test_failure_clears_flag_no_export(self, mw, monkeypatch):
+    def test_failure_clears_pending(self, mw, monkeypatch):
         monkeypatch.setattr(mw, "_refresh_batch_panel", lambda *a, **k: None)
         monkeypatch.setattr(QMessageBox, "critical", lambda *a, **k: None)
-        mw._export_after_fa = True
+        mw._export_pending = {"images": [], "fmt": "csv", "path": "/tmp/a.csv"}
         mw._on_fa_failed("boom")
-        assert mw._export_after_fa is False
+        assert mw._export_pending is None
 
-    def test_cancel_clears_flag_no_export(self, mw, monkeypatch):
+    def test_cancel_clears_pending(self, mw, monkeypatch):
         monkeypatch.setattr(mw, "_refresh_batch_panel", lambda *a, **k: None)
         monkeypatch.setattr(mw, "_refresh_overview_defects", lambda: None)
-        mw._export_after_fa = True
+        mw._export_pending = {"images": [], "fmt": "csv", "path": "/tmp/a.csv"}
         mw._on_fa_cancelled()
-        assert mw._export_after_fa is False
+        assert mw._export_pending is None

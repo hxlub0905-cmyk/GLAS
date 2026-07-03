@@ -348,6 +348,42 @@ def render_grayscale_from_geoms(poi_geoms_fgs: list, anchor: tuple,
     return img
 
 
+def render_gray_and_label_from_geoms(poi_geoms: list, anchor: tuple,
+                                     width_px: int, height_px: int,
+                                     nm_per_px: float, bg_glv: int = 80,
+                                     blur_sigma_px: float = 1.0) -> tuple:
+    """Render BOTH the simulated-GLV grayscale and the integer ROI label map
+    from a SINGLE :func:`gds_boolean.make_mask` raster per POI geom.
+
+    ``poi_geoms`` is ``[(geom, fg_glv, label_id), ...]``. The default F15/F24
+    export emits gray *and* label, and they are rasterised from the same
+    hole-preserving geometry with identical FOV corner / size / nm_per_px — so
+    :func:`render_grayscale_from_geoms` and :func:`render_label_image` each ran
+    ``make_mask`` over the very same geom independently (two ``cv2.fillPoly``
+    passes per POI). This computes each per-POI mask once and paints both
+    outputs from it: the grayscale gets ``fg_glv`` (then one Gaussian blur), the
+    label gets ``label_id`` (crisp, no blur). The result is byte-identical to
+    the two separate renderers and *strengthens* the F15 pixel-for-pixel
+    invariant — a single shared raster cannot drift between gray and label.
+    Returns ``(gray, label)``."""
+    img = np.full((height_px, width_px), np.uint8(bg_glv), dtype=np.uint8)
+    lbl = np.zeros((height_px, width_px), dtype=np.uint8)
+    x_min, y_min = _fov_min_corner(anchor, width_px, height_px, nm_per_px)
+    for geom, fg_glv, label_id in poi_geoms:
+        if geom is None or getattr(geom, "is_empty", False):
+            continue
+        m = gds_boolean.make_mask(geom, width_px=width_px, height_px=height_px,
+                                  x_min_nm=x_min, y_min_nm=y_min,
+                                  nm_per_px=nm_per_px)
+        sel = m > 0
+        img[sel] = np.uint8(fg_glv)
+        lbl[sel] = np.uint8(label_id)
+    if blur_sigma_px and blur_sigma_px > 0 and cv2 is not None:
+        k = int(max(1, round(blur_sigma_px * 3))) * 2 + 1
+        img = cv2.GaussianBlur(img, (k, k), float(blur_sigma_px))
+    return img, lbl
+
+
 def _parabola_subpx(res: np.ndarray, bx: int, by: int, axis: int) -> float:
     """Sub-pixel peak offset (∈ [-1, 1]) from a 3-point parabola fit around
     the score-map peak along ``axis`` (0 = x, 1 = y)."""
@@ -405,8 +441,11 @@ def fine_align_one(sem_img: np.ndarray, template_full: np.ndarray,
 
 def _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb=None):
     """Walk one layer's ROI geometry into a list of polygon ndarrays (nm)."""
-    res = oasis_random.walk_roi(rar, root, roi_bbox, layer, datatype,
-                                cancel_cb=cancel_cb)
+    # F27 M3/M4: walk_roi_fast uses the native subtree walk when the graph is
+    # native-able (small/viable chip), else the byte-identical pure-Python
+    # BATCHED walk (fast on the big dense-leaf production chip too).
+    res = oasis_random.walk_roi_fast(rar, root, roi_bbox, layer, datatype,
+                                     cancel_cb=cancel_cb)
     polys = [np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float64)
              for x1, y1, x2, y2 in res["rects"].tolist()]
     polys += [np.asarray(p, dtype=np.float64) for p in res["polys"]]
@@ -414,7 +453,7 @@ def _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb=None):
 
 
 def poi_polys_and_geometry_for_roi(rar, root, roi_bbox, poi_spec,
-                                   cancel_cb=None):
+                                   cancel_cb=None, nm_per_px=None):
     """POI outline polygons *and* the hole-preserving resolved geometry for a
     ROI, from a single walk (F13). ``poi_spec`` is ``('raw', layer, datatype)``
     or ``('expr', expr_text, bindings[, recipes])``.
@@ -424,30 +463,100 @@ def poi_polys_and_geometry_for_roi(rar, root, roi_bbox, poi_spec,
     overlay outlines but would *fill* Boolean interior exclusions (subtraction /
     complement) once rasterised into a mask. The mask path therefore needs the
     geometry, not the rings. Returns ``(polys, geom)`` so one ROI walk feeds
-    both the overlay (polys) and the mask (geom)."""
+    both the overlay (polys) and the mask (geom).
+
+    F27 M5: when ``nm_per_px`` is given, an EXPRESSION POI is evaluated in RASTER
+    space (``resolve_expression_raster`` — cv2 dilate/erode/bitwise) instead of
+    shapely, then vectorized back to a hole-preserving geom for the unchanged
+    downstream pipeline. On a dense FOV the shapely grow/shrink morphology is
+    ~15 s; the raster equivalent is ~10 ms (pixel-identical at the export
+    resolution). Raw POIs stay on the (already cheap) shapely union path."""
+    # F27 M4 diagnosis: split the "walk" phase into oasis-walk / shapely-union /
+    # boolean-morphology so the export timing shows WHERE the time goes (on a
+    # dense FOV the shapely Boolean/morphology, not the geometry walk, dominates).
+    def _acc(attr, dt):
+        setattr(rar, attr, getattr(rar, attr, 0.0) + dt)
+
     kind = poi_spec[0]
     if kind == "raw":
         _, layer, datatype = poi_spec
+        _t = time.perf_counter()
         polys = _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb)
-        return polys, gds_boolean.polys_to_geometry(polys)
+        _acc("_t_bwalk", time.perf_counter() - _t)
+        _t = time.perf_counter()
+        geom = gds_boolean.polys_to_geometry(polys)
+        _acc("_t_bunion", time.perf_counter() - _t)
+        return polys, geom
     # expression POI
     expr, bindings = poi_spec[1], poi_spec[2]
     recipes = poi_spec[3] if len(poi_spec) > 3 else {}
     x0, y0, x1, y1 = roi_bbox
+
+    if nm_per_px and nm_per_px > 0:
+        # ── raster Boolean (M5): raw walk → rasterize (slice rects) → cv2
+        # morphology/bitwise → geom. The raw rects go straight into a numpy
+        # slice-fill (raster_layer_mask), skipping both the rect→poly conversion
+        # and per-poly fillPoly (M5+: union ~1.9s → ~0.2s). ──
+        wpx = max(1, int(round((x1 - x0) / nm_per_px)))
+        hpx = max(1, int(round((y1 - y0) / nm_per_px)))
+
+        def raw_mask_provider(layer: int, datatype: int):
+            _t = time.perf_counter()
+            res = oasis_random.walk_roi_fast(rar, root, roi_bbox, layer,
+                                             datatype, cancel_cb=cancel_cb)
+            _acc("_t_bwalk", time.perf_counter() - _t)
+            _t = time.perf_counter()
+            m = gds_boolean.raster_layer_mask(
+                res["rects"], res["polys"], width_px=wpx, height_px=hpx,
+                x_min_nm=x0, y_min_nm=y0, nm_per_px=nm_per_px, invert_y=False)
+            _acc("_t_bunion", time.perf_counter() - _t)
+            return m
+
+        _w0 = getattr(rar, "_t_bwalk", 0.0); _u0 = getattr(rar, "_t_bunion", 0.0)
+        _t = time.perf_counter()
+        mask = gds_boolean.resolve_expression_raster(
+            expr, bindings, raw_mask_provider=raw_mask_provider,
+            recipe_provider=lambda n: recipes.get(n), nm_per_px=nm_per_px)
+        _acc("_t_bmorph", (time.perf_counter() - _t)
+             - (getattr(rar, "_t_bwalk", 0.0) - _w0)
+             - (getattr(rar, "_t_bunion", 0.0) - _u0))
+        _t = time.perf_counter()
+        geom = gds_boolean.mask_to_geometry(
+            mask, x_min_nm=x0, y_min_nm=y0, nm_per_px=nm_per_px, invert_y=False)
+        out = gds_boolean.geometry_to_polygons(geom)
+        _acc("_t_bunion", time.perf_counter() - _t)
+        return out, geom
+
+    # shapely path (interactive canvas / no raster resolution given)
     cx, cy, w, h = (x0 + x1) / 2.0, (y0 + y1) / 2.0, (x1 - x0), (y1 - y0)
 
     def raw_provider(layer: int, datatype: int):
+        _t = time.perf_counter()
         ps = _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb)
-        return gds_boolean.polys_to_geometry(ps)
+        _acc("_t_bwalk", time.perf_counter() - _t)
+        _t = time.perf_counter()
+        g = gds_boolean.polys_to_geometry(ps)
+        _acc("_t_bunion", time.perf_counter() - _t)
+        return g
 
+    _w0 = getattr(rar, "_t_bwalk", 0.0); _u0 = getattr(rar, "_t_bunion", 0.0)
+    _t = time.perf_counter()
     geom = gds_boolean.resolve_expression(
         expr, bindings, raw_provider=raw_provider,
         recipe_provider=lambda n: recipes.get(n),
         fov_bbox=gds_boolean.fov_box(cx, cy, w, h))
-    return gds_boolean.geometry_to_polygons(geom), geom
+    # morphology/boolean = resolve total minus the walk+union it triggered
+    _acc("_t_bmorph", (time.perf_counter() - _t)
+         - (getattr(rar, "_t_bwalk", 0.0) - _w0)
+         - (getattr(rar, "_t_bunion", 0.0) - _u0))
+    _t = time.perf_counter()
+    out = gds_boolean.geometry_to_polygons(geom)
+    _acc("_t_bunion", time.perf_counter() - _t)
+    return out, geom
 
 
-def poi_polys_for_roi(rar, root, roi_bbox, poi_spec, cancel_cb=None):
+def poi_polys_for_roi(rar, root, roi_bbox, poi_spec, cancel_cb=None,
+                      nm_per_px=None):
     """POI polygons (nm, root coords) for a given ROI, for batch fine align
     (plan M4b "Run all") and overlay outlines. ``poi_spec`` is
     ``('raw', layer, datatype)`` or ``('expr', expr_text, bindings[, recipes])``;
@@ -465,7 +574,7 @@ def poi_polys_for_roi(rar, root, roi_bbox, poi_spec, cancel_cb=None):
         _, layer, datatype = poi_spec
         return _walk_roi_polys(rar, root, roi_bbox, layer, datatype, cancel_cb)
     return poi_polys_and_geometry_for_roi(
-        rar, root, roi_bbox, poi_spec, cancel_cb)[0]
+        rar, root, roi_bbox, poi_spec, cancel_cb, nm_per_px=nm_per_px)[0]
 
 
 # ── Optional per-stage timing (diagnostic) ───────────────────────────────────
@@ -476,7 +585,11 @@ def poi_polys_for_roi(rar, root, roi_bbox, poi_spec, cancel_cb=None):
 # (cv2.matchTemplate). Lets us see where a real batch actually spends its time
 # instead of guessing. Off → the four perf_counter() calls are the only cost
 # (nanoseconds), so the production path is unaffected.
-_FA_TIMING = bool(os.environ.get("GLAS_FA_TIMING"))
+# F27 M7: the single debug switch (GLAS_DEBUG / debug.bat) lights this up too, so
+# one flag covers ROI + export timing; spawned workers inherit whichever env is set.
+_FA_TIMING = bool(os.environ.get("GLAS_FA_TIMING")
+                  or os.environ.get("GLAS_DEBUG")
+                  or os.environ.get("MMH_GDS_DEBUG"))
 try:
     _FA_TIMING_EVERY = max(1, int(os.environ.get("GLAS_FA_TIMING_EVERY", "25")))
 except ValueError:
@@ -629,6 +742,14 @@ def _pool_warm_probe() -> bool:
     so :meth:`_BatchPool.ensure_warm` can pay the import + reader-build cost
     before the user clicks Run all."""
     return _G.get("rar") is not None
+
+
+def pool_reader():
+    """This worker process's private reader, built once by :func:`_pool_init`
+    (F25). The unified align+export task (in ``overlay_export``) reads it from
+    here so the fused worker shares the very same warm pool as the fine-align
+    path — keyed on reader identity, the per-batch context rides each task."""
+    return _G.get("rar")
 
 
 # Default idle window before a warm-but-unused pool releases its workers (F23

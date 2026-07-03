@@ -60,6 +60,27 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO, Callable, Iterator, Optional
 
+# ── Optional native decode accelerator (F26) ─────────────────────────────────
+# NOTE (F26 M1 finding): wiring the native ext at the *per-varint* granularity
+# (one Python→C call per read_uvarint/read_svarint) is a REGRESSION — the call +
+# tuple overhead exceeds the 1-2 iteration Python loop it replaces (benchmarked
+# 0.79-0.81x on synthetic D2DB). The win requires amortizing the C boundary over
+# a whole record / record-run (M2: native record-decode loop), not per scalar.
+#
+# F27 M7f: that amortized boundary is exactly a POLYGON point-list — one C call
+# decodes the whole (variable-length) type-0/1 delta run. Rect runs already went
+# native (decode_rect_run, in oasis_random); polygons went through Python on both
+# paths. Import the extension here ONLY for that point-list kernel (VERSION >= 8);
+# absent / older → _POLY_NATIVE is None and decode_point_list stays pure Python.
+try:
+    import oasis_fastdecode as _POLY_FAST      # noqa: E402
+    _POLY_NATIVE = (_POLY_FAST
+                    if (getattr(_POLY_FAST, "VERSION", 0) >= 8
+                        and hasattr(_POLY_FAST, "decode_pointlist_01"))
+                    else None)
+except Exception:                              # pragma: no cover - no build present
+    _POLY_NATIVE = None
+
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -912,6 +933,25 @@ def repetition_offsets_np(rtype: int, raw) -> "np.ndarray":
 
 # ── Point-list (SEMI P39 §7.7.9, used by POLYGON / PATH) ─────────────────────
 
+# F27 M7: opt-in polygon point-list TYPE histogram (diagnostic only). Answers
+# "are this file's polygons rectilinear type 0/1 (which a native fast-path could
+# target cheaply) or the heavier type 2-5?" — so we measure before deciding
+# whether a Cython polygon decoder is worth building. Off by default → the guard
+# short-circuits at zero cost; oasis_random flips it on under debug. Per-process,
+# a plain list; single-threaded per reader. Counting the type never changes the
+# decoded points, so byte-identity is untouched.
+PTYPE_COUNT_ON = False
+_PTYPE_COUNTS = [0, 0, 0, 0, 0, 0]      # index = point-list type 0..5
+
+
+def reset_ptype_counts() -> None:
+    for _i in range(6):
+        _PTYPE_COUNTS[_i] = 0
+
+
+def get_ptype_counts() -> tuple:
+    return tuple(_PTYPE_COUNTS)
+
 
 def decode_point_list(stream: BinaryIO,
                       for_polygon: bool) -> list[tuple[int, int]]:
@@ -937,9 +977,29 @@ def decode_point_list(stream: BinaryIO,
     point (and the implicit closure for type 0/1 polygons).
     """
     ptype = decode_unsigned_int(stream)
+    if for_polygon and PTYPE_COUNT_ON and 0 <= ptype <= 5:
+        _PTYPE_COUNTS[ptype] += 1     # F27 M7 diagnostic histogram (see above)
     n = decode_unsigned_int(stream)
     if n == 0:
         raise OasisFormatError("point-list with zero count")
+
+    # F27 M7f: native type-0/1 point-list decode (the hot polygon case). Only for
+    # a buffer-backed OasisStream (the real reader exposes _buf/_pos, exactly like
+    # the native rect-run path); unit tests hand a raw BytesIO → pure Python. The
+    # kernel reads the n deltas from _buf at _pos and returns the advanced cursor;
+    # on a >64-bit delta (never in real coords) it raises → fall through to Python.
+    if (for_polygon and (ptype == 0 or ptype == 1)
+            and _POLY_NATIVE is not None
+            and getattr(stream, "_buf", None) is not None
+            and hasattr(stream, "_pos")):
+        try:
+            new_pos, pts_arr = _POLY_NATIVE.decode_pointlist_01(
+                stream._buf, stream._pos, ptype, n, 1)
+        except (OverflowError, ValueError):
+            pass                      # fall through to the pure-Python path
+        else:
+            stream._pos = new_pos     # advance the cursor past the deltas
+            return pts_arr            # (m,2) int64 array; np.asarray downstream = identical
     pts: list[tuple[int, int]] = [(0, 0)]
 
     if ptype == 0 or ptype == 1:

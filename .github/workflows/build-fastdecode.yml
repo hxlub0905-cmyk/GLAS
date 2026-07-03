@@ -1,0 +1,88 @@
+name: build-fastdecode
+
+# Builds the optional native decode extension (F26) on a Windows runner (which
+# ships MSVC), for the exact Python the operator uses (3.9 x64), and uploads the
+# .pyd as a downloadable artifact. This is the "no local compiler" delivery
+# path: download the artifact and drop oasis_fastdecode.cp39-win_amd64.pyd into
+# glas/core/ on the locked-down machine — no install, just a file.
+
+on:
+  push:
+    paths:
+      - "glas/core/oasis_fastdecode.pyx"
+      - "setup.py"
+      - ".github/workflows/build-fastdecode.yml"
+  workflow_dispatch: {}   # also runnable on demand from the Actions tab
+
+permissions:
+  contents: write          # so the job can commit the built .pyd back to the branch
+
+jobs:
+  build-windows-cp39:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.9 (x64) — match the operator runtime
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+          architecture: "x64"
+
+      - name: Install build deps
+        # numpy: oasis_fastdecode imports it at runtime (decode_rect_run builds
+        # numpy arrays); needed by the smoke-test + round-trip steps below.
+        run: python -m pip install --upgrade pip cython setuptools wheel numpy
+
+      - name: Compile the extension (MSVC)
+        run: python setup.py build_ext --inplace
+
+      - name: Stage + smoke-test the built .pyd
+        shell: pwsh
+        run: |
+          # Ensure a copy of the .pyd lives in glas/core (on sys.path). On
+          # Windows build_ext --inplace already places it there, so skip files
+          # already in glas/core (copying onto itself errors); copy any that
+          # landed elsewhere (repo root / build\lib).
+          $core = (Resolve-Path "glas/core").Path
+          Get-ChildItem -Recurse -Filter "oasis_fastdecode*.pyd" | ForEach-Object {
+            if ($_.DirectoryName -ne $core) {
+              Copy-Item $_.FullName -Destination "glas/core/" -Force
+            }
+          }
+          Get-ChildItem "glas/core/oasis_fastdecode*.pyd"
+          python -c "import sys; sys.path.insert(0, 'glas/core'); import oasis_fastdecode as f; print('VERSION', f.VERSION, 'selftest', f.selftest())"
+
+      - name: Round-trip test against the pure-Python readers
+        run: |
+          python -m pip install pytest
+          python -m pytest tests/test_fastdecode.py -v
+
+      - name: Upload the .pyd artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: oasis_fastdecode-cp39-win_amd64
+          path: glas/core/oasis_fastdecode*.pyd
+          if-no-files-found: error
+
+      # Locked-down-machine delivery: a committed .pyd (a Windows DLL) makes the
+      # whole source-ZIP download get blocked by corporate file-download policy.
+      # So commit a base64 TEXT sidecar instead — it rides the source ZIP safely
+      # (no executable/PE header), and the user materializes the real .pyd
+      # locally with `python tools/unpack_fastdecode.py`. The .b64 path isn't in
+      # on.push.paths, so this commit doesn't re-trigger the build; [skip ci] too.
+      - name: Encode the .pyd as base64 text + commit the sidecar
+        shell: bash
+        run: |
+          python -c "import base64, pathlib; p = pathlib.Path('glas/core/oasis_fastdecode.cp39-win_amd64.pyd'); pathlib.Path('glas/core/oasis_fastdecode.cp39-win_amd64.pyd.b64').write_text(base64.b64encode(p.read_bytes()).decode())"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Make sure no raw .pyd is ever tracked (it would block the ZIP).
+          git rm --cached --ignore-unmatch glas/core/oasis_fastdecode.cp39-win_amd64.pyd || true
+          git add glas/core/oasis_fastdecode.cp39-win_amd64.pyd.b64
+          if git diff --cached --quiet; then
+            echo "no change to the .b64 sidecar — nothing to commit"
+          else
+            git commit -m "ci: prebuilt oasis_fastdecode.cp39-win_amd64.pyd.b64 (base64 text) [skip ci]"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi

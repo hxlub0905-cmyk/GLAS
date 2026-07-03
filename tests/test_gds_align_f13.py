@@ -101,7 +101,7 @@ def test_manifest_csv_header_has_gray_label(tmp_path):
     # needed); refined=None → nothing written even though gray/label are on.
     jobs = [("img1", None, None, str(src), True)]
     cfg = {"fov_w": 1000.0, "fov_h": 1000.0, "nm_auto": True, "nm_manual": 0.0}
-    w = gat.OverlayExportWorker(
+    w = gat.ExportWorker(
         None, None, [], jobs, cfg, str(tmp_path),
         export_raw=True, export_overlay=False,
         export_gray=True, export_label=True, score_threshold=0.8)

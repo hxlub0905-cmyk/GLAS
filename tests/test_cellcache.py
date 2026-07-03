@@ -214,7 +214,9 @@ class TestSidecarIO:
 
         r1 = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
         ref = orx.walk_roi(r1, 0, roi, 17, 0)
-        assert cellcache.load_prep(p, 0) is not None      # prep persisted
+        # F27 M7k: prep is keyed by the cell's canonical (offset) cache key so a
+        # refnum walk and a name walk share it.
+        assert cellcache.load_prep(p, r1.cache_key_for(0)) is not None  # persisted
 
         r2 = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
         got = orx.walk_roi(r2, 0, roi, 17, 0)

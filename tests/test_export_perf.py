@@ -158,6 +158,38 @@ def test_grayscale_and_label_share_boundaries():
     assert np.array_equal(gray == 80, lbl == 0)       # same background pixels
 
 
+def test_combined_gray_label_matches_separate_renderers():
+    # Perf refactor: the combined one-make_mask-pass renderer must be
+    # byte-identical to calling the two separate renderers (which is what the
+    # export path did before). Covers overlap (later layer wins) + holes + blur.
+    pytest.importorskip("shapely")
+    pytest.importorskip("cv2")
+    import numpy as np
+    from shapely.geometry import Polygon
+    W = H = 80
+    nm = 1.0
+    anchor = (0.0, 0.0)
+    big = _square(0.0, 0.0, 30.0)
+    ring = Polygon([(-30, -30), (30, -30), (30, 30), (-30, 30)],
+                   [[(-12, -12), (12, -12), (12, 12), (-12, 12)]])
+    geoms_fgs = [(big, 200), (ring, 150)]
+    geoms_ids = [(big, 1), (ring, 2)]
+    geoms_all = [(big, 200, 1), (ring, 150, 2)]
+    for blur in (0.0, 1.0):
+        gray_sep = fine_align.render_grayscale_from_geoms(
+            geoms_fgs, anchor, W, H, nm, bg_glv=80, blur_sigma_px=blur)
+        lbl_sep = fine_align.render_label_image(geoms_ids, anchor, W, H, nm)
+        gray_c, lbl_c = fine_align.render_gray_and_label_from_geoms(
+            geoms_all, anchor, W, H, nm, bg_glv=80, blur_sigma_px=blur)
+        assert np.array_equal(gray_c, gray_sep)   # byte-identical grayscale
+        assert np.array_equal(lbl_c, lbl_sep)     # byte-identical label map
+    # And the label still preserves the F15 contracts (ids + holes).
+    _gc, lbl_c = fine_align.render_gray_and_label_from_geoms(
+        geoms_all, anchor, W, H, nm, bg_glv=80, blur_sigma_px=0.0)
+    assert lbl_c[H // 2, W // 2] == 1                  # ring hole shows id 1
+    assert set(np.unique(lbl_c).tolist()) <= {0, 1, 2}
+
+
 def test_overlay_export_module_is_qt_free():
     # The module must import without PyQt6 so a spawn worker can re-import it.
     assert "PyQt6" not in sys.modules or True  # importing it above didn't need Qt
