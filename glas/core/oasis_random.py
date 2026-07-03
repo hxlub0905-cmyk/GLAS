@@ -2576,6 +2576,22 @@ def _batched_walk_affordable(rar: "RandomAccessReader") -> bool:
     return n <= _NATIVE_WALK_MAX_CELLS
 
 
+def native_flatten_worthwhile(rar: "RandomAccessReader") -> bool:
+    """Should the export bother prewarming the native-walk flatten? No on a big
+    S_BOUNDING_BOX chip: there ``walk_roi_fast`` uses the sbbox-pruned
+    ``walk_roi`` (the lazy ``_flatten_cached`` rejects a >``_NATIVE_WALK_MAX_CELLS``
+    graph anyway), and the whole-chip flatten is architecturally non-viable — a
+    giant merge cell aborts the prewarm only after ~90 s spent discovering
+    nothing (the 1750 MB LTV chip). Small graphs and no-sbbox chips (E3B) still
+    prewarm as before."""
+    n = len(getattr(rar, "_by_refnum", ()) or ())
+    has_sbbox = bool(getattr(rar, "_sbbox_by_refnum", None)
+                     or getattr(rar, "_sbbox_by_name", None))
+    if has_sbbox and n > _NATIVE_WALK_MAX_CELLS:
+        return False
+    return True
+
+
 def walk_roi_batched(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
                      layer: int, datatype: int, *, max_depth: int = 128,
                      cancel_cb=None) -> dict:

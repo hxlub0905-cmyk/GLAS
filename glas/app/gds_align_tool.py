@@ -1711,6 +1711,13 @@ class ExportWorker(QObject):
             # it prints the swallowed import error so we can fix it.
             print(f"[export] native flatten walk OFF — {oasis_random.native_status()}; "
                   "using the pruned Python walk", flush=True)
+        elif not oasis_random.native_flatten_worthwhile(self._rar):
+            # F27 M7d: big S_BOUNDING_BOX chip — the export uses the sbbox-pruned
+            # walk_roi, so the whole-chip flatten would just spend ~90 s aborting on
+            # a giant merge cell to learn what we already know. Skip it.
+            print("[export] native-walk flatten skipped — big S_BOUNDING_BOX chip "
+                  "uses the sbbox-pruned walk (no whole-chip flatten; saves the "
+                  "~90s probe)", flush=True)
         else:
             walk_layers: set = set()
 

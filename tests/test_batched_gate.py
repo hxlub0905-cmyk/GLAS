@@ -55,3 +55,15 @@ def test_sbbox_present_is_never_affordable():
 def test_huge_cell_count_never_affordable():
     # Past the hard cap the whole-graph build is too big even with a CE layer.
     assert orx._batched_walk_affordable(_Fake(200_000, (108, 250))) is False
+
+
+def test_flatten_prewarm_skipped_on_big_sbbox_chip():
+    # The LTV chip: big + sbbox → the export must skip the whole-chip flatten
+    # prewarm (it aborts on the giant merge cell after ~90 s).
+    assert orx.native_flatten_worthwhile(_Fake(44_997, (108, 250), sbbox=True)) is False
+
+
+def test_flatten_prewarm_kept_for_no_sbbox_and_small():
+    # E3B (no sbbox) and small chips still prewarm as before.
+    assert orx.native_flatten_worthwhile(_Fake(13_000, (108, 250))) is True     # no sbbox
+    assert orx.native_flatten_worthwhile(_Fake(500, (108, 250), sbbox=True)) is True  # small
