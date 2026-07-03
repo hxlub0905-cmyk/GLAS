@@ -66,8 +66,20 @@ from typing import BinaryIO, Callable, Iterator, Optional
 # tuple overhead exceeds the 1-2 iteration Python loop it replaces (benchmarked
 # 0.79-0.81x on synthetic D2DB). The win requires amortizing the C boundary over
 # a whole record / record-run (M2: native record-decode loop), not per scalar.
-# The compiled module (``oasis_fastdecode``) and its delivery path are validated
-# (M0) and reserved for that M2 port; it is intentionally NOT imported here yet.
+#
+# F27 M7f: that amortized boundary is exactly a POLYGON point-list — one C call
+# decodes the whole (variable-length) type-0/1 delta run. Rect runs already went
+# native (decode_rect_run, in oasis_random); polygons went through Python on both
+# paths. Import the extension here ONLY for that point-list kernel (VERSION >= 8);
+# absent / older → _POLY_NATIVE is None and decode_point_list stays pure Python.
+try:
+    import oasis_fastdecode as _POLY_FAST      # noqa: E402
+    _POLY_NATIVE = (_POLY_FAST
+                    if (getattr(_POLY_FAST, "VERSION", 0) >= 8
+                        and hasattr(_POLY_FAST, "decode_pointlist_01"))
+                    else None)
+except Exception:                              # pragma: no cover - no build present
+    _POLY_NATIVE = None
 
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -970,6 +982,24 @@ def decode_point_list(stream: BinaryIO,
     n = decode_unsigned_int(stream)
     if n == 0:
         raise OasisFormatError("point-list with zero count")
+
+    # F27 M7f: native type-0/1 point-list decode (the hot polygon case). Only for
+    # a buffer-backed OasisStream (the real reader exposes _buf/_pos, exactly like
+    # the native rect-run path); unit tests hand a raw BytesIO → pure Python. The
+    # kernel reads the n deltas from _buf at _pos and returns the advanced cursor;
+    # on a >64-bit delta (never in real coords) it raises → fall through to Python.
+    if (for_polygon and (ptype == 0 or ptype == 1)
+            and _POLY_NATIVE is not None
+            and getattr(stream, "_buf", None) is not None
+            and hasattr(stream, "_pos")):
+        try:
+            new_pos, pts_arr = _POLY_NATIVE.decode_pointlist_01(
+                stream._buf, stream._pos, ptype, n, 1)
+        except (OverflowError, ValueError):
+            pass                      # fall through to the pure-Python path
+        else:
+            stream._pos = new_pos     # advance the cursor past the deltas
+            return pts_arr            # (m,2) int64 array; np.asarray downstream = identical
     pts: list[tuple[int, int]] = [(0, 0)]
 
     if ptype == 0 or ptype == 1:

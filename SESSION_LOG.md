@@ -70,7 +70,17 @@ native ON（VERSION 7）、多邊形 100% type 1，並揭露 cell 44995=`iMerge_
 
 **M7f（native 多邊形可行性——先量再決定）：** native 只加速矩形；多邊形兩條路都 Python。加了 opt-in、零成本 off 的
 point-list type 直方圖（見下），真檔量得 **100% type 1**（最好做 native 的情況）；但多邊形只佔那顆 merge cell 的 ~5%，
-故 native type-0/1 對這檔是「有感但非根治」（~260s 大頭在 placement/rect）。→ 交由 user 決定要不要開 CI 一輪。
+故 native type-0/1 對這檔是「有感但非根治」（~260s 大頭在 placement/rect）。user 決定 **做**（B）。
+
+**M7g（native type-0/1 多邊形解碼——.pyx VERSION 8，需 CI 重編）：** 新 `oasis_fastdecode.decode_pointlist_01(buf, pos,
+ptype, n, for_polygon)`——type 0/1（Manhattan zig-zag）point-list 在 C 解，byte-identical 於 `oasis_streamer.decode_point_list`
+的 type 0/1 分支（含 (0,0) anchor + polygon auto-close）。`oasis_streamer` 於 `decode_point_list` 加 native 快路徑：僅
+buffer-backed OasisStream（`_buf`/`_pos`，與 native rect run 同機制；BytesIO 測試 → 純 Python）、僅 for_polygon 且 ptype∈{0,1}、
+`_POLY_NATIVE` 需 VERSION≥8；>64-bit delta（真檔不會）raise → fall back Python。回傳 (m,2) int64 ndarray，`_read_polygon`
+的 `list(...)` + 下游 `np.asarray` 使結果與純 Python 逐位相同。VERSION 7→8、selftest 加測、CI workflow 依 `.pyx` push 觸發
+重編 Windows `.pyd.b64`。實測 point-list 解碼 **~13x**（40 點 × 200K 個）。
+**⚠️ 這輪需 CI：** push 後 CI 重編 `.pyd`（VERSION 8）並 commit 新 `.b64`；user 需**等 CI 綠燈後**再重抓 ZIP + `unpack`。
+CI 完成前舊 VERSION-7 `.pyd` 會讓 poly native 保持 OFF（gate 需 ≥8）→ 功能正常、只是還沒加速。
 
 **測試：** 新 `tests/test_batched_gate.py`（7：含 sbbox 退回 + prewarm 跳過）、`tests/test_decode_heartbeat.py`（3）、
 `tests/test_poly_ptype_histogram.py`（4）；全 `tests/` **855 passed**。**純 Python，未動 `.pyx` → 免 CI，重抓 ZIP 即可。**

@@ -31,7 +31,12 @@ from libc.math cimport floor, ceil, rint
 #     clip (regular grids stay 1 record, never expanded) for rects/placements
 #     AND polygon emit — so a production array chip walks natively without
 #     materializing the whole chip.
-VERSION = 7
+# 8 = + F27 M7f decode_pointlist_01: native type-0/1 (Manhattan) POLYGON
+#     point-list decode. Rect runs were already native; polygons went through
+#     Python on both paths. A production D2DB chip whose polygons are 100%
+#     rectilinear (measured) now decodes them in C — byte-identical to
+#     oasis_streamer.decode_point_list's type 0/1 branch.
+VERSION = 8
 
 
 def decode_uvarint(const unsigned char[::1] buf, Py_ssize_t pos):
@@ -71,6 +76,77 @@ def decode_svarint(const unsigned char[::1] buf, Py_ssize_t pos):
     if raw & 1:
         return -(<long long>(raw >> 1)), new_pos
     return <long long>(raw >> 1), new_pos
+
+
+def decode_pointlist_01(const unsigned char[::1] buf, Py_ssize_t pos,
+                        int ptype, long long n, int for_polygon):
+    """F27 M7f: native type-0/1 (Manhattan zig-zag) point-list decode.
+
+    Byte-identical to ``oasis_streamer.decode_point_list``'s ``ptype in (0, 1)``
+    branch: type 0 starts on the x axis, type 1 on y; each of the ``n`` signed
+    deltas advances the current axis then the axis flips; for a polygon a final
+    implicit closure point is appended (``(0, y)`` if the next step would be x,
+    else ``(x, 0)``). ``pos`` must point at the first delta (the caller has
+    already consumed ``ptype`` + ``n``).
+
+    Returns ``(new_pos, pts)`` where ``pts`` is an ``(m, 2)`` int64 array that
+    begins with the implicit ``(0, 0)`` anchor — the exact sequence the Python
+    path produces, so ``np.asarray(pts)`` downstream is identical. Raises
+    OverflowError on a >64-bit delta so the caller falls back to Python."""
+    cdef Py_ssize_t nb = buf.shape[0]
+    cdef Py_ssize_t p = pos
+    cdef long long x = 0, y = 0
+    cdef int h = 1 if ptype == 0 else 0       # h=1 => next delta moves along x
+    cdef long long i, d
+    cdef unsigned long long raw
+    cdef int shift
+    cdef unsigned int b
+    cdef Py_ssize_t cap = <Py_ssize_t>n + 2   # (0,0) + n steps + 1 closure
+    arr = np.empty((cap, 2), dtype=np.int64)
+    cdef long long[:, ::1] out = arr
+    out[0, 0] = 0
+    out[0, 1] = 0
+    cdef Py_ssize_t count = 1
+    for i in range(n):
+        # inline unsigned-varint (same bytes/overflow rule as decode_uvarint)
+        raw = 0
+        shift = 0
+        while True:
+            if p >= nb:
+                raise ValueError("unexpected EOF inside point-list delta")
+            b = buf[p]
+            p += 1
+            if shift <= 63:
+                raw |= (<unsigned long long>(b & 0x7F)) << shift
+            elif (b & 0x7F):
+                raise OverflowError("point-list delta exceeds 64 bits")
+            if not (b & 0x80):
+                break
+            shift += 7
+            if shift > 70:
+                raise OverflowError("point-list delta overflow")
+        # signed: sign in the low bit
+        if raw & 1:
+            d = -(<long long>(raw >> 1))
+        else:
+            d = <long long>(raw >> 1)
+        if h:
+            x += d
+        else:
+            y += d
+        h = 0 if h else 1
+        out[count, 0] = x
+        out[count, 1] = y
+        count += 1
+    if for_polygon:
+        if h:
+            out[count, 0] = 0
+            out[count, 1] = y
+        else:
+            out[count, 0] = x
+            out[count, 1] = 0
+        count += 1
+    return p, arr[:count]
 
 
 def decode_rect_run(const unsigned char[::1] buf, Py_ssize_t pos,
@@ -809,4 +885,13 @@ def selftest():
         -50.0, -50.0, 1000.0, 1000.0, 128)
     assert rr.shape[0] == 4, rr
     assert ppts.shape[0] == 0 and poff.shape[0] == 1, (ppts, poff)
+    # F27 M7f decode_pointlist_01: type-0 polygon, n=2, deltas +5 (x) +3 (y).
+    # bytes 0x0a 0x06 (svarint 10->+5, 6->+3). Expect the same auto-closed
+    # rectangle the Python path gives: (0,0) (5,0) (5,3) (0,3).
+    np2, pts = decode_pointlist_01(b"\x0a\x06", 0, 0, 2, 1)
+    assert np2 == 2, np2
+    assert pts.shape[0] == 4, pts
+    assert (pts[0, 0] == 0 and pts[0, 1] == 0 and pts[1, 0] == 5
+            and pts[1, 1] == 0 and pts[2, 0] == 5 and pts[2, 1] == 3
+            and pts[3, 0] == 0 and pts[3, 1] == 3), pts
     return VERSION
