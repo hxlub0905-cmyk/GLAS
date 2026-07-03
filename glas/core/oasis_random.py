@@ -841,6 +841,38 @@ class RandomAccessReader:
     def has_offsets(self) -> bool:
         return bool(self._by_refnum)
 
+    def find_giant_cells(self, *, min_bytes: int = 20_000_000,
+                         max_return: int = 4) -> list:
+        """Cell ids whose ENCODED BYTE SPAN is huge — the giant merge cells that
+        dominate decode time (F27 M7j). The span is the gap to the next cell
+        offset in the file, a direct decode-cost proxy that needs no decoding
+        (unlike sbbox area, which a cheap container can also have). Names are
+        preferred over refnums so the returned id matches how the ROI walk reaches
+        a merge cell (by name), keeping the cellcache key aligned. Largest-first,
+        only spans >= ``min_bytes``, capped at ``max_return``.
+
+        Used by the export orchestrator to decode these ONCE up front so the pool
+        workers load them from the sidecar instead of all cold-decoding the same
+        multi-hundred-MB cell at once and thrashing memory."""
+        off_to_id: dict[int, object] = {}
+        for rn, off in self._by_refnum.items():
+            off_to_id.setdefault(off, rn)
+        for nm, off in self._by_name.items():
+            off_to_id[off] = nm           # a name wins (the walk reaches by name)
+        if not off_to_id:
+            return []
+        offs = sorted(off_to_id)
+        try:
+            filesize = len(self._reader._f._buf)
+        except Exception:                 # noqa: BLE001
+            filesize = offs[-1]
+        spans = []
+        for i, off in enumerate(offs):
+            end = offs[i + 1] if i + 1 < len(offs) else filesize
+            spans.append((end - off, off_to_id[off]))
+        spans.sort(key=lambda t: t[0], reverse=True)
+        return [cid for span, cid in spans if span >= min_bytes][:max_return]
+
     def layer_display_name(self, layer: int, datatype: int) -> str:
         """OASIS LAYERNAME for ``(layer, datatype)``, or "" (F3 M2)."""
         return resolve_layer_name(self._layernames, layer, datatype)

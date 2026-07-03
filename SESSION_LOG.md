@@ -99,6 +99,15 @@ M7e 的 warm 失效因為第一張 defect 剛好不碰那顆 cell。**修法（M
 warm 上限 `min(jobs, max(4, workers))`。用的仍是 pool 相同純函式（byte-identical 護欄）。預期 export 首波 ~500s 的 thrashing
 消失、~12min → ~6min 且記憶體峰值 1×。純 Python、874 passed、免 CI。
 
+**M7j（M7i 失敗 → 改用「直接找出並預解巨大 cell」）：** user 實測 M7i 沒用——warm 跑了前 8 張（都很快、沒碰到
+`iMerge_Top`），因為**會碰那顆 cell 的 defect 分散在第 179+ 張**，warm 前幾張抓不到，pool 一開始還是同時冷解 → thrashing
+（img 179–185 各 ~370–533s）。根因:warm「靠 defect 影像」不可靠。改法（M7j）:**不靠 defect，直接從 offset table 的
+「每顆 cell 編碼 byte 跨距」找出巨大 cell**（跨距=到下一顆 offset 的間隔,是解碼成本的直接 proxy、免解碼；比 sbbox 面積準,
+container 也可能有大 bbox）。`RandomAccessReader.find_giant_cells(min_bytes=20MB, max_return=4)` 回傳（優先用 name,對齊
+walk 的 name-ref cache key）最大跨距的幾顆；export orchestrator 在開 pool 前 `load_cell(gid)` 逐一預解（序列化一次、寫
+sidecar）→ workers 直接從 sidecar 載,不再同時冷解那顆 155s 的大 cell。移除 M7e/M7i 的 defect warm 迴圈。新
+`tests/test_giant_cells.py`（3）；全 877 passed、純 Python、免 CI。
+
 **測試：** 新 `tests/test_batched_gate.py`（7：含 sbbox 退回 + prewarm 跳過）、`tests/test_decode_heartbeat.py`（3）、
 `tests/test_poly_ptype_histogram.py`（4）；全 `tests/` **855 passed**。**純 Python，未動 `.pyx` → 免 CI，重抓 ZIP 即可。**
 

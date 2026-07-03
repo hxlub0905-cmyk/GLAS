@@ -1782,49 +1782,33 @@ class ExportWorker(QObject):
         dropped = False
         rows = []
         jobs = self._jobs
-        # F27 M7e/M7i: cold-wave guard. On a big S_BOUNDING_BOX chip whose geometry
+        # F27 M7j: cold-wave guard. On a big S_BOUNDING_BOX chip whose geometry
         # lives in one giant merge cell (the LTV chip: iMerge_Top, ~10.8 M records,
         # ~155 s to decode), if every pool worker cold-decodes that same cell AT
-        # ONCE the box thrashes on memory — real-file traces showed the first wave
-        # of images running 60× slower (7 s → 420 s) purely from contention, same
-        # geometry work. Fix: run images in-thread here UNTIL one of them has freshly
-        # decoded (and sidecar-cached) the giant cell — then the pooled workers load
-        # it in ms instead of all decoding it together. The first image often misses
-        # the giant cell (its ROI is elsewhere), so warm a few until we hit it, then
-        # stop. Each warm image is the exact pure export function the pool runs
-        # (test_export_fused pins it byte-identical), just in-thread.
-        if jobs and not oasis_random.native_flatten_worthwhile(rar):
-            print("[export] warming the shared giant-cell cache in-thread (so the "
-                  "pool workers don't all cold-decode it at once and thrash) …",
-                  flush=True)
-            _GIANT_WARM_RECORDS = 2_000_000
-            warm_cap = min(len(jobs), max(4, workers))
-            warmed = 0
-            while warmed < warm_cap:
-                before = getattr(rar, "_records_decoded_total", 0)
-                try:
-                    fa, row = overlay_export.align_and_export_one_image(
-                        jobs[warmed], rar, self._root, self._poi, self._cfg,
-                        str(self._out_dir), self._export_raw, self._export_overlay,
-                        self._export_gray, self._export_label, self._score_thr,
-                        cancel_cb=lambda: self._cancel.is_set())
-                except oasis_random.WalkCancelled:
-                    return None
-                rows.append(row)
-                done += 1
-                warmed += 1
-                if fa is not None:
-                    self.result.emit(*fa)
-                self.progress.emit(done, n, str(row["image_id"]))
-                if self._cancel.is_set():
-                    return None
-                fresh = getattr(rar, "_records_decoded_total", 0) - before
-                if fresh >= _GIANT_WARM_RECORDS:
-                    print(f"[export] giant cell decoded + cached after "
-                          f"{warmed} in-thread image(s); pooling the rest",
-                          flush=True)
-                    break
-            jobs = jobs[warmed:]
+        # ONCE the box thrashes on memory — real-file traces showed images running
+        # 60× slower (7 s → 420 s) purely from contention. Decoding it ONCE here
+        # (serial, in the orchestrator) writes the cellcache sidecar so the pooled
+        # workers load it in ms. Earlier warms tried the FIRST few defect images,
+        # but the images that touch the giant cell are scattered (position 179+),
+        # so those warms missed it. Find the giant cell directly by its encoded
+        # byte span in the offset table (no decode needed) — that always finds it.
+        if not oasis_random.native_flatten_worthwhile(rar):
+            giants = rar.find_giant_cells()
+            if giants:
+                print(f"[export] pre-decoding {len(giants)} giant merge cell(s) "
+                      f"once so workers load them from cache (avoids the "
+                      f"all-at-once decode that thrashes memory): {giants}",
+                      flush=True)
+                for gid in giants:
+                    if self._cancel.is_set():
+                        return None
+                    try:
+                        rar.load_cell(gid)   # decode + write sidecar (once, here)
+                    except Exception as _e:  # noqa: BLE001 — best effort
+                        print(f"[export] pre-decode of {gid!r} skipped: {_e}",
+                              flush=True)
+                print("[export] giant cell(s) cached; pooling all images",
+                      flush=True)
         if self._cancel.is_set():
             return None
         with fine_align.batch_pool.lease(
