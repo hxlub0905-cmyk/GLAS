@@ -141,6 +141,16 @@ DEBUG = _DEBUG_LEVEL >= 1     # level 1: concise per-load summary
 TRACE = _DEBUG_LEVEL >= 2     # level 2: deep per-cell / per-section telemetry
 oas.PTYPE_COUNT_ON = DEBUG    # F27 M7: polygon point-list type histogram (debug only)
 
+# F27 M7l: keep the level-1 (--debug) log readable on a real export. The decode
+# heartbeat now ticks every ~15 s (not 2 s) so a 4-minute giant-cell decode is
+# ~17 lines, not ~130, while still reading as live progress; and a cell that
+# decodes in under 15 s prints nothing (kills the small-cell noise). The per-layer
+# walk summary is demoted to level 2 UNLESS the layer was actually slow — so the
+# 1000s of fast (~2-3 s) per-image export lines vanish while the genuinely slow
+# ones (the first-wave cold decode / geom) stay visible for diagnosis.
+_DECODE_HB_INTERVAL_S = 15.0  # seconds between intra-cell decode heartbeat lines
+_ROI_SUMMARY_SLOW_S = 8.0     # per-layer walk summary is level-1 only past this
+
 
 def set_debug(on: bool, level: int = 1) -> None:
     """Toggle ROI debug output. ``level`` 1 = concise summary (decode/walk
@@ -1004,7 +1014,7 @@ class RandomAccessReader:
         if not DEBUG:
             return
         now = time.perf_counter()
-        if now - self._decode_hb_t >= 2.0:
+        if now - self._decode_hb_t >= _DECODE_HB_INTERVAL_S:
             self._decode_hb_t = now
             _dbg(f"  … decoding cell {self._decode_cell!r}: {nrec:,} records, "
                  f"{now - self._decode_t0:.0f}s elapsed")
@@ -2438,16 +2448,22 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
     # Level-1 (--debug) summary: one readable line — where the time went, what
     # the cache did, and whether anything went wrong. Deep per-cell / per-spec
     # counters are level-2 (MMH_GDS_DEBUG=2).
-    _dbg(f"{layer}/{datatype} in {stats.elapsed_s:.1f}s | "
-         f"decode {_decode_prof['total']:.1f}s "
-         f"({cached} cached, {fresh} decoded) | "
-         f"place {stats.t_place:.1f}s | "
-         f"geom {stats.t_rect + stats.t_poly:.1f}s | "
-         f"out {stats.rects_emitted}r {stats.polys_emitted}p"
-         + (f" | mat {stats.arrays_materialized}arr/"
-            f"{stats.instances_materialized}inst maxk={stats.max_array_k}"
-            if stats.instances_materialized else "")
-         + (f" | ⚠ {n_err} decode error(s)" if n_err else ""))
+    # F27 M7l: on a real export this fires per-image × per-layer (1000s of lines).
+    # Keep it at level 1 only when the layer was actually slow (or errored) — the
+    # cold first-wave / geom-bound layers we care about — and demote the fast warm
+    # ones to level 2 so --debug stays readable. Interactive single loads still see
+    # the slow (giant-cell) layer; their fast layers fold into the "── loaded in" line.
+    _emit = _dbg if (stats.elapsed_s >= _ROI_SUMMARY_SLOW_S or n_err) else _trace
+    _emit(f"{layer}/{datatype} in {stats.elapsed_s:.1f}s | "
+          f"decode {_decode_prof['total']:.1f}s "
+          f"({cached} cached, {fresh} decoded) | "
+          f"place {stats.t_place:.1f}s | "
+          f"geom {stats.t_rect + stats.t_poly:.1f}s | "
+          f"out {stats.rects_emitted}r {stats.polys_emitted}p"
+          + (f" | mat {stats.arrays_materialized}arr/"
+             f"{stats.instances_materialized}inst maxk={stats.max_array_k}"
+             if stats.instances_materialized else "")
+          + (f" | ⚠ {n_err} decode error(s)" if n_err else ""))
     if _decode_prof["cell"] is not None:
         _trace(f"  slowest decode: cell {_decode_prof['cell']!r} "
                f"{_decode_prof['max']:.1f}s (placements={_decode_prof['np']}, "

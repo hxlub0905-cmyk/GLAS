@@ -4,6 +4,35 @@
 
 ---
 
+## [2026-07-03] [F27 M7l] --debug log 精簡（心跳 15s + 慢層才印）
+
+**變更類型：** 診斷 ergonomics（log 可讀性）· **狀態：本地驗證（550 core passed；GUI 測試因容器缺 libEGL 無法載，與改動無關）**
+
+**動機（user 回報）：** 用 `debug.bat`（`GLAS_DEBUG=1`）跑真檔 export，log 太長貼不動——單顆大 cell 解碼心跳每 2s 一行（260s → ~130 行），
+export 又每張影像印 2–3 條 per-layer `[roi]` 摘要（1500 張 → 數千行）。user 要「少一點但仍有足夠資訊 + 心跳感」。
+
+**修復實作（純 logging，不動任何解碼/幾何輸出）：**
+1. **解碼心跳 2s → 15s**（`_DECODE_HB_INTERVAL_S=15.0`，`_decode_tick`）：4 分鐘的大 cell 解碼 ~17 行（原 ~130），仍讀得出在動；
+   且 **<15s 就解完的小 cell 完全不印**（殺掉 export 途中 33098/41707… 那批小 cell 噪音）。
+2. **per-layer 摘要「慢才印 level 1」**（`_ROI_SUMMARY_SLOW_S=8.0`，walk 尾端 `_emit = _dbg if elapsed>=門檻 or 有 error else _trace`）：
+   export 每張 ~2–3s 的快層自動降 level 2（level 1 看不到），**只有真正慢的層（第一波冷解 172s／geom 189s 那種）留在 level 1**——正是
+   要診斷的訊號。互動單張載入的快層折進既有 `── loaded in Xs` 那行、giant 慢層照印。**互動/export 通用，無需跨行程傳旗標。**
+
+**測試：** 新增行為 smoke（快層 0 行、門檻設 0 時慢層 1 行、常數值）；`tests/test_decode_heartbeat.py`（心跳計數器不受間隔影響）、
+`test_export_timing.py`（`[export-timing]` 未動）、`test_oasis_random` / `test_giant_cells` / `test_batched_gate` 全過。全核心 **550 passed**
+（2 failed + 7 collection error 皆為 headless 容器缺 `libEGL.so.1` 載不動 PyQt6.QtWidgets，非本次改動）。**純 Python → 免 CI，重抓 ZIP 即可。**
+
+**影響檔案：** `glas/core/oasis_random.py`（`_DECODE_HB_INTERVAL_S` / `_ROI_SUMMARY_SLOW_S` 常數 + `_decode_tick` 間隔 + walk 尾端 `_emit` 慢閘）。
+**Branch：** `claude/code-review-handoff-65xwf4`。
+
+**旁註（M7k 驗證的 log 判讀，待續）：** user 貼回第一次（未清快取）export log。判讀：`[export] pre-decoding … ['_2_gri_yank_top']` **瞬間 cached
+無 155s 心跳** → 證明 **M7k offset-key 對那顆大 merge cell 有效**（互動 refnum 44995 與 export name 共用同一份 sidecar）。**但**第一波 8 worker 仍
+各 414–566s（`206/150 decode 172s` + `17/101 geom 189s`）→ 拖慢第一波的**不是**那顆已快取的大 cell，而是**每張各自要冷解的一批 dense cell + rect
+materialize**（`find_giant_cells` 20MB 門檻抓不到、預解沒暖到）→ 8 worker 同時冷做 → thrashing 未消。待 user 用「完全清快取 + 小批（~16 張）」
+重跑 run1/run2 做乾淨的 M7k 驗證後再定位第一波修法（可能要把 pre-decode 從「只暖 giant」擴到「暖第一波會碰的 dense cell」或降 worker 數）。
+
+---
+
 ## [2026-07-02] [F27 M7] 單一 debug 模式 + 解碼心跳 + export-path batched gate + 清理
 
 **變更類型：** 診斷 ergonomics + bug fix（大檔 ROI walk「看似卡住」）· **狀態：本地驗證（848 passed）；待 user 量真檔**
