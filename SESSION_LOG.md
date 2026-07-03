@@ -108,6 +108,13 @@ walk 的 name-ref cache key）最大跨距的幾顆；export orchestrator 在開
 sidecar）→ workers 直接從 sidecar 載,不再同時冷解那顆 155s 的大 cell。移除 M7e/M7i 的 defect warm 迴圈。新
 `tests/test_giant_cells.py`（3）；全 877 passed、純 Python、免 CI。
 
+**M7k（「同一顆 cell 被解兩次」根因 → cellcache key 改用 offset）：** user 追問「walk roi 已 decode，export 又 decode 一次，
+差在哪」——根因:**互動 walk 用 refnum（44995）到達那顆 cell、export walk 用 name（'iMerge_Top'）到達**,而 cellcache key
+是 `repr(cell_id)` → `44995` ≠ `iMerge_Top` → 兩份 sidecar → 解兩次。改法:cellcache 的 key 改用**該 cell 的 byte offset**
+（`RandomAccessReader.cache_key_for()`,refnum/name 都 resolve 到同一 offset）→ 互動與 export（及跨 session）**共用同一份
+sidecar,那顆大 cell 全域只解一次**。`load_cell` 的 load/save + `_place_prep` 的 load_prep/save_prep 皆改用 canonical key。
+`test_cellcache` 的 prep round-trip 測試改用 `cache_key_for`,新增 offset-key 不變式測試；全 878 passed、純 Python、免 CI。
+
 **測試：** 新 `tests/test_batched_gate.py`（7：含 sbbox 退回 + prewarm 跳過）、`tests/test_decode_heartbeat.py`（3）、
 `tests/test_poly_ptype_histogram.py`（4）；全 `tests/` **855 passed**。**純 Python，未動 `.pyx` → 免 CI，重抓 ZIP 即可。**
 

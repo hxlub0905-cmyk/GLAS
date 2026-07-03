@@ -889,6 +889,14 @@ class RandomAccessReader:
             return self._by_name.get(cell_id)
         return None
 
+    def cache_key_for(self, cell_id: object) -> object:
+        """Canonical cross-reader on-disk cache key for a cell — its byte OFFSET,
+        so the SAME cell reached by refnum (44995) from one walk and by name
+        ('iMerge_Top') from another shares one sidecar instead of caching (and
+        decoding) it twice (F27 M7k). Falls back to the id for an unknown cell."""
+        off = self.offset_for(cell_id)
+        return off if off is not None else cell_id
+
     def sbbox_for(self, cell_id: object) -> Optional[Bbox]:
         """S_BOUNDING_BOX *complete* bbox (cid-local grid frame) for
         ``cell_id``, or None if the file didn't carry one for this cell (F16).
@@ -908,16 +916,23 @@ class RandomAccessReader:
         :class:`CellContent` if the cell has no known offset."""
         if cell_id in self._memo:
             return self._memo[cell_id]
+        offset = self.offset_for(cell_id)
+        # F27 M7k: key the on-disk sidecar by the cell's byte OFFSET, not the
+        # cell_id string. The SAME cell is reached by refnum (44995) from one
+        # walk and by name ('iMerge_Top') from another; both resolve to one
+        # offset, so an offset key makes the interactive load and the export
+        # SHARE one sidecar instead of decoding the giant merge cell twice.
+        # (offset_for maps refnum/name/bytes → the same int; None = unknown cell.)
+        ckey = offset if offset is not None else cell_id
         # F16-B: a big flat merge cell costs minutes to decode; reuse a sidecar
         # from a previous session if the source file is unchanged.
-        cached = cellcache.load(self._path, cell_id, self._init_wanted)
+        cached = cellcache.load(self._path, ckey, self._init_wanted)
         if cached is not None:
             self._memo[cell_id] = cached
             self._n_loaded += 1
             self._n_cache_hits += 1
             _trace(f"load_cell {cell_id!r}: served from on-disk cache")
             return cached
-        offset = self.offset_for(cell_id)
         if offset is None:
             _dbg(f"load_cell {cell_id!r}: no offset (unknown cell)")
             content = CellContent()
@@ -971,7 +986,7 @@ class RandomAccessReader:
             self._records_decoded_total = (
                 getattr(self, "_records_decoded_total", 0) + nrec)
             if nrec >= cellcache.min_records():
-                if cellcache.save(self._path, cell_id, self._init_wanted, content):
+                if cellcache.save(self._path, ckey, self._init_wanted, content):
                     _dbg(f"cached decoded cell {cell_id!r} "
                          f"({nrec:,} records) → sidecar (next session loads fast)")
         finally:
@@ -2267,7 +2282,7 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
             # Reuse a persisted gather from a previous session/worker (it is ROI-
             # and layer-independent), so a batch worker skips the ~tens-of-seconds
             # build entirely (F16-B M7).
-            prep = cellcache.load_prep(rar._path, cid)
+            prep = cellcache.load_prep(rar._path, rar.cache_key_for(cid))
             if prep is not None:
                 content._place_prep = prep
         if prep is None:
@@ -2327,7 +2342,7 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
                     arb_skip, unk_skip)
             content._place_prep = prep
             if _big:                          # persist for next session/worker
-                cellcache.save_prep(rar._path, cid, prep)
+                cellcache.save_prep(rar._path, rar.cache_key_for(cid), prep)
         (base_M, base_t, placed_all, arr_local, rcount, valid,
          arb_skip, unk_skip) = prep
         stats.placements_scanned += N
@@ -2538,7 +2553,7 @@ def _batch_place_prep(rar, content, cid, reachable_bbox):
     N = content.placement_count()
     _big = N >= cellcache.min_records()
     if prep is None and _big:
-        prep = cellcache.load_prep(rar._path, cid)
+        prep = cellcache.load_prep(rar._path, rar.cache_key_for(cid))
         if prep is not None:
             content._place_prep = prep
     if prep is None:
@@ -2592,7 +2607,7 @@ def _batch_place_prep(rar, content, cid, reachable_bbox):
                 arb_skip, unk_skip)
         content._place_prep = prep
         if _big:
-            cellcache.save_prep(rar._path, cid, prep)
+            cellcache.save_prep(rar._path, rar.cache_key_for(cid), prep)
     return prep
 
 

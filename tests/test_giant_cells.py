@@ -54,3 +54,13 @@ def test_threshold_and_cap():
 def test_no_offsets_returns_empty():
     r = _reader({}, {}, 0)
     assert r.find_giant_cells() == []
+
+
+def test_cache_key_is_canonical_by_offset():
+    # F27 M7k: the SAME cell reached by refnum (44995) and by name ('iMerge_Top')
+    # must map to ONE cache key (its offset) so it isn't decoded + cached twice.
+    r = _reader({44995: 12345}, {"iMerge_Top": 12345}, 100)
+    assert r.cache_key_for(44995) == 12345
+    assert r.cache_key_for("iMerge_Top") == 12345
+    assert r.cache_key_for(44995) == r.cache_key_for("iMerge_Top")
+    assert r.cache_key_for(999) == 999          # unknown cell → falls back to id
