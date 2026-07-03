@@ -267,6 +267,8 @@ def align_and_export_one_image(job, rar, root, poi_colored, cfg, out_dir,
     _tp0 = getattr(rar, "_walk_tplace_total", 0.0) if _timing else 0.0
     _tr0 = getattr(rar, "_walk_trect_total", 0.0) if _timing else 0.0
     _tpo0 = getattr(rar, "_walk_tpoly_total", 0.0) if _timing else 0.0
+    _am0 = getattr(rar, "_walk_arrmat_total", 0) if _timing else 0
+    _im0 = getattr(rar, "_walk_instmat_total", 0) if _timing else 0
     _bw0 = getattr(rar, "_t_bwalk", 0.0) if _timing else 0.0
     _bu0 = getattr(rar, "_t_bunion", 0.0) if _timing else 0.0
     _bm0 = getattr(rar, "_t_bmorph", 0.0) if _timing else 0.0
@@ -293,6 +295,12 @@ def align_and_export_one_image(job, rar, root, poi_colored, cfg, out_dir,
         bwalk = (getattr(rar, "_t_bwalk", 0.0) - _bw0) * 1e3
         bunion = (getattr(rar, "_t_bunion", 0.0) - _bu0) * 1e3
         bmorph = (getattr(rar, "_t_bmorph", 0.0) - _bm0) * 1e3
+        # F27 M7h: rect-array materialization — pinpoints whether the rect walk
+        # time is a giant repetition array over-expanded (arrmat/instmat/maxk huge
+        # vs few output = fixable) or genuinely proportional to a dense flat cell.
+        arrmat = getattr(rar, "_walk_arrmat_total", 0) - _am0
+        instmat = getattr(rar, "_walk_instmat_total", 0) - _im0
+        maxk = getattr(rar, "_walk_maxk_total", 0)
         print(f"[export-timing] pid={os.getpid()} img={image_id}  "
               f"read={_seg['read']:.0f} walk={_seg['walk']:.0f} "
               f"match={_seg['match']:.0f} raster={_seg['raster']:.0f}  "
@@ -300,6 +308,7 @@ def align_and_export_one_image(job, rar, root, poi_colored, cfg, out_dir,
               f"reach_new={reach_new} cellvisits={cellvisits} "
               f"instances={instances}  "
               f"[walk: place={tplace:.0f} rect={trect:.0f} poly={tpoly:.0f}]  "
+              f"[mat: arrays={arrmat} instances={instmat} maxk={maxk}]  "
               f"[bool: walk={bwalk:.0f} union={bunion:.0f} morph={bmorph:.0f}]  "
               f"status={row['status']}", flush=True)
 

@@ -2369,6 +2369,17 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
                              + stats.t_rect)
     rar._walk_tpoly_total = (getattr(rar, "_walk_tpoly_total", 0.0)
                              + stats.t_poly)
+    # F27 M7h diagnosis: how many rect-array instances the walk had to MATERIALIZE
+    # (expand offsets for) vs how few it emitted. arrays_materialized/instances_
+    # materialized ≫ output means a giant repetition array is being expanded just
+    # to keep a handful near the FOV — the fixable "geom dominates" case; ~equal
+    # means the emit cost is genuinely proportional to output (a dense flat cell).
+    rar._walk_arrmat_total = (getattr(rar, "_walk_arrmat_total", 0)
+                              + stats.arrays_materialized)
+    rar._walk_instmat_total = (getattr(rar, "_walk_instmat_total", 0)
+                               + stats.instances_materialized)
+    rar._walk_maxk_total = max(getattr(rar, "_walk_maxk_total", 0),
+                               stats.max_array_k)
     n_err = len(rar.errors)
     # Level-1 (--debug) summary: one readable line — where the time went, what
     # the cache did, and whether anything went wrong. Deep per-cell / per-spec
@@ -2379,6 +2390,9 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
          f"place {stats.t_place:.1f}s | "
          f"geom {stats.t_rect + stats.t_poly:.1f}s | "
          f"out {stats.rects_emitted}r {stats.polys_emitted}p"
+         + (f" | mat {stats.arrays_materialized}arr/"
+            f"{stats.instances_materialized}inst maxk={stats.max_array_k}"
+            if stats.instances_materialized else "")
          + (f" | ⚠ {n_err} decode error(s)" if n_err else ""))
     if _decode_prof["cell"] is not None:
         _trace(f"  slowest decode: cell {_decode_prof['cell']!r} "

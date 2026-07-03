@@ -82,6 +82,15 @@ buffer-backed OasisStream（`_buf`/`_pos`，與 native rect run 同機制；Byte
 **⚠️ 這輪需 CI：** push 後 CI 重編 `.pyd`（VERSION 8）並 commit 新 `.b64`；user 需**等 CI 綠燈後**再重抓 ZIP + `unpack`。
 CI 完成前舊 VERSION-7 `.pyd` 會讓 poly native 保持 OFF（gate 需 ≥8）→ 功能正常、只是還沒加速。
 
+**M7h（VERSION 8 真檔 log → native poly 對此檔無感 + 定位真瓶頸）：** user 用 VERSION 8 實測：大 cell 解碼速率
+不變（~41K rec/s）→ **多邊形不是解碼時間的大頭**（大頭是 8.8M rects + 1.5M placements），native poly 對此檔淹沒在雜訊。
+真 export 瓶頸（單張密集 defect ~390s）：`iMerge_Top` 解碼 ~155s（cold-wave，M7e 的 warp 沒擋到——第一張 defect
+剛好在該 cell 外）+ 17/101 rect emit（`geom`）**~189s**（每 worker process 首次走那顆才付、之後 ~2s；且互動時同顆只 ~11s
+→ 17x 落差未明）。加診斷把 `arrays_materialized/instances_materialized/max_array_k` 上到 rar accumulator + export-timing
+`[mat: arrays=.. instances=.. maxk=..]` 與互動 per-layer `| mat ..arr/..inst maxk=..`——用真數據判「巨大 repetition array
+被過度展開（可修）」vs「密集 flat cell 本質成本」。純 Python telemetry、873 passed。**下一步：user 重跑 export 貼 `[mat:]`
+數字，再決定 fix。**
+
 **測試：** 新 `tests/test_batched_gate.py`（7：含 sbbox 退回 + prewarm 跳過）、`tests/test_decode_heartbeat.py`（3）、
 `tests/test_poly_ptype_histogram.py`（4）；全 `tests/` **855 passed**。**純 Python，未動 `.pyx` → 免 CI，重抓 ZIP 即可。**
 
