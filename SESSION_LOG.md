@@ -56,8 +56,24 @@ ROI 的那顆大 cell 仍得整顆 decode；1750 MB 檔 → 數分鐘）。過�
   起頭 reset、`_on_roi_finished` 於 DEBUG 印一行，例：`polygon point-types (10 total): 0·manh-h=7 4·gdelta=3 → rectilinear
   0/1 = 70% …`。→ 用真數據決定 polygon native 值不值得做、要做哪幾種。計數不改解碼輸出（byte-identity 不變）。
 
-**測試：** 新 `tests/test_batched_gate.py`（5）、`tests/test_decode_heartbeat.py`（3）、`tests/test_poly_ptype_histogram.py`
-（4：計數/PATH 不計/預設關/無多邊形）；全 `tests/` **853 passed**。**純 Python，未動 `.pyx` → 免 CI，重抓 ZIP 即可。**
+**M7d/M7e（真檔 log 二次分析——export 端兩個 CI-free 加速）：** user 用 `debug.bat` 貼回 LTV 完整 log，證實
+native ON（VERSION 7）、多邊形 100% type 1，並揭露 cell 44995=`iMerge_Top` 是巨大 merge cell（1.5M placements +
+~477K polys + ~8.8M rects = 10.8M records，~260s 解一次、之後 sidecar 秒載）。兩個 export 端浪費：
+- **M7d：省掉開頭 91s 的無用 flatten prewarm。** 大 sbbox 檔 export 開頭會試著整片 flatten 給 native walk，卡在
+  44995（單顆 bbox-decode 72s）abort。但大 sbbox 檔的 walk 本來就走 `walk_roi`（lazy `_flatten_cached` 對 >4000 cell
+  直接 return None），prewarm 只是花 90s 確認一件已知的事。新增 `native_flatten_worthwhile(rar)`（sbbox present 且
+  cell 數 > native cap → False），export 據此跳過 prewarm。無 sbbox（E3B）/ 小檔照舊。
+- **M7e：消除 export 的 cold-wave。** 大 merge cell 檔，每個 pool worker 會「同時各自」冷解同一顆 44995（N× 記憶體 +
+  重工，RAM 吃緊時更慢）。改為在大 sbbox 檔時，orchestrator **先在 in-thread 跑第一張**（解一次 + 寫 sidecar），其餘
+  張再進 pool → workers 從 sidecar 秒載。用的是 pool task 完全相同的純函式 `align_and_export_one_image`（`test_export_fused`
+  護欄），結果 byte-identical，只是換執行位置。
+
+**M7f（native 多邊形可行性——先量再決定）：** native 只加速矩形；多邊形兩條路都 Python。加了 opt-in、零成本 off 的
+point-list type 直方圖（見下），真檔量得 **100% type 1**（最好做 native 的情況）；但多邊形只佔那顆 merge cell 的 ~5%，
+故 native type-0/1 對這檔是「有感但非根治」（~260s 大頭在 placement/rect）。→ 交由 user 決定要不要開 CI 一輪。
+
+**測試：** 新 `tests/test_batched_gate.py`（7：含 sbbox 退回 + prewarm 跳過）、`tests/test_decode_heartbeat.py`（3）、
+`tests/test_poly_ptype_histogram.py`（4）；全 `tests/` **855 passed**。**純 Python，未動 `.pyx` → 免 CI，重抓 ZIP 即可。**
 
 **影響檔案：** `glas/core/oasis_random.py`（心跳欄位 + `_decode_tick` + load_cell arm/clear + 兩 loop 心跳 + `GLAS_DEBUG`
 alias + `_batched_walk_affordable` gate）、`glas/core/fine_align.py`（`_FA_TIMING` 吃 `GLAS_DEBUG`）、

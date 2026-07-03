@@ -1781,6 +1781,35 @@ class ExportWorker(QObject):
         done = 0
         dropped = False
         rows = []
+        jobs = self._jobs
+        # F27 M7e: cold-wave guard. On a big S_BOUNDING_BOX chip whose geometry
+        # lives in one giant merge cell (the LTV chip: any ROI hits cell 44995,
+        # ~260 s to decode), every pool worker would cold-decode that same cell at
+        # once — N× memory + N× redundant CPU. Run the FIRST image in-thread here
+        # first: it decodes the shared cell once and writes the cellcache sidecar,
+        # so the pooled workers load it in seconds instead of each re-decoding it.
+        # Identical result — align_and_export_one_image is the exact pure function
+        # the pool task calls (test_export_fused pins it), just run in-thread.
+        if jobs and not oasis_random.native_flatten_worthwhile(rar):
+            print("[export] warming the shared-cell cache with the first image "
+                  "in-thread (so workers don't each re-decode the giant merge "
+                  "cell) …", flush=True)
+            try:
+                fa, row = overlay_export.align_and_export_one_image(
+                    jobs[0], rar, self._root, self._poi, self._cfg,
+                    str(self._out_dir), self._export_raw, self._export_overlay,
+                    self._export_gray, self._export_label, self._score_thr,
+                    cancel_cb=lambda: self._cancel.is_set())
+            except oasis_random.WalkCancelled:
+                return None
+            rows.append(row)
+            done += 1
+            if fa is not None:
+                self.result.emit(*fa)
+            self.progress.emit(done, n, str(row["image_id"]))
+            jobs = jobs[1:]
+        if self._cancel.is_set():
+            return None
         with fine_align.batch_pool.lease(
                 str(rar._path), rar._init_wanted, rar._dtype, rar._bbox_layer,
                 rar.index_snapshot(), workers) as ex:
@@ -1788,7 +1817,7 @@ class ExportWorker(QObject):
                 overlay_export._afe_pool_task, job, self._root, self._poi,
                 self._cfg, str(self._out_dir), self._export_raw,
                 self._export_overlay, self._export_gray, self._export_label,
-                self._score_thr) for job in self._jobs]
+                self._score_thr) for job in jobs] if jobs else []
             for fut in futures:
                 if self._cancel.is_set() and not dropped:
                     for f in futures:
