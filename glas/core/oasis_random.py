@@ -793,6 +793,7 @@ class RandomAccessReader:
         self._decode_records = 0
         self._decode_t0 = 0.0
         self._decode_hb_t = 0.0
+        self._records_decoded_total = 0   # F27 M7i: cumulative fresh-decoded recs
         _dbg(f"RandomAccessReader: {len(self._by_refnum):,} offsets indexed "
              f"from {self._path.name} (wanted={wanted_layers} "
              f"bbox_layer={bbox_layer})")
@@ -931,6 +932,12 @@ class RandomAccessReader:
             # F16-B: persist big cells so the next session loads them in seconds.
             nrec = (content.placement_count() + content.total_rects()
                     + content.total_polys())
+            # F27 M7i: cumulative FRESHLY-decoded record count (cache hits excluded
+            # — those are cheap). The export warm loop watches its per-image delta
+            # to know when it has decoded (and sidecar-cached) the giant merge cell,
+            # so the pool workers load it instead of all cold-decoding it at once.
+            self._records_decoded_total = (
+                getattr(self, "_records_decoded_total", 0) + nrec)
             if nrec >= cellcache.min_records():
                 if cellcache.save(self._path, cell_id, self._init_wanted, content):
                     _dbg(f"cached decoded cell {cell_id!r} "

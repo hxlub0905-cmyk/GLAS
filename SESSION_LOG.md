@@ -88,8 +88,16 @@ CI 完成前舊 VERSION-7 `.pyd` 會讓 poly native 保持 OFF（gate 需 ≥8�
 剛好在該 cell 外）+ 17/101 rect emit（`geom`）**~189s**（每 worker process 首次走那顆才付、之後 ~2s；且互動時同顆只 ~11s
 → 17x 落差未明）。加診斷把 `arrays_materialized/instances_materialized/max_array_k` 上到 rar accumulator + export-timing
 `[mat: arrays=.. instances=.. maxk=..]` 與互動 per-layer `| mat ..arr/..inst maxk=..`——用真數據判「巨大 repetition array
-被過度展開（可修）」vs「密集 flat cell 本質成本」。純 Python telemetry、873 passed。**下一步：user 重跑 export 貼 `[mat:]`
-數字，再決定 fix。**
+被過度展開（可修）」vs「密集 flat cell 本質成本」。純 Python telemetry、873 passed。
+
+**M7i（`[mat:]` 真檔 log → 定案真因是「記憶體 thrashing」+ 修好 cold-wave）：** `[mat:]` 顯示快（7s）與慢（420s）的
+export 影像 **materialization 完全一樣（~200K instances）**→ 不是展開問題。慢的全是第一波（img 141–153）**同時**冷解同一顆
+`iMerge_Top`（10.8M records）的 worker：7 個 process 各持一份巨大解碼結果 → RAM 爆 → thrashing → 同樣的幾何工作慢 60×。
+M7e 的 warm 失效因為第一張 defect 剛好不碰那顆 cell。**修法（M7i）：** warm 改成**迴圈**——in-thread 連續跑影像直到某張
+「新鮮解碼」了 ≥2M records（即碰到並 sidecar 快取了那顆巨大 cell），才把其餘丟進 pool → workers 從 sidecar 秒載、不再同時
+冷解 → 無 thrashing。加 `RandomAccessReader._records_decoded_total`（僅計 fresh decode、cache hit 不計）給 warm 迴圈偵測；
+warm 上限 `min(jobs, max(4, workers))`。用的仍是 pool 相同純函式（byte-identical 護欄）。預期 export 首波 ~500s 的 thrashing
+消失、~12min → ~6min 且記憶體峰值 1×。純 Python、874 passed、免 CI。
 
 **測試：** 新 `tests/test_batched_gate.py`（7：含 sbbox 退回 + prewarm 跳過）、`tests/test_decode_heartbeat.py`（3）、
 `tests/test_poly_ptype_histogram.py`（4）；全 `tests/` **855 passed**。**純 Python，未動 `.pyx` → 免 CI，重抓 ZIP 即可。**

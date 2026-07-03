@@ -49,3 +49,15 @@ def test_load_still_correct_with_heartbeat(tmp_path):
     res = orx.walk_roi(r, 0, roi, 17, 0)
     assert res["rects"].shape[0] > 0
     assert r._decode_cell is None
+
+
+def test_records_decoded_total_counts_fresh_only(tmp_path):
+    # F27 M7i: the export warm loop watches this to know when it decoded the giant
+    # cell. It must grow on a FRESH decode and NOT on a memo re-hit.
+    r = _reader(tmp_path)
+    assert r._records_decoded_total == 0
+    r.load_cell(0)                      # fresh decode of the root
+    after_first = r._records_decoded_total
+    assert after_first > 0
+    r.load_cell(0)                      # memo hit → no change
+    assert r._records_decoded_total == after_first

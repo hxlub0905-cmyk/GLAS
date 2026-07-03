@@ -1782,32 +1782,49 @@ class ExportWorker(QObject):
         dropped = False
         rows = []
         jobs = self._jobs
-        # F27 M7e: cold-wave guard. On a big S_BOUNDING_BOX chip whose geometry
-        # lives in one giant merge cell (the LTV chip: any ROI hits cell 44995,
-        # ~260 s to decode), every pool worker would cold-decode that same cell at
-        # once — N× memory + N× redundant CPU. Run the FIRST image in-thread here
-        # first: it decodes the shared cell once and writes the cellcache sidecar,
-        # so the pooled workers load it in seconds instead of each re-decoding it.
-        # Identical result — align_and_export_one_image is the exact pure function
-        # the pool task calls (test_export_fused pins it), just run in-thread.
+        # F27 M7e/M7i: cold-wave guard. On a big S_BOUNDING_BOX chip whose geometry
+        # lives in one giant merge cell (the LTV chip: iMerge_Top, ~10.8 M records,
+        # ~155 s to decode), if every pool worker cold-decodes that same cell AT
+        # ONCE the box thrashes on memory — real-file traces showed the first wave
+        # of images running 60× slower (7 s → 420 s) purely from contention, same
+        # geometry work. Fix: run images in-thread here UNTIL one of them has freshly
+        # decoded (and sidecar-cached) the giant cell — then the pooled workers load
+        # it in ms instead of all decoding it together. The first image often misses
+        # the giant cell (its ROI is elsewhere), so warm a few until we hit it, then
+        # stop. Each warm image is the exact pure export function the pool runs
+        # (test_export_fused pins it byte-identical), just in-thread.
         if jobs and not oasis_random.native_flatten_worthwhile(rar):
-            print("[export] warming the shared-cell cache with the first image "
-                  "in-thread (so workers don't each re-decode the giant merge "
-                  "cell) …", flush=True)
-            try:
-                fa, row = overlay_export.align_and_export_one_image(
-                    jobs[0], rar, self._root, self._poi, self._cfg,
-                    str(self._out_dir), self._export_raw, self._export_overlay,
-                    self._export_gray, self._export_label, self._score_thr,
-                    cancel_cb=lambda: self._cancel.is_set())
-            except oasis_random.WalkCancelled:
-                return None
-            rows.append(row)
-            done += 1
-            if fa is not None:
-                self.result.emit(*fa)
-            self.progress.emit(done, n, str(row["image_id"]))
-            jobs = jobs[1:]
+            print("[export] warming the shared giant-cell cache in-thread (so the "
+                  "pool workers don't all cold-decode it at once and thrash) …",
+                  flush=True)
+            _GIANT_WARM_RECORDS = 2_000_000
+            warm_cap = min(len(jobs), max(4, workers))
+            warmed = 0
+            while warmed < warm_cap:
+                before = getattr(rar, "_records_decoded_total", 0)
+                try:
+                    fa, row = overlay_export.align_and_export_one_image(
+                        jobs[warmed], rar, self._root, self._poi, self._cfg,
+                        str(self._out_dir), self._export_raw, self._export_overlay,
+                        self._export_gray, self._export_label, self._score_thr,
+                        cancel_cb=lambda: self._cancel.is_set())
+                except oasis_random.WalkCancelled:
+                    return None
+                rows.append(row)
+                done += 1
+                warmed += 1
+                if fa is not None:
+                    self.result.emit(*fa)
+                self.progress.emit(done, n, str(row["image_id"]))
+                if self._cancel.is_set():
+                    return None
+                fresh = getattr(rar, "_records_decoded_total", 0) - before
+                if fresh >= _GIANT_WARM_RECORDS:
+                    print(f"[export] giant cell decoded + cached after "
+                          f"{warmed} in-thread image(s); pooling the rest",
+                          flush=True)
+                    break
+            jobs = jobs[warmed:]
         if self._cancel.is_set():
             return None
         with fine_align.batch_pool.lease(
