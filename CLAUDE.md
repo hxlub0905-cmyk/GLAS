@@ -218,7 +218,9 @@ HMI 風格表達式 → 遞迴下降 parser → AST → shapely 運算。運算�
 
 ### 進行中 (In Progress)
 
-- （目前無）
+- [F28] 程式內即時效能監控 HUD / Log 獨立視窗（分類彩色、涵蓋全部事件、預設開啟可關）。plan：
+  `docs/plans/F28-perf-hud.md`（已核准，本輪做 M1–M4；M5 deferred）。復用 open PR #15 的
+  `perfmon`/`perf_panel` 地基 + 接 F27 worker 計時 + ramp/RAM。
 
 ### 待辦 (Backlog)
 

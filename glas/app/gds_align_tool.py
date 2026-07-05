@@ -141,6 +141,8 @@ from fine_align import (  # noqa: E402,F401
     poi_polys_and_geometry_for_roi,
     rasterize_layer, render_composite_template, render_poi_template,
 )
+import perfmon          # noqa: E402  — F28: Qt-free perf event bus (HUD feeds off it)
+import perf_panel       # noqa: E402  — F28: the live perf-monitor HUD window
 # F14: the Qt-free per-image image/mask export compute (and the moved
 # overlay_outlines_on_sem / _safe_name helpers) live in glas/core so the export
 # batch can run across a spawn-based ProcessPool, mirroring fine_align (F8).
@@ -6182,6 +6184,16 @@ class MainWindow(QMainWindow):
         self.sem_panel.fine_align.results_requested.connect(self._open_fa_results)
         self.sem_viewer.drag_changed.connect(self._on_overlay_drag)
 
+        # F28: live performance-monitor HUD — a separate top-level window fed by
+        # the Qt-free ``perfmon`` event bus (any thread can record() into it). It
+        # opens by default; its visibility is persisted, and its own close box +
+        # the View-menu toggle stay in sync via the ``closed`` signal.
+        self._perf_win = perf_panel.PerfWindow(perfmon.monitor, self)
+        self._perf_win.closed.connect(
+            lambda: self._view_perf_action.setChecked(False))
+        self._view_perf_action.setChecked(
+            QSettings("GLAS", "GLAS").value("perf_window_open", True, type=bool))
+
         self._doc: Optional[GdsDocument] = None
         self._load_path: Optional[str] = None
 
@@ -6656,6 +6668,16 @@ class MainWindow(QMainWindow):
         quit_action.triggered.connect(self.close)
         menu.addAction(quit_action)
 
+        # F28: View menu — toggle the live performance-monitor HUD window. It is
+        # a separate top-level window (default open); this checkable action + its
+        # own close box both drive visibility, kept in sync via ``perf.closed``.
+        view_menu = self.menuBar().addMenu("&View")
+        self._view_perf_action = QAction("&Performance monitor", self)
+        self._view_perf_action.setCheckable(True)
+        self._view_perf_action.setShortcut("Ctrl+Shift+P")
+        self._view_perf_action.toggled.connect(self._toggle_perf_window)
+        view_menu.addAction(self._view_perf_action)
+
         help_menu = self.menuBar().addMenu("&Help")
         welcome_action = QAction("Show &welcome…", self)
         welcome_action.triggered.connect(self._show_welcome_dialog)
@@ -6664,6 +6686,17 @@ class MainWindow(QMainWindow):
         about_action = QAction("&About", self)
         about_action.triggered.connect(self._show_about)
         help_menu.addAction(about_action)
+
+    def _toggle_perf_window(self, on: bool) -> None:
+        """Show / hide the F28 performance-monitor HUD window and remember it."""
+        win = getattr(self, "_perf_win", None)
+        if win is not None:
+            if on:
+                win.show()
+                win.raise_()
+            else:
+                win.hide()
+        QSettings("GLAS", "GLAS").setValue("perf_window_open", bool(on))
 
     # ── actions ────────────────────────────────────────────────────────────
 
@@ -7137,6 +7170,12 @@ class MainWindow(QMainWindow):
         # ProcessPoolExecutor's atexit handler reaps any stragglers anyway.
         try:
             fine_align.batch_pool.shutdown()
+        except Exception:
+            pass
+        # F28: really close the perf HUD (its own X only hides it) + detach the
+        # monitor callback so no event hits a torn-down widget.
+        try:
+            self._perf_win.shutdown()
         except Exception:
             pass
         super().closeEvent(ev)

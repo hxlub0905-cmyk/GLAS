@@ -4,6 +4,35 @@
 
 ---
 
+## [2026-07-03] [F28 M1+M2] 即時效能監控 HUD — 事件匯流排 + 獨立深色監控台視窗
+
+**變更類型：** 新功能（perf 監控地基 + HUD UI）· **狀態：本地驗證（全套 838 passed；HUD 截圖確認外觀）· 已核准 M1–M4**
+
+**M1 事件匯流排（`glas/core/perfmon.py`，Qt-free，強化自 open PR #15）：** `PerfMonitor` session 單例：
+`record(op, ms, label, category, level, **meta)` + `timed()` context manager + ring buffer + per-op 聚合 +
+`on_event` callback + `.txt` sink；新增 `category`（預設取 op `:` 前綴，供 UI 上色/篩選）、`level`
+（info/warn/error，供標紅）、可選 `echo_console`（用 `devlog` 上色印終端）。RLock 保護、任何 thread 可 record。
+`tests/test_perfmon.py`（16）。
+
+**M2 HUD 視窗（`glas/app/perf_panel.py` → `PerfWindow`）：** 獨立 top-level 深色「監控台」視窗（可丟副螢幕）：
+頂部 **KPI 總覽列**（phase/ramp/throughput/ram/progress，`update_overview`/`push_summary` 餵）＋**聚合表**
+（op 名依分類色）＋**分類彩色 log**（13 類 `CATEGORY_COLORS`，warn/error 標琥珀/紅底 + `⚠`）＋**類別篩選 chips**
+＋**暫停**＋**存 .txt**＋**Clear**。`_Bridge`（event+summary 兩 signal, QueuedConnection）安全跨 thread。
+`tests/test_perf_panel.py`（10，`importorskip PyQt6`）。
+
+**整合（`gds_align_tool.py`）：** MainWindow 建 `PerfWindow`（**預設開啟**、`QSettings` 記憶可見性）；
+新 **View 選單「Performance monitor」toggle**（Ctrl+Shift+P）；視窗 X 只隱藏（`closed` 同步 toggle）；
+MainWindow closeEvent `shutdown()`（真關 + detach monitor callback）。
+
+**尚未接資料：** M3（互動事件插樁）、M4（export worker 即時監控 + ramp/RAM 餵總覽）接續。目前 HUD 空跑不影響任何現有流程
+（monitor 無訂閱者時 record 極輕；未插樁前不產生事件）。截圖預覽已給 user。
+
+**影響檔案：** `glas/core/perfmon.py`（新）、`glas/app/perf_panel.py`（新）、`glas/app/gds_align_tool.py`
+（import + View 選單 + PerfWindow 建立/toggle/closeEvent）、`tests/test_perfmon.py`（新 16）、`tests/test_perf_panel.py`（新 10）。
+**Branch：** `claude/code-review-handoff-65xwf4`（PR #18）。**純 Python → 免 CI。**
+
+---
+
 ## [2026-07-03] [F28 plan] 程式內即時效能監控 HUD / Log 視窗（草擬，待核准）
 
 **變更類型：** 規劃（新功能 plan 檔，尚未動 code）· **狀態：plan 已寫、待 user 核准才開工**

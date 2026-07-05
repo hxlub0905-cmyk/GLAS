@@ -50,9 +50,14 @@ ramp/RAM 狀態，並做分類彩色美化。**console 輸出保留**為 headles
 **選擇：** 保留現況（`perfmon` 加**可選 console sink**，讓事件同時能印到終端），**不移除**既有 print。
 **理由：** headless / cron / 貼 log 分析仍需要；全面改寫每個 print 風險高、收益低。UI 成為主要豐富視圖即可。
 
-### Q5: 開關與 gating？
-**選擇：** View 選單 toggle 開關 dock；dev-mode 下可見（與其他診斷一致）；可見狀態存 `QSettings`。
-**理由：** 與既有 `_dev_mode` / 診斷工具慣例一致；user 要「程式內選擇開啟」。若之後想「一律可見」再放寬。
+### Q5: 開關與 gating？（user 定案）
+**選擇：** HUD 為**獨立 top-level 視窗**（非 dock，可移到第二螢幕邊看邊操作）；**預設開啟**（app 啟動即開）；
+主視窗**上方 toolbar/header 一個 toggle 鈕**可關/開，視窗自身的 X 也是隱藏（toggle 同步狀態）；狀態存
+`QSettings`（記住上次開/關）。**不 dev-mode gate**（一律可用）。
+**理由：** user 明示「預設開啟、可在 UI 上方關掉、log HUD 為獨立視窗」。獨立視窗最適合「邊監控邊操作 / 丟到副螢幕」。
+
+### Q6: M5（worker mid-image 心跳）做不做？
+**選擇：** 先不做（user「聽建議」）。本輪交付 **M1–M4**；M5 標記 deferred，日後需要再評估。
 
 ---
 
@@ -60,26 +65,28 @@ ramp/RAM 狀態，並做分類彩色美化。**console 輸出保留**為 headles
 
 > 粒度：每個 milestone 約一個 session。M1–M4 交付核心價值，M5 可選，M6 收尾。
 
-### M1: 事件匯流排地基（復用 perfmon，Qt-free）  [status: planned]
+### M1: 事件匯流排地基（復用 perfmon，Qt-free）  [status: done 2026-07-03]
 
-- [ ] 從 PR #15 取回 `glas/core/perfmon.py`（`PerfMonitor` 單例 / `record` / `timed` / ring buffer /
-  聚合 / `on_event` / `.txt` sink），對齊目前 schema。
-- [ ] `PerfEvent` 增 `category`（類別 key，供上色/篩選）與 `level`（info/warn/error）欄。
-- [ ] 定義**類別集合 + 顏色對照**（core 端只存類別字串，顏色對照放 app）：
-  `open/scan/roi/decode/boolean/poi/template/export/worker/ramp/align/cache/warn`。
-- [ ] 加**可選 console sink**（`monitor.echo_console=True` 時 record 也用 `devlog` 上色印一行），
-  讓 UI 與終端共用同一事件流。
-- [ ] 驗證：復用 PR #15 的 `tests/test_perfmon.py`（13）+ 新增 category/level/console-sink 測試；全綠。
+- [x] 取回並強化 `glas/core/perfmon.py`（`PerfMonitor` 單例 / `record` / `timed` / ring buffer /
+  聚合 / `on_event` / `.txt` sink）。
+- [x] `PerfEvent` 增 `category`（預設取 op `:` 前綴）與 `level`（info/warn/error）欄。
+- [x] 定義類別集合 `CATEGORIES`（顏色對照放 app 端 `perf_panel.CATEGORY_COLORS`）。
+- [x] 加可選 console sink（`monitor.echo_console=True` → record 也用 `devlog` 上色印一行）。
+- [x] 驗證：新 `tests/test_perfmon.py`（16：聚合/ring/callback/timed/category/level/console/logfile/thread-safe）全綠。
 
-### M2: HUD 面板 UI（復用 perf_panel + 精美化 + 分類彩色）  [status: planned]
+### M2: HUD 視窗 UI（復用 perf_panel + 精美化 + 分類彩色 + 獨立視窗）  [status: done 2026-07-03]
 
-- [ ] 取回 `glas/app/perf_panel.py`，改為**可 dock/可浮動**面板，套 `styles.py` palette（暖色系一致）。
-- [ ] 版面：頂部**總覽列**（ramp/吞吐/RAM/進度/階段占位）＋中段**聚合表**＋下段**分類彩色 log**。
-- [ ] **分類彩色**：每筆 log 依 category 上色（映射到 `styles` 的 ACCENT/SUCCESS/DANGER/WARNING/MIN/MAX…）；
-  warn/error/thrash 標紅底。加**類別篩選 chips**（點選只看某些類別）＋**暫停**鈕。
-- [ ] `_Bridge`（pyqtSignal, QueuedConnection）保留：任何 thread 的事件安全 marshal 回 GUI thread。
-- [ ] View 選單加 “Performance monitor” toggle；可見狀態存 `QSettings`；主視窗關閉 `detach()`。
-- [ ] 驗證：復用 PR #15 的 `tests/test_perf_panel.py`（5）+ 新增分類彩色/篩選/總覽列測試（`importorskip PyQt6`）。
+- [x] `glas/app/perf_panel.py` → `PerfWindow`（獨立 top-level 視窗，`Qt.Window`、parent 為主視窗非 modal、
+  可自由移動/丟副螢幕），**深色監控台配色**（刻意與奶油色主 app 區隔、彩色 log 更醒目）。
+- [x] 版面：頂部**總覽列** KPI tiles（phase/ramp/throughput/ram/progress，`update_overview`/`push_summary` 餵）
+  ＋中段**聚合表**（op 名依分類色）＋下段**分類彩色 log**。
+- [x] **分類彩色**：`CATEGORY_COLORS`（13 類，深底可辨）；warn/error 標琥珀/紅底 + `⚠` flag。
+  **類別篩選 chips**（點選 rebuild log）＋**暫停**（暫停時 log 凍結、resume rebuild）。
+- [x] `_Bridge`（event + summary 兩 signal，QueuedConnection）：任何 thread 安全 marshal 回 GUI。
+- [x] **預設開啟**：MainWindow 建 `PerfWindow`、View 選單「Performance monitor」toggle（Ctrl+Shift+P）；
+  視窗 X 只隱藏（`closed` 同步 toggle）；可見狀態存 `QSettings`；MainWindow closeEvent `shutdown()`（真關+detach）。
+- [x] 驗證：新 `tests/test_perf_panel.py`（10：wiring/事件→表列+log/分類色/篩選/暫停/總覽/warn色/clear/close隱藏/shutdown）；
+  截圖確認外觀精美；全套 **838 passed**。
 
 ### M3: 插樁主行程事件（互動側，涵蓋 Q2「全部」）  [status: planned]
 
@@ -99,7 +106,7 @@ ramp/RAM 狀態，並做分類彩色美化。**console 輸出保留**為 headles
 - [ ] 驗證：`test_export_ram_cap.py` 擴充 run_ramped 事件回呼測試；`test_export_fused` 仍 byte-identical；
   手動真檔 export 看 HUD 即時 worker 狀態（user 端）。
 
-### M5:（可選）worker mid-image 即時心跳（Queue 串流）  [status: planned]
+### M5:（可選）worker mid-image 即時心跳（Queue 串流）  [status: deferred — user「聽建議」先不做]
 
 - [ ] 經 pool init 傳入 `multiprocessing.Queue`；worker 把 decode 心跳（cell/records/elapsed）+ 階段事件 put 上去。
 - [ ] 主行程背景 drainer → `monitor.record` → HUD 顯示「worker 正在解 cell X，第 N 筆」。
