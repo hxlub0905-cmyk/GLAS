@@ -8,7 +8,12 @@ the sidecar-size proxy and the find_giant_cells refactor.
 from __future__ import annotations
 
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+import pytest
 
 _ROOT = Path(__file__).resolve().parents[1]
 for _sub in ("glas/core", "glas/app", "tests"):
@@ -105,3 +110,97 @@ def test_giant_estimate_zero_when_no_giant(tmp_path):
     r = orx.RandomAccessReader(p, wanted_layers={(17, 0)})
     # a tiny fixture has no 20 MB+ span -> no giant -> 0 (no cap).
     assert r.giant_cell_estimate_bytes() == 0
+
+
+# ── run_ramped (F27 M7n: staged warm-up submission) ──────────────────────────
+
+def test_ramp_processes_all_in_order():
+    ex = ThreadPoolExecutor(max_workers=6)
+    got = {}
+    res = fine_align.run_ramped(
+        ex, lambda i: ex.submit(lambda x=i: x * 10), 20,
+        ramp_initial=2, ramp_max=6,
+        on_result=lambda i, r: got.__setitem__(i, r))
+    ex.shutdown()
+    assert res == {i: i * 10 for i in range(20)}
+    assert got == {i: i * 10 for i in range(20)}
+    # rows rebuilt in task order regardless of completion order
+    assert [res[i] for i in sorted(res)] == [i * 10 for i in range(20)]
+
+
+def test_ramp_peak_concurrency_within_max():
+    cur = {"n": 0, "peak": 0}
+    lock = threading.Lock()
+
+    def task(i):
+        with lock:
+            cur["n"] += 1
+            cur["peak"] = max(cur["peak"], cur["n"])
+        time.sleep(0.002)
+        with lock:
+            cur["n"] -= 1
+        return i
+
+    ex = ThreadPoolExecutor(max_workers=8)
+    fine_align.run_ramped(ex, lambda i: ex.submit(task, i), 40,
+                          ramp_initial=2, ramp_max=5, on_result=lambda i, r: None)
+    ex.shutdown()
+    assert cur["peak"] <= 5             # never exceeds ramp_max
+
+
+def test_ramp_initial_burst_is_bounded():
+    # With every task blocked, only ramp_initial can be in flight before any
+    # completes — proving the cold first wave is staged, not all-at-once.
+    release = threading.Event()
+    started = []
+    lock = threading.Lock()
+
+    def task(i):
+        with lock:
+            started.append(i)
+        release.wait(3.0)
+        return i
+
+    ex = ThreadPoolExecutor(max_workers=8)
+    out = {}
+
+    def run():
+        out.update(fine_align.run_ramped(
+            ex, lambda i: ex.submit(task, i), 20,
+            ramp_initial=3, ramp_max=8, on_result=lambda i, r: None))
+
+    t = threading.Thread(target=run)
+    t.start()
+    time.sleep(0.4)
+    with lock:
+        assert len(started) == 3        # exactly ramp_initial, nothing more
+    release.set()
+    t.join(5.0)
+    ex.shutdown()
+    assert not t.is_alive()
+    assert out == {i: i for i in range(20)}
+
+
+def test_ramp_cancel_stops_submission():
+    ex = ThreadPoolExecutor(max_workers=2)
+    n_done = {"n": 0}
+
+    def on_result(i, r):
+        n_done["n"] += 1
+
+    res = fine_align.run_ramped(
+        ex, lambda i: ex.submit(lambda x=i: x), 100,
+        ramp_initial=1, ramp_max=2, on_result=on_result,
+        cancel_cb=lambda: n_done["n"] >= 3)
+    ex.shutdown()
+    assert n_done["n"] >= 3
+    assert len(res) < 100               # stopped early, not the whole batch
+
+
+def test_ramp_noop_when_initial_ge_max():
+    ex = ThreadPoolExecutor(max_workers=4)
+    res = fine_align.run_ramped(
+        ex, lambda i: ex.submit(lambda x=i: x), 10,
+        ramp_initial=4, ramp_max=4, on_result=lambda i, r: None)
+    ex.shutdown()
+    assert res == {i: i for i in range(10)}

@@ -23,7 +23,8 @@ import os
 import sys
 import threading
 import time
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import (FIRST_COMPLETED, CancelledError,
+                                ProcessPoolExecutor, wait)
 
 import numpy as np
 
@@ -201,6 +202,61 @@ def ram_capped_worker_count(auto_workers: int, giant_bytes: int,
     per_worker = max(1, int(giant_bytes * fac))
     cap = int((avail_bytes * frac) // per_worker)
     return max(1, min(auto_workers, cap))
+
+
+def run_ramped(ex, submit_one, n, *, ramp_initial, ramp_max,
+               on_result, cancel_cb=None) -> dict:
+    """Feed ``n`` tasks (indices 0..n-1) to executor ``ex`` with an in-flight cap
+    that starts at ``ramp_initial`` and rises by one per completed task up to
+    ``ramp_max`` (F27 M7n).
+
+    On a cold process pool this warms a few workers at a time — bounding the
+    first-wave memory spike where N workers each ``np.load`` a giant merge cell at
+    once and thrash — then reaches full ``ramp_max`` concurrency so the bulk keeps
+    full throughput. Small batches finish before the ramp opens up (so they never
+    thrash); large batches spend all but the first few tasks at full width. When
+    ``ramp_initial >= ramp_max`` it's a no-op ramp (full width immediately), so a
+    roomy machine sees no behaviour change.
+
+    ``submit_one(i)`` submits task ``i`` on ``ex`` and returns its Future.
+    ``on_result(i, result)`` is called as each task completes (completion order,
+    not submit order). ``cancel_cb()`` truthy stops further submission and cancels
+    in-flight tasks. A task exception (other than cancellation) propagates. Returns
+    ``{i: result}`` for tasks that completed (cancelled ones absent)."""
+    ramp = max(1, min(int(ramp_initial), int(ramp_max)))
+    hard = max(1, int(ramp_max))
+    inflight: dict = {}                 # Future -> task index
+    submitted = 0
+    stopped = False
+    results: dict = {}
+
+    def _fill():
+        nonlocal submitted
+        while (submitted < n and len(inflight) < ramp
+               and not (cancel_cb and cancel_cb())):
+            inflight[submit_one(submitted)] = submitted
+            submitted += 1
+
+    _fill()
+    while inflight:
+        if cancel_cb and cancel_cb() and not stopped:
+            stopped = True
+            for f in list(inflight):
+                f.cancel()              # drop not-yet-started tasks
+        done, _ = wait(list(inflight), return_when=FIRST_COMPLETED)
+        for fut in done:
+            idx = inflight.pop(fut)
+            try:
+                res = fut.result()
+            except CancelledError:
+                continue                # a pending task we just dropped
+            results[idx] = res
+            on_result(idx, res)
+            if ramp < hard:
+                ramp += 1               # one more worker may warm up now
+        if not stopped:
+            _fill()
+    return results
 
 
 # ── Rasterization helper (used by Boolean masks / template) ──────────────────

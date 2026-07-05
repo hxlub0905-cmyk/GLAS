@@ -1692,10 +1692,11 @@ class ExportWorker(QObject):
         warm F23 pool** (keyed on reader identity; the reader is built once by
         ``fine_align._pool_init``). The per-batch context rides each task, and
         ``rar.index_snapshot()`` lets each worker skip its own name-table scan.
-        Jobs are submitted up front (workers stay busy) and consumed in
-        submission order so progress ticks top-to-bottom and the manifest matches
-        the sequential output. Returns rows, or ``None`` if cancelled (partial
-        PNGs on disk are kept)."""
+        Jobs are fed through a RAM-seeded concurrency ramp (F27 M7n) so a cold
+        pool warms a few workers at a time then opens to full throughput; results
+        are collected as they complete and reordered to submission order so the
+        manifest matches the sequential output. Returns rows, or ``None`` if
+        cancelled (partial PNGs on disk are kept)."""
         n = len(self._jobs)
         rar = self._rar
         # F27 M3c: prewarm the native-walk flatten sidecar ONCE here, in the
@@ -1779,8 +1780,6 @@ class ExportWorker(QObject):
         except Exception as _e:      # noqa: BLE001
             print(f"[export] reach prewarm skipped: {_e}", flush=True)
         done = 0
-        dropped = False
-        rows = []
         jobs = self._jobs
         # F27 M7j: cold-wave guard. On a big S_BOUNDING_BOX chip whose geometry
         # lives in one giant merge cell (the LTV chip: iMerge_Top, ~10.8 M records,
@@ -1811,31 +1810,53 @@ class ExportWorker(QObject):
                       flush=True)
         if self._cancel.is_set():
             return None
+        # F27 M7n: seed the concurrency ramp from what THIS machine's free RAM can
+        # hold cold. Each pool worker np.loads its own full copy of the giant merge
+        # cell; N at once on a tight-RAM tool thrash and the first wave runs ~15x
+        # slower. Instead of a hard worker cap (which would slow the bulk of a big
+        # batch), ramp: start at `ramp_initial` and open to full `workers` one per
+        # completion, so the cold pool warms a few at a time then hits full
+        # throughput. No giant / RAM undetectable / roomy machine → ramp_initial ==
+        # workers → no-op (unchanged behaviour). Auto-detected per tool, self-tuning.
+        ramp_initial = fine_align.ram_capped_worker_count(
+            workers, rar.giant_cell_estimate_bytes() if rar is not None else 0,
+            fine_align.available_ram_bytes())
+        if ramp_initial < workers:
+            _gm = (rar.giant_cell_estimate_bytes() if rar is not None else 0) / 1e6
+            _av = (fine_align.available_ram_bytes() or 0) / 1e9
+            print(f"[export] ramping workers {ramp_initial}→{workers} to warm the "
+                  f"cold pool gradually ({_gm:.0f} MB giant × copies vs {_av:.1f} GB "
+                  f"free RAM) — avoids the first-wave memory thrash without capping "
+                  f"bulk throughput; override via 'Parallel workers'", flush=True)
+        rows_by_idx: dict = {}
+
+        def _on_result(idx, res):
+            nonlocal done
+            fa, row = res
+            rows_by_idx[idx] = row
+            done += 1
+            if fa is not None:
+                self.result.emit(*fa)
+            self.progress.emit(done, n, str(row["image_id"]))
+
         with fine_align.batch_pool.lease(
                 str(rar._path), rar._init_wanted, rar._dtype, rar._bbox_layer,
                 rar.index_snapshot(), workers) as ex:
-            futures = [ex.submit(
-                overlay_export._afe_pool_task, job, self._root, self._poi,
-                self._cfg, str(self._out_dir), self._export_raw,
-                self._export_overlay, self._export_gray, self._export_label,
-                self._score_thr) for job in jobs] if jobs else []
-            for fut in futures:
-                if self._cancel.is_set() and not dropped:
-                    for f in futures:
-                        f.cancel()          # drop not-yet-started tasks
-                    dropped = True
-                try:
-                    fa, row = fut.result()
-                except CancelledError:
-                    continue                # a pending task we just dropped
-                rows.append(row)
-                done += 1
-                if fa is not None:
-                    self.result.emit(*fa)
-                self.progress.emit(done, n, str(row["image_id"]))
+
+            def _submit(i):
+                return ex.submit(
+                    overlay_export._afe_pool_task, jobs[i], self._root, self._poi,
+                    self._cfg, str(self._out_dir), self._export_raw,
+                    self._export_overlay, self._export_gray, self._export_label,
+                    self._score_thr)
+
+            fine_align.run_ramped(
+                ex, _submit, len(jobs), ramp_initial=ramp_initial,
+                ramp_max=workers, on_result=_on_result,
+                cancel_cb=self._cancel.is_set)
         if self._cancel.is_set():
             return None
-        return rows
+        return [rows_by_idx[i] for i in sorted(rows_by_idx)]
 
     def _write_manifest(self, rows) -> str:
         csv_path = self._out_dir / "overlay_manifest.csv"

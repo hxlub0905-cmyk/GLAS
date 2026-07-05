@@ -4,6 +4,25 @@
 
 ---
 
+## [2026-07-03] [F27 M7n] export 第一波 ramp-up 分批暖機（消 thrashing 不砍量產吞吐）
+
+**變更類型：** 效能（承 M7m 基礎設施，接線第一波修法）· **狀態：本地驗證（全套 812 passed；`run_ramped` 排程單元測試完整；pool 編排依專案慣例靠真檔 end-to-end）**
+
+**動機：** M7k 證實大 cell 只解一次，但 export 第一波仍 ~400–510s／張 = 記憶體 thrashing（8 worker 各 `np.load` 一份完整 giant cell 同時載 → RAM 尖峰）。**取捨（user 選 D丙：批次不一定、兩者都要）：** 硬砍 worker 消 thrash 但拖慢大批量產（後段 1000+ 輕量張吞吐減半，交叉點 ~200–300 張），不可取。
+
+**修法（ramp-up 分批暖機）：** 不砍 worker 上限，改**控制提交並行度逐步升高**：
+- `fine_align.run_ramped(ex, submit_one, n, ramp_initial, ramp_max, on_result, cancel_cb)`（Qt-free、可測）：in-flight 上限從 `ramp_initial` 起、**每完成一張 +1** 升到滿 `ramp_max`；冷 pool 一次只暖幾個 worker（尖峰受控）、暖了就開到滿（量產全速）。小批還沒開到滿就跑完（天生不 thrash）；大批只有頭幾張分批、其餘全寬。完成順序收集、結尾依 index 重排 → manifest 與循序輸出一致。cancel 停止提交 + 取消 in-flight。
+- **seed 來自 M7m 的 RAM 偵測**：`ramp_initial = ram_capped_worker_count(workers, giant_bytes, avail)`——本機自動偵測、跨 tool 自適應；無 giant／RAM 未知／機器寬裕 → `ramp_initial == workers` → **no-op（零行為變更）**。比硬砍**寬容**：seed 偏高時逐步上線仍分散尖峰。
+- app `ExportWorker._run_process_pool`（1690）：提交迴圈改用 `run_ramped`；DEBUG 下印 `[export] ramping workers R→W …`。互動路徑／`_run_in_thread`（小批 n≤2）不受影響。F13 fine-align-only 的 `_run_process_pool`（1533）本輪未動（可後續比照）。
+
+**測試：** `tests/test_export_ram_cap.py` 增 5（全部處理且依序、peak ≤ ramp_max、初始 burst == ramp_initial〔Event 卡住驗證〕、cancel 早停、initial≥max no-op）；**全套 812 passed**（裝 libEGL 後 GUI/export 測試亦全綠）。**純 Python → 免 CI，重抓 ZIP 即可。**
+
+**待 user 驗收：** 同一批（快取已暖免 155s）重跑，看 `[export] ramping workers R→W` + 第一波是否不再 400s+；大批看後段是否維持全速。
+
+**影響檔案：** `glas/core/fine_align.py`（`run_ramped` + import wait/FIRST_COMPLETED/CancelledError）、`glas/app/gds_align_tool.py`（`ExportWorker._run_process_pool` 提交迴圈 + ramp seed/log + docstring）、`tests/test_export_ram_cap.py`（+5）。**Branch：** `claude/code-review-handoff-65xwf4`（PR #18）。
+
+---
+
 ## [2026-07-03] [F27 M7k 驗證 + M7m 基礎設施] 大 cell 只解一次已證實；第一波真因 = 記憶體 thrashing
 
 **變更類型：** 驗證 + 效能基礎設施（RAM-aware worker cap，尚未接線）· **狀態：M7k 已用真檔證實；M7m 函式+測試就緒（562 passed），接線待 user 決定批次取捨**
