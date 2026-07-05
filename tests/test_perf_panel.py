@@ -124,5 +124,22 @@ def test_shutdown_detaches_callback(app):
     mon = perfmon.PerfMonitor()
     w = perf_panel.PerfWindow(monitor=mon)
     assert mon.on_event is w._emit
+    assert mon.on_summary is w._emit_summary
     w.shutdown()
     assert mon.on_event is None              # detached so no dangling callback
+    assert mon.on_summary is None
+
+
+# ── overview KPIs via monitor.set_summary (F28 M4) ───────────────────────────
+
+def test_summary_wired(win):
+    w, mon = win
+    assert mon.on_summary is w._emit_summary
+
+
+def test_set_summary_reaches_overview_tiles(win, app):
+    w, mon = win
+    mon.set_summary(phase="export", throughput="4.2 img/s")
+    app.processEvents()                      # flush the queued bridge signal
+    assert w._tiles["phase"].text() == "export"
+    assert w._tiles["throughput"].text() == "4.2 img/s"

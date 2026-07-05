@@ -111,6 +111,9 @@ class PerfMonitor:
         self._agg: "OrderedDict[str, dict]" = OrderedDict()
         # UI HUD 掛這個（單一消費者）。record() 在持鎖外呼叫回呼，避免回呼反向取鎖。
         self.on_event: Optional[Callable[[PerfEvent], None]] = None
+        # UI HUD 的頂部總覽列掛這個：任何 thread 可 :meth:`set_summary` 推 ramp/吞吐/
+        # RAM/進度 等即時 KPI（與 per-event 流分開，不進 ring buffer / 聚合）。
+        self.on_summary: Optional[Callable[[dict], None]] = None
         self.enabled = True
         # 開了才也印到終端（用 devlog 上色）；預設關，避免與既有 print 雙重輸出。
         self.echo_console = False
@@ -160,6 +163,16 @@ class PerfMonitor:
             except Exception:
                 pass
         return ev
+
+    def set_summary(self, **fields) -> None:
+        """推一組即時 KPI 到 UI 總覽列（phase/ramp/throughput/ram/progress 任意子集）。
+        可從任何 thread 呼叫（UI 端負責 marshal 回 GUI thread）。無訂閱者 → no-op。"""
+        cb = self.on_summary
+        if cb is not None and fields:
+            try:
+                cb(dict(fields))
+            except Exception:
+                pass
 
     @contextmanager
     def timed(self, op: str, label: str = "", *, category: str = "",

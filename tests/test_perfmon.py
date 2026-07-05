@@ -150,6 +150,31 @@ def test_disabled_monitor_records_nothing():
     assert m.aggregates() == []
 
 
+# ── set_summary (F28 M4: overview KPIs) ──────────────────────────────────────
+
+def test_set_summary_calls_subscriber():
+    m = _fresh()
+    got = []
+    m.on_summary = got.append
+    m.set_summary(ramp="3 → 8", progress="1/10")
+    assert got == [{"ramp": "3 → 8", "progress": "1/10"}]
+
+
+def test_set_summary_no_subscriber_is_noop():
+    m = _fresh()
+    m.set_summary(ramp="x")             # no on_summary → nothing happens, no error
+
+
+def test_set_summary_swallows_subscriber_error():
+    m = _fresh()
+
+    def boom(_d):
+        raise RuntimeError("hud gone")
+
+    m.on_summary = boom
+    m.set_summary(ramp="x")             # must not propagate
+
+
 def test_format_event_shape():
     ev = perfmon.PerfEvent(op="roi", label="6/0", ms=12.3, meta={"rects": 5})
     line = perfmon.format_event(ev)

@@ -88,23 +88,25 @@ ramp/RAM 狀態，並做分類彩色美化。**console 輸出保留**為 headles
 - [x] 驗證：新 `tests/test_perf_panel.py`（10：wiring/事件→表列+log/分類色/篩選/暫停/總覽/warn色/clear/close隱藏/shutdown）；
   截圖確認外觀精美；全套 **838 passed**。
 
-### M3: 插樁主行程事件（互動側，涵蓋 Q2「全部」）  [status: planned]
+### M3: 插樁主行程事件（互動側，涵蓋 Q2「全部」）  [status: done 2026-07-03]
 
-- [ ] 在既有計時點呼叫 `monitor.record`：open+index、scan layers、ROI walk（per-layer decode/place/geom/mat）、
-  boolean eval、POI/template build、coordinate jump、alignment（matchTemplate）。多數點已有耗時數字，只需接線。
-- [ ] 讓這些點的 `[roi]` 等既有 print 與 `monitor.record` 共用一份資料（避免雙重量測）。
-- [ ] 驗證：手動開面板做一次互動載入 + boolean + 對位，確認各類別事件即時上色出現；`pytest` 綠。
+- [x] 在既有計時點呼叫 `perfmon.monitor.record`（全在 app 端主行程 callback，**core 保持與 perf 系統解耦**）：
+  **open+index**（reader built）、**scan layers**（`_on_scan`/`_on_scan_finished`）、**ROI walk**（`_on_roi_finished`
+  逐 layer decode/geom/rects，慢層標 warn）、**boolean eval**（`_recompute_recipes`）、**align**（單張 `_on_run_fine_align`）。
+- [x] 用既有 stats（per_layer / perf_counter）記錄，不新增量測、不動 core。
+- [x] 驗證：全套 838 passed（後續 M4 再 +5）；截圖含互動類別事件上色。（poi/template/coordinate-jump 屬次要，暫略。）
 
-### M4: export worker 即時監控（批次側，user 痛點）  [status: planned]
+### M4: export worker 即時監控（批次側，user 痛點）  [status: done 2026-07-03]
 
-- [ ] `fine_align.run_ramped` 加事件回呼：submit/start/complete + 目前 in-flight（→ HUD 即時顯示
-  「worker 槽位 → img N，已跑 Ts」＋ ramp `R→W`＋吞吐 img/s）。
-- [ ] per-image worker 計時**回傳**：`align_and_export_one_image` / `_afe_pool_task` 附帶 timing dict
-  （decode/emit/bool/mat/total/pid）。**護欄：** 維持 `test_export_fused` 的 `(fa,row)` byte-identical
-  （timing 為附加、不動 fa/row；必要時測試改解包 3 元素並仍斷言 fa/row 相等）。
-- [ ] HUD 依回傳明細畫 per-worker 分解 + **thrash 警示**（decode 或 emit 遠高於暖值→標紅）＋可用 RAM。
-- [ ] 驗證：`test_export_ram_cap.py` 擴充 run_ramped 事件回呼測試；`test_export_fused` 仍 byte-identical；
-  手動真檔 export 看 HUD 即時 worker 狀態（user 端）。
+- [x] **per-image 計時由 orchestrator 量測**（`ExportWorker._run_process_pool` 的 `_submit`/`_on_result` 記
+  submit→complete wall time）——**免動 `align_and_export_one_image`（保持 byte-identical）**、免 run_ramped 回呼。
+- [x] `_afe_pool_task` 僅多回傳 `os.getpid()`（3-tuple），讓 orchestrator 依 **worker pid 分組**（`worker:<pid>` op）；
+  `_run_in_thread` 用主 pid 同樣記錄。`test_export_fused` 只需改該一處解包（fa/row 斷言不變 → byte-identity 保住）。
+- [x] **thrash 警示**：per-image ≥ 30s → `level=warn`（HUD 標紅）。**總覽 KPI**：`perfmon.set_summary` 推
+  phase/ramp `R→W`/throughput img/s/free RAM/progress（每張刷新，RAM 即時）。
+- [x] perfmon 加 `on_summary`+`set_summary`（跨 thread 推總覽，與 on_event 對稱）；PerfWindow 掛 `on_summary`。
+- [x] 驗證：`test_perfmon.py`（+3 set_summary）、`test_perf_panel.py`（+2 summary→overview）、`test_export_fused`
+  護欄過；全套 **843 passed**；M4 export-flow 截圖確認 per-worker 列 + thrash 標紅 + 即時 KPI。
 
 ### M5:（可選）worker mid-image 即時心跳（Queue 串流）  [status: deferred — user「聽建議」先不做]
 

@@ -4,6 +4,36 @@
 
 ---
 
+## [2026-07-03] [F28 M3+M4] HUD 接上資料 — 互動事件插樁 + export worker 即時監控
+
+**變更類型：** 新功能（perf HUD 資料接線）· **狀態：本地驗證（全套 843 passed；M4 export-flow 截圖確認）**
+
+**M3 互動側插樁（全在 app 端主行程 callback，core 保持與 perf 系統解耦）：** `perfmon.monitor.record` 於
+**open+index**（reader built）、**scan layers**（`_on_scan`/`_on_scan_finished`）、**ROI walk**（`_on_roi_finished`
+逐 layer decode/geom/rects，慢層 warn）、**boolean**（`_recompute_recipes`）、**align**（單張 `_on_run_fine_align`）。
+用既有 stats / perf_counter，不新增量測、不動 core。
+
+**M4 export worker 即時監控（user 痛點；關鍵設計 = 免動 byte-identical 核心）：**
+- **per-image 計時由 orchestrator 量測**（`ExportWorker._run_process_pool` 的 `_submit`/`_on_result` 記 submit→complete
+  wall time）→ **`align_and_export_one_image` 完全不動、保持 byte-identical**（`test_export_fused` 6 個直接呼叫免改）。
+- `_afe_pool_task` 僅多回傳 `os.getpid()`（3-tuple）→ orchestrator 依 **worker pid 分組**（`worker:<pid>` op，HUD 每 worker 一列）；
+  `_run_in_thread` 用主 pid 同樣記錄。唯一測試改動：`test_export_fused` 那一處 `_afe_pool_task` 解包（fa/row 斷言不變）。
+- **thrash 警示**：per-image ≥ 30s → warn（HUD 標紅）。**總覽 KPI**：`perfmon.set_summary` 推 phase/ramp `R→W`/
+  throughput img/s/free RAM（每張刷新）/progress。
+- **perfmon 加 `on_summary`+`set_summary`**（跨 thread 推總覽，與 on_event 對稱）；`PerfWindow` 掛 `on_summary`、shutdown 一併 detach。
+
+**測試：** `test_perfmon.py`（+3 set_summary）、`test_perf_panel.py`（+2 summary→overview wiring/整合）、`test_export_fused`
+（`_afe_pool_task` 解包 + pid 斷言）；全套 **843 passed**。**純 Python → 免 CI。**
+
+**影響檔案：** `glas/core/perfmon.py`（on_summary/set_summary）、`glas/core/overlay_export.py`（`_afe_pool_task` 回 pid）、
+`glas/app/perf_panel.py`（掛 on_summary）、`glas/app/gds_align_tool.py`（M3 插樁 ×5 + M4 orchestrator 量測/worker 事件/總覽 KPI）、
+`tests/test_perfmon.py`（+3）、`tests/test_perf_panel.py`（+2）、`tests/test_export_fused.py`（解包）、
+`docs/plans/F28-perf-hud.md`（M3/M4 done）、`CLAUDE.md`（§4 模組 + §8）。**Branch：** `claude/code-review-handoff-65xwf4`（PR #18）。
+
+**剩 M6 收尾：** README 補「效能監控」段、處理 open PR #15（本案取代）、user 真檔驗收（開 HUD 跑 export 看即時 worker 列 + thrash 標紅）。
+
+---
+
 ## [2026-07-03] [F28 M1+M2] 即時效能監控 HUD — 事件匯流排 + 獨立深色監控台視窗
 
 **變更類型：** 新功能（perf 監控地基 + HUD UI）· **狀態：本地驗證（全套 838 passed；HUD 截圖確認外觀）· 已核准 M1–M4**

@@ -95,7 +95,9 @@ class PerfWindow(QWidget):
         self._bridge.summary.connect(self.update_overview,
                                      Qt.ConnectionType.QueuedConnection)
         self._emit = self._bridge.event.emit
+        self._emit_summary = self._bridge.summary.emit
         self._monitor.on_event = self._emit
+        self._monitor.on_summary = self._emit_summary
         self._prime_from_monitor()
 
     # ── UI ────────────────────────────────────────────────────────────────────
@@ -339,6 +341,8 @@ class PerfWindow(QWidget):
         """主視窗真的要關時呼叫：切斷 callback + 關 log 檔 + 真正關閉。"""
         if self._monitor.on_event is self._emit:
             self._monitor.on_event = None
+        if self._monitor.on_summary is self._emit_summary:
+            self._monitor.on_summary = None
         self._monitor.close_logfile()
         super().close()
 
