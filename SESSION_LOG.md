@@ -4,6 +4,24 @@
 
 ---
 
+## [2026-07-03] [F28 plan] 程式內即時效能監控 HUD / Log 視窗（草擬，待核准）
+
+**變更類型：** 規劃（新功能 plan 檔，尚未動 code）· **狀態：plan 已寫、待 user 核准才開工**
+
+**動機：** user 要把除錯體驗從「盯 `debug.bat` 終端」升級成**程式內可開關、精美、分類彩色、資訊詳盡的即時
+監控視窗**（Q1=甲 UI HUD、Q2=C 全部事件皆記錄且分類上色）。**復用 open PR #15**（`perfmon.py` Qt-free 事件
+收集器 + `perf_panel.py` HUD dock 骨架，其已知缺口「subprocess worker 事件回不來」正是 F27 `[export-timing]`
+要接的）。關鍵設計：即時 worker 監控**用主程式 `run_ramped` 的 in-flight 追蹤 + 完成回傳明細，免跨行程 IPC**
+（mid-image 心跳才需 Queue，列可選 M5）。
+
+**產出：** `docs/plans/F28-perf-hud.md`（Goal / Q&A（甲C + 架構抉擇）/ M1 事件匯流排地基 · M2 HUD UI 精美分類彩色 ·
+M3 互動事件插樁 · M4 export worker 即時監控 · M5 可選心跳 · M6 收尾 / Affected Files / Risks / 驗證）。
+建議先交付 M1+M2 再逐步長出。**未動任何程式碼。**
+
+**影響檔案：** `docs/plans/F28-perf-hud.md`（新）。**Branch：** `claude/code-review-handoff-65xwf4`（PR #18）。
+
+---
+
 ## [2026-07-03] [F27 M7n] export 第一波 ramp-up 分批暖機（消 thrashing 不砍量產吞吐）
 
 **變更類型：** 效能（承 M7m 基礎設施，接線第一波修法）· **狀態：本地驗證（全套 812 passed；`run_ramped` 排程單元測試完整；pool 編排依專案慣例靠真檔 end-to-end）**

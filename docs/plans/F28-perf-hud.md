@@ -1,0 +1,156 @@
+# [F28] 程式內即時效能監控 HUD / Log 視窗（分類彩色、涵蓋全部事件）
+
+> **狀態：** planned
+> **§8 ID：** [F28]
+> **建立：** 2026-07-03
+> **負責 branch：** claude/code-review-handoff-65xwf4（PR #18）
+
+---
+
+## Goal & Context
+
+**問題觀察：** F27 一連串效能除錯全靠 `debug.bat` 的終端輸出（`[roi]` / `[export-timing]` /
+`[export] ramping …` …）。訊息雖豐富但：(1) 在 console 快速捲動、難即時看趨勢；(2) export
+worker 是**獨立行程**，per-worker 計時只 print 掉、UI 拿不到；(3) 無分類彩色、不易一眼分辨。
+user 要求把除錯體驗升級成**程式內可開關的、精美、分類彩色、資訊詳盡的即時監控視窗**，取代盯終端機。
+
+**成功長相：** 主視窗內一個可開關（View 選單）的 dock 面板，即時顯示：
+- **頂部總覽列：** ramp 狀態 `R→W`、吞吐 `img/s`、可用 RAM、已完成 `N/total`、目前階段。
+- **per-worker / per-op 聚合表：** 每個 worker(pid) 或操作類別的 最近/次數/平均/最大 耗時，即時更新。
+- **分類彩色事件 log：** 每筆事件依**類別上色**（ROI/Export/Decode/Boolean/Align/Cache/Warn…），
+  可篩選類別、可暫停、可存 `.txt`。異常（decode/emit 尖峰＝thrash、錯誤）標紅。
+- **即時 worker 監控：** 哪個 worker 正在跑哪張、已跑幾秒（主程式 `run_ramped` 本就知道，免跨行程 IPC）；
+  每張完成時補上 decode/emit/bool/mat 明細。
+
+**與現有系統關係：** **復用並取代** open PR #15（`perfmon.py` + `perf_panel.py`，已建好 Qt-free 事件
+收集器 + HUD dock 骨架，但只量主行程操作、沒有 worker 資料）。本案把它接上 F27 的 worker 計時 +
+ramp/RAM 狀態，並做分類彩色美化。**console 輸出保留**為 headless / log 檔 fallback（不移除、不再加強）。
+
+---
+
+## Q&A Decisions
+
+### Q1: 顯示在哪？
+**選項：** 甲 UI dock HUD ／ 乙 終端即時儀表板 ／ 丙 兩者
+**選擇：** 甲（UI dock HUD）。**理由：** user 要「像時時監控那樣」的精美視窗、程式內開關；終端不再是重點
+（保留為 fallback，不再加強）。
+
+### Q2: 監控範圍？
+**選項：** A 只 export ／ B 也含互動 ／ C 全部
+**選擇：** C（全部事件皆可記錄）。**理由：** user 明示「任何事件都可以記錄，但可以分類、不同事件不同顏色」。
+
+### Q3: 即時 worker 監控如何取得資料（避免脆弱的跨行程 IPC）？
+**選項：** (a) 主程式 in-flight 追蹤 + 完成時回傳明細（無 IPC）／ (b) worker 經 `multiprocessing.Queue`
+即時串流（含 mid-image 心跳）
+**選擇：** 先做 (a)（M4），(b) 列為可選 M5。**理由：** 主程式的 `run_ramped` 已掌握「哪張在哪個 worker、
+起訖時間」，能即時顯示 worker 忙碌狀態 + 完成明細，**零跨行程風險**、涵蓋 95% 需求；mid-image 心跳
+（大 cell 解到第幾筆）才需要 Queue，留待確認值不值得。
+
+### Q4: console 輸出怎麼辦？
+**選擇：** 保留現況（`perfmon` 加**可選 console sink**，讓事件同時能印到終端），**不移除**既有 print。
+**理由：** headless / cron / 貼 log 分析仍需要；全面改寫每個 print 風險高、收益低。UI 成為主要豐富視圖即可。
+
+### Q5: 開關與 gating？
+**選擇：** View 選單 toggle 開關 dock；dev-mode 下可見（與其他診斷一致）；可見狀態存 `QSettings`。
+**理由：** 與既有 `_dev_mode` / 診斷工具慣例一致；user 要「程式內選擇開啟」。若之後想「一律可見」再放寬。
+
+---
+
+## Milestones
+
+> 粒度：每個 milestone 約一個 session。M1–M4 交付核心價值，M5 可選，M6 收尾。
+
+### M1: 事件匯流排地基（復用 perfmon，Qt-free）  [status: planned]
+
+- [ ] 從 PR #15 取回 `glas/core/perfmon.py`（`PerfMonitor` 單例 / `record` / `timed` / ring buffer /
+  聚合 / `on_event` / `.txt` sink），對齊目前 schema。
+- [ ] `PerfEvent` 增 `category`（類別 key，供上色/篩選）與 `level`（info/warn/error）欄。
+- [ ] 定義**類別集合 + 顏色對照**（core 端只存類別字串，顏色對照放 app）：
+  `open/scan/roi/decode/boolean/poi/template/export/worker/ramp/align/cache/warn`。
+- [ ] 加**可選 console sink**（`monitor.echo_console=True` 時 record 也用 `devlog` 上色印一行），
+  讓 UI 與終端共用同一事件流。
+- [ ] 驗證：復用 PR #15 的 `tests/test_perfmon.py`（13）+ 新增 category/level/console-sink 測試；全綠。
+
+### M2: HUD 面板 UI（復用 perf_panel + 精美化 + 分類彩色）  [status: planned]
+
+- [ ] 取回 `glas/app/perf_panel.py`，改為**可 dock/可浮動**面板，套 `styles.py` palette（暖色系一致）。
+- [ ] 版面：頂部**總覽列**（ramp/吞吐/RAM/進度/階段占位）＋中段**聚合表**＋下段**分類彩色 log**。
+- [ ] **分類彩色**：每筆 log 依 category 上色（映射到 `styles` 的 ACCENT/SUCCESS/DANGER/WARNING/MIN/MAX…）；
+  warn/error/thrash 標紅底。加**類別篩選 chips**（點選只看某些類別）＋**暫停**鈕。
+- [ ] `_Bridge`（pyqtSignal, QueuedConnection）保留：任何 thread 的事件安全 marshal 回 GUI thread。
+- [ ] View 選單加 “Performance monitor” toggle；可見狀態存 `QSettings`；主視窗關閉 `detach()`。
+- [ ] 驗證：復用 PR #15 的 `tests/test_perf_panel.py`（5）+ 新增分類彩色/篩選/總覽列測試（`importorskip PyQt6`）。
+
+### M3: 插樁主行程事件（互動側，涵蓋 Q2「全部」）  [status: planned]
+
+- [ ] 在既有計時點呼叫 `monitor.record`：open+index、scan layers、ROI walk（per-layer decode/place/geom/mat）、
+  boolean eval、POI/template build、coordinate jump、alignment（matchTemplate）。多數點已有耗時數字，只需接線。
+- [ ] 讓這些點的 `[roi]` 等既有 print 與 `monitor.record` 共用一份資料（避免雙重量測）。
+- [ ] 驗證：手動開面板做一次互動載入 + boolean + 對位，確認各類別事件即時上色出現；`pytest` 綠。
+
+### M4: export worker 即時監控（批次側，user 痛點）  [status: planned]
+
+- [ ] `fine_align.run_ramped` 加事件回呼：submit/start/complete + 目前 in-flight（→ HUD 即時顯示
+  「worker 槽位 → img N，已跑 Ts」＋ ramp `R→W`＋吞吐 img/s）。
+- [ ] per-image worker 計時**回傳**：`align_and_export_one_image` / `_afe_pool_task` 附帶 timing dict
+  （decode/emit/bool/mat/total/pid）。**護欄：** 維持 `test_export_fused` 的 `(fa,row)` byte-identical
+  （timing 為附加、不動 fa/row；必要時測試改解包 3 元素並仍斷言 fa/row 相等）。
+- [ ] HUD 依回傳明細畫 per-worker 分解 + **thrash 警示**（decode 或 emit 遠高於暖值→標紅）＋可用 RAM。
+- [ ] 驗證：`test_export_ram_cap.py` 擴充 run_ramped 事件回呼測試；`test_export_fused` 仍 byte-identical；
+  手動真檔 export 看 HUD 即時 worker 狀態（user 端）。
+
+### M5:（可選）worker mid-image 即時心跳（Queue 串流）  [status: planned]
+
+- [ ] 經 pool init 傳入 `multiprocessing.Queue`；worker 把 decode 心跳（cell/records/elapsed）+ 階段事件 put 上去。
+- [ ] 主行程背景 drainer → `monitor.record` → HUD 顯示「worker 正在解 cell X，第 N 筆」。
+- [ ] 驗證：Queue 生命週期（含 F23 常駐 pool、cancel）不洩漏；手動看大 cell 解碼即時進度。
+- [ ] **先確認值不值得做**（(a) 已涵蓋大部分；此為錦上添花）。
+
+### M6: 收尾（測試 / 文件 / 護欄）  [status: planned]
+
+- [ ] 面板關閉時 `monitor` overhead ≈ 0（無訂閱者則 record 極輕）；thread-safety 覆核。
+- [ ] `CLAUDE.md` §4/§5 補模組（perfmon/perf_panel）；README 補「效能監控」段；`SESSION_LOG` 條目。
+- [ ] 關閉/處理 PR #15（本案取代之：或 cherry-pick 後 close，或說明差異）。
+- [ ] 全套 `pytest tests/ -q` 綠。
+
+---
+
+## Affected Files
+
+- `glas/core/perfmon.py`（**新/復用自 PR #15**：event bus，加 category/level/console sink）
+- `glas/app/perf_panel.py`（**新/復用自 PR #15**：dock HUD，精美化 + 分類彩色 + 篩選 + 總覽列）
+- `glas/app/gds_align_tool.py`（View 選單 toggle、掛 dock、ExportWorker/互動插樁、`run_ramped` 事件）
+- `glas/core/fine_align.py`（`run_ramped` 事件回呼；per-image timing 回傳）
+- `glas/core/overlay_export.py`（`align_and_export_one_image` 回傳 timing；護欄）
+- `glas/core/devlog.py`（category→色 對照可共用；console sink）
+- `tests/test_perfmon.py`（復用+擴充）、`tests/test_perf_panel.py`（復用+擴充）、`tests/test_export_ram_cap.py`（run_ramped 事件）
+- `docs/plans/F28-perf-hud.md`（本檔）、`CLAUDE.md`、`README.md`、`SESSION_LOG.md`
+
+---
+
+## Risks / Open Questions
+
+- **byte-identical 護欄**：M4 動 `align_and_export_one_image` 回傳；務必保 `test_export_fused` 的 fa/row 逐位相同。
+- **執行緒/行程安全**：`monitor.record` 已 RLock；worker 事件走「回傳（M4）」或「Queue（M5）」，皆不直接碰 GUI。
+- **效能 overhead**：面板關閉時 record 必須極輕（無訂閱者早退）；插樁不得拖慢熱路徑。
+- **pool 編排無單元測試**（專案慣例靠真檔 end-to-end）：M4/M5 的即時顯示最終靠 user 真檔驗收。
+- **待 user 後續確認**：M5（mid-image 心跳）值不值得做；面板要不要「非 dev-mode 也可見」。
+- **範圍不小**：建議先交付 **M1+M2**（地基+可開的彩色 HUD 空殼），再 M3（互動事件）、M4（worker）逐步長出。
+
+---
+
+## 驗證方式
+
+- [ ] 所有 milestone checkbox 已勾（M5 可選）
+- [ ] `pytest tests/test_perfmon.py tests/test_perf_panel.py tests/test_export_ram_cap.py tests/test_export_fused.py -v` 通過
+- [ ] 手動：程式內 View→Performance monitor 開面板 → 做一次互動載入 + 一次批次 export → 各類別事件即時、
+  分類彩色、worker 槽位即時、thrash 標紅；存 `.txt` 可回貼
+- [ ] `SESSION_LOG.md` 有對應紀錄
+
+---
+
+## 完成後
+
+- 最終 SESSION_LOG 條目註記 `完成 [F28]`；`CLAUDE.md` §8 若登記則移除
+- 處理 open PR #15（取代/close）
+- 本檔保留為 design history
