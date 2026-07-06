@@ -4,6 +4,26 @@
 
 ---
 
+## [2026-07-03] [F28 hotfix] HUD decode 後閃退修復 + 配色改沿用主 app 暖色系（user 回報）
+
+**變更類型：** bug fix（閃退）+ UI 配色 · **狀態：本地驗證（846 passed；截圖確認新配色）**
+
+**#1 閃退（嚴重）：** user 回報「decode 完會閃退」。根因：M3 在 `_on_roi_finished`（decode 完回呼）呼叫
+`self._perf_win.update_overview(phase=…, progress=…)` 用**關鍵字參數**，但 `update_overview(self, summary: dict)`
+只吃一個 dict → **TypeError**；此為 queued signal slot，PyQt6 遇未捕捉例外直接 abort → 閃退。GUI 測試未驅動真 ROI 載入
+故 843 passed 漏了此路徑。**修：** `update_overview(self, summary=None, **fields)` 同時吃 dict 與 kwargs。新增回歸測試。
+
+**#2 配色（user 覺得深色監控台與奶油色主 app 突兀）：** `perf_panel` 改**沿用 `styles.py` 暖奶油色系 token**
+（`BG_PAGE`/`BG_SURFACE`/`BG_INPUT`/`BORDER_DEFAULT`/`TEXT_PRIMARY`/`TEXT_HINT`/`ACCENT`），與整體 UI 一致；
+`CATEGORY_COLORS` 13 類改成**在淺底上可辨的深飽和色**；warn 列改淺琥珀底、error 用 `DANGER_BG`；chip 選中填色白字。
+
+**測試：** `tests/test_perf_panel.py` +1（`update_overview` 吃 kwargs 的回歸）；全套 **846 passed**。純 Python。
+
+**影響檔案：** `glas/app/perf_panel.py`（update_overview 簽名 + 配色/_qss/_chip_qss 改淺色 + `import styles`）、
+`tests/test_perf_panel.py`（+1）。**Branch：** `claude/code-review-handoff-65xwf4`（PR #18）。
+
+---
+
 ## [2026-07-03] [F28 M6 部分] README「效能監控 HUD」段 + 關閉 PR #15（本案取代）
 
 **變更類型：** 文件 + repo 收尾 · **狀態：完成（M6 剩 user 真機驗收）**

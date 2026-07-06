@@ -143,3 +143,15 @@ def test_set_summary_reaches_overview_tiles(win, app):
     app.processEvents()                      # flush the queued bridge signal
     assert w._tiles["phase"].text() == "export"
     assert w._tiles["throughput"].text() == "4.2 img/s"
+
+
+def test_update_overview_accepts_kwargs(win):
+    # regression: _on_roi_finished calls update_overview(phase=…, progress=…) with
+    # KEYWORD args. The dict-only signature raised TypeError in that Qt slot →
+    # PyQt6 aborted the app right after an ROI decode ("閃退"). Must accept both.
+    w, _mon = win
+    w.update_overview(phase="interactive load", progress="3,418 rects")
+    assert w._tiles["phase"].text() == "interactive load"
+    assert w._tiles["progress"].text() == "3,418 rects"
+    w.update_overview({"ram": "5.1 GB free"})    # dict form still works
+    assert w._tiles["ram"].text() == "5.1 GB free"

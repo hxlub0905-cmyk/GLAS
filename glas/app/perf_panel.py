@@ -26,34 +26,35 @@ from PyQt6.QtWidgets import (
 )
 
 import perfmon
+import styles
 
-# ── 深色監控台配色（獨立視窗，刻意與奶油色主 app 區隔，彩色 log 更醒目）─────────────
-_BG = "#1e1f22"
-_PANEL = "#26282c"
-_LOG_BG = "#161719"
-_BORDER = "#33363b"
-_TEXT = "#d6d9df"
-_MUTED = "#888e98"
+# ── 配色：沿用主 app 的暖奶油色系（直接取 styles.py token，與整體 UI 一致）──────────
+_BG = styles.BG_PAGE            # #f7f4ef  視窗底
+_PANEL = styles.BG_SURFACE      # #fff8f2  tile / 聚合表底
+_LOG_BG = styles.BG_INPUT       # #ffffff  log 底
+_BORDER = styles.BORDER_DEFAULT  # #e8d8c8
+_TEXT = styles.TEXT_PRIMARY     # #3f3428
+_MUTED = styles.TEXT_HINT       # #8a7660
 
-# 分類 → 顏色（在深底上都清楚可辨、彼此夠分）。未列分類走 _CAT_DEFAULT。
+# 分類 → 顏色（在淺奶油底上都清楚可辨、彼此夠分；用深/飽和色達對比）。未列走 _CAT_DEFAULT。
 CATEGORY_COLORS = {
-    "open": "#6cb6ff",     # blue    — 開檔 + 建索引
-    "scan": "#7ee0c0",     # teal    — 掃 layer
-    "roi": "#4ec9b0",      # cyan    — ROI walk
-    "decode": "#f2a04b",   # amber   — cell 解碼
-    "boolean": "#c586c0",  # purple  — Boolean
-    "poi": "#dcdcaa",      # khaki   — POI build
-    "template": "#9cdcfe",  # l-blue  — template
-    "export": "#89d185",   # green   — image export
-    "worker": "#b8a2ff",   # lilac   — pool worker
-    "ramp": "#e6c07b",     # gold    — worker ramp
-    "align": "#4fc1ff",    # br-blue — matchTemplate
-    "cache": "#9aa0a6",    # gray    — cell cache
-    "warn": "#f28b82",     # coral   — 警示
+    "open": "#2f6ea5",     # blue   — 開檔 + 建索引
+    "scan": "#2b8a7a",     # teal   — 掃 layer
+    "roi": "#1f8a70",      # green  — ROI walk
+    "decode": "#c9791a",   # amber  — cell 解碼（≈ app ACCENT_ACTIVE）
+    "boolean": "#8e44ad",  # purple — Boolean
+    "poi": "#9a7b3f",      # khaki  — POI build
+    "template": "#3a6a8a",  # blue  — template
+    "export": "#3e7f5d",   # green  — image export（≈ app SUCCESS_TEXT）
+    "worker": "#6b4fb0",   # violet — pool worker
+    "ramp": "#a9741a",     # gold   — worker ramp
+    "align": "#3170a8",    # blue   — matchTemplate
+    "cache": "#7a6a5a",    # brown  — cell cache（≈ app TEXT_SECONDARY）
+    "warn": "#b8442b",     # red    — 警示（深 DANGER）
 }
-_CAT_DEFAULT = "#b0b4bb"
-_WARN_BG = "#3a2a1c"
-_ERROR_BG = "#3c2222"
+_CAT_DEFAULT = "#6a5a48"
+_WARN_BG = "#fbf0dd"           # 淺琥珀（thrash/warn 底）
+_ERROR_BG = styles.DANGER_BG   # #feeee8（error 底）
 
 
 def category_color(cat: str) -> str:
@@ -274,10 +275,13 @@ class PerfWindow(QWidget):
             self._table.setItem(row, c, item)
 
     # ── 總覽列（GUI thread；M4 餵資料）─────────────────────────────────────────
-    def update_overview(self, summary: dict) -> None:
-        """更新頂部 KPI tiles。``summary`` 可含 phase/ramp/throughput/ram/progress
-        任意子集（缺的不動）。可透過 :meth:`push_summary` 從 worker thread 安全呼叫。"""
-        for key, val in (summary or {}).items():
+    def update_overview(self, summary=None, **fields) -> None:
+        """更新頂部 KPI tiles。可傳 dict（``update_overview({"ramp": …})``，bridge 用）
+        或關鍵字（``update_overview(phase=…)``，呼叫端方便）；兩者皆可、缺的不動。
+        亦可透過 :meth:`push_summary` 從 worker thread 安全呼叫。"""
+        data = dict(summary or {})
+        data.update(fields)
+        for key, val in data.items():
             lbl = self._tiles.get(key)
             if lbl is not None:
                 lbl.setText(str(val))
@@ -351,17 +355,18 @@ class PerfWindow(QWidget):
         return f"""
         QWidget {{ background:{_BG}; color:{_TEXT};
                    font-family:'Segoe UI','Noto Sans',sans-serif; font-size:12px; }}
-        QLabel#title {{ font-size:14px; font-weight:600; color:#eef0f4; }}
+        QLabel#title {{ font-size:14px; font-weight:600; color:{styles.TEXT_PRIMARY}; }}
         QFrame#tile {{ background:{_PANEL}; border:1px solid {_BORDER};
                        border-radius:7px; }}
         QLabel#tileCap {{ color:{_MUTED}; font-size:9px; letter-spacing:1px; }}
-        QLabel#tileVal {{ color:#eef0f4; font-size:15px; font-weight:600; }}
-        QPushButton#tool {{ background:{_PANEL}; border:1px solid {_BORDER};
+        QLabel#tileVal {{ color:{styles.TEXT_PRIMARY}; font-size:15px; font-weight:600; }}
+        QPushButton#tool {{ background:{styles.BG_INPUT}; border:1px solid {_BORDER};
                             border-radius:6px; padding:4px 10px; color:{_TEXT}; }}
-        QPushButton#tool:hover {{ border-color:#4a4e55; background:#2e3136; }}
+        QPushButton#tool:hover {{ border-color:{styles.ACCENT};
+                                  background:{styles.ACCENT_BG}; }}
         QToolButton#chip {{ border:1px solid {_BORDER}; border-radius:9px;
                             padding:1px 8px; font-size:10px; color:{_MUTED};
-                            background:transparent; }}
+                            background:{styles.BG_INPUT}; }}
         QTableWidget {{ background:{_PANEL}; border:1px solid {_BORDER};
                         border-radius:7px; gridline-color:transparent; }}
         QHeaderView::section {{ background:{_PANEL}; color:{_MUTED};
@@ -376,7 +381,7 @@ class PerfWindow(QWidget):
     @staticmethod
     def _chip_qss(color: str) -> str:
         return (f"QToolButton#chip {{ color:{_MUTED}; }}"
-                f"QToolButton#chip:checked {{ color:#17181a; background:{color};"
+                f"QToolButton#chip:checked {{ color:#ffffff; background:{color};"
                 f" border-color:{color}; font-weight:600; }}")
 
 
