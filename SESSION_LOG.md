@@ -4,6 +4,26 @@
 
 ---
 
+## [2026-07-03] [F28 review-fix] M7l 慢層閘改用「本次 walk 新增 error 數」（PR #18 codex P2）
+
+**變更類型：** bug fix（承 M7l；PR #18 review 指出）· **狀態：本地驗證（845 passed）**
+
+**現象（reviewer 正確指出）：** M7l 的 per-layer summary 慢層閘 `_emit = _dbg if (elapsed>=門檻 or n_err) else _trace`
+用 `n_err = len(rar.errors)`（**累積值**）。batch export 每個 worker 重用同一 `RandomAccessReader`、`rar.errors` 只增不減
+（僅互動載入才清），故一旦某張碰到壞 cell，之後**每張快層又全部回到 level 1** → M7l 的「慢才印」在長 export 遇到一顆
+壞 cell 後就失效、log 又洪流。
+
+**修復：** `walk_roi` 起頭記 `errs_at_start = len(rar.errors)`（比照既有 `cells_at_start` 慣例），summary 改用
+**delta** `n_err = len(rar.errors) - errs_at_start`（本次 walk 新增的 error 數）→ 只有真正在這次 walk 出錯的層才強制
+level 1，累積舊 error 不再污染。`walk_roi_batched`/`walk_roi_fast` 無此 summary、不受影響。
+
+**測試：** 新 `tests/test_roi_summary_gate.py`（2：預置累積 error 後快層仍降級 / 乾淨快層降級）；全套 **845 passed**。純 Python。
+
+**影響檔案：** `glas/core/oasis_random.py`（`walk_roi` baseline + delta gate）、`tests/test_roi_summary_gate.py`（新）。
+**Branch：** `claude/code-review-handoff-65xwf4`（PR #18）。
+
+---
+
 ## [2026-07-03] [F28 M3+M4] HUD 接上資料 — 互動事件插樁 + export worker 即時監控
 
 **變更類型：** 新功能（perf HUD 資料接線）· **狀態：本地驗證（全套 843 passed；M4 export-flow 截圖確認）**

@@ -2122,6 +2122,9 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
     _t0 = time.perf_counter()
     cells_at_start = rar._n_loaded
     hits_at_start = rar._n_cache_hits
+    errs_at_start = len(rar.errors)     # F28: baseline so the summary gate below
+    #                                     counts NEW errors this walk, not the
+    #                                     reader's cumulative total.
     stats = RoiWalkStats()
     rect_out: list = []
     poly_out: list = []
@@ -2477,7 +2480,12 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
                                + stats.instances_materialized)
     rar._walk_maxk_total = max(getattr(rar, "_walk_maxk_total", 0),
                                stats.max_array_k)
-    n_err = len(rar.errors)
+    # F28: NEW errors from THIS walk only — a batch worker reuses one reader
+    # across many images and rar.errors is append-only, so gating the summary on
+    # the cumulative len(rar.errors) would force every later fast layer back to
+    # level 1 after a single bad cell, defeating the M7l slow-layer filter for the
+    # rest of a long export. Gate (and display) the per-walk delta instead.
+    n_err = len(rar.errors) - errs_at_start
     # Level-1 (--debug) summary: one readable line — where the time went, what
     # the cache did, and whether anything went wrong. Deep per-cell / per-spec
     # counters are level-2 (MMH_GDS_DEBUG=2).
