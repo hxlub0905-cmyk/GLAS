@@ -4,6 +4,26 @@
 
 ---
 
+## [2026-07-03] [F28 事件可見性] ramp 事件永遠印（含 no-ramp 理由）+ decode 事件擴及互動載入（user 回報 E3B）
+
+**變更類型：** 事件可見性/一致性 · **狀態：本地驗證（846 passed）**
+
+**背景（user 跑 E3B 檔回報「ramp/decode log 沒出來」）：** E3B（`sbbox=0`、階層式密集葉、**無 giant merge cell**）與
+LTV（單一 10.8M-record giant）本質不同。原本 ramp 事件 gated 在 `_gbytes>0`、decode 事件只在 export giant 預解 →
+E3B 兩者都不亮，user 誤以為壞了。**釐清：** E3B 無 giant → 無 thrash 風險 → **8→8 不 ramp 是正確且最佳**
+（E3B 第一波 ~30s 是密集葉「冷解」CPU-bound、非記憶體 thrash；砍 worker 反而更慢）。
+
+**修（可見性/一致性）：**
+- **ramp 事件永遠印**（不再 gated）：`warm R→W (giant thrash guard)` ／ `W workers · giant fits → no ramp` ／
+  `W workers · no giant cell → no ramp (CPU-bound)`，附 giant MB / free RAM → user 一眼看懂決策，不再靜默。
+- **decode 事件擴及互動載入**：`_on_roi_finished` 若本次 `t_decode≥1s 且 decoded>0` 補記一筆 `decode`
+  （label=`N cells`，≥30s 標紅）→ E3B/任何真的有解碼的載入都會亮 decode chip，不再只限 export giant 預解。
+
+**測試：** 全套 **846 passed**。純 Python。**影響檔案：** `glas/app/gds_align_tool.py`（ramp 事件不 gated + 互動 decode 事件）。
+**Branch：** `claude/code-review-handoff-65xwf4`（PR #18）。
+
+---
+
 ## [2026-07-03] [F28 補事件 + Export log] 補齊沒記錄的類別、ramp 進 HUD、Rec.txt 改一次性匯出（user 回報）
 
 **變更類型：** 功能補完 + UX · **狀態：本地驗證（846 passed；截圖確認 11 類全亮）**

@@ -1856,16 +1856,21 @@ class ExportWorker(QObject):
                   f"{(_avail or 0) / 1e9:.1f} GB free RAM) — avoids the first-wave "
                   f"memory thrash without capping bulk throughput; override via "
                   f"'Parallel workers'", flush=True)
-        # F28: surface the ramp decision in the perf HUD (previously console-only,
-        # so users couldn't see whether/why the first-wave ramp engaged).
-        if _gbytes > 0:
-            perfmon.monitor.record(
-                "ramp", 0.0, category="ramp",
-                label=(f"warm {ramp_initial} → {workers} workers"
-                       if ramp_initial < workers
-                       else f"{workers} workers (RAM roomy — no ramp)"),
-                giant=f"{_gbytes / 1e6:.0f}MB",
-                free_ram=(f"{_avail / 1e9:.1f}GB" if _avail else "?"))
+        # F28: ALWAYS surface the ramp decision in the perf HUD (even when it's a
+        # no-op) so it's never silent — otherwise a file with no giant cell (E3B:
+        # hierarchical, no S_BOUNDING_BOX) looks like the ramp "didn't fire". Only
+        # a giant merge cell makes the first wave MEMORY-bound (worth staggering);
+        # without one the cold decode is CPU-bound and full width is optimal.
+        if ramp_initial < workers:
+            _ramp_label = f"warm {ramp_initial} → {workers} workers (giant thrash guard)"
+        elif _gbytes > 0:
+            _ramp_label = f"{workers} workers · giant fits in RAM → no ramp"
+        else:
+            _ramp_label = f"{workers} workers · no giant cell → no ramp (CPU-bound)"
+        perfmon.monitor.record(
+            "ramp", 0.0, category="ramp", label=_ramp_label,
+            giant=(f"{_gbytes / 1e6:.0f}MB" if _gbytes > 0 else "none"),
+            free_ram=(f"{_avail / 1e9:.1f}GB" if _avail else "?"))
         rows_by_idx: dict = {}
         # F28 M4: feed the live perf HUD. Per-image wall time is measured HERE
         # (submit→complete), grouped by the worker pid the pool task returns, so
@@ -7910,6 +7915,14 @@ class MainWindow(QMainWindow):
                 level=(perfmon.LEVEL_WARN if s.elapsed_s >= 30 else "info"))
         self._perf_win.update_overview(phase="interactive load",
                                        progress=f"{total_rects:,} rects")
+        # F28: a "decode" event when this load did real fresh decoding (E3B: dense
+        # leaf cells; LTV: the giant flat cell) — so the decode chip lights on any
+        # file that actually decodes, not only the export giant pre-decode.
+        if t_decode >= 1.0 and decoded > 0:
+            perfmon.monitor.record(
+                "decode", t_decode * 1e3, label=f"{decoded:,} cells",
+                category="decode",
+                level=(perfmon.LEVEL_WARN if t_decode >= 30 else "info"))
         # F27 M7: polygon point-list type histogram — tells us whether a native
         # (Cython) polygon decoder would help this file, and which encodings.
         if oasis_random.DEBUG and total_polys:
