@@ -1791,10 +1791,13 @@ class ExportWorker(QObject):
             import time as _time
             _rt = _time.perf_counter()
             if oasis_random.reach_prewarm(rar, self._root):
-                print(f"[export] reach-bbox map ready in "
-                      f"{_time.perf_counter() - _rt:.0f}s "
-                      f"({len(getattr(rar, '_reach_memo', ()))} cells; "
-                      f"shared with workers)", flush=True)
+                _rms = (_time.perf_counter() - _rt) * 1e3
+                _rcells = len(getattr(rar, "_reach_memo", ()))
+                print(f"[export] reach-bbox map ready in {_rms / 1e3:.0f}s "
+                      f"({_rcells} cells; shared with workers)", flush=True)
+                perfmon.monitor.record(              # F28: → perf HUD
+                    "cache", _rms, label="reach-bbox map", category="cache",
+                    cells=_rcells)
         except Exception as _e:      # noqa: BLE001
             print(f"[export] reach prewarm skipped: {_e}", flush=True)
         done = 0
@@ -1819,13 +1822,21 @@ class ExportWorker(QObject):
                 for gid in giants:
                     if self._cancel.is_set():
                         return None
+                    _dt0 = time.perf_counter()
                     try:
                         rar.load_cell(gid)   # decode + write sidecar (once, here)
+                        _dms = (time.perf_counter() - _dt0) * 1e3
+                        perfmon.monitor.record(   # F28: → perf HUD (cold vs cached)
+                            "decode", _dms, label=f"giant {gid}", category="decode",
+                            level=(perfmon.LEVEL_WARN if _dms >= 30_000 else "info"))
                     except Exception as _e:  # noqa: BLE001 — best effort
                         print(f"[export] pre-decode of {gid!r} skipped: {_e}",
                               flush=True)
                 print("[export] giant cell(s) cached; pooling all images",
                       flush=True)
+                perfmon.monitor.record(
+                    "cache", 0.0, label=f"{len(giants)} giant cell(s) ready",
+                    category="cache")
         if self._cancel.is_set():
             return None
         # F27 M7n: seed the concurrency ramp from what THIS machine's free RAM can
@@ -1845,6 +1856,16 @@ class ExportWorker(QObject):
                   f"{(_avail or 0) / 1e9:.1f} GB free RAM) — avoids the first-wave "
                   f"memory thrash without capping bulk throughput; override via "
                   f"'Parallel workers'", flush=True)
+        # F28: surface the ramp decision in the perf HUD (previously console-only,
+        # so users couldn't see whether/why the first-wave ramp engaged).
+        if _gbytes > 0:
+            perfmon.monitor.record(
+                "ramp", 0.0, category="ramp",
+                label=(f"warm {ramp_initial} → {workers} workers"
+                       if ramp_initial < workers
+                       else f"{workers} workers (RAM roomy — no ramp)"),
+                giant=f"{_gbytes / 1e6:.0f}MB",
+                free_ram=(f"{_avail / 1e9:.1f}GB" if _avail else "?"))
         rows_by_idx: dict = {}
         # F28 M4: feed the live perf HUD. Per-image wall time is measured HERE
         # (submit→complete), grouped by the worker pid the pool task returns, so
@@ -1894,6 +1915,11 @@ class ExportWorker(QObject):
                 ex, _submit, len(jobs), ramp_initial=ramp_initial,
                 ramp_max=workers, on_result=_on_result,
                 cancel_cb=self._cancel.is_set)
+        # F28: batch-level summary event (the "export" category) + reset the strip.
+        _batch_ms = (time.perf_counter() - _bt0) * 1e3
+        perfmon.monitor.record(
+            "export", _batch_ms, label=f"{done} / {n} images", category="export",
+            throughput=f"{done / max(1e-6, _batch_ms / 1e3):.1f} img/s")
         perfmon.monitor.set_summary(phase="idle")
         if self._cancel.is_set():
             return None
@@ -7119,14 +7145,17 @@ class MainWindow(QMainWindow):
         anchor = self._coarse_anchor(img)
         H, W = sem.shape[:2]
         cfg = self.sem_panel.fine_align.values()
-        _at0 = time.perf_counter()
+        _tt0 = time.perf_counter()
         template = self._build_template(anchor, W, H, nm_per_px, cfg)
+        perfmon.monitor.record(          # F28: template synth → HUD
+            "template", (time.perf_counter() - _tt0) * 1e3,
+            label=str(img.image_id), category="template")
         radius_px = cfg["search_radius_nm"] / nm_per_px
+        _mt0 = time.perf_counter()
         dx_nm, dy_nm, score, used_r = fine_align_one(sem, template, nm_per_px,
                                                      radius_px)
-        # F28 M3: single-image fine align (template synth + matchTemplate) → HUD.
-        perfmon.monitor.record(
-            "align", (time.perf_counter() - _at0) * 1e3,
+        perfmon.monitor.record(          # F28 M3: matchTemplate → HUD
+            "align", (time.perf_counter() - _mt0) * 1e3,
             label=str(img.image_id), category="align", score=round(score, 3),
             dx=f"{dx_nm:.0f}", dy=f"{dy_nm:.0f}")
         self._refined[img.image_id] = (dx_nm, dy_nm, score)

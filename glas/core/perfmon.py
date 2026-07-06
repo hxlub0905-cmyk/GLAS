@@ -39,10 +39,10 @@ LEVEL_INFO = "info"
 LEVEL_WARN = "warn"
 LEVEL_ERROR = "error"
 
-# 粗分類的正典集合（UI 篩選 chips + 顏色對照的 key；顏色對照本身在 app 端）。未列的
-# 分類 UI 以中性色顯示，仍可運作。
-CATEGORIES = ("open", "scan", "roi", "decode", "boolean", "poi", "template",
-              "export", "worker", "ramp", "align", "cache", "warn")
+# 粗分類的正典集合（= UI 篩選 chips，只列「真的會產生事件」的分類，避免出現永遠不亮的
+# chip）。顏色對照 `perf_panel.CATEGORY_COLORS` 可另含 warn（供 level=warn 的列上色，非 chip）。
+CATEGORIES = ("open", "scan", "roi", "decode", "boolean", "template",
+              "export", "worker", "ramp", "align", "cache")
 
 # op 類別 → 顯示名（聚合表與 log 共用；未列的 op 原樣顯示）。
 OP_LABELS = {

@@ -4,6 +4,32 @@
 
 ---
 
+## [2026-07-03] [F28 補事件 + Export log] 補齊沒記錄的類別、ramp 進 HUD、Rec.txt 改一次性匯出（user 回報）
+
+**變更類型：** 功能補完 + UX · **狀態：本地驗證（846 passed；截圖確認 11 類全亮）**
+
+**背景（user 跑真檔後回報）：** (1) filter chip 有 13 個但實際只有幾個會亮 → 代表有些事件根本沒記錄；
+(2)「Rec.txt」沒用，應改成「匯出目前顯示的 log」；(3) 之前說的 ramp「A」在 HUD 看不到（`[export] ramping…`
+只印終端）。**附記：** user 真檔 log 顯示 ramp **確實在動**（worker pid 分批上線 2→4→2、第一波從 ~510s 降到 ~48–129s）。
+
+**補齊的事件（全在 orchestrator/主行程插樁）：**
+- **ramp**：export 開跑記 ramp 決策（`warm R → W workers`，含 giant MB / free RAM）→ **HUD 直接看得到「A」**。
+- **decode**：export 預解 giant cell 的耗時（冷 ~155s 標紅 / 暖秒過）。
+- **cache**：reach-bbox map ready + giant cell(s) ready。
+- **export**：批次結束摘要（`N/N images`，throughput）。
+- **template**：互動 fine-align 的 template 合成（原本併在 align，拆開）。
+- **移除永遠不亮的 chip**：`poi`、`warn`（warn 是 level 不是 category，thrash 已以紅底列呈現）→ `CATEGORIES` 剩 11 類、皆會亮。
+
+**Rec.txt → Export log…：** 舊「邊跑邊寫檔」改成**一次性匯出目前顯示的 log**（`_export_log`：存 `QPlainTextEdit` 現有內容，
+所見即所存、含套用中的類別篩選）。perfmon 的 set_logfile/close_logfile 保留（未用、無害）。
+
+**測試：** 全套 **846 passed**（既有測試涵蓋；chip 數/事件無硬斷言）。純 Python。
+
+**影響檔案：** `glas/core/perfmon.py`（CATEGORIES 去 poi/warn）、`glas/app/perf_panel.py`（Export log 按鈕 + `_export_log`）、
+`glas/app/gds_align_tool.py`（cache/decode/ramp/export/template 五類事件插樁）。**Branch：** `claude/code-review-handoff-65xwf4`（PR #18）。
+
+---
+
 ## [2026-07-03] [F28 hotfix] HUD decode 後閃退修復 + 配色改沿用主 app 暖色系（user 回報）
 
 **變更類型：** bug fix（閃退）+ UI 配色 · **狀態：本地驗證（846 passed；截圖確認新配色）**

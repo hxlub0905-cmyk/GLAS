@@ -118,10 +118,10 @@ class PerfWindow(QWidget):
         self._pause_btn = QPushButton("⏸  Pause")
         self._pause_btn.setObjectName("tool")
         self._pause_btn.clicked.connect(self._toggle_pause)
-        self._log_btn = QPushButton("● Rec .txt")
+        self._log_btn = QPushButton("Export log…")
         self._log_btn.setObjectName("tool")
-        self._log_btn.setToolTip("把每筆事件即時寫到一個 .txt 檔（可回貼分析）")
-        self._log_btn.clicked.connect(self._toggle_logfile)
+        self._log_btn.setToolTip("把目前顯示的 log 存成一個 .txt（可回貼分析）")
+        self._log_btn.clicked.connect(self._export_log)
         clear_btn = QPushButton("Clear")
         clear_btn.setObjectName("tool")
         clear_btn.clicked.connect(self._clear)
@@ -311,28 +311,26 @@ class PerfWindow(QWidget):
         self._table.setRowCount(0)
         self._log.clear()
 
-    def _toggle_logfile(self) -> None:
-        if self._monitor.is_logging():
-            self._monitor.close_logfile()
-            self._reflect_logging_state()
+    def _export_log(self) -> None:
+        """把**目前顯示的 log**（套用中的類別篩選後所見）一次性存成 .txt。取代舊的
+        『邊跑邊寫檔』（user 覺得沒用）——現在是「所見即所存」的快照。"""
+        text = self._log.toPlainText()
+        if not text.strip():
             return
         default = f"glas_perf_{time.strftime('%Y%m%d_%H%M%S')}.txt"
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save performance log", default, "Text files (*.txt)")
+            self, "Export performance log", default, "Text files (*.txt)")
         if not path:
             return
         if not path.lower().endswith(".txt"):
             path += ".txt"
-        self._monitor.set_logfile(path)
-        self._reflect_logging_state()
-
-    def _reflect_logging_state(self) -> None:
-        if self._monitor.is_logging():
-            self._log_btn.setText("■ Stop rec")
-            self._log_btn.setToolTip(f"logging → {Path(self._monitor.logpath).name}")
-        else:
-            self._log_btn.setText("● Rec .txt")
-            self._log_btn.setToolTip("把每筆事件即時寫到一個 .txt 檔（可回貼分析）")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(f"# GLAS performance log · "
+                        f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(text + "\n")
+        except Exception:                   # noqa: BLE001 — save 失敗不可影響監控
+            pass
 
     # ── 生命週期 ────────────────────────────────────────────────────────────────
     def closeEvent(self, e) -> None:
