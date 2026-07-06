@@ -221,9 +221,12 @@ HMI 風格表達式 → 遞迴下降 parser → AST → shapely 運算。運算�
 ### 進行中 (In Progress)
 
 - [F28] 程式內即時效能監控 HUD / Log 獨立視窗（分類彩色、涵蓋全部事件、預設開啟可關）。
-  **M1–M4 完成**（`perfmon` 事件匯流排 + `perf_panel` 深色監控台視窗 + 互動插樁 + export worker 即時監控/ramp/RAM/thrash 標紅）；
-  M5（worker mid-image 心跳）deferred。**剩 M6 收尾**：文件（README）、處理 open PR #15（本案取代之）、user 真檔驗收。
-  plan：`docs/plans/F28-perf-hud.md`。
+  **M1–M4 完成 + 收尾大致完成**（`perfmon` 事件匯流排 + `perf_panel` 暖色系監控視窗〔配色沿用 styles.py〕 + 互動插樁
+  + export worker 即時監控/ramp/RAM/thrash 標紅 + 11 類事件全接 + Export log 一次性匯出；README 已補、PR #15 已關）。
+  M5（worker mid-image 心跳）deferred。**剩：user 真機驗收**。plan：`docs/plans/F28-perf-hud.md`。
+- [F29] LTV giant-cell 共享記憶體（消除 8× giant 複製 thrash，估 ~3×）+ 效能/體驗 roadmap（M2 ramp/RAM 護欄、
+  M3 UX/ETA/level 篩選、M4 [B01] 中文路徑、M5 native placement 解碼）。**plan 已寫、可行性審核過（walk 唯讀→唯讀 SHM 可行）、
+  待 user 核准開工 M1**。plan：`docs/plans/F29-shared-mem-giant-roadmap.md`。
 
 ### 待辦 (Backlog)
 

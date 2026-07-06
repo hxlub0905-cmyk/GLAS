@@ -4,6 +4,29 @@
 
 ---
 
+## [2026-07-06] [F29 plan] LTV giant-cell 共享記憶體 + 效能/體驗 roadmap（草擬，待核准）
+
+**變更類型：** 規劃（新 plan 檔 + 可行性審核，尚未動 code）· **狀態：plan 已寫、待 user 核准開工 M1**
+
+**動機（LTV/E3B 真檔 log 效能分析）：** LTV（974MB giant flat cell）export 時每 worker 各 `np.load` 一份 → 8×=7.8GB +
+冷解尖峰 → 超過 12GB free → paging → 電腦卡 + 第一波 88–132s。E3B（無 giant）則 CPU-bound、8 worker 全速、不卡。
+**根因 = 單一 cell 記憶體 × worker 數 > RAM，非檔案大小。**
+
+**可行性審核（general-purpose agent，531s、33 tool uses）：** ✅ **唯讀共享記憶體可行**——walk 全程把 giant 的
+`_rcol`/`_pcol`/`_pl_soa` 陣列當唯讀（`Transform` frozen、emit 全 `.copy()`/新配置、無 in-place 寫入），大陣列連續純
+dtype 扁平（coords (N,4) int64 ≈ 281MB 為主、polygon CSR 非 ragged）可 SHM-back；注入點 = `load_cell` 於 `cellcache.load`
+(`:972`) 前查 offset-keyed `_shared_cells`；發布點 = orchestrator 已在 `:1827` 預解 giant 一次。⚠️ caveat：`from_cache_arrays`
+衍生的 dense `rr`/`names`（object）不能進 SHM → 每 worker 重建（~70–150MB）；F23 常駐 pool 的 SHM 生命週期（跨批 `_memo`
+失效、Windows/POSIX unlink 不對稱）。win = 7.8GB → ~2GB（消 thrash，非零）。
+
+**產出：** `docs/plans/F29-shared-mem-giant-roadmap.md`（M1 共享記憶體 giant〔7 子任務：sharedcell 模組 / load_cell 掛 attach /
+orchestrator 發布傳遞 / 生命週期 / SHM 生效免 ramp / byte-identical 護欄 / 真機驗〕；M2 更聰明 ramp + 即時 RAM 護欄；
+M3 UX（ETA/暖機提示/level 篩選）；M4 [B01] 中文路徑；M5 native placement 解碼；Backlog）。**未動任何程式碼。**
+
+**影響檔案：** `docs/plans/F29-shared-mem-giant-roadmap.md`（新）、`CLAUDE.md`（§8 F29）。**Branch：** `claude/code-review-handoff-65xwf4`（PR #18）。
+
+---
+
 ## [2026-07-03] [F28 事件可見性] ramp 事件永遠印（含 no-ramp 理由）+ decode 事件擴及互動載入（user 回報 E3B）
 
 **變更類型：** 事件可見性/一致性 · **狀態：本地驗證（846 passed）**
