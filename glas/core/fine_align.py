@@ -23,7 +23,8 @@ import os
 import sys
 import threading
 import time
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import (FIRST_COMPLETED, CancelledError,
+                                ProcessPoolExecutor, wait)
 
 import numpy as np
 
@@ -120,6 +121,142 @@ def batch_worker_count(override: int = 0, cap: int = 16) -> int:
         return max(1, int(override))
     import os
     return max(1, min(os.cpu_count() or 1, cap))
+
+
+def _env_float(name: str, default: float) -> float:
+    """Positive float from env ``name``, else ``default`` (bad/absent → default)."""
+    try:
+        v = float(os.environ.get(name, ""))
+        return v if v > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def available_ram_bytes():
+    """Best-effort AVAILABLE physical RAM in bytes for THIS machine right now, or
+    ``None`` if it can't be determined. Detected at call time so the export worker
+    cap self-tunes per tool (F27 M7m) — nothing is hard-coded. Tries, in order:
+    ``psutil`` → Windows ``GlobalMemoryStatusEx`` → POSIX ``sysconf`` →
+    ``/proc/meminfo``. Never raises."""
+    try:
+        import psutil  # type: ignore
+        return int(psutil.virtual_memory().available)
+    except Exception:                       # noqa: BLE001 — optional dep / any error
+        pass
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            class _MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong),
+                            ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong),
+                            ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong),
+                            ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong),
+                            ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+            ms = _MEMORYSTATUSEX()
+            ms.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+                return int(ms.ullAvailPhys)
+        except Exception:                   # noqa: BLE001
+            pass
+    try:
+        return int(os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
+    except (ValueError, OSError, AttributeError):
+        pass
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except Exception:                       # noqa: BLE001
+        pass
+    return None
+
+
+def ram_capped_worker_count(auto_workers: int, giant_bytes: int,
+                            avail_bytes, *, factor: float = None,
+                            fraction: float = None) -> int:
+    """Cap ``auto_workers`` so ``auto_workers`` per-worker copies of a
+    ~``giant_bytes`` merge cell don't exceed available RAM and thrash (F27 M7m).
+
+    Each export pool worker ``np.load``s its OWN full copy of the giant merge cell
+    from the sidecar; on a tight-RAM tool 8 of them at once blow past physical RAM
+    → paging → the first wave runs ~15× slower. When a giant is present and RAM is
+    detectable, cap workers to ``avail_bytes * fraction`` / (``giant_bytes *
+    factor``); otherwise (no giant / RAM unknown / already 1) return
+    ``auto_workers`` unchanged. Never caps below 1. Tunable per-tool without a
+    rebuild via ``GLAS_EXPORT_RAM_FRACTION`` (default 0.6 of free RAM) and
+    ``GLAS_EXPORT_WORKER_MEM_FACTOR`` (default 2.5× the giant, covering the giant
+    copy + child-cell decode + the transient rasterization buffers)."""
+    if auto_workers <= 1 or giant_bytes <= 0 or not avail_bytes or avail_bytes <= 0:
+        return auto_workers
+    fac = factor if factor is not None else _env_float(
+        "GLAS_EXPORT_WORKER_MEM_FACTOR", 2.5)
+    frac = fraction if fraction is not None else _env_float(
+        "GLAS_EXPORT_RAM_FRACTION", 0.6)
+    per_worker = max(1, int(giant_bytes * fac))
+    cap = int((avail_bytes * frac) // per_worker)
+    return max(1, min(auto_workers, cap))
+
+
+def run_ramped(ex, submit_one, n, *, ramp_initial, ramp_max,
+               on_result, cancel_cb=None) -> dict:
+    """Feed ``n`` tasks (indices 0..n-1) to executor ``ex`` with an in-flight cap
+    that starts at ``ramp_initial`` and rises by one per completed task up to
+    ``ramp_max`` (F27 M7n).
+
+    On a cold process pool this warms a few workers at a time — bounding the
+    first-wave memory spike where N workers each ``np.load`` a giant merge cell at
+    once and thrash — then reaches full ``ramp_max`` concurrency so the bulk keeps
+    full throughput. Small batches finish before the ramp opens up (so they never
+    thrash); large batches spend all but the first few tasks at full width. When
+    ``ramp_initial >= ramp_max`` it's a no-op ramp (full width immediately), so a
+    roomy machine sees no behaviour change.
+
+    ``submit_one(i)`` submits task ``i`` on ``ex`` and returns its Future.
+    ``on_result(i, result)`` is called as each task completes (completion order,
+    not submit order). ``cancel_cb()`` truthy stops further submission and cancels
+    in-flight tasks. A task exception (other than cancellation) propagates. Returns
+    ``{i: result}`` for tasks that completed (cancelled ones absent)."""
+    ramp = max(1, min(int(ramp_initial), int(ramp_max)))
+    hard = max(1, int(ramp_max))
+    inflight: dict = {}                 # Future -> task index
+    submitted = 0
+    stopped = False
+    results: dict = {}
+
+    def _fill():
+        nonlocal submitted
+        while (submitted < n and len(inflight) < ramp
+               and not (cancel_cb and cancel_cb())):
+            inflight[submit_one(submitted)] = submitted
+            submitted += 1
+
+    _fill()
+    while inflight:
+        if cancel_cb and cancel_cb() and not stopped:
+            stopped = True
+            for f in list(inflight):
+                f.cancel()              # drop not-yet-started tasks
+        done, _ = wait(list(inflight), return_when=FIRST_COMPLETED)
+        for fut in done:
+            idx = inflight.pop(fut)
+            try:
+                res = fut.result()
+            except CancelledError:
+                continue                # a pending task we just dropped
+            results[idx] = res
+            on_result(idx, res)
+            if ramp < hard:
+                ramp += 1               # one more worker may warm up now
+        if not stopped:
+            _fill()
+    return results
 
 
 # ── Rasterization helper (used by Boolean masks / template) ──────────────────

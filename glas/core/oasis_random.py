@@ -141,6 +141,16 @@ DEBUG = _DEBUG_LEVEL >= 1     # level 1: concise per-load summary
 TRACE = _DEBUG_LEVEL >= 2     # level 2: deep per-cell / per-section telemetry
 oas.PTYPE_COUNT_ON = DEBUG    # F27 M7: polygon point-list type histogram (debug only)
 
+# F27 M7l: keep the level-1 (--debug) log readable on a real export. The decode
+# heartbeat now ticks every ~15 s (not 2 s) so a 4-minute giant-cell decode is
+# ~17 lines, not ~130, while still reading as live progress; and a cell that
+# decodes in under 15 s prints nothing (kills the small-cell noise). The per-layer
+# walk summary is demoted to level 2 UNLESS the layer was actually slow — so the
+# 1000s of fast (~2-3 s) per-image export lines vanish while the genuinely slow
+# ones (the first-wave cold decode / geom) stay visible for diagnosis.
+_DECODE_HB_INTERVAL_S = 15.0  # seconds between intra-cell decode heartbeat lines
+_ROI_SUMMARY_SLOW_S = 8.0     # per-layer walk summary is level-1 only past this
+
 
 def set_debug(on: bool, level: int = 1) -> None:
     """Toggle ROI debug output. ``level`` 1 = concise summary (decode/walk
@@ -841,19 +851,14 @@ class RandomAccessReader:
     def has_offsets(self) -> bool:
         return bool(self._by_refnum)
 
-    def find_giant_cells(self, *, min_bytes: int = 20_000_000,
-                         max_return: int = 4) -> list:
-        """Cell ids whose ENCODED BYTE SPAN is huge — the giant merge cells that
-        dominate decode time (F27 M7j). The span is the gap to the next cell
-        offset in the file, a direct decode-cost proxy that needs no decoding
-        (unlike sbbox area, which a cheap container can also have). Names are
-        preferred over refnums so the returned id matches how the ROI walk reaches
-        a merge cell (by name), keeping the cellcache key aligned. Largest-first,
-        only spans >= ``min_bytes``, capped at ``max_return``.
-
-        Used by the export orchestrator to decode these ONCE up front so the pool
-        workers load them from the sidecar instead of all cold-decoding the same
-        multi-hundred-MB cell at once and thrashing memory."""
+    def _giant_cells_with_spans(self, *, min_bytes: int = 20_000_000,
+                                max_return: int = 4) -> list:
+        """``[(cell_id, encoded_byte_span), …]`` largest-first for cells whose
+        span (gap to the next cell offset) is >= ``min_bytes``, capped at
+        ``max_return``. The span needs no decoding and is a direct decode-cost /
+        memory proxy (unlike sbbox area, which a cheap container can also have).
+        Names win over refnums so the id matches how the ROI walk reaches a merge
+        cell (by name), keeping the cellcache key aligned."""
         off_to_id: dict[int, object] = {}
         for rn, off in self._by_refnum.items():
             off_to_id.setdefault(off, rn)
@@ -871,7 +876,45 @@ class RandomAccessReader:
             end = offs[i + 1] if i + 1 < len(offs) else filesize
             spans.append((end - off, off_to_id[off]))
         spans.sort(key=lambda t: t[0], reverse=True)
-        return [cid for span, cid in spans if span >= min_bytes][:max_return]
+        return [(cid, span) for span, cid in spans
+                if span >= min_bytes][:max_return]
+
+    def find_giant_cells(self, *, min_bytes: int = 20_000_000,
+                         max_return: int = 4) -> list:
+        """Cell ids whose ENCODED BYTE SPAN is huge — the giant merge cells that
+        dominate decode time (F27 M7j). See :meth:`_giant_cells_with_spans`.
+
+        Used by the export orchestrator to decode these ONCE up front so the pool
+        workers load them from the sidecar instead of all cold-decoding the same
+        multi-hundred-MB cell at once and thrashing memory."""
+        return [cid for cid, _span in self._giant_cells_with_spans(
+            min_bytes=min_bytes, max_return=max_return)]
+
+    def giant_cell_estimate_bytes(self) -> int:
+        """Estimated peak DECODED bytes of the largest giant merge cell — i.e.
+        how much RAM one export worker's ``np.load`` of it from the sidecar will
+        allocate. Prefers the exact on-disk sidecar size (uncompressed .npz ≈ the
+        decoded array bytes); when the cell isn't cached yet (the very first cold
+        run) falls back to the encoded byte span. 0 when the file has no giant
+        cell. Used to cap export worker count so N per-worker copies fit in the
+        machine's RAM (F27 M7m) — the cap self-tunes per tool, no hard-coded size.
+        Never raises."""
+        try:
+            pairs = self._giant_cells_with_spans()
+        except Exception:                 # noqa: BLE001
+            return 0
+        best = 0
+        for cid, span in pairs:
+            try:
+                sz = cellcache.cached_size(
+                    self._path, self.cache_key_for(cid), self._init_wanted)
+            except Exception:             # noqa: BLE001
+                sz = 0
+            if sz <= 0:
+                sz = int(span)            # cold run: encoded span (lower bound)
+            if sz > best:
+                best = sz
+        return best
 
     def layer_display_name(self, layer: int, datatype: int) -> str:
         """OASIS LAYERNAME for ``(layer, datatype)``, or "" (F3 M2)."""
@@ -1004,7 +1047,7 @@ class RandomAccessReader:
         if not DEBUG:
             return
         now = time.perf_counter()
-        if now - self._decode_hb_t >= 2.0:
+        if now - self._decode_hb_t >= _DECODE_HB_INTERVAL_S:
             self._decode_hb_t = now
             _dbg(f"  … decoding cell {self._decode_cell!r}: {nrec:,} records, "
                  f"{now - self._decode_t0:.0f}s elapsed")
@@ -2079,6 +2122,9 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
     _t0 = time.perf_counter()
     cells_at_start = rar._n_loaded
     hits_at_start = rar._n_cache_hits
+    errs_at_start = len(rar.errors)     # F28: baseline so the summary gate below
+    #                                     counts NEW errors this walk, not the
+    #                                     reader's cumulative total.
     stats = RoiWalkStats()
     rect_out: list = []
     poly_out: list = []
@@ -2434,20 +2480,31 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
                                + stats.instances_materialized)
     rar._walk_maxk_total = max(getattr(rar, "_walk_maxk_total", 0),
                                stats.max_array_k)
-    n_err = len(rar.errors)
+    # F28: NEW errors from THIS walk only — a batch worker reuses one reader
+    # across many images and rar.errors is append-only, so gating the summary on
+    # the cumulative len(rar.errors) would force every later fast layer back to
+    # level 1 after a single bad cell, defeating the M7l slow-layer filter for the
+    # rest of a long export. Gate (and display) the per-walk delta instead.
+    n_err = len(rar.errors) - errs_at_start
     # Level-1 (--debug) summary: one readable line — where the time went, what
     # the cache did, and whether anything went wrong. Deep per-cell / per-spec
     # counters are level-2 (MMH_GDS_DEBUG=2).
-    _dbg(f"{layer}/{datatype} in {stats.elapsed_s:.1f}s | "
-         f"decode {_decode_prof['total']:.1f}s "
-         f"({cached} cached, {fresh} decoded) | "
-         f"place {stats.t_place:.1f}s | "
-         f"geom {stats.t_rect + stats.t_poly:.1f}s | "
-         f"out {stats.rects_emitted}r {stats.polys_emitted}p"
-         + (f" | mat {stats.arrays_materialized}arr/"
-            f"{stats.instances_materialized}inst maxk={stats.max_array_k}"
-            if stats.instances_materialized else "")
-         + (f" | ⚠ {n_err} decode error(s)" if n_err else ""))
+    # F27 M7l: on a real export this fires per-image × per-layer (1000s of lines).
+    # Keep it at level 1 only when the layer was actually slow (or errored) — the
+    # cold first-wave / geom-bound layers we care about — and demote the fast warm
+    # ones to level 2 so --debug stays readable. Interactive single loads still see
+    # the slow (giant-cell) layer; their fast layers fold into the "── loaded in" line.
+    _emit = _dbg if (stats.elapsed_s >= _ROI_SUMMARY_SLOW_S or n_err) else _trace
+    _emit(f"{layer}/{datatype} in {stats.elapsed_s:.1f}s | "
+          f"decode {_decode_prof['total']:.1f}s "
+          f"({cached} cached, {fresh} decoded) | "
+          f"place {stats.t_place:.1f}s | "
+          f"geom {stats.t_rect + stats.t_poly:.1f}s | "
+          f"out {stats.rects_emitted}r {stats.polys_emitted}p"
+          + (f" | mat {stats.arrays_materialized}arr/"
+             f"{stats.instances_materialized}inst maxk={stats.max_array_k}"
+             if stats.instances_materialized else "")
+          + (f" | ⚠ {n_err} decode error(s)" if n_err else ""))
     if _decode_prof["cell"] is not None:
         _trace(f"  slowest decode: cell {_decode_prof['cell']!r} "
                f"{_decode_prof['max']:.1f}s (placements={_decode_prof['np']}, "

@@ -141,6 +141,8 @@ from fine_align import (  # noqa: E402,F401
     poi_polys_and_geometry_for_roi,
     rasterize_layer, render_composite_template, render_poi_template,
 )
+import perfmon          # noqa: E402  — F28: Qt-free perf event bus (HUD feeds off it)
+import perf_panel       # noqa: E402  — F28: the live perf-monitor HUD window
 # F14: the Qt-free per-image image/mask export compute (and the moved
 # overlay_outlines_on_sem / _safe_name helpers) live in glas/core so the export
 # batch can run across a spawn-based ProcessPool, mirroring fine_align (F8).
@@ -710,6 +712,7 @@ class _LayerPickPage(QWizardPage):
         if not path:
             return
         self._scan_btn.setEnabled(False)
+        self._scan_t0 = time.perf_counter()          # F28 M3: perf HUD timing
         self._status.setText(f"Scanning {Path(path).name}…")
         self._scan_thread = QThread(self)
         self._scan_worker = LayerScanWorker(str(path))
@@ -734,6 +737,12 @@ class _LayerPickPage(QWizardPage):
         else:
             layers = list(result) if isinstance(result, list) else []
             self._scan_result = {"layers": layers}
+        # F28 M3: scan layers → perf HUD.
+        perfmon.monitor.record(
+            "scan", (time.perf_counter()
+                     - getattr(self, "_scan_t0", time.perf_counter())) * 1e3,
+            label=f"{len(layers)} layer(s)", category="scan",
+            source=(self._scan_result or {}).get("source", ""))
         if not layers:
             self._status.setText(
                 "Scan found no layers — type pairs manually below.")
@@ -1670,9 +1679,11 @@ class ExportWorker(QObject):
         ``None`` if cancelled mid-batch."""
         n = len(self._jobs)
         rows = []
+        perfmon.monitor.set_summary(phase="export (in-thread)", progress=f"0 / {n}")
         for job in self._jobs:
             if self._cancel.is_set():
                 return None
+            _it0 = time.perf_counter()
             try:
                 fa, row = overlay_export.align_and_export_one_image(
                     job, self._rar, self._root, self._poi, self._cfg,
@@ -1681,10 +1692,17 @@ class ExportWorker(QObject):
                     cancel_cb=self._cancel.is_set)
             except oasis_random.WalkCancelled:
                 return None
+            # F28 M4: per-image timing into the perf HUD (in-thread → main pid).
+            perfmon.monitor.record(
+                f"worker:{os.getpid()}", (time.perf_counter() - _it0) * 1e3,
+                label=f"img {row['image_id']}", category="worker",
+                status=row.get("status", ""))
             rows.append(row)
             if fa is not None:
                 self.result.emit(*fa)
             self.progress.emit(len(rows), n, str(row["image_id"]))
+            perfmon.monitor.set_summary(progress=f"{len(rows)} / {n}")
+        perfmon.monitor.set_summary(phase="idle")
         return rows
 
     def _run_process_pool(self, workers: int):
@@ -1692,10 +1710,11 @@ class ExportWorker(QObject):
         warm F23 pool** (keyed on reader identity; the reader is built once by
         ``fine_align._pool_init``). The per-batch context rides each task, and
         ``rar.index_snapshot()`` lets each worker skip its own name-table scan.
-        Jobs are submitted up front (workers stay busy) and consumed in
-        submission order so progress ticks top-to-bottom and the manifest matches
-        the sequential output. Returns rows, or ``None`` if cancelled (partial
-        PNGs on disk are kept)."""
+        Jobs are fed through a RAM-seeded concurrency ramp (F27 M7n) so a cold
+        pool warms a few workers at a time then opens to full throughput; results
+        are collected as they complete and reordered to submission order so the
+        manifest matches the sequential output. Returns rows, or ``None`` if
+        cancelled (partial PNGs on disk are kept)."""
         n = len(self._jobs)
         rar = self._rar
         # F27 M3c: prewarm the native-walk flatten sidecar ONCE here, in the
@@ -1772,15 +1791,16 @@ class ExportWorker(QObject):
             import time as _time
             _rt = _time.perf_counter()
             if oasis_random.reach_prewarm(rar, self._root):
-                print(f"[export] reach-bbox map ready in "
-                      f"{_time.perf_counter() - _rt:.0f}s "
-                      f"({len(getattr(rar, '_reach_memo', ()))} cells; "
-                      f"shared with workers)", flush=True)
+                _rms = (_time.perf_counter() - _rt) * 1e3
+                _rcells = len(getattr(rar, "_reach_memo", ()))
+                print(f"[export] reach-bbox map ready in {_rms / 1e3:.0f}s "
+                      f"({_rcells} cells; shared with workers)", flush=True)
+                perfmon.monitor.record(              # F28: → perf HUD
+                    "cache", _rms, label="reach-bbox map", category="cache",
+                    cells=_rcells)
         except Exception as _e:      # noqa: BLE001
             print(f"[export] reach prewarm skipped: {_e}", flush=True)
         done = 0
-        dropped = False
-        rows = []
         jobs = self._jobs
         # F27 M7j: cold-wave guard. On a big S_BOUNDING_BOX chip whose geometry
         # lives in one giant merge cell (the LTV chip: iMerge_Top, ~10.8 M records,
@@ -1802,40 +1822,113 @@ class ExportWorker(QObject):
                 for gid in giants:
                     if self._cancel.is_set():
                         return None
+                    _dt0 = time.perf_counter()
                     try:
                         rar.load_cell(gid)   # decode + write sidecar (once, here)
+                        _dms = (time.perf_counter() - _dt0) * 1e3
+                        perfmon.monitor.record(   # F28: → perf HUD (cold vs cached)
+                            "decode", _dms, label=f"giant {gid}", category="decode",
+                            level=(perfmon.LEVEL_WARN if _dms >= 30_000 else "info"))
                     except Exception as _e:  # noqa: BLE001 — best effort
                         print(f"[export] pre-decode of {gid!r} skipped: {_e}",
                               flush=True)
                 print("[export] giant cell(s) cached; pooling all images",
                       flush=True)
+                perfmon.monitor.record(
+                    "cache", 0.0, label=f"{len(giants)} giant cell(s) ready",
+                    category="cache")
         if self._cancel.is_set():
             return None
+        # F27 M7n: seed the concurrency ramp from what THIS machine's free RAM can
+        # hold cold. Each pool worker np.loads its own full copy of the giant merge
+        # cell; N at once on a tight-RAM tool thrash and the first wave runs ~15x
+        # slower. Instead of a hard worker cap (which would slow the bulk of a big
+        # batch), ramp: start at `ramp_initial` and open to full `workers` one per
+        # completion, so the cold pool warms a few at a time then hits full
+        # throughput. No giant / RAM undetectable / roomy machine → ramp_initial ==
+        # workers → no-op (unchanged behaviour). Auto-detected per tool, self-tuning.
+        _gbytes = rar.giant_cell_estimate_bytes() if rar is not None else 0
+        _avail = fine_align.available_ram_bytes()
+        ramp_initial = fine_align.ram_capped_worker_count(workers, _gbytes, _avail)
+        if ramp_initial < workers:
+            print(f"[export] ramping workers {ramp_initial}→{workers} to warm the "
+                  f"cold pool gradually ({_gbytes / 1e6:.0f} MB giant × copies vs "
+                  f"{(_avail or 0) / 1e9:.1f} GB free RAM) — avoids the first-wave "
+                  f"memory thrash without capping bulk throughput; override via "
+                  f"'Parallel workers'", flush=True)
+        # F28: ALWAYS surface the ramp decision in the perf HUD (even when it's a
+        # no-op) so it's never silent — otherwise a file with no giant cell (E3B:
+        # hierarchical, no S_BOUNDING_BOX) looks like the ramp "didn't fire". Only
+        # a giant merge cell makes the first wave MEMORY-bound (worth staggering);
+        # without one the cold decode is CPU-bound and full width is optimal.
+        if ramp_initial < workers:
+            _ramp_label = f"warm {ramp_initial} → {workers} workers (giant thrash guard)"
+        elif _gbytes > 0:
+            _ramp_label = f"{workers} workers · giant fits in RAM → no ramp"
+        else:
+            _ramp_label = f"{workers} workers · no giant cell → no ramp (CPU-bound)"
+        perfmon.monitor.record(
+            "ramp", 0.0, category="ramp", label=_ramp_label,
+            giant=(f"{_gbytes / 1e6:.0f}MB" if _gbytes > 0 else "none"),
+            free_ram=(f"{_avail / 1e9:.1f}GB" if _avail else "?"))
+        rows_by_idx: dict = {}
+        # F28 M4: feed the live perf HUD. Per-image wall time is measured HERE
+        # (submit→complete), grouped by the worker pid the pool task returns, so
+        # the monitor shows each worker's images + flags the slow first-wave
+        # (thrash) rows — with no worker-return plumbing and
+        # align_and_export_one_image left byte-identical. The top strip shows the
+        # ramp / throughput / free RAM / progress live.
+        _started: dict = {}
+        _bt0 = time.perf_counter()
+        perfmon.monitor.set_summary(
+            phase="export", ramp=f"{ramp_initial} → {workers}",
+            ram=(f"{_avail / 1e9:.1f} GB free" if _avail else "—"),
+            throughput="—", progress=f"0 / {n}")
+
+        def _on_result(idx, res):
+            nonlocal done
+            fa, row, pid = res
+            rows_by_idx[idx] = row
+            done += 1
+            dt_ms = (time.perf_counter() - _started.pop(idx, _bt0)) * 1e3
+            perfmon.monitor.record(
+                f"worker:{pid}", dt_ms, label=f"img {row['image_id']}",
+                category="worker", status=row.get("status", ""),
+                level=(perfmon.LEVEL_WARN if dt_ms >= 30_000 else "info"))
+            _el = max(1e-6, time.perf_counter() - _bt0)
+            _av = fine_align.available_ram_bytes()
+            perfmon.monitor.set_summary(
+                progress=f"{done} / {n}", throughput=f"{done / _el:.1f} img/s",
+                ram=(f"{_av / 1e9:.1f} GB free" if _av else "—"))
+            if fa is not None:
+                self.result.emit(*fa)
+            self.progress.emit(done, n, str(row["image_id"]))
+
         with fine_align.batch_pool.lease(
                 str(rar._path), rar._init_wanted, rar._dtype, rar._bbox_layer,
                 rar.index_snapshot(), workers) as ex:
-            futures = [ex.submit(
-                overlay_export._afe_pool_task, job, self._root, self._poi,
-                self._cfg, str(self._out_dir), self._export_raw,
-                self._export_overlay, self._export_gray, self._export_label,
-                self._score_thr) for job in jobs] if jobs else []
-            for fut in futures:
-                if self._cancel.is_set() and not dropped:
-                    for f in futures:
-                        f.cancel()          # drop not-yet-started tasks
-                    dropped = True
-                try:
-                    fa, row = fut.result()
-                except CancelledError:
-                    continue                # a pending task we just dropped
-                rows.append(row)
-                done += 1
-                if fa is not None:
-                    self.result.emit(*fa)
-                self.progress.emit(done, n, str(row["image_id"]))
+
+            def _submit(i):
+                _started[i] = time.perf_counter()
+                return ex.submit(
+                    overlay_export._afe_pool_task, jobs[i], self._root, self._poi,
+                    self._cfg, str(self._out_dir), self._export_raw,
+                    self._export_overlay, self._export_gray, self._export_label,
+                    self._score_thr)
+
+            fine_align.run_ramped(
+                ex, _submit, len(jobs), ramp_initial=ramp_initial,
+                ramp_max=workers, on_result=_on_result,
+                cancel_cb=self._cancel.is_set)
+        # F28: batch-level summary event (the "export" category) + reset the strip.
+        _batch_ms = (time.perf_counter() - _bt0) * 1e3
+        perfmon.monitor.record(
+            "export", _batch_ms, label=f"{done} / {n} images", category="export",
+            throughput=f"{done / max(1e-6, _batch_ms / 1e3):.1f} img/s")
+        perfmon.monitor.set_summary(phase="idle")
         if self._cancel.is_set():
             return None
-        return rows
+        return [rows_by_idx[i] for i in sorted(rows_by_idx)]
 
     def _write_manifest(self, rows) -> str:
         csv_path = self._out_dir / "overlay_manifest.csv"
@@ -6161,6 +6254,16 @@ class MainWindow(QMainWindow):
         self.sem_panel.fine_align.results_requested.connect(self._open_fa_results)
         self.sem_viewer.drag_changed.connect(self._on_overlay_drag)
 
+        # F28: live performance-monitor HUD — a separate top-level window fed by
+        # the Qt-free ``perfmon`` event bus (any thread can record() into it). It
+        # opens by default; its visibility is persisted, and its own close box +
+        # the View-menu toggle stay in sync via the ``closed`` signal.
+        self._perf_win = perf_panel.PerfWindow(perfmon.monitor, self)
+        self._perf_win.closed.connect(
+            lambda: self._view_perf_action.setChecked(False))
+        self._view_perf_action.setChecked(
+            QSettings("GLAS", "GLAS").value("perf_window_open", True, type=bool))
+
         self._doc: Optional[GdsDocument] = None
         self._load_path: Optional[str] = None
 
@@ -6635,6 +6738,16 @@ class MainWindow(QMainWindow):
         quit_action.triggered.connect(self.close)
         menu.addAction(quit_action)
 
+        # F28: View menu — toggle the live performance-monitor HUD window. It is
+        # a separate top-level window (default open); this checkable action + its
+        # own close box both drive visibility, kept in sync via ``perf.closed``.
+        view_menu = self.menuBar().addMenu("&View")
+        self._view_perf_action = QAction("&Performance monitor", self)
+        self._view_perf_action.setCheckable(True)
+        self._view_perf_action.setShortcut("Ctrl+Shift+P")
+        self._view_perf_action.toggled.connect(self._toggle_perf_window)
+        view_menu.addAction(self._view_perf_action)
+
         help_menu = self.menuBar().addMenu("&Help")
         welcome_action = QAction("Show &welcome…", self)
         welcome_action.triggered.connect(self._show_welcome_dialog)
@@ -6643,6 +6756,17 @@ class MainWindow(QMainWindow):
         about_action = QAction("&About", self)
         about_action.triggered.connect(self._show_about)
         help_menu.addAction(about_action)
+
+    def _toggle_perf_window(self, on: bool) -> None:
+        """Show / hide the F28 performance-monitor HUD window and remember it."""
+        win = getattr(self, "_perf_win", None)
+        if win is not None:
+            if on:
+                win.show()
+                win.raise_()
+            else:
+                win.hide()
+        QSettings("GLAS", "GLAS").setValue("perf_window_open", bool(on))
 
     # ── actions ────────────────────────────────────────────────────────────
 
@@ -7026,10 +7150,19 @@ class MainWindow(QMainWindow):
         anchor = self._coarse_anchor(img)
         H, W = sem.shape[:2]
         cfg = self.sem_panel.fine_align.values()
+        _tt0 = time.perf_counter()
         template = self._build_template(anchor, W, H, nm_per_px, cfg)
+        perfmon.monitor.record(          # F28: template synth → HUD
+            "template", (time.perf_counter() - _tt0) * 1e3,
+            label=str(img.image_id), category="template")
         radius_px = cfg["search_radius_nm"] / nm_per_px
+        _mt0 = time.perf_counter()
         dx_nm, dy_nm, score, used_r = fine_align_one(sem, template, nm_per_px,
                                                      radius_px)
+        perfmon.monitor.record(          # F28 M3: matchTemplate → HUD
+            "align", (time.perf_counter() - _mt0) * 1e3,
+            label=str(img.image_id), category="align", score=round(score, 3),
+            dx=f"{dx_nm:.0f}", dy=f"{dy_nm:.0f}")
         self._refined[img.image_id] = (dx_nm, dy_nm, score)
         self._fa_meta[img.image_id] = (int(used_r), "ok")
         self.sem_panel.fine_align.set_result(score, dx_nm, dy_nm)
@@ -7116,6 +7249,12 @@ class MainWindow(QMainWindow):
         # ProcessPoolExecutor's atexit handler reaps any stragglers anyway.
         try:
             fine_align.batch_pool.shutdown()
+        except Exception:
+            pass
+        # F28: really close the perf HUD (its own X only hides it) + detach the
+        # monitor callback so no event hits a torn-down widget.
+        try:
+            self._perf_win.shutdown()
         except Exception:
             pass
         super().closeEvent(ev)
@@ -7763,6 +7902,27 @@ class MainWindow(QMainWindow):
               f"decode {t_decode:.1f}s ({cached} from cache, {decoded} decoded) · "
               f"prune {'ON' if sbbox_on else 'off'}"
               + (f" · ⚠ {errs} decode error(s)" if errs else ""), flush=True)
+        # F28 M3: mirror the [roi] telemetry into the live perf HUD — one event
+        # per layer (decode / geom split) + a decode roll-up so the monitor shows
+        # exactly where an interactive load spent its time.
+        for (ly, dt), s in per_layer:
+            geom_s = getattr(s, "t_rect", 0.0) + getattr(s, "t_poly", 0.0)
+            perfmon.monitor.record(
+                "roi", s.elapsed_s * 1e3, label=f"{ly}/{dt}", category="roi",
+                decode=f"{getattr(s, 't_decode', 0.0):.1f}s",
+                geom=f"{geom_s:.1f}s", rects=s.rects_emitted,
+                polys=s.polys_emitted, cells=s.cells_decoded,
+                level=(perfmon.LEVEL_WARN if s.elapsed_s >= 30 else "info"))
+        self._perf_win.update_overview(phase="interactive load",
+                                       progress=f"{total_rects:,} rects")
+        # F28: a "decode" event when this load did real fresh decoding (E3B: dense
+        # leaf cells; LTV: the giant flat cell) — so the decode chip lights on any
+        # file that actually decodes, not only the export giant pre-decode.
+        if t_decode >= 1.0 and decoded > 0:
+            perfmon.monitor.record(
+                "decode", t_decode * 1e3, label=f"{decoded:,} cells",
+                category="decode",
+                level=(perfmon.LEVEL_WARN if t_decode >= 30 else "info"))
         # F27 M7: polygon point-list type histogram — tells us whether a native
         # (Cython) polygon decoder would help this file, and which encodings.
         if oasis_random.DEBUG and total_polys:
@@ -7892,12 +8052,17 @@ class MainWindow(QMainWindow):
                 path, wanted_layers=set(layer_keys),
                 bbox_layer=oasis_random.DEFAULT_BBOX_LAYER)
             n_sbbox = len(rar._sbbox_by_refnum) + len(rar._sbbox_by_name)
+            _build_ms = (_t.perf_counter() - _t0) * 1e3
             print(f"{devlog.tag('roi')} reader built in "
-                  f"{_t.perf_counter() - _t0:.1f}s · "
+                  f"{_build_ms / 1e3:.1f}s · "
                   f"{len(rar._by_refnum):,} cells indexed · S_BOUNDING_BOX on "
                   f"{n_sbbox:,} cells "
                   f"({'decode-free prune' if n_sbbox else 'NONE -> bbox-by-decode'})",
                   flush=True)
+            # F28 M3: reader build → perf HUD (open + index).
+            perfmon.monitor.record(
+                "open", _build_ms, label=Path(path).name, category="open",
+                cells=len(rar._by_refnum), sbbox=n_sbbox)
         except Exception as exc:
             QApplication.restoreOverrideCursor()
             self._show_load_error("ROI open failed", str(exc))
@@ -8032,17 +8197,26 @@ class MainWindow(QMainWindow):
         if fov is None:
             fov = self._recipe_fov()
         errors: list[str] = []
+        _bt0 = time.perf_counter()
+        _npolys = 0
         for r in self._recipes:
             try:
                 polys = self._eval_expression(r["expr"], r["bindings"], fov)
             except Exception as exc:
                 errors.append(f"{r['name']}: {exc}")
                 polys = []
+            _npolys += len(polys)
             key = LayerKey(layer=-1, datatype=0, name=r["name"], synthetic=True)
             self._doc.entries.append(LayerEntry(
                 key=key, polygons=polys, visible=True, color=QColor(r["color"]),
                 bboxes=self._bboxes_from_polys(polys),
                 expr_text=r["expr"], expr_bindings=dict(r["bindings"])))
+        if self._recipes:                            # F28 M3: Boolean eval → HUD
+            perfmon.monitor.record(
+                "boolean", (time.perf_counter() - _bt0) * 1e3,
+                label=f"{len(self._recipes)} recipe(s)", category="boolean",
+                polys=_npolys, errors=len(errors),
+                level=(perfmon.LEVEL_ERROR if errors else "info"))
         self.layer_panel.set_document(self._doc)
         self.canvas.refresh()
         return errors

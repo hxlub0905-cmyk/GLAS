@@ -4,6 +4,278 @@
 
 ---
 
+## [2026-07-06] [F29 plan] LTV giant-cell 共享記憶體 + 效能/體驗 roadmap（草擬，待核准）
+
+**變更類型：** 規劃（新 plan 檔 + 可行性審核，尚未動 code）· **狀態：plan 已寫、待 user 核准開工 M1**
+
+**動機（LTV/E3B 真檔 log 效能分析）：** LTV（974MB giant flat cell）export 時每 worker 各 `np.load` 一份 → 8×=7.8GB +
+冷解尖峰 → 超過 12GB free → paging → 電腦卡 + 第一波 88–132s。E3B（無 giant）則 CPU-bound、8 worker 全速、不卡。
+**根因 = 單一 cell 記憶體 × worker 數 > RAM，非檔案大小。**
+
+**可行性審核（general-purpose agent，531s、33 tool uses）：** ✅ **唯讀共享記憶體可行**——walk 全程把 giant 的
+`_rcol`/`_pcol`/`_pl_soa` 陣列當唯讀（`Transform` frozen、emit 全 `.copy()`/新配置、無 in-place 寫入），大陣列連續純
+dtype 扁平（coords (N,4) int64 ≈ 281MB 為主、polygon CSR 非 ragged）可 SHM-back；注入點 = `load_cell` 於 `cellcache.load`
+(`:972`) 前查 offset-keyed `_shared_cells`；發布點 = orchestrator 已在 `:1827` 預解 giant 一次。⚠️ caveat：`from_cache_arrays`
+衍生的 dense `rr`/`names`（object）不能進 SHM → 每 worker 重建（~70–150MB）；F23 常駐 pool 的 SHM 生命週期（跨批 `_memo`
+失效、Windows/POSIX unlink 不對稱）。win = 7.8GB → ~2GB（消 thrash，非零）。
+
+**產出：** `docs/plans/F29-shared-mem-giant-roadmap.md`（M1 共享記憶體 giant〔7 子任務：sharedcell 模組 / load_cell 掛 attach /
+orchestrator 發布傳遞 / 生命週期 / SHM 生效免 ramp / byte-identical 護欄 / 真機驗〕；M2 更聰明 ramp + 即時 RAM 護欄；
+M3 UX（ETA/暖機提示/level 篩選）；M4 [B01] 中文路徑；M5 native placement 解碼；Backlog）。**未動任何程式碼。**
+
+**影響檔案：** `docs/plans/F29-shared-mem-giant-roadmap.md`（新）、`CLAUDE.md`（§8 F29）。**Branch：** `claude/code-review-handoff-65xwf4`（PR #18）。
+
+---
+
+## [2026-07-03] [F28 事件可見性] ramp 事件永遠印（含 no-ramp 理由）+ decode 事件擴及互動載入（user 回報 E3B）
+
+**變更類型：** 事件可見性/一致性 · **狀態：本地驗證（846 passed）**
+
+**背景（user 跑 E3B 檔回報「ramp/decode log 沒出來」）：** E3B（`sbbox=0`、階層式密集葉、**無 giant merge cell**）與
+LTV（單一 10.8M-record giant）本質不同。原本 ramp 事件 gated 在 `_gbytes>0`、decode 事件只在 export giant 預解 →
+E3B 兩者都不亮，user 誤以為壞了。**釐清：** E3B 無 giant → 無 thrash 風險 → **8→8 不 ramp 是正確且最佳**
+（E3B 第一波 ~30s 是密集葉「冷解」CPU-bound、非記憶體 thrash；砍 worker 反而更慢）。
+
+**修（可見性/一致性）：**
+- **ramp 事件永遠印**（不再 gated）：`warm R→W (giant thrash guard)` ／ `W workers · giant fits → no ramp` ／
+  `W workers · no giant cell → no ramp (CPU-bound)`，附 giant MB / free RAM → user 一眼看懂決策，不再靜默。
+- **decode 事件擴及互動載入**：`_on_roi_finished` 若本次 `t_decode≥1s 且 decoded>0` 補記一筆 `decode`
+  （label=`N cells`，≥30s 標紅）→ E3B/任何真的有解碼的載入都會亮 decode chip，不再只限 export giant 預解。
+
+**測試：** 全套 **846 passed**。純 Python。**影響檔案：** `glas/app/gds_align_tool.py`（ramp 事件不 gated + 互動 decode 事件）。
+**Branch：** `claude/code-review-handoff-65xwf4`（PR #18）。
+
+---
+
+## [2026-07-03] [F28 補事件 + Export log] 補齊沒記錄的類別、ramp 進 HUD、Rec.txt 改一次性匯出（user 回報）
+
+**變更類型：** 功能補完 + UX · **狀態：本地驗證（846 passed；截圖確認 11 類全亮）**
+
+**背景（user 跑真檔後回報）：** (1) filter chip 有 13 個但實際只有幾個會亮 → 代表有些事件根本沒記錄；
+(2)「Rec.txt」沒用，應改成「匯出目前顯示的 log」；(3) 之前說的 ramp「A」在 HUD 看不到（`[export] ramping…`
+只印終端）。**附記：** user 真檔 log 顯示 ramp **確實在動**（worker pid 分批上線 2→4→2、第一波從 ~510s 降到 ~48–129s）。
+
+**補齊的事件（全在 orchestrator/主行程插樁）：**
+- **ramp**：export 開跑記 ramp 決策（`warm R → W workers`，含 giant MB / free RAM）→ **HUD 直接看得到「A」**。
+- **decode**：export 預解 giant cell 的耗時（冷 ~155s 標紅 / 暖秒過）。
+- **cache**：reach-bbox map ready + giant cell(s) ready。
+- **export**：批次結束摘要（`N/N images`，throughput）。
+- **template**：互動 fine-align 的 template 合成（原本併在 align，拆開）。
+- **移除永遠不亮的 chip**：`poi`、`warn`（warn 是 level 不是 category，thrash 已以紅底列呈現）→ `CATEGORIES` 剩 11 類、皆會亮。
+
+**Rec.txt → Export log…：** 舊「邊跑邊寫檔」改成**一次性匯出目前顯示的 log**（`_export_log`：存 `QPlainTextEdit` 現有內容，
+所見即所存、含套用中的類別篩選）。perfmon 的 set_logfile/close_logfile 保留（未用、無害）。
+
+**測試：** 全套 **846 passed**（既有測試涵蓋；chip 數/事件無硬斷言）。純 Python。
+
+**影響檔案：** `glas/core/perfmon.py`（CATEGORIES 去 poi/warn）、`glas/app/perf_panel.py`（Export log 按鈕 + `_export_log`）、
+`glas/app/gds_align_tool.py`（cache/decode/ramp/export/template 五類事件插樁）。**Branch：** `claude/code-review-handoff-65xwf4`（PR #18）。
+
+---
+
+## [2026-07-03] [F28 hotfix] HUD decode 後閃退修復 + 配色改沿用主 app 暖色系（user 回報）
+
+**變更類型：** bug fix（閃退）+ UI 配色 · **狀態：本地驗證（846 passed；截圖確認新配色）**
+
+**#1 閃退（嚴重）：** user 回報「decode 完會閃退」。根因：M3 在 `_on_roi_finished`（decode 完回呼）呼叫
+`self._perf_win.update_overview(phase=…, progress=…)` 用**關鍵字參數**，但 `update_overview(self, summary: dict)`
+只吃一個 dict → **TypeError**；此為 queued signal slot，PyQt6 遇未捕捉例外直接 abort → 閃退。GUI 測試未驅動真 ROI 載入
+故 843 passed 漏了此路徑。**修：** `update_overview(self, summary=None, **fields)` 同時吃 dict 與 kwargs。新增回歸測試。
+
+**#2 配色（user 覺得深色監控台與奶油色主 app 突兀）：** `perf_panel` 改**沿用 `styles.py` 暖奶油色系 token**
+（`BG_PAGE`/`BG_SURFACE`/`BG_INPUT`/`BORDER_DEFAULT`/`TEXT_PRIMARY`/`TEXT_HINT`/`ACCENT`），與整體 UI 一致；
+`CATEGORY_COLORS` 13 類改成**在淺底上可辨的深飽和色**；warn 列改淺琥珀底、error 用 `DANGER_BG`；chip 選中填色白字。
+
+**測試：** `tests/test_perf_panel.py` +1（`update_overview` 吃 kwargs 的回歸）；全套 **846 passed**。純 Python。
+
+**影響檔案：** `glas/app/perf_panel.py`（update_overview 簽名 + 配色/_qss/_chip_qss 改淺色 + `import styles`）、
+`tests/test_perf_panel.py`（+1）。**Branch：** `claude/code-review-handoff-65xwf4`（PR #18）。
+
+---
+
+## [2026-07-03] [F28 M6 部分] README「效能監控 HUD」段 + 關閉 PR #15（本案取代）
+
+**變更類型：** 文件 + repo 收尾 · **狀態：完成（M6 剩 user 真機驗收）**
+
+- **README**：新增「即時效能監控 HUD」段（開關 View→Performance monitor / Ctrl+Shift+P、KPI 總覽、聚合表、
+  分類彩色 log、thrash 標紅、篩選/暫停/存 .txt），並更新測試數（~707→~850，含 perfmon）。
+- **PR #15**（舊 perf HUD 提案）**已 close**，附 superseded-by-#18 說明（F28 復用其 `perfmon`/`perf_panel` 地基
+  並擴充 worker 計時 / ramp/RAM / 分類彩色 / 獨立視窗）。
+- CLAUDE.md §4 已列 perfmon/perf_panel、§8 F28 標 M1–M4 完成。
+
+**影響檔案：** `README.md`、`docs/plans/F28-perf-hud.md`（M6 勾選）。**Branch：** `claude/code-review-handoff-65xwf4`（PR #18）。
+
+---
+
+## [2026-07-03] [F28 review-fix] M7l 慢層閘改用「本次 walk 新增 error 數」（PR #18 codex P2）
+
+**變更類型：** bug fix（承 M7l；PR #18 review 指出）· **狀態：本地驗證（845 passed）**
+
+**現象（reviewer 正確指出）：** M7l 的 per-layer summary 慢層閘 `_emit = _dbg if (elapsed>=門檻 or n_err) else _trace`
+用 `n_err = len(rar.errors)`（**累積值**）。batch export 每個 worker 重用同一 `RandomAccessReader`、`rar.errors` 只增不減
+（僅互動載入才清），故一旦某張碰到壞 cell，之後**每張快層又全部回到 level 1** → M7l 的「慢才印」在長 export 遇到一顆
+壞 cell 後就失效、log 又洪流。
+
+**修復：** `walk_roi` 起頭記 `errs_at_start = len(rar.errors)`（比照既有 `cells_at_start` 慣例），summary 改用
+**delta** `n_err = len(rar.errors) - errs_at_start`（本次 walk 新增的 error 數）→ 只有真正在這次 walk 出錯的層才強制
+level 1，累積舊 error 不再污染。`walk_roi_batched`/`walk_roi_fast` 無此 summary、不受影響。
+
+**測試：** 新 `tests/test_roi_summary_gate.py`（2：預置累積 error 後快層仍降級 / 乾淨快層降級）；全套 **845 passed**。純 Python。
+
+**影響檔案：** `glas/core/oasis_random.py`（`walk_roi` baseline + delta gate）、`tests/test_roi_summary_gate.py`（新）。
+**Branch：** `claude/code-review-handoff-65xwf4`（PR #18）。
+
+---
+
+## [2026-07-03] [F28 M3+M4] HUD 接上資料 — 互動事件插樁 + export worker 即時監控
+
+**變更類型：** 新功能（perf HUD 資料接線）· **狀態：本地驗證（全套 843 passed；M4 export-flow 截圖確認）**
+
+**M3 互動側插樁（全在 app 端主行程 callback，core 保持與 perf 系統解耦）：** `perfmon.monitor.record` 於
+**open+index**（reader built）、**scan layers**（`_on_scan`/`_on_scan_finished`）、**ROI walk**（`_on_roi_finished`
+逐 layer decode/geom/rects，慢層 warn）、**boolean**（`_recompute_recipes`）、**align**（單張 `_on_run_fine_align`）。
+用既有 stats / perf_counter，不新增量測、不動 core。
+
+**M4 export worker 即時監控（user 痛點；關鍵設計 = 免動 byte-identical 核心）：**
+- **per-image 計時由 orchestrator 量測**（`ExportWorker._run_process_pool` 的 `_submit`/`_on_result` 記 submit→complete
+  wall time）→ **`align_and_export_one_image` 完全不動、保持 byte-identical**（`test_export_fused` 6 個直接呼叫免改）。
+- `_afe_pool_task` 僅多回傳 `os.getpid()`（3-tuple）→ orchestrator 依 **worker pid 分組**（`worker:<pid>` op，HUD 每 worker 一列）；
+  `_run_in_thread` 用主 pid 同樣記錄。唯一測試改動：`test_export_fused` 那一處 `_afe_pool_task` 解包（fa/row 斷言不變）。
+- **thrash 警示**：per-image ≥ 30s → warn（HUD 標紅）。**總覽 KPI**：`perfmon.set_summary` 推 phase/ramp `R→W`/
+  throughput img/s/free RAM（每張刷新）/progress。
+- **perfmon 加 `on_summary`+`set_summary`**（跨 thread 推總覽，與 on_event 對稱）；`PerfWindow` 掛 `on_summary`、shutdown 一併 detach。
+
+**測試：** `test_perfmon.py`（+3 set_summary）、`test_perf_panel.py`（+2 summary→overview wiring/整合）、`test_export_fused`
+（`_afe_pool_task` 解包 + pid 斷言）；全套 **843 passed**。**純 Python → 免 CI。**
+
+**影響檔案：** `glas/core/perfmon.py`（on_summary/set_summary）、`glas/core/overlay_export.py`（`_afe_pool_task` 回 pid）、
+`glas/app/perf_panel.py`（掛 on_summary）、`glas/app/gds_align_tool.py`（M3 插樁 ×5 + M4 orchestrator 量測/worker 事件/總覽 KPI）、
+`tests/test_perfmon.py`（+3）、`tests/test_perf_panel.py`（+2）、`tests/test_export_fused.py`（解包）、
+`docs/plans/F28-perf-hud.md`（M3/M4 done）、`CLAUDE.md`（§4 模組 + §8）。**Branch：** `claude/code-review-handoff-65xwf4`（PR #18）。
+
+**剩 M6 收尾：** README 補「效能監控」段、處理 open PR #15（本案取代）、user 真檔驗收（開 HUD 跑 export 看即時 worker 列 + thrash 標紅）。
+
+---
+
+## [2026-07-03] [F28 M1+M2] 即時效能監控 HUD — 事件匯流排 + 獨立深色監控台視窗
+
+**變更類型：** 新功能（perf 監控地基 + HUD UI）· **狀態：本地驗證（全套 838 passed；HUD 截圖確認外觀）· 已核准 M1–M4**
+
+**M1 事件匯流排（`glas/core/perfmon.py`，Qt-free，強化自 open PR #15）：** `PerfMonitor` session 單例：
+`record(op, ms, label, category, level, **meta)` + `timed()` context manager + ring buffer + per-op 聚合 +
+`on_event` callback + `.txt` sink；新增 `category`（預設取 op `:` 前綴，供 UI 上色/篩選）、`level`
+（info/warn/error，供標紅）、可選 `echo_console`（用 `devlog` 上色印終端）。RLock 保護、任何 thread 可 record。
+`tests/test_perfmon.py`（16）。
+
+**M2 HUD 視窗（`glas/app/perf_panel.py` → `PerfWindow`）：** 獨立 top-level 深色「監控台」視窗（可丟副螢幕）：
+頂部 **KPI 總覽列**（phase/ramp/throughput/ram/progress，`update_overview`/`push_summary` 餵）＋**聚合表**
+（op 名依分類色）＋**分類彩色 log**（13 類 `CATEGORY_COLORS`，warn/error 標琥珀/紅底 + `⚠`）＋**類別篩選 chips**
+＋**暫停**＋**存 .txt**＋**Clear**。`_Bridge`（event+summary 兩 signal, QueuedConnection）安全跨 thread。
+`tests/test_perf_panel.py`（10，`importorskip PyQt6`）。
+
+**整合（`gds_align_tool.py`）：** MainWindow 建 `PerfWindow`（**預設開啟**、`QSettings` 記憶可見性）；
+新 **View 選單「Performance monitor」toggle**（Ctrl+Shift+P）；視窗 X 只隱藏（`closed` 同步 toggle）；
+MainWindow closeEvent `shutdown()`（真關 + detach monitor callback）。
+
+**尚未接資料：** M3（互動事件插樁）、M4（export worker 即時監控 + ramp/RAM 餵總覽）接續。目前 HUD 空跑不影響任何現有流程
+（monitor 無訂閱者時 record 極輕；未插樁前不產生事件）。截圖預覽已給 user。
+
+**影響檔案：** `glas/core/perfmon.py`（新）、`glas/app/perf_panel.py`（新）、`glas/app/gds_align_tool.py`
+（import + View 選單 + PerfWindow 建立/toggle/closeEvent）、`tests/test_perfmon.py`（新 16）、`tests/test_perf_panel.py`（新 10）。
+**Branch：** `claude/code-review-handoff-65xwf4`（PR #18）。**純 Python → 免 CI。**
+
+---
+
+## [2026-07-03] [F28 plan] 程式內即時效能監控 HUD / Log 視窗（草擬，待核准）
+
+**變更類型：** 規劃（新功能 plan 檔，尚未動 code）· **狀態：plan 已寫、待 user 核准才開工**
+
+**動機：** user 要把除錯體驗從「盯 `debug.bat` 終端」升級成**程式內可開關、精美、分類彩色、資訊詳盡的即時
+監控視窗**（Q1=甲 UI HUD、Q2=C 全部事件皆記錄且分類上色）。**復用 open PR #15**（`perfmon.py` Qt-free 事件
+收集器 + `perf_panel.py` HUD dock 骨架，其已知缺口「subprocess worker 事件回不來」正是 F27 `[export-timing]`
+要接的）。關鍵設計：即時 worker 監控**用主程式 `run_ramped` 的 in-flight 追蹤 + 完成回傳明細，免跨行程 IPC**
+（mid-image 心跳才需 Queue，列可選 M5）。
+
+**產出：** `docs/plans/F28-perf-hud.md`（Goal / Q&A（甲C + 架構抉擇）/ M1 事件匯流排地基 · M2 HUD UI 精美分類彩色 ·
+M3 互動事件插樁 · M4 export worker 即時監控 · M5 可選心跳 · M6 收尾 / Affected Files / Risks / 驗證）。
+建議先交付 M1+M2 再逐步長出。**未動任何程式碼。**
+
+**影響檔案：** `docs/plans/F28-perf-hud.md`（新）。**Branch：** `claude/code-review-handoff-65xwf4`（PR #18）。
+
+---
+
+## [2026-07-03] [F27 M7n] export 第一波 ramp-up 分批暖機（消 thrashing 不砍量產吞吐）
+
+**變更類型：** 效能（承 M7m 基礎設施，接線第一波修法）· **狀態：本地驗證（全套 812 passed；`run_ramped` 排程單元測試完整；pool 編排依專案慣例靠真檔 end-to-end）**
+
+**動機：** M7k 證實大 cell 只解一次，但 export 第一波仍 ~400–510s／張 = 記憶體 thrashing（8 worker 各 `np.load` 一份完整 giant cell 同時載 → RAM 尖峰）。**取捨（user 選 D丙：批次不一定、兩者都要）：** 硬砍 worker 消 thrash 但拖慢大批量產（後段 1000+ 輕量張吞吐減半，交叉點 ~200–300 張），不可取。
+
+**修法（ramp-up 分批暖機）：** 不砍 worker 上限，改**控制提交並行度逐步升高**：
+- `fine_align.run_ramped(ex, submit_one, n, ramp_initial, ramp_max, on_result, cancel_cb)`（Qt-free、可測）：in-flight 上限從 `ramp_initial` 起、**每完成一張 +1** 升到滿 `ramp_max`；冷 pool 一次只暖幾個 worker（尖峰受控）、暖了就開到滿（量產全速）。小批還沒開到滿就跑完（天生不 thrash）；大批只有頭幾張分批、其餘全寬。完成順序收集、結尾依 index 重排 → manifest 與循序輸出一致。cancel 停止提交 + 取消 in-flight。
+- **seed 來自 M7m 的 RAM 偵測**：`ramp_initial = ram_capped_worker_count(workers, giant_bytes, avail)`——本機自動偵測、跨 tool 自適應；無 giant／RAM 未知／機器寬裕 → `ramp_initial == workers` → **no-op（零行為變更）**。比硬砍**寬容**：seed 偏高時逐步上線仍分散尖峰。
+- app `ExportWorker._run_process_pool`（1690）：提交迴圈改用 `run_ramped`；DEBUG 下印 `[export] ramping workers R→W …`。互動路徑／`_run_in_thread`（小批 n≤2）不受影響。F13 fine-align-only 的 `_run_process_pool`（1533）本輪未動（可後續比照）。
+
+**測試：** `tests/test_export_ram_cap.py` 增 5（全部處理且依序、peak ≤ ramp_max、初始 burst == ramp_initial〔Event 卡住驗證〕、cancel 早停、initial≥max no-op）；**全套 812 passed**（裝 libEGL 後 GUI/export 測試亦全綠）。**純 Python → 免 CI，重抓 ZIP 即可。**
+
+**待 user 驗收：** 同一批（快取已暖免 155s）重跑，看 `[export] ramping workers R→W` + 第一波是否不再 400s+；大批看後段是否維持全速。
+
+**影響檔案：** `glas/core/fine_align.py`（`run_ramped` + import wait/FIRST_COMPLETED/CancelledError）、`glas/app/gds_align_tool.py`（`ExportWorker._run_process_pool` 提交迴圈 + ramp seed/log + docstring）、`tests/test_export_ram_cap.py`（+5）。**Branch：** `claude/code-review-handoff-65xwf4`（PR #18）。
+
+---
+
+## [2026-07-03] [F27 M7k 驗證 + M7m 基礎設施] 大 cell 只解一次已證實；第一波真因 = 記憶體 thrashing
+
+**變更類型：** 驗證 + 效能基礎設施（RAM-aware worker cap，尚未接線）· **狀態：M7k 已用真檔證實；M7m 函式+測試就緒（562 passed），接線待 user 決定批次取捨**
+
+**M7k 驗證（user 清空快取後跑 run1 冷 / run2 重開）：** ✅ **成立**。
+- run2 重開後（RAM 全清、只能靠磁碟 sidecar）：互動載入 **361s → 36s**、`6/0 decode 15.4s (2 cached, 510 decoded)`（giant 是那「2 cached」）、**全程零解碼心跳**、export `pre-decoding [giant]` 秒過。
+- 證明那顆 10.8M-record 大 cell（refnum 44995 = name `_2_gri_yank_top`）**全域只解一次（run1 那次），之後互動／export／跨 session 全部從磁碟共用**（offset-key 跨 session 命中）。
+
+**第一波 export 仍 ~400–510s／張的真因（新定位）：** **不是** giant cell（它已快取），而是**記憶體 thrashing**。證據：同樣的工作在單行程互動下快 **11–19×**（互動解 510 cell=15.4s vs export worker 433 cell=167s；互動 `17/101` emit 120k inst=9.3s vs export=176s），且 export 的 geom 時間在各張間忽高忽低（51/92/117/176/196s，inst 數卻一樣）——記憶體爭用的指紋。**機制：** 每個 worker 第一張時各自 `np.load` 一份完整 giant cell（幾百 MB，cellcache 存 `.npz` 非共享）+ 冷解 433 child cell + materialize，**8 worker 同時做 → 峰值 RAM 爆 → paging**。只發生在「每 worker 第一張」（前 ~8 張），之後 memo 暖了 ~7s/張。正是交接 §6 早預告的「記憶體 N×」風險兌現。
+
+**M7m 基礎設施（已寫、已測、未接線）：** 為「RAM-aware 自動壓 export worker 數」備好純函式，**跨機自動偵測、免寫死**（user 會在不同 tool 跑）：
+- `fine_align.available_ram_bytes()`：偵測本機可用實體 RAM（psutil → Windows `GlobalMemoryStatusEx` → POSIX `sysconf` → `/proc/meminfo`，全 fallback、不 raise）。
+- `fine_align.ram_capped_worker_count(auto, giant_bytes, avail, factor, fraction)`：算「N 份 giant 塞得下幾個 worker」；無 giant／RAM 未知／已 1 → 原樣返回；不低於 1；`GLAS_EXPORT_RAM_FRACTION`(0.6)／`GLAS_EXPORT_WORKER_MEM_FACTOR`(2.5) 可調。
+- `cellcache.cached_size()`：giant sidecar `.npz` 檔案大小（≈ 解碼後 array bytes）當 RAM 估算 proxy。
+- `oasis_random`：`find_giant_cells` 抽出 `_giant_cells_with_spans`（帶 span）；新增 `giant_cell_estimate_bytes()`（有 sidecar 用實際大小、冷跑用 byte 跨距）。
+
+**未接線原因（取捨待 user 定）：** 「硬壓 worker 數」對**小批大賺、大批反虧**（後段 1000+ 輕量張是 worker×吞吐，8→4 減半；交叉點 ~200–300 張）。故 app 端接線**暫還原**（零行為變更、無回歸），待 user 回覆「批次大小 + 開頭卡的困擾度」再定案：小批→硬壓；大批→ramp-up 分批暖機或不動。
+
+**測試：** 新 `tests/test_export_ram_cap.py`（12：cap 數學／RAM 偵測 int|None／sidecar size／find_giant_cells 重構不變式／env 覆寫）；全核心 **562 passed**（2 failed 為容器缺 libEGL、與改動無關）。**純 Python → 免 CI。**
+
+**影響檔案：** `glas/core/fine_align.py`（`available_ram_bytes` / `ram_capped_worker_count` / `_env_float`）、`glas/core/oasis_random.py`（`_giant_cells_with_spans` / `giant_cell_estimate_bytes`）、`glas/core/cellcache.py`（`cached_size`）、`tests/test_export_ram_cap.py`（新）。**Branch：** `claude/code-review-handoff-65xwf4`（PR #18）。
+
+---
+
+## [2026-07-03] [F27 M7l] --debug log 精簡（心跳 15s + 慢層才印）
+
+**變更類型：** 診斷 ergonomics（log 可讀性）· **狀態：本地驗證（550 core passed；GUI 測試因容器缺 libEGL 無法載，與改動無關）**
+
+**動機（user 回報）：** 用 `debug.bat`（`GLAS_DEBUG=1`）跑真檔 export，log 太長貼不動——單顆大 cell 解碼心跳每 2s 一行（260s → ~130 行），
+export 又每張影像印 2–3 條 per-layer `[roi]` 摘要（1500 張 → 數千行）。user 要「少一點但仍有足夠資訊 + 心跳感」。
+
+**修復實作（純 logging，不動任何解碼/幾何輸出）：**
+1. **解碼心跳 2s → 15s**（`_DECODE_HB_INTERVAL_S=15.0`，`_decode_tick`）：4 分鐘的大 cell 解碼 ~17 行（原 ~130），仍讀得出在動；
+   且 **<15s 就解完的小 cell 完全不印**（殺掉 export 途中 33098/41707… 那批小 cell 噪音）。
+2. **per-layer 摘要「慢才印 level 1」**（`_ROI_SUMMARY_SLOW_S=8.0`，walk 尾端 `_emit = _dbg if elapsed>=門檻 or 有 error else _trace`）：
+   export 每張 ~2–3s 的快層自動降 level 2（level 1 看不到），**只有真正慢的層（第一波冷解 172s／geom 189s 那種）留在 level 1**——正是
+   要診斷的訊號。互動單張載入的快層折進既有 `── loaded in Xs` 那行、giant 慢層照印。**互動/export 通用，無需跨行程傳旗標。**
+
+**測試：** 新增行為 smoke（快層 0 行、門檻設 0 時慢層 1 行、常數值）；`tests/test_decode_heartbeat.py`（心跳計數器不受間隔影響）、
+`test_export_timing.py`（`[export-timing]` 未動）、`test_oasis_random` / `test_giant_cells` / `test_batched_gate` 全過。全核心 **550 passed**
+（2 failed + 7 collection error 皆為 headless 容器缺 `libEGL.so.1` 載不動 PyQt6.QtWidgets，非本次改動）。**純 Python → 免 CI，重抓 ZIP 即可。**
+
+**影響檔案：** `glas/core/oasis_random.py`（`_DECODE_HB_INTERVAL_S` / `_ROI_SUMMARY_SLOW_S` 常數 + `_decode_tick` 間隔 + walk 尾端 `_emit` 慢閘）。
+**Branch：** `claude/code-review-handoff-65xwf4`。
+
+**旁註（M7k 驗證的 log 判讀，待續）：** user 貼回第一次（未清快取）export log。判讀：`[export] pre-decoding … ['_2_gri_yank_top']` **瞬間 cached
+無 155s 心跳** → 證明 **M7k offset-key 對那顆大 merge cell 有效**（互動 refnum 44995 與 export name 共用同一份 sidecar）。**但**第一波 8 worker 仍
+各 414–566s（`206/150 decode 172s` + `17/101 geom 189s`）→ 拖慢第一波的**不是**那顆已快取的大 cell，而是**每張各自要冷解的一批 dense cell + rect
+materialize**（`find_giant_cells` 20MB 門檻抓不到、預解沒暖到）→ 8 worker 同時冷做 → thrashing 未消。待 user 用「完全清快取 + 小批（~16 張）」
+重跑 run1/run2 做乾淨的 M7k 驗證後再定位第一波修法（可能要把 pre-decode 從「只暖 giant」擴到「暖第一波會碰的 dense cell」或降 worker 數）。
+
+---
+
 ## [2026-07-02] [F27 M7] 單一 debug 模式 + 解碼心跳 + export-path batched gate + 清理
 
 **變更類型：** 診斷 ergonomics + bug fix（大檔 ROI walk「看似卡住」）· **狀態：本地驗證（848 passed）；待 user 量真檔**

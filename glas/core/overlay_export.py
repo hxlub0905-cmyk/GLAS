@@ -501,7 +501,12 @@ def _afe_pool_task(job, root, poi_colored, cfg, out_dir,
                    score_thr):
     """ProcessPoolExecutor task: align+export one image with this process's
     private reader (built by ``fine_align._pool_init``). Cancellation is handled
-    by the orchestrator dropping not-yet-started futures."""
-    return align_and_export_one_image(
+    by the orchestrator dropping not-yet-started futures.
+
+    Returns ``(fa_result, row, pid)`` — the worker pid lets the orchestrator group
+    the live perf-HUD timing by worker (F28 M4); ``align_and_export_one_image``
+    itself stays a byte-identical ``(fa, row)``."""
+    fa, row = align_and_export_one_image(
         job, fine_align.pool_reader(), root, poi_colored, cfg, out_dir,
         export_raw, export_overlay, export_gray, export_label, score_thr)
+    return fa, row, os.getpid()

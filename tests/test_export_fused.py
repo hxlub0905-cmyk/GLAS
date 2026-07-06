@@ -206,8 +206,9 @@ def test_afe_pool_task_uses_shared_reader(tmp_path, monkeypatch):
     monkeypatch.setattr(fine_align, "_G", {"rar": rar})
     out = tmp_path / "out"
     out.mkdir()
-    fa, row = overlay_export._afe_pool_task(
+    fa, row, pid = overlay_export._afe_pool_task(   # F28 M4: task now returns pid
         ("D1", None, None, "", False), 0, _POI_COLORED, _CFG, str(out),
         False, False, False, False, 0.0)
     # No coords / no file → graceful row, and it ran against the shared reader.
     assert row["image_id"] == "D1"
+    assert isinstance(pid, int) and pid > 0

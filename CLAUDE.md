@@ -100,9 +100,11 @@ GLAS/
 │   │   ├── gds_boolean.py       # 遞迴下降 parser + shapely Boolean 引擎 + mask
 │   │   ├── gds_layer_cache.py   # layer .npz cache + metadata（schema v4/v5）
 │   │   ├── cellcache.py         # F16-B：大 cell 解碼結果 + placement prep 的 sidecar 快取（欄狀 .npz）
+│   │   ├── perfmon.py           # F28 即時效能事件收集器（Qt-free；HUD 的資料匯流排 + on_summary）
 │   │   └── klarf_parser.py      # KLARF I/O（自 MMH 複製，純標準庫）
 │   └── app/                 # 🖼 PyQt6 app 殼
 │       ├── gds_align_tool.py    # 主視窗 + 所有 widget（~4500 行）
+│       ├── perf_panel.py        # F28 即時效能監控 HUD（獨立深色監控台視窗，分類彩色 + 總覽 KPI）
 │       ├── sem_loader.py        # KLARF / 資料夾載 SEM 影像列表
 │       ├── styles.py            # QSS 設計 token（自 MMH 複製）
 │       ├── collapsible.py       # CollapsibleSection widget（自 MMH 複製）
@@ -218,7 +220,13 @@ HMI 風格表達式 → 遞迴下降 parser → AST → shapely 運算。運算�
 
 ### 進行中 (In Progress)
 
-- （目前無）
+- [F28] 程式內即時效能監控 HUD / Log 獨立視窗（分類彩色、涵蓋全部事件、預設開啟可關）。
+  **M1–M4 完成 + 收尾大致完成**（`perfmon` 事件匯流排 + `perf_panel` 暖色系監控視窗〔配色沿用 styles.py〕 + 互動插樁
+  + export worker 即時監控/ramp/RAM/thrash 標紅 + 11 類事件全接 + Export log 一次性匯出；README 已補、PR #15 已關）。
+  M5（worker mid-image 心跳）deferred。**剩：user 真機驗收**。plan：`docs/plans/F28-perf-hud.md`。
+- [F29] LTV giant-cell 共享記憶體（消除 8× giant 複製 thrash，估 ~3×）+ 效能/體驗 roadmap（M2 ramp/RAM 護欄、
+  M3 UX/ETA/level 篩選、M4 [B01] 中文路徑、M5 native placement 解碼）。**plan 已寫、可行性審核過（walk 唯讀→唯讀 SHM 可行）、
+  待 user 核准開工 M1**。plan：`docs/plans/F29-shared-mem-giant-roadmap.md`。
 
 ### 待辦 (Backlog)
 

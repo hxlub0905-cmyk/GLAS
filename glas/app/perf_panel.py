@@ -1,0 +1,389 @@
+"""即時效能監控 HUD —— 獨立視窗（F28 M2；原型自 open PR #15 復用 + 大改）。
+
+一個獨立的深色「監控台」top-level 視窗（可自由移動 / 丟副螢幕），顯示 :mod:`perfmon`
+monitor 的事件流：
+
+  * 頂部 **總覽列**：階段 / ramp / 吞吐 / RAM / 進度（由 :meth:`update_overview` 餵）；
+  * 中段 **聚合表**：per-op 最近 / 次數 / 平均 / 最大，op 名依分類上色；
+  * 下段 **分類彩色 log**：每筆事件依 ``category`` 上色（warn/error 標紅底）；可按分類 chip
+    篩選、可暫停、可存 ``.txt``、可清除。
+
+``monitor.record()`` 可能在 worker thread 觸發（ROI / batch），故透過 ``_Bridge`` 的
+pyqtSignal 把事件 marshal 回 GUI thread（Qt 跨 thread signal 預設 queued）才動 widget。
+"""
+from __future__ import annotations
+
+import time
+from collections import deque
+from pathlib import Path
+
+from PyQt6.QtCore import QObject, Qt, pyqtSignal
+from PyQt6.QtGui import QColor
+from PyQt6.QtWidgets import (
+    QFileDialog, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel,
+    QPlainTextEdit, QPushButton, QTableWidget, QTableWidgetItem, QToolButton,
+    QVBoxLayout, QWidget,
+)
+
+import perfmon
+import styles
+
+# ── 配色：沿用主 app 的暖奶油色系（直接取 styles.py token，與整體 UI 一致）──────────
+_BG = styles.BG_PAGE            # #f7f4ef  視窗底
+_PANEL = styles.BG_SURFACE      # #fff8f2  tile / 聚合表底
+_LOG_BG = styles.BG_INPUT       # #ffffff  log 底
+_BORDER = styles.BORDER_DEFAULT  # #e8d8c8
+_TEXT = styles.TEXT_PRIMARY     # #3f3428
+_MUTED = styles.TEXT_HINT       # #8a7660
+
+# 分類 → 顏色（在淺奶油底上都清楚可辨、彼此夠分；用深/飽和色達對比）。未列走 _CAT_DEFAULT。
+CATEGORY_COLORS = {
+    "open": "#2f6ea5",     # blue   — 開檔 + 建索引
+    "scan": "#2b8a7a",     # teal   — 掃 layer
+    "roi": "#1f8a70",      # green  — ROI walk
+    "decode": "#c9791a",   # amber  — cell 解碼（≈ app ACCENT_ACTIVE）
+    "boolean": "#8e44ad",  # purple — Boolean
+    "poi": "#9a7b3f",      # khaki  — POI build
+    "template": "#3a6a8a",  # blue  — template
+    "export": "#3e7f5d",   # green  — image export（≈ app SUCCESS_TEXT）
+    "worker": "#6b4fb0",   # violet — pool worker
+    "ramp": "#a9741a",     # gold   — worker ramp
+    "align": "#3170a8",    # blue   — matchTemplate
+    "cache": "#7a6a5a",    # brown  — cell cache（≈ app TEXT_SECONDARY）
+    "warn": "#b8442b",     # red    — 警示（深 DANGER）
+}
+_CAT_DEFAULT = "#6a5a48"
+_WARN_BG = "#fbf0dd"           # 淺琥珀（thrash/warn 底）
+_ERROR_BG = styles.DANGER_BG   # #feeee8（error 底）
+
+
+def category_color(cat: str) -> str:
+    return CATEGORY_COLORS.get(cat, _CAT_DEFAULT)
+
+
+class _Bridge(QObject):
+    """把 monitor 事件 / summary 從任意 thread 安全送回 GUI thread。"""
+    event = pyqtSignal(object)
+    summary = pyqtSignal(dict)
+
+
+class PerfWindow(QWidget):
+    """即時效能監控 HUD（獨立視窗）。傳入 :class:`perfmon.PerfMonitor`（預設 session 單例）。
+
+    ``closed`` 在使用者關掉視窗（X）時 emit，讓主視窗的 toggle 鈕同步狀態（視窗只隱藏、
+    不真的銷毀，除非主視窗關閉時呼叫 :meth:`shutdown`）。"""
+
+    _COLS = ["", "Operation", "last", "count", "avg", "max"]
+    closed = pyqtSignal()
+
+    def __init__(self, monitor=None, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.Window)
+        self.setWindowTitle("GLAS · Performance Monitor")
+        self.resize(720, 560)
+        self._monitor = monitor if monitor is not None else perfmon.monitor
+        self._rows: dict = {}                       # op -> table row
+        self._events: "deque" = deque(maxlen=600)   # for filter rebuilds
+        self._active_cats: set = set(perfmon.CATEGORIES) | {"misc"}
+        self._paused = False
+        self._chips: dict = {}
+
+        self._build_ui()
+
+        # 接上 monitor（queued cross-thread）。存穩定 emit 參照以便 detach 比對。
+        self._bridge = _Bridge()
+        self._bridge.event.connect(self._on_event, Qt.ConnectionType.QueuedConnection)
+        self._bridge.summary.connect(self.update_overview,
+                                     Qt.ConnectionType.QueuedConnection)
+        self._emit = self._bridge.event.emit
+        self._emit_summary = self._bridge.summary.emit
+        self._monitor.on_event = self._emit
+        self._monitor.on_summary = self._emit_summary
+        self._prime_from_monitor()
+
+    # ── UI ────────────────────────────────────────────────────────────────────
+    def _build_ui(self) -> None:
+        self.setStyleSheet(self._qss())
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(8)
+
+        # 標題 + 工具列
+        bar = QHBoxLayout()
+        bar.setSpacing(6)
+        title = QLabel("⚡  Performance Monitor")
+        title.setObjectName("title")
+        bar.addWidget(title)
+        bar.addStretch(1)
+        self._pause_btn = QPushButton("⏸  Pause")
+        self._pause_btn.setObjectName("tool")
+        self._pause_btn.clicked.connect(self._toggle_pause)
+        self._log_btn = QPushButton("Export log…")
+        self._log_btn.setObjectName("tool")
+        self._log_btn.setToolTip("把目前顯示的 log 存成一個 .txt（可回貼分析）")
+        self._log_btn.clicked.connect(self._export_log)
+        clear_btn = QPushButton("Clear")
+        clear_btn.setObjectName("tool")
+        clear_btn.clicked.connect(self._clear)
+        for w in (self._pause_btn, self._log_btn, clear_btn):
+            bar.addWidget(w)
+        root.addLayout(bar)
+
+        # 總覽列（KPI tiles）
+        self._tiles: dict = {}
+        strip = QHBoxLayout()
+        strip.setSpacing(8)
+        for key, cap in (("phase", "PHASE"), ("ramp", "WORKERS"),
+                         ("throughput", "THROUGHPUT"), ("ram", "FREE RAM"),
+                         ("progress", "PROGRESS")):
+            tile, val = self._make_tile(cap)
+            self._tiles[key] = val
+            strip.addWidget(tile, 1)
+        root.addLayout(strip)
+
+        # 聚合表
+        self._table = QTableWidget(0, len(self._COLS), self)
+        self._table.setHorizontalHeaderLabels(self._COLS)
+        self._table.verticalHeader().setVisible(False)
+        self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self._table.setShowGrid(False)
+        hh = self._table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self._table.setColumnWidth(0, 16)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for c in range(2, len(self._COLS)):
+            hh.setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
+        self._table.setMaximumHeight(190)
+        root.addWidget(self._table)
+
+        # 分類篩選 chips
+        chips = QHBoxLayout()
+        chips.setSpacing(4)
+        chips.addWidget(self._muted_label("Filter:"))
+        for cat in perfmon.CATEGORIES:
+            chip = QToolButton(self)
+            chip.setObjectName("chip")
+            chip.setText(cat)
+            chip.setCheckable(True)
+            chip.setChecked(True)
+            chip.setStyleSheet(self._chip_qss(category_color(cat)))
+            chip.toggled.connect(lambda on, c=cat: self._toggle_category(c, on))
+            self._chips[cat] = chip
+            chips.addWidget(chip)
+        chips.addStretch(1)
+        root.addLayout(chips)
+
+        # 事件 log（深底、等寬、彩色）
+        self._log = QPlainTextEdit(self)
+        self._log.setObjectName("log")
+        self._log.setReadOnly(True)
+        self._log.setMaximumBlockCount(600)
+        root.addWidget(self._log, 1)
+
+    def _make_tile(self, caption: str):
+        tile = QFrame(self)
+        tile.setObjectName("tile")
+        lay = QVBoxLayout(tile)
+        lay.setContentsMargins(10, 6, 10, 6)
+        lay.setSpacing(1)
+        cap = QLabel(caption)
+        cap.setObjectName("tileCap")
+        val = QLabel("—")
+        val.setObjectName("tileVal")
+        lay.addWidget(cap)
+        lay.addWidget(val)
+        return tile, val
+
+    def _muted_label(self, text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setStyleSheet(f"color:{_MUTED}; font-size:11px;")
+        return lbl
+
+    # ── monitor 既有狀態（視窗晚於事件建立時補回）──────────────────────────────
+    def _prime_from_monitor(self) -> None:
+        for op, a in self._monitor.aggregates():
+            self._upsert_row(op, a)
+        for ev in self._monitor.recent(120):
+            self._events.append(ev)
+            self._append_line(ev)
+
+    # ── 事件處理（GUI thread）──────────────────────────────────────────────────
+    def _on_event(self, ev) -> None:
+        self._events.append(ev)
+        for op, a in self._monitor.aggregates():
+            if op == ev.op:
+                self._upsert_row(op, a)
+                break
+        if not self._paused:
+            self._append_line(ev)
+
+    def _append_line(self, ev) -> None:
+        if ev.category not in self._active_cats:
+            return
+        color = category_color(ev.category)
+        ts = time.strftime("%H:%M:%S", time.localtime(ev.t))
+        name = perfmon.OP_LABELS.get(ev.op, ev.op)
+        metas = "  ".join(f"{k}={v}" for k, v in ev.meta.items())
+        bg = ""
+        if ev.level == perfmon.LEVEL_ERROR:
+            bg = f"background:{_ERROR_BG};"
+        elif ev.level == perfmon.LEVEL_WARN:
+            bg = f"background:{_WARN_BG};"
+        flag = "" if ev.level == perfmon.LEVEL_INFO else f" ⚠{ev.level}"
+        detail = f"  {ev.label}" if ev.label else ""
+        meta_html = (f" <span style='color:{_MUTED}'>({metas})</span>"
+                     if metas else "")
+        html = (f"<span style='{bg}'>"
+                f"<span style='color:{_MUTED}'>{ts}</span> "
+                f"<span style='color:{color}'>●</span> "
+                f"<span style='color:{color}'>{_esc(name)}</span> "
+                f"<span style='color:{_TEXT}'>{ev.ms:8.1f} ms{flag}"
+                f"{_esc(detail)}</span>{meta_html}</span>")
+        self._log.appendHtml(html)
+
+    def _rebuild_log(self) -> None:
+        self._log.clear()
+        for ev in self._events:
+            self._append_line(ev)
+
+    def _upsert_row(self, op: str, a: dict) -> None:
+        name = perfmon.OP_LABELS.get(op, op)
+        avg = a.get("avg", a["total"] / a["n"] if a["n"] else 0.0)
+        color = QColor(category_color(a.get("category", "")))
+        cells = ["", name, f"{a['last']:.0f}", str(a["n"]),
+                 f"{avg:.0f}", f"{a['max']:.0f}"]
+        row = self._rows.get(op)
+        if row is None:
+            row = self._table.rowCount()
+            self._table.insertRow(row)
+            self._rows[op] = row
+        for c, text in enumerate(cells):
+            item = QTableWidgetItem(text)
+            if c == 0:
+                item.setText("●")
+                item.setForeground(color)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            elif c == 1:
+                item.setForeground(color)
+            else:
+                item.setForeground(QColor(_TEXT))
+                item.setTextAlignment(Qt.AlignmentFlag.AlignRight
+                                      | Qt.AlignmentFlag.AlignVCenter)
+            if a.get("level") == perfmon.LEVEL_WARN and c == 1:
+                item.setForeground(QColor(CATEGORY_COLORS["warn"]))
+            self._table.setItem(row, c, item)
+
+    # ── 總覽列（GUI thread；M4 餵資料）─────────────────────────────────────────
+    def update_overview(self, summary=None, **fields) -> None:
+        """更新頂部 KPI tiles。可傳 dict（``update_overview({"ramp": …})``，bridge 用）
+        或關鍵字（``update_overview(phase=…)``，呼叫端方便）；兩者皆可、缺的不動。
+        亦可透過 :meth:`push_summary` 從 worker thread 安全呼叫。"""
+        data = dict(summary or {})
+        data.update(fields)
+        for key, val in data.items():
+            lbl = self._tiles.get(key)
+            if lbl is not None:
+                lbl.setText(str(val))
+
+    def push_summary(self, **fields) -> None:
+        """thread-safe：從任何 thread 更新總覽列（marshal 回 GUI thread）。"""
+        self._bridge.summary.emit(dict(fields))
+
+    # ── 工具列動作 ──────────────────────────────────────────────────────────────
+    def _toggle_category(self, cat: str, on: bool) -> None:
+        if on:
+            self._active_cats.add(cat)
+        else:
+            self._active_cats.discard(cat)
+        self._rebuild_log()
+
+    def _toggle_pause(self) -> None:
+        self._paused = not self._paused
+        self._pause_btn.setText("▶  Resume" if self._paused else "⏸  Pause")
+        if not self._paused:
+            self._rebuild_log()
+
+    def _clear(self) -> None:
+        self._monitor.clear()
+        self._events.clear()
+        self._rows.clear()
+        self._table.setRowCount(0)
+        self._log.clear()
+
+    def _export_log(self) -> None:
+        """把**目前顯示的 log**（套用中的類別篩選後所見）一次性存成 .txt。取代舊的
+        『邊跑邊寫檔』（user 覺得沒用）——現在是「所見即所存」的快照。"""
+        text = self._log.toPlainText()
+        if not text.strip():
+            return
+        default = f"glas_perf_{time.strftime('%Y%m%d_%H%M%S')}.txt"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export performance log", default, "Text files (*.txt)")
+        if not path:
+            return
+        if not path.lower().endswith(".txt"):
+            path += ".txt"
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(f"# GLAS performance log · "
+                        f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(text + "\n")
+        except Exception:                   # noqa: BLE001 — save 失敗不可影響監控
+            pass
+
+    # ── 生命週期 ────────────────────────────────────────────────────────────────
+    def closeEvent(self, e) -> None:
+        # 使用者按 X：只隱藏、不銷毀（主視窗 toggle 可再開）；通知主視窗同步狀態。
+        e.ignore()
+        self.hide()
+        self.closed.emit()
+
+    def shutdown(self) -> None:
+        """主視窗真的要關時呼叫：切斷 callback + 關 log 檔 + 真正關閉。"""
+        if self._monitor.on_event is self._emit:
+            self._monitor.on_event = None
+        if self._monitor.on_summary is self._emit_summary:
+            self._monitor.on_summary = None
+        self._monitor.close_logfile()
+        super().close()
+
+    # ── 樣式 ────────────────────────────────────────────────────────────────────
+    def _qss(self) -> str:
+        return f"""
+        QWidget {{ background:{_BG}; color:{_TEXT};
+                   font-family:'Segoe UI','Noto Sans',sans-serif; font-size:12px; }}
+        QLabel#title {{ font-size:14px; font-weight:600; color:{styles.TEXT_PRIMARY}; }}
+        QFrame#tile {{ background:{_PANEL}; border:1px solid {_BORDER};
+                       border-radius:7px; }}
+        QLabel#tileCap {{ color:{_MUTED}; font-size:9px; letter-spacing:1px; }}
+        QLabel#tileVal {{ color:{styles.TEXT_PRIMARY}; font-size:15px; font-weight:600; }}
+        QPushButton#tool {{ background:{styles.BG_INPUT}; border:1px solid {_BORDER};
+                            border-radius:6px; padding:4px 10px; color:{_TEXT}; }}
+        QPushButton#tool:hover {{ border-color:{styles.ACCENT};
+                                  background:{styles.ACCENT_BG}; }}
+        QToolButton#chip {{ border:1px solid {_BORDER}; border-radius:9px;
+                            padding:1px 8px; font-size:10px; color:{_MUTED};
+                            background:{styles.BG_INPUT}; }}
+        QTableWidget {{ background:{_PANEL}; border:1px solid {_BORDER};
+                        border-radius:7px; gridline-color:transparent; }}
+        QHeaderView::section {{ background:{_PANEL}; color:{_MUTED};
+                                border:0; border-bottom:1px solid {_BORDER};
+                                padding:4px; font-size:10px; }}
+        QPlainTextEdit#log {{ background:{_LOG_BG}; border:1px solid {_BORDER};
+                              border-radius:7px;
+                              font-family:'Consolas','DejaVu Sans Mono',monospace;
+                              font-size:11px; color:{_TEXT}; }}
+        """
+
+    @staticmethod
+    def _chip_qss(color: str) -> str:
+        return (f"QToolButton#chip {{ color:{_MUTED}; }}"
+                f"QToolButton#chip:checked {{ color:#ffffff; background:{color};"
+                f" border-color:{color}; font-weight:600; }}")
+
+
+def _esc(text: str) -> str:
+    """最小 HTML escape（log 走 appendHtml）。"""
+    return (str(text).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;"))
