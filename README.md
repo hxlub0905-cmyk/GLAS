@@ -49,6 +49,22 @@
 
 ---
 
+## 即時效能監控 HUD
+
+程式啟動時開一個**獨立的深色監控台視窗**（可拖到副螢幕邊看邊操作），把每個關鍵操作的耗時
+即時分類上色顯示——取代盯 `debug.bat` 終端。
+
+- **開關**：主視窗 **View → Performance monitor**（或 **Ctrl+Shift+P**）；**預設開啟**，關掉會記住。
+- **頂部 KPI 總覽**：export 進行時即時顯示 worker ramp `R→W` / 吞吐 img/s / 可用 RAM / 進度。
+- **聚合表**：每個操作（或 export 的每個 worker `pid`）的 最近 / 次數 / 平均 / 最大 耗時。
+- **分類彩色 log**：ROI / 解碼 / Boolean / 對位 / export worker … 各類別各自上色；異常
+  （thrash：單張 ≥ 30s、decode error）自動**標紅**，可按類別篩選、暫停、存 `.txt` 回貼分析。
+
+事件匯流排 `glas/core/perfmon.py`（Qt-free）與 HUD `glas/app/perf_panel.py`；插樁點皆走主行程
+callback，`core` 引擎不依賴此系統。
+
+---
+
 ## Quick Start
 
 ```bash
@@ -106,7 +122,7 @@ GLAS/
 
 ```bash
 pytest tests/ -v
-# ~707 項：OASIS parser / 座標換算 / Boolean / 對位 / KLARF / catalog / batch accel / devlog
+# ~850 項：OASIS parser / 座標換算 / Boolean / 對位 / KLARF / catalog / batch accel / devlog / perfmon
 ```
 
 無顯示環境執行 GUI 測試：

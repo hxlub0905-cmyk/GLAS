@@ -115,12 +115,13 @@ ramp/RAM 狀態，並做分類彩色美化。**console 輸出保留**為 headles
 - [ ] 驗證：Queue 生命週期（含 F23 常駐 pool、cancel）不洩漏；手動看大 cell 解碼即時進度。
 - [ ] **先確認值不值得做**（(a) 已涵蓋大部分；此為錦上添花）。
 
-### M6: 收尾（測試 / 文件 / 護欄）  [status: planned]
+### M6: 收尾（測試 / 文件 / 護欄）  [status: in progress]
 
-- [ ] 面板關閉時 `monitor` overhead ≈ 0（無訂閱者則 record 極輕）；thread-safety 覆核。
-- [ ] `CLAUDE.md` §4/§5 補模組（perfmon/perf_panel）；README 補「效能監控」段；`SESSION_LOG` 條目。
-- [ ] 關閉/處理 PR #15（本案取代之：或 cherry-pick 後 close，或說明差異）。
-- [ ] 全套 `pytest tests/ -q` 綠。
+- [x] 面板關閉時 `monitor` overhead ≈ 0（無訂閱者 → record 早退／set_summary no-op）；thread-safety 走 RLock + `_Bridge` queued。
+- [x] `CLAUDE.md` §4 補模組（perfmon/perf_panel）+ §8 更新；README 補「即時效能監控 HUD」段 + 測試數。
+- [x] **關閉 PR #15**（本案取代之，已留 superseded 說明 comment）。
+- [x] 全套 `pytest tests/ -q` 綠（845 passed）。
+- [ ] **user 真機驗收**（開 HUD 跑 export 看即時 worker 列 + thrash 標紅 + KPI；配色/版面回饋）— 待 user。
 
 ---
 

@@ -4,6 +4,20 @@
 
 ---
 
+## [2026-07-03] [F28 M6 部分] README「效能監控 HUD」段 + 關閉 PR #15（本案取代）
+
+**變更類型：** 文件 + repo 收尾 · **狀態：完成（M6 剩 user 真機驗收）**
+
+- **README**：新增「即時效能監控 HUD」段（開關 View→Performance monitor / Ctrl+Shift+P、KPI 總覽、聚合表、
+  分類彩色 log、thrash 標紅、篩選/暫停/存 .txt），並更新測試數（~707→~850，含 perfmon）。
+- **PR #15**（舊 perf HUD 提案）**已 close**，附 superseded-by-#18 說明（F28 復用其 `perfmon`/`perf_panel` 地基
+  並擴充 worker 計時 / ramp/RAM / 分類彩色 / 獨立視窗）。
+- CLAUDE.md §4 已列 perfmon/perf_panel、§8 F28 標 M1–M4 完成。
+
+**影響檔案：** `README.md`、`docs/plans/F28-perf-hud.md`（M6 勾選）。**Branch：** `claude/code-review-handoff-65xwf4`（PR #18）。
+
+---
+
 ## [2026-07-03] [F28 review-fix] M7l 慢層閘改用「本次 walk 新增 error 數」（PR #18 codex P2）
 
 **變更類型：** bug fix（承 M7l；PR #18 review 指出）· **狀態：本地驗證（845 passed）**
