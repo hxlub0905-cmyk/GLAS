@@ -29,6 +29,11 @@ F27 log/ramp。M7j orchestrator 預解仍在 main（pre-existing，~12s 一次�
 `gds_align_tool.py` / `cellcache.py`（`load_arrays`）/ `tests/test_cellcache.py` 至 main。plan 檔標「撤案」保留為 design history。
 **Branch：** `claude/code-review-handoff-65xwf4`（force-with-lease 回 main）。
 
+**撤除後真機驗收（user 確認「不卡 很順」）：** 8 workers（`ramp warm 2 → 8`, `free_ram=9.9GB`）跑 LTV **196 張 ≈ 7 分鐘、全程無凍結**。
+暖機前 8 張 ~60–137s（每 worker 各建一次 giant extent cache，ramp 錯開不 thrash），穩定期 **~6–8s/張 × 8 並行**。
+**結論：F27 M7n ramp（保留）已足夠讓 8 workers 不 thrash；SHM 的複雜度與開銷不值得。** 後續真正的速度槓桿是 flat giant
+per-ROI 幾何的 spatial index（暖機一次性 + ~7s/張 地板，皆與記憶體重複無關），列為未來可選優化。
+
 ---
 
 ## [2026-07-06] [F29 plan] LTV giant-cell 共享記憶體 + 效能/體驗 roadmap（草擬，待核准）
