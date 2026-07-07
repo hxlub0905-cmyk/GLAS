@@ -224,6 +224,10 @@ HMI 風格表達式 → 遞迴下降 parser → AST → shapely 運算。運算�
   **M1–M4 完成 + 收尾大致完成**（`perfmon` 事件匯流排 + `perf_panel` 暖色系監控視窗〔配色沿用 styles.py〕 + 互動插樁
   + export worker 即時監控/ramp/RAM/thrash 標紅 + 11 類事件全接 + Export log 一次性匯出；README 已補、PR #15 已關）。
   M5（worker mid-image 心跳）deferred。**剩：user 真機驗收**。plan：`docs/plans/F28-perf-hud.md`。
+- [F30] LTV export TPT 優化（walk 熱路徑）。真機證實暖機後 ~5s/張、walk 佔 80%：~2666ms 遞迴+decode 黑盒、giant rect
+  emit 536ms（每張對 10.8M bbox 重 transform，但 T 固定→ROI-independent）。**plan 已寫、user 核准積極路線（含 L4 遞迴重構）、
+  待核准開工 M1**。分階段：M1 量測（印 `t_decode` 拆黑盒）→ M2 giant 空間索引+transform 快取 → M3 暖機 footprint →
+  M4 遞迴重構（batched-via-sbbox，byte-identical 護欄）→ M5 真機驗收。plan：`docs/plans/F30-export-tpt-walk-hotpath.md`。
 
 ### 待辦 (Backlog)
 
