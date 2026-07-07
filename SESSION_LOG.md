@@ -4,6 +4,33 @@
 
 ---
 
+## [2026-07-07] [F29] 撤案 — 共享記憶體 giant 真機驗收失敗，revert 回 session 前
+
+**變更類型：** 撤案 / revert（移除整個 F29 SHM 機制）· **狀態：branch reset 回 `origin/main`（846 passed）· PR #19 關閉**
+
+**動機（user 真機 LTV 連續驗收）：** F29 M1 全部實作完成並上 PR #19（sharedcell publish/attach、`_shared_cells`、
+orchestrator 發布、sidecar 快速發布、free giant、codex P2 修正），但 user 真機回報「**UI 每張圖凍一次**、session 前不會」。
+`[export-timing]` 分解**確認根因**：
+- worker **實際運算只有 ~5s/張**（`walk` 35s→3s 會攤提，giant 幾何其實沒問題）；
+- 但**牆鐘 ~35s/張** → 每張有 **~30s「非運算」空檔**（worker 5s 算完後呆等 ~30s 才拿到下一張）；
+- `free_ram` 三次測試 **11GB → 7.2GB → 4.4GB** 一路下滑。
+研判：那 30s 是 **F29 的 per-task SHM 傳遞 + Windows pagefile-backed shared_memory 在低 RAM 下 paging** 的開銷 ——
+**對 user 的 2-worker 情境，比它取代的「每 worker 各自 np.load」還糟**。SHM 只共享了 coords，未共享每 worker ~GB 的
+衍生 extent cache，記憶體壓力沒真的解掉，反而多一層 pagefile SHM thrash。
+
+**決策（user 明示「直接撤」）：** `git reset --hard origin/main` 移除 branch 上 5 個 F29 commit（回到 PR #18 merged 狀態）。
+匯出回到 session 前流程：workers 各自處理 giant（2-worker 無 thrash、無 30s 空檔、無 publish 凍結）。**保留** F28 效能 HUD、
+F27 log/ramp。M7j orchestrator 預解仍在 main（pre-existing，~12s 一次性、非本次 flagged 的 per-image 凍結；如仍礙眼可另議 gate）。
+
+**教訓：** SHM 的可行性審核只驗了「唯讀正確性」，沒驗「Windows pagefile SHM 在低 RAM 的效能」與「per-task descriptor 傳遞
+開銷」——真機才暴露。真正的 LTV 瓶頸是 flat giant 的 per-ROI 幾何（~5s/張 warm，另需 spatial index），與記憶體重複無關。
+
+**影響檔案：** 移除 `glas/core/sharedcell.py`、`tests/test_sharedcell.py`；還原 `oasis_random.py` / `overlay_export.py` /
+`gds_align_tool.py` / `cellcache.py`（`load_arrays`）/ `tests/test_cellcache.py` 至 main。plan 檔標「撤案」保留為 design history。
+**Branch：** `claude/code-review-handoff-65xwf4`（force-with-lease 回 main）。
+
+---
+
 ## [2026-07-06] [F29 plan] LTV giant-cell 共享記憶體 + 效能/體驗 roadmap（草擬，待核准）
 
 **變更類型：** 規劃（新 plan 檔 + 可行性審核，尚未動 code）· **狀態：plan 已寫、待 user 核准開工 M1**
