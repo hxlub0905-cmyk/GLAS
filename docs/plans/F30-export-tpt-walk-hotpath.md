@@ -68,16 +68,20 @@ footprint」，不碰跨行程共享。
 - [ ] **驗證（待 user）**：真機 `GLAS_FA_TIMING=1 GLAS_FA_TIMING_EVERY=1` 跑 5 張，貼 `[export-timing]`，得 decode vs 遞迴 拆分
   → **據此定 M4 主攻方向**（decode 大則 M4 併 leaf 快取；遞迴大則 M4 專攻 per-instance vectorize）。
 
-### M2: giant rect 空間索引 + ROI-independent transform 快取（L2）  [status: planned]
+### M2: giant rect emit（L2）  [status: transform-cache 試作後撤回 · 降級/重評]
 
-- [ ] 確認 giant 的 rect transform 後 root-coord bbox 只依賴 `(cell, T)`（T 每張固定）→ 在 `walk_roi` 的 giant rect emit
-  路徑（`oasis_random.py:2256-2285`）把 `T.apply_to_rects(ext_bb)` 結果**快取於 per-worker（keyed on cell+T）**，每張只重跑 ROI mask。
-- [ ] 在快取的 root-coord bbox 上建**空間索引**（sort-by-x + `searchsorted`，或 coarse grid bucket）——ROI-independent、per-worker
-  建一次；per-ROI 只查桶取候選 rect，取代 O(10.8M) 全掃。
-- [ ] 記憶體護欄：索引 ~O(N) int（sort：86MB / grid：更小），per-worker、**不共享、不進 sidecar**（避免 F29 RAM 雷）；量測確認總量不逼近 free RAM。
-- [ ] **byte-identical 護欄**：新 emit 的 rect SET 與現行 `walk_roi` 逐一相同（order-independent，rasterize 不在意順序）；
-  加 `tests/test_walk_giant_index.py`。
-- [ ] 驗證：`pytest` 綠 + 單機 micro-bench（giant rect emit 536ms → 目標 <100ms）；真機一張 `[export-timing]` 的 `rect` 下降。
+**試作 + 撤回（2026-07-07）：** 先做了「transform 快取」版（`CellContent._trect_cache` + `rect_ext_transformed`，把
+`T.apply_to_rects(ext_bb)` 結果 memo 於 cell+T），byte-identical 護欄綠（`test_walk_giant_index.py`）。但**撤回**，兩個真相：
+1. **記憶體雷（F29 教訓重演）：** 快取的 tb = 10.8M×4×8B = **346MB/worker × 8 = +2.8GB 常駐**。真機 free_ram 已到 9.9GB
+   （giant per-worker footprint 已用 ~6.4-8.8GB）→ +2.8GB 極可能重新 paging，正是剛撤掉 F29 的失敗。**違反 F30 自訂「降 footprint 不增」原則。**
+2. **收益比想像小且更糊：** 這裡 env 無 native `.pyd`，bench（719ms/img）**灌水**；真機 `apply_to_rects` 是 native（10.8M ~150ms）。
+   且 giant 的 survivor loop 只 ~2150 iter（小）；`[export-timing]` 的 `mat: arrays=11413 instances=205849` 顯示 rect=536ms 的
+   **大頭其實是 leaf cell 的 repetition 展開**，不是 giant transform。→ 攻 giant transform 的性價比低。
+
+**重評方向（不急、低優先）：**
+- 記憶體中性的小改：flat giant 無 repetition 時 `tb[keep]` 即輸出，省掉 survivor loop + 第二次 transform（~10-30ms，byte-identical，零記憶體）——但收益太小，暫不做。
+- 真正要吃 10.8M transform+mask（~200ms）得靠**記憶體精簡的空間索引**（grid-on-local ~84MB，不存 tb），但要解 long-thin rect 的多格 span（複雜），且只佔 rect 的一部分。
+- **結論：M2 降為低優先**；rect=536ms 的大頭（leaf repetition + native transform）性價比不如 M4 的 2666ms。**先看 M1 真機數據再決定要不要回頭做 M2。**
 
 ### M3: 暖機 footprint 降低（L3，非 F29 共享）  [status: planned]
 

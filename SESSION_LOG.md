@@ -18,7 +18,15 @@
 **測試：** `test_export_fused`（byte-identical 護欄）/ `test_oasis_random` / `test_cellcache` 共 59 passed；inline 驗 `_walk_tdecode_total` 流通。
 
 **待 user：** 真機 `GLAS_FA_TIMING=1 GLAS_FA_TIMING_EVERY=1` 跑 5 張，貼 `[export-timing]` → 定 M4 主攻（decode vs 遞迴）。
-**影響檔案：** `glas/core/oasis_random.py`、`glas/core/overlay_export.py`、`docs/plans/F30-...md`、`CLAUDE.md`（§8 F30）。
+
+**M2 試作後撤回（transform 快取，同日）：** 做了「把 giant 的 `T.apply_to_rects(ext_bb)` 結果 memo 於 cell+T」版
+（`_trect_cache` + `rect_ext_transformed`，byte-identical 護欄綠）。**撤回**：(1) 快取 tb = 346MB/worker × 8 = **+2.8GB 常駐**，
+真機 free_ram 已到 9.9GB → 極可能重演剛撤掉的 F29 paging（違反 F30「降 footprint 不增」）；(2) 收益比想像小——此 env 無 native
+`.pyd`、bench 灌水，真機 `apply_to_rects` 是 native（~150ms）、giant survivor loop 僅 ~2150 iter，且 `mat: arrays=11413
+instances=205849` 顯示 rect=536ms 大頭其實是 **leaf repetition 展開**非 giant transform。→ **M2 降為低優先**，rect 性價比不如
+M4 的 2666ms；先看 M1 真機數據再決定。`git checkout` 還原 oasis_random.py（保留已 commit 的 M1）、刪 `test_walk_giant_index.py`。
+
+**影響檔案：** `glas/core/oasis_random.py`（M1）、`glas/core/overlay_export.py`（M1）、`docs/plans/F30-...md`、`CLAUDE.md`（§8 F30）。
 **Branch：** `claude/code-review-handoff-65xwf4`。
 
 ---
