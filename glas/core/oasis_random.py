@@ -2469,6 +2469,11 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
                              + stats.t_rect)
     rar._walk_tpoly_total = (getattr(rar, "_walk_tpoly_total", 0.0)
                              + stats.t_poly)
+    # F30 M1: also surface decode (load_cell: OASIS decode + cache load) so the
+    # export timer can split the "recursion + decode" block — decode vs the
+    # per-instance recursion/transform overhead — instead of it being one black box.
+    rar._walk_tdecode_total = (getattr(rar, "_walk_tdecode_total", 0.0)
+                               + stats.t_decode)
     # F27 M7h diagnosis: how many rect-array instances the walk had to MATERIALIZE
     # (expand offsets for) vs how few it emitted. arrays_materialized/instances_
     # materialized ≫ output means a giant repetition array is being expanded just

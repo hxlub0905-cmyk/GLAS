@@ -4,6 +4,25 @@
 
 ---
 
+## [2026-07-07] [F30 M1] export TPT 優化：量測 — 拆開「遞迴+decode」黑盒
+
+**變更類型：** 診斷插樁（純 Python、不改運算、不需 CI）· **狀態：code done、59 tests 綠、待 user 真機數據定調 M4**
+
+**動機：** F29 撤案後真機 LTV 8-worker 已不卡、196 張 ~7min；但暖機後仍 ~5s/張、walk 佔 80%，其中 ~2666ms 是「per-instance
+遞迴 + decode」黑盒，`[export-timing]` 看不到 decode vs 遞迴 拆分 → 無法決定 M4 該攻哪塊。plan：`docs/plans/F30-export-tpt-walk-hotpath.md`。
+
+**實作：** `RoiWalkStats.t_decode` 已在 `walk_roi` 量（`_decode_prof`），只是沒導出。`oasis_random.walk_roi` 尾段新增
+`rar._walk_tdecode_total += stats.t_decode`（比照既有 `_walk_trect_total` 等 per-reader 累加）；`overlay_export`
+的 `[export-timing]` 快照差量後印於 `[walk: place=… rect=… poly=… decode=…]`。`walk − (place+rect+poly+decode) ≈ 純遞迴`。
+
+**測試：** `test_export_fused`（byte-identical 護欄）/ `test_oasis_random` / `test_cellcache` 共 59 passed；inline 驗 `_walk_tdecode_total` 流通。
+
+**待 user：** 真機 `GLAS_FA_TIMING=1 GLAS_FA_TIMING_EVERY=1` 跑 5 張，貼 `[export-timing]` → 定 M4 主攻（decode vs 遞迴）。
+**影響檔案：** `glas/core/oasis_random.py`、`glas/core/overlay_export.py`、`docs/plans/F30-...md`、`CLAUDE.md`（§8 F30）。
+**Branch：** `claude/code-review-handoff-65xwf4`。
+
+---
+
 ## [2026-07-07] [F29] 撤案 — 共享記憶體 giant 真機驗收失敗，revert 回 session 前
 
 **變更類型：** 撤案 / revert（移除整個 F29 SHM 機制）· **狀態：branch reset 回 `origin/main`（846 passed）· PR #19 關閉**

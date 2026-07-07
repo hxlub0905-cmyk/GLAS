@@ -60,13 +60,13 @@ footprint」，不碰跨行程共享。
 > 分階段：M1 量測（極快、決定主戰場）→ M2/M3 安全自足加速（建立 walk-level byte-identical 護欄）→ M4 遞迴重構（大、險）
 > → M5 整體真機驗收。每個 milestone 可獨立 ship + 真機回歸。
 
-### M1: 量測 — 拆開 2666ms 黑盒（L1）  [status: planned]
+### M1: 量測 — 拆開 2666ms 黑盒（L1）  [status: code done · 待 user 真機數據]
 
-- [ ] `overlay_export.align_and_export_one_image` 的 `[export-timing]` 加印 `stats.t_decode`（reader 已在量 `_decode_prof`，
-  `oasis_random.py:2453`，只是沒導出）——把 decode 從「遞迴+decode」黑盒分離。
-- [ ] 順帶印暖機組成：第一張 vs 穩定張的 decode / 遞迴 / extent-build 差量（讓暖機 60-137s 的來源可見）。
-- [ ] 純 Python、不改任何運算邏輯、不需 CI。
-- [ ] 驗證：user 真機跑 5 張，貼 `[export-timing]`，得到 decode vs 遞迴 拆分 → **據此定 M4 主攻方向**（decode 大則 M4 併 leaf 快取；遞迴大則 M4 專攻 per-instance vectorize）。
+- [x] `overlay_export.align_and_export_one_image` 的 `[export-timing]` 加印 `decode`（reader 新增 `_walk_tdecode_total`
+  累加 `stats.t_decode`；overlay_export 快照差量後印於 `[walk: … decode=…]`）——把 decode 從「遞迴+decode」黑盒分離。
+- [x] 純 Python、不改運算邏輯、不需 CI；`walk − (place+rect+poly+decode) ≈ 純 per-instance 遞迴`。59 tests 綠、`_walk_tdecode_total` 流通已驗。
+- [ ] **驗證（待 user）**：真機 `GLAS_FA_TIMING=1 GLAS_FA_TIMING_EVERY=1` 跑 5 張，貼 `[export-timing]`，得 decode vs 遞迴 拆分
+  → **據此定 M4 主攻方向**（decode 大則 M4 併 leaf 快取；遞迴大則 M4 專攻 per-instance vectorize）。
 
 ### M2: giant rect 空間索引 + ROI-independent transform 快取（L2）  [status: planned]
 
