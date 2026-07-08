@@ -95,7 +95,23 @@ footprint」，不碰跨行程共享。
 - [ ] 評估：M2 的空間索引是否可**取代** per-image transient 的 transformed-bbox 陣列 → 進一步降單 worker giant footprint → 減 8-worker 冷啟併發記憶體壓力（純降用量、不跨 worker 共享）。
 - [ ] 驗證：真機暖機期總時間下降、`free_ram` 低點抬升、無新 thrash（HUD worker 列不大片標紅）。
 
-### M4: walk 遞迴主體重構（L4）— 消 ~4.2-4.8s per-instance 遞迴  [status: 路徑 (a) 選定，待 user 核准開工]
+### M4: walk 遞迴主體重構（L4）— 消 ~4.2-4.8s per-instance 遞迴  [status: 護欄已建 + 正確性已 de-risk · 核心「可負擔 topo」為硬問題]
+
+**進度（2026-07-07，user 核准開工後）：**
+- ✅ **sbbox byte-identity 護欄已建**（`test_walk_batched.py::test_batched_matches_walk_roi_sbbox_hierarchy`）：leaf 放 20×20 grid + sbbox
+  設真實 extent，`walk_roi` vs `walk_roi_batched` 在 all/tight/strip/empty ROI 全 byte-identical（含 sbbox prune）。**→ batched 機制在 sbbox 資料上正確性已證，M4 只剩「可負擔」問題，非正確性。**
+- 🔍 **讀 `walk_roi_batched` 處理迴圈（:2791-2885）發現：** 它的 emit/傳遞**本身已 ROI-pruned**（`xf` dict 只有被 ROI-reaching segment 打到的 cell 才處理，其餘 `continue`）。**唯一貴的是 whole-graph `order`（topo）build**（:2761-2790）—— 它 `load_cell_bbox` 解**每一個** reachable cell（LTV 無 CE → full-decode，giant 10.8M 還不吃 sidecar），且 `load_cell` memo **無 eviction → 全 44996 cell 幾何常駐**（記憶體）。
+
+**「可負擔 topo」的兩條路（核心設計岔路）：**
+- **(i) whole-graph topo + sidecar-aware**：讓 topo build 對大 cell 走 `load_cell`（giant 走 sidecar 便宜）。**但仍解+持有全 44996 cell** →
+  decode 時間 + 記憶體雙重 regression（recursive walk 整批只碰 ~5000 unique cell；whole-graph 解 44996 = 4-9× 更多 + 全持有）→ **F29 鄰域記憶體雷**。**否決**（違反 F30 原則）。
+- **(ii) ROI-pruned lazy batched（正解、但硬）**：不建 whole-graph topo，用 worklist/chaotic-iteration 只在 ROI-reachable 子圖傳遞 segment、
+  最後每 cell emit 一次。避開 decode+記憶體 regression。**但這是真正難的 DAG 演算法**（cell 被多 parent 放置 = DAG，要「所有 parent 先於 child」卻不預建全圖 topo → segment 成長時需重傳遞至 fixpoint）+ 高 byte-identity 風險。多步、需逐段驗。
+
+**現實：M4 核心 (ii) 是多 session 的硬工程。** 已完成的 de-risk（護欄 + 定位「只剩 topo 可負擔性」）是實打實的進度；(ii) 的實作待 user 決定投入。
+
+---
+（以下為原 M1 定案 + 可行性分析，保留為脈絡。）
 
 **M1 數據定案（2026-07-07）：穩定張 = 遞迴主導（~4.2-4.8s）、decode 小（~5-8%）→ 選 L4 路徑 (a)「sbbox-pruned 子圖 batch」。**
 不是原本那個「whole-graph decode-free batched」（下方證得不可行），而是**只在 walk_roi 已用 sbbox 剪出的 ~210-cell ROI 子圖內**
