@@ -65,8 +65,12 @@ footprint」，不碰跨行程共享。
 - [x] `overlay_export.align_and_export_one_image` 的 `[export-timing]` 加印 `decode`（reader 新增 `_walk_tdecode_total`
   累加 `stats.t_decode`；overlay_export 快照差量後印於 `[walk: … decode=…]`）——把 decode 從「遞迴+decode」黑盒分離。
 - [x] 純 Python、不改運算邏輯、不需 CI；`walk − (place+rect+poly+decode) ≈ 純 per-instance 遞迴`。59 tests 綠、`_walk_tdecode_total` 流通已驗。
-- [ ] **驗證（待 user）**：真機 `GLAS_FA_TIMING=1 GLAS_FA_TIMING_EVERY=1` 跑 5 張，貼 `[export-timing]`，得 decode vs 遞迴 拆分
-  → **據此定 M4 主攻方向**（decode 大則 M4 併 leaf 快取；遞迴大則 M4 專攻 per-instance vectorize）。
+- [x] **驗證（user 真機，2026-07-07）**：拿到 `decode=` 拆分。**結論：遞迴大、decode 小。**
+  - **暖機後穩定張**（batch 主體）：`img 1477` total=6430 walk=5358 → **decode=231、rect=617、place=257 → 遞迴（walk−place−rect−poly−decode）≈4253ms**；
+    `img 1512` total=8330 walk=7127 → decode=545、rect=1051、place=714 → **遞迴≈4817ms**。decode 僅 ~5-8%。
+  - **冷第一張/worker**：`img 1469/1467/1480` total~68s、**decode=23.9-25.6s**（giant extent 冷建 + ~470 cell 冷解）—— 這是 warmup（M3），非穩定張。
+  - **定案：穩定張 = per-instance 遞迴主導（~4.2-4.8s）→ 走 L4；decode 小 → L5 leaf 快取剔除。** 真正冗餘：leaf 被放 K 次 → K 次
+    `walk()` 各重 emit 同一 leaf 幾何（`mat instances≈197k`）。
 
 ### M2: giant rect emit（L2）  [status: transform-cache 試作後撤回 · 降級/重評]
 
@@ -91,9 +95,15 @@ footprint」，不碰跨行程共享。
 - [ ] 評估：M2 的空間索引是否可**取代** per-image transient 的 transformed-bbox 陣列 → 進一步降單 worker giant footprint → 減 8-worker 冷啟併發記憶體壓力（純降用量、不跨 worker 共享）。
 - [ ] 驗證：真機暖機期總時間下降、`free_ram` 低點抬升、無新 thrash（HUD worker 列不大片標紅）。
 
-### M4: walk 遞迴主體重構（L4）— 消 2666ms per-instance 遞迴  [status: 原構想不可行 · 改路徑待 M1 數據]
+### M4: walk 遞迴主體重構（L4）— 消 ~4.2-4.8s per-instance 遞迴  [status: 路徑 (a) 選定，待 user 核准開工]
 
-**可行性結論（Explore agent，2026-07-07）：原 plan 的「decode-free batched via sbbox」對 LTV 定義級不可行。**
+**M1 數據定案（2026-07-07）：穩定張 = 遞迴主導（~4.2-4.8s）、decode 小（~5-8%）→ 選 L4 路徑 (a)「sbbox-pruned 子圖 batch」。**
+不是原本那個「whole-graph decode-free batched」（下方證得不可行），而是**只在 walk_roi 已用 sbbox 剪出的 ~210-cell ROI 子圖內**
+把「leaf 被放 K 次 → K 次 `walk()` 各重 emit」collapse 成「per-child 一次、vectorize over K 個 translation」（複用
+`_emit_plain_rects_seg`）。這**不建 whole-graph topo**（子圖只碰 walk 本來就會 decode 的 cell）→ 繞開下方 Q4 矛盾。
+估：穩定張 walk ~5s → ~1.5-2s、per-image ~6s → ~3s、batch ~7min → ~4min。
+
+**可行性結論（Explore agent，2026-07-07）：原 plan 的「decode-free batched via sbbox」（whole-graph topo）對 LTV 定義級不可行。**
 - batched 要 topo order（`oasis_random.py:2761-2790`）→ 要 parent→child 邊 = **placements**（:2781）；`sbbox_for`（:943）只給
   一個 bbox tuple、**不含子 cell 邊**。placements 只能靠解碼 record stream 取得。
 - LTV 無 CE 層 → `load_cell_bbox` 的早停（:1202）永不觸發 → 對每個 reachable cell **full-decode**（含 giant 的 10.8M

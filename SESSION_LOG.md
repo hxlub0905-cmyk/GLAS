@@ -17,7 +17,10 @@
 
 **測試：** `test_export_fused`（byte-identical 護欄）/ `test_oasis_random` / `test_cellcache` 共 59 passed；inline 驗 `_walk_tdecode_total` 流通。
 
-**待 user：** 真機 `GLAS_FA_TIMING=1 GLAS_FA_TIMING_EVERY=1` 跑 5 張，貼 `[export-timing]` → 定 M4 主攻（decode vs 遞迴）。
+**M1 數據（user 真機，已到）：** 穩定張 decode 小（~231-545ms，~5-8%）、**per-instance 遞迴主導**（walk−place−rect−poly−decode
+≈4.2-4.8s）；冷第一張/worker 才 decode-heavy（~24s，giant extent 冷建，屬 warmup/M3）。**定案：L4 走路徑 (a)「sbbox-pruned 子圖
+batch」**（只在 ~210-cell ROI 子圖內 collapse「leaf 放 K 次 → K 次 walk() 重 emit」為 vectorized，不建 whole-graph topo → 繞開
+agent 證得的 whole-graph 不可行）。decode 小 → L5 leaf 快取剔除。M4 開工前待 user 核准（大重構、byte-identical 為硬底線）。
 
 **M2 試作後撤回（transform 快取，同日）：** 做了「把 giant 的 `T.apply_to_rects(ext_bb)` 結果 memo 於 cell+T」版
 （`_trect_cache` + `rect_ext_transformed`，byte-identical 護欄綠）。**撤回**：(1) 快取 tb = 346MB/worker × 8 = **+2.8GB 常駐**，
