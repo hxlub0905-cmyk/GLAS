@@ -69,6 +69,26 @@ def test_batched_matches_walk_roi_small_grid(tmp_path):
     _cmp(p, {(17, 0)}, 17, 0, [(-100, -100, 6000, 6000), (1900, 1900, 2100, 2100)])
 
 
+def test_batched_matches_walk_roi_sbbox_hierarchy(tmp_path):
+    # F30 M4 guard: the batched machinery must be byte-identical to walk_roi on an
+    # S_BOUNDING_BOX chip too (the LTV shape) — the existing batched tests only use
+    # S_CELL_OFFSET fixtures, so the sbbox-prune descent path was untested. A leaf
+    # (10x10 rect) placed on a 20x20 grid; sbbox set to the true extents so the
+    # prune actually fires on the tight/empty ROIs and both walks must prune the
+    # same instances.
+    places = [(x * 40, y * 40) for y in range(20) for x in range(20)]
+    p = tmp_path / "sbh.oas"
+    p.write_bytes(T._build_hierarchy_sbbox(
+        places, root_sbbox=[0, 0, 0, 20 * 40 + 10, 20 * 40 + 10],
+        child_sbbox=[0, 0, 0, 10, 10]))
+    _cmp(p, {(17, 0)}, 17, 0, [
+        (-50, -50, 20 * 40 + 50, 20 * 40 + 50),   # all placements
+        (300, 300, 340, 340),                      # tight — sbbox prunes far ones
+        (-10, 300, 850, 340),                      # a horizontal strip (one row)
+        (10_000_000, 10_000_000, 10_000_100, 10_000_100),  # empty
+    ])
+
+
 def test_batched_matches_walk_roi_rect_repetition(tmp_path):
     # A RECTANGLE with a type-2 repetition inside the cell (own-geometry clip).
     start = (bytes([oas.START]) + T._astr("1.0") + bytes([0])
