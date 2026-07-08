@@ -91,17 +91,37 @@ footprint」，不碰跨行程共享。
 - [ ] 評估：M2 的空間索引是否可**取代** per-image transient 的 transformed-bbox 陣列 → 進一步降單 worker giant footprint → 減 8-worker 冷啟併發記憶體壓力（純降用量、不跨 worker 共享）。
 - [ ] 驗證：真機暖機期總時間下降、`free_ram` 低點抬升、無新 thrash（HUD worker 列不大片標紅）。
 
-### M4: walk 遞迴主體重構（L4）— 消 2666ms per-instance 遞迴  [status: planned]
+### M4: walk 遞迴主體重構（L4）— 消 2666ms per-instance 遞迴  [status: 原構想不可行 · 改路徑待 M1 數據]
 
-- [ ] （前置）依 M1 數據定位：2666ms 中 decode 佔多少、per-instance 遞迴佔多少。
-- [ ] 讓 `walk_roi_batched` 對「sbbox + 無 CE」型**可負擔**：目前 `_batched_walk_affordable`（`oasis_random.py:2678`）因 sbbox 直接
-  回 False（topo build 的 `load_cell_bbox` 會 full-decode）。改用 **sbbox（decode-free）建 topo / instance 集**，繞開 full-decode，
-  讓 batched 的「每 cell 一次、vectorize over instances」取代 3340 次 per-instance `walk()`。
-- [ ] （若 decode 也大）併入 leaf 快取策略（L5）：ROI-touched leaf 打包單一 archive 或降 `min_records`，避免每 worker 首觸重解。
-- [ ] **byte-identical 護欄（最關鍵）**：batched 路徑的 rect+poly SET 與 `walk_roi` 逐一相同（既有 `walk_roi_batched` 已宣稱
-  byte-identical，需對 LTV sbbox 型補測）；保留 `walk_roi` 為 fallback，只有護欄綠才切路。
-- [ ] Open question（Q2）：若純 Python decode-free batched 不可行 → 與 user 確認走 native descent（.pyx，需 CI）或止步 M2/M3。
-- [ ] 驗證：`pytest` 綠（含新 byte-identical 測）+ 真機 LTV per-image walk 主體大幅下降、總時間對照。
+**可行性結論（Explore agent，2026-07-07）：原 plan 的「decode-free batched via sbbox」對 LTV 定義級不可行。**
+- batched 要 topo order（`oasis_random.py:2761-2790`）→ 要 parent→child 邊 = **placements**（:2781）；`sbbox_for`（:943）只給
+  一個 bbox tuple、**不含子 cell 邊**。placements 只能靠解碼 record stream 取得。
+- LTV 無 CE 層 → `load_cell_bbox` 的早停（:1202）永不觸發 → 對每個 reachable cell **full-decode**（含 giant 的 10.8M
+  records，且走獨立 `_bbox_memo`、**不吃 cellcache sidecar**）。OASIS record stream 順序變長 → **無法「只解 placement、跳過幾何」**
+  （要到第 N 個 record 必得 parse 前面每一個）。
+- 好消息：batched 的**剪枝數學已與 walk_roi 一致**（都走 `reachable_bbox` 的 sbbox-first 分支，:2756/:1119）；擋掉純粹是 topo build 的 decode 成本、非正確性。
+
+**per-instance 遞迴（2666ms）真結構：** `walk()`（:2187）每 FOV instance 進一次；`load_cell` 對 memo 命中**不重解**（:960）——
+所以「遞迴」那半 = :2434 的 `for k in sel: walk(...)` 的 K 次函式開銷 + 子 leaf 幾何被放 K 次就重算 K 次（:2256-2309）。
+placement gather 已快取（`_place_prep`）。
+
+**替代 L4 路徑（待 M1 數字選路，不預先綁死）：**
+- **(a) sbbox-pruned 子圖 batch**：保留 walk_roi 的 sbbox 剪枝（只碰 ~210 cell），把 :2434 的 per-instance K×`walk()` 換成
+  per-child segment 累積 + vectorized emit（複用 `_emit_plain_rects_seg` :2579 / `_batch_place_prep` :2610）。**繞開 Q4 矛盾
+  （不建 whole-graph topo）**；效益最高、但要把 tree 遞迴重構成 DAG worklist，byte-identical 風險最高。純 Python。
+- **(b) placement-aware 輕解碼 + giant 走 sidecar**：讓 topo build 對已快取大 cell 走 `load_cell`（sidecar 命中免重解 giant），
+  餵現成 batched。改動集中、prune 已一致 → byte-identical 風險較低；**但「一次性掃 44996 cell」的 warmup 成本是真機未知數（F29 鄰域雷）**。純 Python。
+- **(c) native descent（.pyx）**：最高效益（~100×），但需 CI + 破壞 F30「純 Python」現況。
+- **(d) 只 vectorize 密集 repetition 那段**（不動 topo）：最安全、但 giant flat 無 repetition → 對 giant 無益，只吃「leaf 被密集重複」。
+
+**硬前提：M1 真機 `decode` vs `walk−(place+rect+poly+decode)`（遞迴）拆分。**
+- 遞迴大 → (a)/(d) 對症；
+- **decode 大 → 上面全部都不解 decode**，得改攻 **L5 leaf 快取**（見下 M4' / plan 原 L5：`min_records` 或 ROI-touched leaf archive）。
+- **沒有這個數字，任何 L4 選路都是盲賭。** → M4 開工前必須先有 M1 數據。
+
+- [ ] byte-identical 護欄缺口（agent 指出）：現有 `test_walk_batched` 的 fixture **只有 S_CELL_OFFSET、無 S_BOUNDING_BOX** →
+  不涵蓋 LTV 的 sbbox 路徑；M4 要補一個**帶 sbbox 的合成 fixture**、經 `walk_roi_fast` gate 分流、與 `walk_roi`（golden）逐一比對。
+- [ ] 保留 `walk_roi` 為 fallback，只有護欄綠才切路。
 
 ### M5: 整體真機驗收 + 收尾  [status: planned]
 
