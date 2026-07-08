@@ -95,9 +95,22 @@ footprint」，不碰跨行程共享。
 - [ ] 評估：M2 的空間索引是否可**取代** per-image transient 的 transformed-bbox 陣列 → 進一步降單 worker giant footprint → 減 8-worker 冷啟併發記憶體壓力（純降用量、不跨 worker 共享）。
 - [ ] 驗證：真機暖機期總時間下降、`free_ram` 低點抬升、無新 thrash（HUD worker 列不大片標紅）。
 
-### M4: walk 遞迴主體重構（L4）— 消 ~4.2-4.8s per-instance 遞迴  [status: 護欄已建 + 正確性已 de-risk · 核心「可負擔 topo」為硬問題]
+### M4: walk 遞迴主體重構（L4）— 消 ~4.2-4.8s per-instance 遞迴  [status: 第一刀「contained leaf 快取路」已 ship（護欄綠）· 待真機驗收 · 跨 parent DAG 為硬問題留 (ii)]
 
-**進度（2026-07-07，user 核准開工後）：**
+**已 ship（2026-07-08）— contained leaf fast-path（`_WALK_LEAF_BATCH`）：** 在 `walk_roi` 的 placement descent（:2491）
+把「target 是純幾何 leaf（`placement_count()==0`）且 **surviving instance > 1**（`len(sel) > 1`）」的 `for k in sel: walk(...)`
+K× 遞迴，換成**一次** `_emit_leaf_segment`（:2681）——plain-rects/no-poly 走 vectorized `_emit_plain_rects_seg`、有 repeated
+rect / polygon 則落回逐 instance `_emit_cell_geom`。這正打 LTV 的 dense repetition array（`mat maxk=6938`：一個 placement 6938
+instance 從 6938 次 `walk()` → 1 次 vectorized emit）。**不碰 topo/DAG**，故繞開下方 (ii) 的硬問題。
+- **byte-identical 護欄**（`test_walk_leaf_batch.py`，5 tests）：`_WALK_LEAF_BATCH` ON vs OFF 在 dense array / 多 distinct
+  placement / sbbox prune / repeated-rect 落回 / size-cap 落回全 byte-identical。全套 852 綠。
+- **F29 記憶體雷雙重防護**：(1) `len(sel) > 1` gate —— giant flat cell 只被放一次（`sel==1`）→ 永不進快取路 → 不 cache coords；
+  (2) `_LEAF_PLAIN_MAX_RECTS = 1_000_000` cap —— `rect_plain_coords` 對超過的 cell **在 materialize float64 前**回 None（防某檔把
+  百萬-rect flat cell 當 repetition array 放）→ 落回逐 instance emit、零額外快取。**giant 的 345MB coords copy（F29 的錯）不會發生。**
+- **範疇界定：** 這只 collapse「單一 placement 的 repetition array」（K 個同 pitch instance）。「leaf 被 K 個 **distinct** placement
+  放」（cross-parent 冗餘，`mat instances≈205849` 的另一半）仍是下方 (ii) 的 DAG 問題，本刀刻意不碰。→ **部分 M4 win，待真機量 walk 降幅。**
+
+**先前 de-risk（2026-07-07）：**
 - ✅ **sbbox byte-identity 護欄已建**（`test_walk_batched.py::test_batched_matches_walk_roi_sbbox_hierarchy`）：leaf 放 20×20 grid + sbbox
   設真實 extent，`walk_roi` vs `walk_roi_batched` 在 all/tight/strip/empty ROI 全 byte-identical（含 sbbox prune）。**→ batched 機制在 sbbox 資料上正確性已證，M4 只剩「可負擔」問題，非正確性。**
 - 🔍 **讀 `walk_roi_batched` 處理迴圈（:2791-2885）發現：** 它的 emit/傳遞**本身已 ROI-pruned**（`xf` dict 只有被 ROI-reaching segment 打到的 cell 才處理，其餘 `continue`）。**唯一貴的是 whole-graph `order`（topo）build**（:2761-2790）—— 它 `load_cell_bbox` 解**每一個** reachable cell（LTV 無 CE → full-decode，giant 10.8M 還不吃 sidecar），且 `load_cell` memo **無 eviction → 全 44996 cell 幾何常駐**（記憶體）。
