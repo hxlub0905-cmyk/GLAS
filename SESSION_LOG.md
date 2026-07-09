@@ -6,9 +6,18 @@
 
 ## [2026-07-08] [F30 M4] walk 遞迴主體：leaf 分組 emit（`_WALK_LEAF_BATCH`，cut-1→cut-2）
 
-**變更類型：** 效能重構（walk 熱路徑，純 Python、不需 CI）· **狀態：code done、852 tests 綠、byte-identical 護欄全過、待 user 真機驗收**
+**變更類型：** 效能重構（walk 熱路徑，純 Python、不需 CI）· **狀態：cut-2 已真機驗收＝大致中性；真瓶頸另在，加 M4′ 診斷重定向**
 
-**動機：** M1 真機定調——LTV 穩定張 walk 主體是 **per-instance 遞迴主導**（~4.2-4.8s）。冗餘有兩類：(a) dense repetition
+**真機驗收（2026-07-08，user LTV 8-worker）+ M4′ 診斷：** cut-2 上機後 **TPT 大致中性**。`[export-timing]` 拆解定案：
+`walk − (place+rect+poly+decode)` 這塊「UNACCOUNTED」才是 walk 主體，**不是** cut-1/cut-2 攻的 emit（`rect=`）。穩定張
+（warm，decode=0）：UNACCOUNTED ≈ 3646-7351ms、rect(emit) 僅 729-7708ms——低內容 ROI 時 UNACCOUNTED 是 emit 的 5×。
+這塊是 `walk()` placement loop 內**每 array 的 analytic clip（`_clip_grid_offsets`，~11000 次/張 Python）+ root-coord exact
+prune（plb + `apply_to_rects` + ROI mask，~200k candidate instance/張）**，之前無計時 → M1 式黑盒重現。**M4′：** 加
+`t_clip`/`t_prune` 兩計時（RoiWalkStats + per-reader 累加 + `[export-timing]` 印 `clip=`/`prune=`），下一張真機即可分辨主戰場
+是 clip（Python-per-array，需 batched/演算法）還是 prune（可批次化 `apply_to_rects`+mask）。cut-1/cut-2 保留（byte-identical、
+對高內容 ROI 的 emit 仍略有幫助）。冷啟首波（ramp 2→8）另 40-165s/張、rect 20-49s（giant emit × 記憶體爭用），是 M3 warmup 大魚。
+
+**動機（cut-1/cut-2）：** M1 真機定調——LTV 穩定張 walk 主體是 **per-instance 遞迴主導**（~4.2-4.8s）。冗餘有兩類：(a) dense repetition
 array 被逐 instance `walk()`（`[export-timing]` `mat maxk=6938`）、(b) 同 leaf 被同 parent 多個 placement 各放一次。
 plan：`docs/plans/F30-export-tpt-walk-hotpath.md`（M4 路徑 (a) 第一刀）。
 
@@ -36,8 +45,8 @@ repeated-rect 落回 / size-cap 落回，`_WALK_LEAF_BATCH` ON vs OFF 全 byte-i
 **852 passed, 4 skipped**（含 `test_export_fused` 融合匯出 byte-identity）。
 
 **影響檔案：** `glas/core/oasis_random.py`（`_WALK_LEAF_BATCH` / `_LEAF_PLAIN_MAX_RECTS` / `rect_plain_coords` /
-`_emit_leaf_segment` / descent 分組）、`tests/test_walk_leaf_batch.py`（新）、`tests/test_walk_batched.py`、
-`docs/plans/F30-export-tpt-walk-hotpath.md`。
+`_emit_leaf_segment` / descent 分組；M4′：`t_clip`/`t_prune`）、`glas/core/overlay_export.py`（M4′：`[export-timing]` 印
+`clip=`/`prune=`）、`tests/test_walk_leaf_batch.py`（新）、`tests/test_walk_batched.py`、`docs/plans/F30-export-tpt-walk-hotpath.md`。
 **Branch：** `claude/code-review-handoff-65xwf4`。
 
 ---

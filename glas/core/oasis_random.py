@@ -1531,6 +1531,13 @@ class RoiWalkStats:
     t_place: float = 0.0
     t_rect: float = 0.0
     t_poly: float = 0.0
+    # F30 M4′: the untimed in-loop per-array work that the export-timing
+    # "UNACCOUNTED" chunk (walk − place − rect − poly − decode) turned out to be
+    # dominated by — split so the next cut targets the real cost. t_clip = the
+    # per-array analytic sub-grid clip (_clip_grid_offsets, Python-per-array);
+    # t_prune = the root-coord exact prune (plb build + apply_to_rects + ROI mask).
+    t_clip: float = 0.0
+    t_prune: float = 0.0
 
 
 def _xform_bbox(T: Transform, bbox: Bbox) -> np.ndarray:
@@ -2467,7 +2474,9 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
             # Materialize only the sub-grid whose instances can reach the ROI
             # (analytic clip for regular grids; full array for arbitrary lists),
             # then exact-mask in root coords.
+            _tc = time.perf_counter()
             oa = _clip_grid_offsets(rtype, rraw, placed, T, roi)  # (K,2)
+            stats.t_clip += time.perf_counter() - _tc
             K = oa.shape[0]
             stats.arrays_materialized += 1
             stats.instances_materialized += K
@@ -2476,12 +2485,14 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
             if K == 0:
                 stats.instances_pruned += full_k
                 continue
+            _tp = time.perf_counter()
             plb = np.empty((K, 4), dtype=np.float64)
             plb[:, 0] = placed[0] + oa[:, 0]; plb[:, 1] = placed[1] + oa[:, 1]
             plb[:, 2] = placed[2] + oa[:, 0]; plb[:, 3] = placed[3] + oa[:, 1]
             rootb = T.apply_to_rects(plb)                        # -> root coords
             mask = _roi_overlap_mask(rootb, roi)
             sel = np.flatnonzero(mask)
+            stats.t_prune += time.perf_counter() - _tp
             stats.instances_pruned += full_k - len(sel)
             if len(sel) == 0:
                 continue
@@ -2565,6 +2576,13 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
     # per-instance recursion/transform overhead — instead of it being one black box.
     rar._walk_tdecode_total = (getattr(rar, "_walk_tdecode_total", 0.0)
                                + stats.t_decode)
+    # F30 M4′: split the remaining UNACCOUNTED (walk − place − rect − poly −
+    # decode) into the per-array analytic clip vs the root-coord exact prune —
+    # real-machine steady-state showed this is the dominant walk cost, not the emit.
+    rar._walk_tclip_total = (getattr(rar, "_walk_tclip_total", 0.0)
+                             + stats.t_clip)
+    rar._walk_tprune_total = (getattr(rar, "_walk_tprune_total", 0.0)
+                              + stats.t_prune)
     # F27 M7h diagnosis: how many rect-array instances the walk had to MATERIALIZE
     # (expand offsets for) vs how few it emitted. arrays_materialized/instances_
     # materialized ≫ output means a giant repetition array is being expanded just

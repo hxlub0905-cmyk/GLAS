@@ -112,6 +112,20 @@ per-`(target, composed_M)` group（`leaf_groups` dict，`composed_M.tobytes()` �
 - **範疇界定：** cut-2 收「**同 parent 內**」的 cross-placement 冗餘。「leaf 被**跨 parent**多處放」（DAG 冗餘，`mat instances≈205849`
   的另一半）仍留 (ii)。→ **部分 M4 win，待真機量 walk 降幅。**
 
+**真機驗收（2026-07-08，user LTV 8-worker）：cut-2 大致中性 → 攻錯目標，重定向。** `[export-timing]` 拆解定案：
+| 區塊（warm 穩定張，decode=0）| 時間 | 註 |
+|---|---|---|
+| **UNACCOUNTED = walk−(place+rect+poly+decode)** | **3646-7351ms** | 之前無計時的**每-array clip + root-coord prune**——真主體 |
+| rect（emit，cut-1/cut-2 攻的）| 729-7708ms | 低內容 ROI 時僅 UNACCOUNTED 的 1/5 |
+| place（gather+prune 前段）| 297-1114ms | |
+| cold 首波（ramp 2→8）| **40-165s/張** | rect 20-49s＝giant emit × 記憶體爭用；M3 warmup 大魚 |
+
+- **cut-1/cut-2 攻的 emit 不是穩定張主體**；主體是 `walk()` placement loop 內：`_clip_grid_offsets`（~11000 次/張 Python-per-array）
+  + plb+`apply_to_rects`+ROI mask（~200k candidate instance/張，`mat instances≈207115`）。cut-1/cut-2 保留（byte-identical、對高內容 ROI emit 仍略助）。
+- **M4′（已加，2026-07-08）：** `RoiWalkStats.t_clip`/`t_prune` + per-reader 累加 + `[export-timing]` 印 `clip=`/`prune=`。
+  下一張真機即可分辨主戰場：**clip**（Python-per-array，需 batched/演算法重構）vs **prune**（可批次化——所有 array 的候選 bbox 串一起、
+  一次 `apply_to_rects`+一次 mask、再散射回各 array，byte-identical、零 topo/DAG、記憶體中性）。**先量再攻，不再盲改 emit。**
+
 **(ii) blocker 已定位（2026-07-08，讀碼確認）：** cross-parent 冗餘正是 `walk_roi_batched` 的專長（`norep_groups` 跨 edge 分組），
 但被 `_batched_walk_affordable` 對 sbbox 檔擋掉（`:2793`）。**唯一 blocker 是 whole-graph topo build（`:2856-2881`）**：它對每個
 reachable cell 呼 `load_cell_bbox`，LTV 無 CE → 對 giant **full-decode 10.8M records**（不吃 sidecar）。
