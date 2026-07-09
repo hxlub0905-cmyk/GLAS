@@ -95,20 +95,31 @@ footprint」，不碰跨行程共享。
 - [ ] 評估：M2 的空間索引是否可**取代** per-image transient 的 transformed-bbox 陣列 → 進一步降單 worker giant footprint → 減 8-worker 冷啟併發記憶體壓力（純降用量、不跨 worker 共享）。
 - [ ] 驗證：真機暖機期總時間下降、`free_ram` 低點抬升、無新 thrash（HUD worker 列不大片標紅）。
 
-### M4: walk 遞迴主體重構（L4）— 消 ~4.2-4.8s per-instance 遞迴  [status: 第一刀「contained leaf 快取路」已 ship（護欄綠）· 待真機驗收 · 跨 parent DAG 為硬問題留 (ii)]
+### M4: walk 遞迴主體重構（L4）— 消 ~4.2-4.8s per-instance 遞迴  [status: cut-2「leaf 分組 emit」已 ship（護欄綠）· 待真機驗收 · 跨 parent DAG 留 (ii)，blocker 已定位]
 
-**已 ship（2026-07-08）— contained leaf fast-path（`_WALK_LEAF_BATCH`）：** 在 `walk_roi` 的 placement descent（:2491）
-把「target 是純幾何 leaf（`placement_count()==0`）且 **surviving instance > 1**（`len(sel) > 1`）」的 `for k in sel: walk(...)`
-K× 遞迴，換成**一次** `_emit_leaf_segment`（:2681）——plain-rects/no-poly 走 vectorized `_emit_plain_rects_seg`、有 repeated
-rect / polygon 則落回逐 instance `_emit_cell_geom`。這正打 LTV 的 dense repetition array（`mat maxk=6938`：一個 placement 6938
-instance 從 6938 次 `walk()` → 1 次 vectorized emit）。**不碰 topo/DAG**，故繞開下方 (ii) 的硬問題。
+**已 ship（2026-07-08）— leaf 分組 emit（`_WALK_LEAF_BATCH`，cut-2 subsumes cut-1）：** 在 `walk_roi` 的 `walk()` placement
+descent，當 `pl.target` 是純幾何 leaf（`placement_count()==0`）時**不遞迴**——把該 leaf 的存活 instance 累進
+per-`(target, composed_M)` group（`leaf_groups` dict，`composed_M.tobytes()` 為 key 的一部分）；parent 的 placement loop 跑完
+後，每個 group 用**一次** `_emit_leaf_segment`（新增）vectorize emit 全部 instance。
+- **一次收兩類冗餘**：(a) 單 placement 的 dense repetition array（`mat maxk=6938`：6938 次 `walk()` → 1 次 vectorized emit）；
+  (b) 同 parent 內多個 distinct placement 放同 leaf（同 target+同 M → 同 group → 一次 emit）。singleton leaf 也走 group 路
+  （省 `walk()` 函式開銷）→ 對 leaf **嚴格 ≥ 遞迴速度**。**不碰 topo/DAG**，繞開下方 (ii) 硬問題。
 - **byte-identical 護欄**（`test_walk_leaf_batch.py`，5 tests）：`_WALK_LEAF_BATCH` ON vs OFF 在 dense array / 多 distinct
-  placement / sbbox prune / repeated-rect 落回 / size-cap 落回全 byte-identical。全套 852 綠。
-- **F29 記憶體雷雙重防護**：(1) `len(sel) > 1` gate —— giant flat cell 只被放一次（`sel==1`）→ 永不進快取路 → 不 cache coords；
-  (2) `_LEAF_PLAIN_MAX_RECTS = 1_000_000` cap —— `rect_plain_coords` 對超過的 cell **在 materialize float64 前**回 None（防某檔把
-  百萬-rect flat cell 當 repetition array 放）→ 落回逐 instance emit、零額外快取。**giant 的 345MB coords copy（F29 的錯）不會發生。**
-- **範疇界定：** 這只 collapse「單一 placement 的 repetition array」（K 個同 pitch instance）。「leaf 被 K 個 **distinct** placement
-  放」（cross-parent 冗餘，`mat instances≈205849` 的另一半）仍是下方 (ii) 的 DAG 問題，本刀刻意不碰。→ **部分 M4 win，待真機量 walk 降幅。**
+  placement 分組 / sbbox prune 分組 / repeated-rect 落回 / size-cap 落回全 byte-identical；`TestBigGridRepetition` 精確 rects+stats 綠。全套 852 綠（含 `test_export_fused`）。
+- **F29 記憶體雷防護**：`_LEAF_PLAIN_MAX_RECTS = 1_000_000` cap —— `rect_plain_coords` 對超過的 cell **在 materialize float64 前**
+  （先看 `shape[0]`）回 None → 落回逐 instance `_emit_cell_geom`、零額外快取。giant flat cell（10.8M rects）雖也走 group 路，
+  但 cap 直接擋掉 coords copy → **345MB copy（F29 的錯）不會重演**。`leaf_groups` 為 per-`walk()`-call 區域變數、return 即釋放、不跨 parent 累積。
+- **範疇界定：** cut-2 收「**同 parent 內**」的 cross-placement 冗餘。「leaf 被**跨 parent**多處放」（DAG 冗餘，`mat instances≈205849`
+  的另一半）仍留 (ii)。→ **部分 M4 win，待真機量 walk 降幅。**
+
+**(ii) blocker 已定位（2026-07-08，讀碼確認）：** cross-parent 冗餘正是 `walk_roi_batched` 的專長（`norep_groups` 跨 edge 分組），
+但被 `_batched_walk_affordable` 對 sbbox 檔擋掉（`:2793`）。**唯一 blocker 是 whole-graph topo build（`:2856-2881`）**：它對每個
+reachable cell 呼 `load_cell_bbox`，LTV 無 CE → 對 giant **full-decode 10.8M records**（不吃 sidecar）。
+- 記憶體**不是**問題：`_decode_bbox_at`（`:1210`）只留 `placements` + 一個 own-bbox（geometry 不入 CellContent），故 `_bbox_memo`
+  持 44996 個輕量 content = 有界。segment 處理迴圈本就 ROI-pruned（`xf.pop` 沒 segment 就 skip），`load_cell` 只碰 ~5000 ROI cell。
+- 故 (ii) 解法收斂為**小而準**：topo build 對有 sidecar 的 giant 走 `load_cell`（免 10.8M decode）、其餘走 load_cell_bbox；再翻
+  `_batched_walk_affordable` 對 sbbox 的 gate（或加 opt-in）。**一次性 topo warmup 成本（44996 小 cell decode）是真機未知數** →
+  待 cut-2 真機數據（walk 降幅、殘量落點）再定是否投入。**不預先綁死。**
 
 **先前 de-risk（2026-07-07）：**
 - ✅ **sbbox byte-identity 護欄已建**（`test_walk_batched.py::test_batched_matches_walk_roi_sbbox_hierarchy`）：leaf 放 20×20 grid + sbbox

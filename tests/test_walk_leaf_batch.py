@@ -1,17 +1,15 @@
-"""F30 M4: the recursive walk's leaf fast-path (``_WALK_LEAF_BATCH``) — emitting a
-pure-geometry leaf's geometry over a whole surviving placement segment in one op
-instead of one recursive ``walk()`` per instance — must be **byte-identical** to
-the per-instance recursion. Compare ``walk_roi`` with the fast-path ON vs OFF over
-a spread of fixtures.
+"""F30 M4: the recursive walk's leaf fast-path (``_WALK_LEAF_BATCH``) — a
+pure-geometry leaf target does not recurse; its surviving instances accumulate
+into a per-(target, matrix) group that is emitted ONCE (vectorized over every
+instance) after the parent's placement loop — must be **byte-identical** to the
+per-instance recursion. Compare ``walk_roi`` with the fast-path ON vs OFF.
 
-The fast-path only fires for a placement with **more than one** surviving instance
-(``len(sel) > 1``): a dense repetition array is where the K× recursion cost lives,
-and the ``len(sel) > 1`` gate also excludes the once-placed giant flat cell from
-ever caching a coords copy (the F29 memory lesson). Distinct single-instance
-placements therefore stay on recursion — the tests over those fixtures guard that
-adding the fast-path machinery does not perturb them. A leaf whose own rects
-repeat (or that exceeds ``_LEAF_PLAIN_MAX_RECTS``) declines the vectorized emit and
-falls to the exact per-instance emit; those fallbacks are guarded too.
+The group collapses BOTH a dense repetition array's ROI survivors AND multiple
+distinct placements of the same leaf in one parent (both land in the same group).
+A leaf whose own rects repeat, that carries polygons, or that exceeds
+``_LEAF_PLAIN_MAX_RECTS`` (the F29 giant-coords memory guard) declines the
+vectorized emit and falls to the exact per-instance emit; those fallbacks are
+guarded too.
 """
 from __future__ import annotations
 
@@ -53,25 +51,23 @@ def _cmp_on_off(path, wanted, layer, dt, rois, monkeypatch):
 
 
 def test_leaf_batch_dense_repetition_array(tmp_path, monkeypatch):
-    # A 1M-instance placement array of a leaf rect — the fast-path collapses the
-    # ROI survivors (a block ROI keeps many, so len(sel) > 1 fires) into one
-    # vectorized emit; must match the per-instance walk. The tight/empty ROIs keep
-    # 0 or 1 instance -> recursion path, still must match.
+    # A 1M-instance placement array of a leaf rect — the group collapses the ROI
+    # survivors (whether a block keeps many or a tight ROI keeps one) into one
+    # vectorized emit; must match the per-instance walk over all ROI sizes.
     p = tmp_path / "g.oas"
     p.write_bytes(T._build_big_grid(1000, 1000, 1000))
     _cmp_on_off(p, {(17, 0)}, 17, 0, [
-        (1900, 1900, 2100, 2100),      # one instance -> len(sel)==1 -> recursion
-        (-100, -100, 5000, 5000),      # a block -> len(sel) > 1 -> fast path
+        (1900, 1900, 2100, 2100),      # one instance
+        (-100, -100, 5000, 5000),      # a block of instances
         (10_000_000, 0, 10_000_100, 100),  # empty
     ], monkeypatch)
 
 
 def test_leaf_batch_many_distinct_placements(tmp_path, monkeypatch):
-    # 1200 DISTINCT single-instance placements of a leaf. Each has len(sel)==1, so
-    # the fast-path gate declines them all and they stay on recursion; this guards
-    # that the fast-path machinery does not perturb the many-distinct-placement
-    # case (the cross-parent redundancy that the contained fast-path deliberately
-    # leaves to the harder DAG batching).
+    # 1200 DISTINCT single-instance placements of one leaf, same parent + same
+    # orientation -> they all land in ONE per-(target, matrix) group and emit
+    # once. This is the cut-2 cross-placement collapse (not just a repetition
+    # array); must be byte-identical to the per-instance recursion.
     places = [(x * 40, y * 40) for y in range(30) for x in range(40)]
     p = tmp_path / "h.oas"
     p.write_bytes(T._build_hierarchy(places))
@@ -83,9 +79,9 @@ def test_leaf_batch_many_distinct_placements(tmp_path, monkeypatch):
 
 
 def test_leaf_batch_sbbox_prune(tmp_path, monkeypatch):
-    # Distinct single-instance placements on an S_BOUNDING_BOX chip (the LTV
-    # shape): singletons stay on recursion, so this guards that the fast-path
-    # addition does not disturb the sbbox-prune descent.
+    # Distinct single-instance placements of one leaf on an S_BOUNDING_BOX chip
+    # (the LTV shape): the survivors that pass the sbbox prune are grouped and
+    # emitted once — guards the group emit is byte-identical under sbbox pruning.
     places = [(x * 40, y * 40) for y in range(20) for x in range(20)]
     p = tmp_path / "sbh.oas"
     p.write_bytes(T._build_hierarchy_sbbox(

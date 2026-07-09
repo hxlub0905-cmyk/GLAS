@@ -4,33 +4,39 @@
 
 ---
 
-## [2026-07-08] [F30 M4] walk 遞迴主體：contained leaf fast-path（`_WALK_LEAF_BATCH`）
+## [2026-07-08] [F30 M4] walk 遞迴主體：leaf 分組 emit（`_WALK_LEAF_BATCH`，cut-1→cut-2）
 
 **變更類型：** 效能重構（walk 熱路徑，純 Python、不需 CI）· **狀態：code done、852 tests 綠、byte-identical 護欄全過、待 user 真機驗收**
 
-**動機：** M1 真機定調——LTV 穩定張 walk 主體是 **per-instance 遞迴主導**（~4.2-4.8s），冗餘來源是「dense repetition array
-被逐 instance `walk()`」（`[export-timing]` `mat maxk=6938`：一個 placement 6938 instance 各進一次 `walk()` 重 emit 同一 leaf
-幾何）。plan：`docs/plans/F30-export-tpt-walk-hotpath.md`（M4 路徑 (a) 的第一刀）。
+**動機：** M1 真機定調——LTV 穩定張 walk 主體是 **per-instance 遞迴主導**（~4.2-4.8s）。冗餘有兩類：(a) dense repetition
+array 被逐 instance `walk()`（`[export-timing]` `mat maxk=6938`）、(b) 同 leaf 被同 parent 多個 placement 各放一次。
+plan：`docs/plans/F30-export-tpt-walk-hotpath.md`（M4 路徑 (a) 第一刀）。
 
-**實作：** `oasis_random.walk_roi` 的 placement descent（`walk()` 內 :2491）——當 `pl.target` 是純幾何 leaf
-（`placement_count()==0`）且 surviving instance > 1（`len(sel) > 1`）時，把 `for k in sel: walk(...)` 的 K× 遞迴換成**一次**
-`_emit_leaf_segment`（新增，:2681）：plain-rects/no-poly 走既有 vectorized `_emit_plain_rects_seg`，有 repeated rect / polygon
-則落回逐 instance `_emit_cell_geom`（與遞迴同一 emit 碼）。新增 `CellContent.rect_plain_coords`（純 leaf 的 `(N,4)` coords，
-非 plain 或超 cap 回 None）。**不碰 topo/DAG**，繞開 whole-graph batched 的 decode+記憶體 regression。
+**實作（cut-2，subsumes cut-1）：** `oasis_random.walk_roi` 的 `walk()` placement descent——當 `pl.target` 是純幾何 leaf
+（`placement_count()==0`）時**不遞迴**，把該 leaf 的存活 instance 累進 per-`(target, composed_M)` group；parent 的
+placement loop 跑完後，每個 group 用**一次** `_emit_leaf_segment`（新增）vectorize emit 掉全部 instance。這同時 collapse
+(a) 單 placement 的 repetition array **和** (b) 同 parent 多個 distinct placement 放同 leaf。plain-rects/no-poly 走
+vectorized `_emit_plain_rects_seg`；repeated rect / polygon 落回逐 instance `_emit_cell_geom`（與遞迴同一 emit 碼）。新增
+`CellContent.rect_plain_coords`（純 leaf 的 `(N,4)` coords；非 plain / 有 poly / 超 cap 回 None）。singleton leaf 也走 group
+路（省掉 `walk()` 函式開銷）→ 對 leaf **嚴格 ≥ 遞迴速度**。**不碰 topo/DAG**，繞開 whole-graph batched 的 decode+記憶體 regression。
 
-**F29 記憶體雷雙重防護（硬要求）：** (1) `len(sel) > 1` gate——giant flat cell（`_2_gri_yank_top`，10.8M rects）只被放一次
-（`sel==1`）→ 永不進快取路 → 不 cache coords；(2) `_LEAF_PLAIN_MAX_RECTS = 1_000_000` cap——`rect_plain_coords` 對超過的 cell
-**在 materialize float64 前**回 None → 落回逐 instance emit、零額外快取。**giant 345MB coords copy（F29 的錯）不會重演。**
+**F29 記憶體雷防護（硬要求）：** `_LEAF_PLAIN_MAX_RECTS = 1_000_000` cap——`rect_plain_coords` 對超過的 cell **在 materialize
+float64 前**（先看 `shape[0]`）回 None → 落回逐 instance emit、零額外快取。giant flat cell（`_2_gri_yank_top`，10.8M rects）
+雖也走 group 路，但 cap 直接擋掉 coords copy → **345MB copy（F29 的錯）不會重演**。`leaf_groups` 為 per-`walk()`-call 區域變數、
+return 即釋放、不跨 parent 累積。
 
-**範疇：** 只 collapse「單一 placement 的 repetition array」。「leaf 被 K 個 distinct placement 放」（cross-parent DAG 冗餘）仍留
-M4 (ii) 硬問題，本刀不碰 → 部分 win，待真機量 walk 降幅。
+**範疇：** cut-2 收「同 parent 內」的 cross-placement 冗餘。「leaf 被**跨 parent**多處放」（DAG 冗餘）仍留 M4 (ii)——已定位唯一
+blocker 是 `walk_roi_batched` 的 whole-graph topo build（`load_cell_bbox` 對 giant 10.8M full-decode；`_decode_bbox_at` 只留
+placements+bbox 故**記憶體有界**，純 decode 時間問題）→ 解法是「topo 對 giant 走 sidecar + 翻 `_batched_walk_affordable` gate」，
+但一次性 warmup 成本未量測，待真機 cut-2 數據再定投入。
 
-**測試：** 新增 `tests/test_walk_leaf_batch.py`（5 tests：dense array vectorized / 多 distinct placement 不擾動 / sbbox prune
-不擾動 / repeated-rect 落回 / size-cap 落回，`_WALK_LEAF_BATCH` ON vs OFF 全 byte-identical）；`test_walk_batched` 補
-`test_batched_matches_walk_roi_sbbox_hierarchy`。全套 `pytest tests/` **852 passed, 4 skipped**。
+**測試：** 新增 `tests/test_walk_leaf_batch.py`（5 tests：dense array / 多 distinct placement 分組 / sbbox prune 分組 /
+repeated-rect 落回 / size-cap 落回，`_WALK_LEAF_BATCH` ON vs OFF 全 byte-identical）；`test_walk_batched` 補
+`test_batched_matches_walk_roi_sbbox_hierarchy`；`TestBigGridRepetition`（精確 rects + stats）綠。全套 `pytest tests/`
+**852 passed, 4 skipped**（含 `test_export_fused` 融合匯出 byte-identity）。
 
 **影響檔案：** `glas/core/oasis_random.py`（`_WALK_LEAF_BATCH` / `_LEAF_PLAIN_MAX_RECTS` / `rect_plain_coords` /
-`_emit_leaf_segment` / descent fast-path）、`tests/test_walk_leaf_batch.py`（新）、`tests/test_walk_batched.py`、
+`_emit_leaf_segment` / descent 分組）、`tests/test_walk_leaf_batch.py`（新）、`tests/test_walk_batched.py`、
 `docs/plans/F30-export-tpt-walk-hotpath.md`。
 **Branch：** `claude/code-review-handoff-65xwf4`。
 

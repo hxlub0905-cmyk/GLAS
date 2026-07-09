@@ -102,21 +102,24 @@ _FASTWALK = _FAST if (_FAST is not None and getattr(_FAST, "VERSION", 0) >= 7) \
 # a shared/persisted flatten will lift this.)
 _NATIVE_WALK_MAX_CELLS = 4000
 _NATIVE_WALK_MAX_RECTS = 400_000
-# F30 M4: in the recursive walk, when a placement's target is a pure-geometry leaf
-# (no child placements), emit its geometry over the whole surviving instance
-# segment in one vectorized op instead of one recursive walk() per instance. This
-# collapses a dense placement array's many ROI survivors (the LTV per-instance
-# recursion cost) without any topo / DAG handling. Byte-identical to the K× walk()
-# (reuses the batched emit helpers, guarded by test_walk_batched). Toggle only so
-# the guard test can compare on vs off; always on in production.
+# F30 M4: in the recursive walk, a placement whose target is a pure-geometry leaf
+# (no child placements) does not recurse — its surviving instances accumulate into
+# a per-(target, matrix) group and the group is emitted ONCE (vectorized over every
+# instance) after the parent's placement loop, instead of one recursive walk() per
+# instance. This collapses BOTH a dense repetition array's ROI survivors AND
+# multiple distinct placements of the same leaf, without any topo / DAG handling.
+# Byte-identical to the K× walk() (reuses the batched emit helpers, guarded by
+# test_walk_leaf_batch). Toggle only so the guard test can compare on vs off;
+# always on in production.
 _WALK_LEAF_BATCH = True
 # F30 M4 memory guard (F29 lesson): the vectorized leaf emit caches a float64
 # coords copy of the leaf. For a giant flat cell (LTV `_2_gri_yank_top`, 10.8M
 # rects → 345MB × 8 workers) that copy is exactly the F29 paging regression, so a
-# leaf over this many rects declines the vectorized path and falls to the
-# per-instance emit (no extra cache). The giant is also placed once (len(sel)==1),
-# which the fast-path condition already skips — this cap is defense-in-depth for
-# any file that places a millions-of-rects flat cell as a repetition array.
+# leaf over this many rects declines the vectorized path (rect_plain_coords returns
+# None BEFORE materializing the copy) and falls to the exact per-instance emit with
+# no extra cache. This cap — not any len(sel) gate — is what keeps the giant's
+# coords out of memory now that every leaf (including the once-placed giant) is
+# routed through the group emit.
 _LEAF_PLAIN_MAX_RECTS = 1_000_000
 # Placement repetition is expanded into individual edges at flatten time (M3d),
 # so bound the EXPANDED edge count too — a dense device/die array must not blow
@@ -2447,6 +2450,11 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
         keep = valid & _roi_overlap_mask(T.apply_to_rects(arr_local), roi)
         stats.instances_pruned += int(rcount[valid & ~keep].sum())
         stats.t_place += time.perf_counter() - _ts_pl   # gather+prune only
+        # F30 M4: pure-geometry leaf targets are accumulated into per-(target,
+        # matrix) groups and emitted ONCE after this loop (see the group-emit
+        # below) instead of a recursive walk() per instance. Non-leaf targets
+        # keep the recursion. None disables the fast-path (guard test only).
+        leaf_groups = {} if _WALK_LEAF_BATCH else None
         for i in np.flatnonzero(keep):
             pl = content.placement_at(int(i))     # lazy single (no full build)
             rtype, rraw = pl.repetition_type, pl.repetition_raw
@@ -2480,26 +2488,26 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
             place_ts = base.t + oa                              # (K,2)
             composed_M = T.M @ base.M
             composed_ts = place_ts @ T.M.T + T.t                # (K,2)
-            # F30 M4: if the target is a pure-geometry leaf (no child placements)
-            # placed on MORE than one surviving instance, emit its geometry over
-            # the whole segment in one vectorized op instead of one recursive
-            # walk() per instance — this collapses a dense placement array's ROI
-            # survivors (the LTV per-instance recursion cost). Byte-identical to
-            # the K× walk() (_emit_leaf_segment reuses the proven emit helpers;
-            # guarded by test_walk_leaf_batch). The `len(sel) > 1` gate keeps
-            # singletons on recursion (zero batching benefit) and, crucially,
-            # excludes the once-placed giant flat cell from ever caching a coords
-            # copy (F29 memory lesson). Non-leaf targets keep the exact recursive
-            # descent + cycle guard.
+            # F30 M4: a pure-geometry leaf target (no child placements) does not
+            # recurse — accumulate its surviving instances into a per-(target,
+            # matrix) group and emit the whole group ONCE after the loop. This
+            # collapses BOTH a dense repetition array's ROI survivors AND multiple
+            # distinct placements of the same leaf in this parent into one
+            # vectorized emit (byte-identical to the per-instance walk(), guarded
+            # by test_walk_leaf_batch). Non-leaf targets keep the exact recursive
+            # descent + cycle guard. The giant flat cell lands here too, but its
+            # coords copy is declined by _LEAF_PLAIN_MAX_RECTS (rect_plain_coords
+            # returns None), so it falls to the per-instance emit with no extra
+            # cache — the F29 memory lesson.
             tgt = rar.load_cell(pl.target)
-            if _WALK_LEAF_BATCH and len(sel) > 1 and tgt.placement_count() == 0:
+            if leaf_groups is not None and tgt.placement_count() == 0:
                 seg_ts = composed_ts[sel]                       # (S,2)
-                stats.cell_visits += int(seg_ts.shape[0])
-                stats.instances_visited += int(seg_ts.shape[0])
-                _ts_lf = time.perf_counter()
-                _emit_leaf_segment(tgt, key, composed_M, seg_ts, roi,
-                                   rect_out, poly_out)
-                stats.t_rect += time.perf_counter() - _ts_lf
+                gk = (pl.target, composed_M.tobytes())
+                grp = leaf_groups.get(gk)
+                if grp is None:
+                    leaf_groups[gk] = [tgt, composed_M, [seg_ts]]
+                else:
+                    grp[2].append(seg_ts)
             else:
                 visiting.add(pl.target)
                 for k in sel:
@@ -2507,6 +2515,18 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
                     walk(pl.target, Transform(M=composed_M, t=composed_ts[k]),
                          visiting, depth + 1)
                 visiting.discard(pl.target)
+        # ── emit each accumulated leaf group once (vectorized over all its
+        # surviving instances) — the collapse of the per-instance recursion ──
+        if leaf_groups:
+            _ts_lf = time.perf_counter()
+            for tgt, cM, ts_list in leaf_groups.values():
+                seg_ts = (ts_list[0] if len(ts_list) == 1
+                          else np.concatenate(ts_list))
+                stats.cell_visits += int(seg_ts.shape[0])
+                stats.instances_visited += int(seg_ts.shape[0])
+                _emit_leaf_segment(tgt, key, cM, seg_ts, roi,
+                                   rect_out, poly_out)
+            stats.t_rect += time.perf_counter() - _ts_lf
 
     walk(root_id, Transform.identity(), set(), 0)
     rects = (np.concatenate(rect_out)
