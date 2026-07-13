@@ -102,6 +102,25 @@ _FASTWALK = _FAST if (_FAST is not None and getattr(_FAST, "VERSION", 0) >= 7) \
 # a shared/persisted flatten will lift this.)
 _NATIVE_WALK_MAX_CELLS = 4000
 _NATIVE_WALK_MAX_RECTS = 400_000
+# F30 M4: in the recursive walk, a placement whose target is a pure-geometry leaf
+# (no child placements) does not recurse — its surviving instances accumulate into
+# a per-(target, matrix) group and the group is emitted ONCE (vectorized over every
+# instance) after the parent's placement loop, instead of one recursive walk() per
+# instance. This collapses BOTH a dense repetition array's ROI survivors AND
+# multiple distinct placements of the same leaf, without any topo / DAG handling.
+# Byte-identical to the K× walk() (reuses the batched emit helpers, guarded by
+# test_walk_leaf_batch). Toggle only so the guard test can compare on vs off;
+# always on in production.
+_WALK_LEAF_BATCH = True
+# F30 M4 memory guard (F29 lesson): the vectorized leaf emit caches a float64
+# coords copy of the leaf. For a giant flat cell (LTV `_2_gri_yank_top`, 10.8M
+# rects → 345MB × 8 workers) that copy is exactly the F29 paging regression, so a
+# leaf over this many rects declines the vectorized path (rect_plain_coords returns
+# None BEFORE materializing the copy) and falls to the exact per-instance emit with
+# no extra cache. This cap — not any len(sel) gate — is what keeps the giant's
+# coords out of memory now that every leaf (including the once-placed giant) is
+# routed through the group emit.
+_LEAF_PLAIN_MAX_RECTS = 1_000_000
 # Placement repetition is expanded into individual edges at flatten time (M3d),
 # so bound the EXPANDED edge count too — a dense device/die array must not blow
 # up the CSR. Over this, the graph drops to the Python walk (which clips each
@@ -399,6 +418,40 @@ class CellContent:
             got = (base, _ext_from_columnar(base, rt, rr))
             self._ext_cache[ck] = got
         return got
+
+    def rect_plain_coords(self, key: LayerKey):
+        """``(N,4)`` float64 rect coords for ``key`` **iff every rect is plain**
+        (no per-rect repetition) **and** ``N <= _LEAF_PLAIN_MAX_RECTS``, else
+        ``None`` (F30 M4). Lets a caller emit the whole cell over a placement
+        segment in one vectorized op (:func:`_emit_plain_rects_seg`) — for a
+        no-repetition cell the base bbox IS the rect, so this is exactly what the
+        per-instance emit would transform. The row-count cap is checked **before**
+        materializing the float64 copy, so a giant flat cell never caches a
+        hundreds-of-MB coords array (F29 lesson); callers fall to the per-instance
+        emit on ``None``. Cached (in ``_ext_cache`` under a distinct key); handles
+        both the columnar (cache-loaded) and the freshly-decoded ``rect_specs``
+        backing."""
+        ck = ("rplain", key)
+        got = self._ext_cache.get(ck)
+        if got is None:
+            col = self._rcol.get(key)
+            if col is not None:
+                c, rt, _rr = col
+                coords = (np.ascontiguousarray(c, dtype=np.float64)
+                          if (c.shape[0] <= _LEAF_PLAIN_MAX_RECTS
+                              and not bool((np.asarray(rt) >= 0).any()))
+                          else None)
+            else:
+                specs = self.rect_specs.get(key) or ()
+                if len(specs) <= _LEAF_PLAIN_MAX_RECTS and all(
+                        s[4] is None for s in specs):
+                    coords = (np.array([s[:4] for s in specs], dtype=np.float64)
+                              if specs else np.empty((0, 4), dtype=np.float64))
+                else:
+                    coords = None
+            got = (coords,)
+            self._ext_cache[ck] = got
+        return got[0]
 
     def poly_arrays(self, key: LayerKey):
         """``(base (P,4), extent (P,4))`` local-frame bbox arrays for the
@@ -1478,6 +1531,13 @@ class RoiWalkStats:
     t_place: float = 0.0
     t_rect: float = 0.0
     t_poly: float = 0.0
+    # F30 M4′: the untimed in-loop per-array work that the export-timing
+    # "UNACCOUNTED" chunk (walk − place − rect − poly − decode) turned out to be
+    # dominated by — split so the next cut targets the real cost. t_clip = the
+    # per-array analytic sub-grid clip (_clip_grid_offsets, Python-per-array);
+    # t_prune = the root-coord exact prune (plb build + apply_to_rects + ROI mask).
+    t_clip: float = 0.0
+    t_prune: float = 0.0
 
 
 def _xform_bbox(T: Transform, bbox: Bbox) -> np.ndarray:
@@ -2397,6 +2457,11 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
         keep = valid & _roi_overlap_mask(T.apply_to_rects(arr_local), roi)
         stats.instances_pruned += int(rcount[valid & ~keep].sum())
         stats.t_place += time.perf_counter() - _ts_pl   # gather+prune only
+        # F30 M4: pure-geometry leaf targets are accumulated into per-(target,
+        # matrix) groups and emitted ONCE after this loop (see the group-emit
+        # below) instead of a recursive walk() per instance. Non-leaf targets
+        # keep the recursion. None disables the fast-path (guard test only).
+        leaf_groups = {} if _WALK_LEAF_BATCH else None
         for i in np.flatnonzero(keep):
             pl = content.placement_at(int(i))     # lazy single (no full build)
             rtype, rraw = pl.repetition_type, pl.repetition_raw
@@ -2409,7 +2474,9 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
             # Materialize only the sub-grid whose instances can reach the ROI
             # (analytic clip for regular grids; full array for arbitrary lists),
             # then exact-mask in root coords.
+            _tc = time.perf_counter()
             oa = _clip_grid_offsets(rtype, rraw, placed, T, roi)  # (K,2)
+            stats.t_clip += time.perf_counter() - _tc
             K = oa.shape[0]
             stats.arrays_materialized += 1
             stats.instances_materialized += K
@@ -2418,24 +2485,59 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
             if K == 0:
                 stats.instances_pruned += full_k
                 continue
+            _tp = time.perf_counter()
             plb = np.empty((K, 4), dtype=np.float64)
             plb[:, 0] = placed[0] + oa[:, 0]; plb[:, 1] = placed[1] + oa[:, 1]
             plb[:, 2] = placed[2] + oa[:, 0]; plb[:, 3] = placed[3] + oa[:, 1]
             rootb = T.apply_to_rects(plb)                        # -> root coords
             mask = _roi_overlap_mask(rootb, roi)
             sel = np.flatnonzero(mask)
+            stats.t_prune += time.perf_counter() - _tp
             stats.instances_pruned += full_k - len(sel)
             if len(sel) == 0:
                 continue
             place_ts = base.t + oa                              # (K,2)
             composed_M = T.M @ base.M
             composed_ts = place_ts @ T.M.T + T.t                # (K,2)
-            visiting.add(pl.target)
-            for k in sel:
-                stats.instances_visited += 1
-                walk(pl.target, Transform(M=composed_M, t=composed_ts[k]),
-                     visiting, depth + 1)
-            visiting.discard(pl.target)
+            # F30 M4: a pure-geometry leaf target (no child placements) does not
+            # recurse — accumulate its surviving instances into a per-(target,
+            # matrix) group and emit the whole group ONCE after the loop. This
+            # collapses BOTH a dense repetition array's ROI survivors AND multiple
+            # distinct placements of the same leaf in this parent into one
+            # vectorized emit (byte-identical to the per-instance walk(), guarded
+            # by test_walk_leaf_batch). Non-leaf targets keep the exact recursive
+            # descent + cycle guard. The giant flat cell lands here too, but its
+            # coords copy is declined by _LEAF_PLAIN_MAX_RECTS (rect_plain_coords
+            # returns None), so it falls to the per-instance emit with no extra
+            # cache — the F29 memory lesson.
+            tgt = rar.load_cell(pl.target)
+            if leaf_groups is not None and tgt.placement_count() == 0:
+                seg_ts = composed_ts[sel]                       # (S,2)
+                gk = (pl.target, composed_M.tobytes())
+                grp = leaf_groups.get(gk)
+                if grp is None:
+                    leaf_groups[gk] = [tgt, composed_M, [seg_ts]]
+                else:
+                    grp[2].append(seg_ts)
+            else:
+                visiting.add(pl.target)
+                for k in sel:
+                    stats.instances_visited += 1
+                    walk(pl.target, Transform(M=composed_M, t=composed_ts[k]),
+                         visiting, depth + 1)
+                visiting.discard(pl.target)
+        # ── emit each accumulated leaf group once (vectorized over all its
+        # surviving instances) — the collapse of the per-instance recursion ──
+        if leaf_groups:
+            _ts_lf = time.perf_counter()
+            for tgt, cM, ts_list in leaf_groups.values():
+                seg_ts = (ts_list[0] if len(ts_list) == 1
+                          else np.concatenate(ts_list))
+                stats.cell_visits += int(seg_ts.shape[0])
+                stats.instances_visited += int(seg_ts.shape[0])
+                _emit_leaf_segment(tgt, key, cM, seg_ts, roi,
+                                   rect_out, poly_out)
+            stats.t_rect += time.perf_counter() - _ts_lf
 
     walk(root_id, Transform.identity(), set(), 0)
     rects = (np.concatenate(rect_out)
@@ -2469,6 +2571,18 @@ def walk_roi(rar: "RandomAccessReader", root_id: object, roi_bbox: Bbox,
                              + stats.t_rect)
     rar._walk_tpoly_total = (getattr(rar, "_walk_tpoly_total", 0.0)
                              + stats.t_poly)
+    # F30 M1: also surface decode (load_cell: OASIS decode + cache load) so the
+    # export timer can split the "recursion + decode" block — decode vs the
+    # per-instance recursion/transform overhead — instead of it being one black box.
+    rar._walk_tdecode_total = (getattr(rar, "_walk_tdecode_total", 0.0)
+                               + stats.t_decode)
+    # F30 M4′: split the remaining UNACCOUNTED (walk − place − rect − poly −
+    # decode) into the per-array analytic clip vs the root-coord exact prune —
+    # real-machine steady-state showed this is the dominant walk cost, not the emit.
+    rar._walk_tclip_total = (getattr(rar, "_walk_tclip_total", 0.0)
+                             + stats.t_clip)
+    rar._walk_tprune_total = (getattr(rar, "_walk_tprune_total", 0.0)
+                              + stats.t_prune)
     # F27 M7h diagnosis: how many rect-array instances the walk had to MATERIALIZE
     # (expand offsets for) vs how few it emitted. arrays_materialized/instances_
     # materialized ≫ output means a giant repetition array is being expanded just
@@ -2600,6 +2714,26 @@ def _emit_plain_rects_seg(coords: np.ndarray, M: np.ndarray, ts: np.ndarray,
         if m.any():
             out = np.stack([xmin, ymin, xmax, ymax], axis=-1)[m]   # (S,4)
             rect_out.append(out)
+
+
+def _emit_leaf_segment(content, key, M: np.ndarray, ts: np.ndarray, roi: Bbox,
+                       rect_out: list, poly_out: list) -> None:
+    """Emit a pure-leaf cell's ``key`` geometry over one placement segment (shared
+    matrix ``M`` + ``K`` translations ``ts``) — byte-identical to ``K``× calls to
+    :func:`_emit_cell_geom` with ``Transform(M, ts[j])`` (F30 M4). The common
+    plain-rects / no-poly case goes through the vectorized
+    :func:`_emit_plain_rects_seg`; anything else (repeated rects, polygons) falls
+    to the exact per-instance emit — same code the batched walk uses (:2822)."""
+    if not (content.rect_count(key) or content.poly_count(key)):
+        return
+    coords = (content.rect_plain_coords(key)
+              if content.poly_count(key) == 0 else None)
+    if coords is not None:
+        _emit_plain_rects_seg(coords, M, ts, roi, rect_out)
+    else:
+        for j in range(ts.shape[0]):
+            _emit_cell_geom(content, key, Transform(M=M, t=ts[j]), roi,
+                            rect_out, poly_out)
 
 
 def _batch_place_prep(rar, content, cid, reachable_bbox):

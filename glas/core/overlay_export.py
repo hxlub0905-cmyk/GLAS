@@ -267,6 +267,9 @@ def align_and_export_one_image(job, rar, root, poi_colored, cfg, out_dir,
     _tp0 = getattr(rar, "_walk_tplace_total", 0.0) if _timing else 0.0
     _tr0 = getattr(rar, "_walk_trect_total", 0.0) if _timing else 0.0
     _tpo0 = getattr(rar, "_walk_tpoly_total", 0.0) if _timing else 0.0
+    _tdc0 = getattr(rar, "_walk_tdecode_total", 0.0) if _timing else 0.0  # F30 M1
+    _tcl0 = getattr(rar, "_walk_tclip_total", 0.0) if _timing else 0.0    # F30 M4′
+    _tpr0 = getattr(rar, "_walk_tprune_total", 0.0) if _timing else 0.0   # F30 M4′
     _am0 = getattr(rar, "_walk_arrmat_total", 0) if _timing else 0
     _im0 = getattr(rar, "_walk_instmat_total", 0) if _timing else 0
     _bw0 = getattr(rar, "_t_bwalk", 0.0) if _timing else 0.0
@@ -292,6 +295,14 @@ def align_and_export_one_image(job, rar, root, poi_colored, cfg, out_dir,
         tplace = (getattr(rar, "_walk_tplace_total", 0.0) - _tp0) * 1e3
         trect = (getattr(rar, "_walk_trect_total", 0.0) - _tr0) * 1e3
         tpoly = (getattr(rar, "_walk_tpoly_total", 0.0) - _tpo0) * 1e3
+        # F30 M1: decode (load_cell) split out of the "recursion + decode" block.
+        # walk minus (place + rect + poly + decode) ≈ pure per-instance recursion.
+        tdecode = (getattr(rar, "_walk_tdecode_total", 0.0) - _tdc0) * 1e3
+        # F30 M4′: split that remainder into the per-array analytic clip vs the
+        # root-coord exact prune (plb + apply_to_rects + ROI mask) — the real
+        # steady-state hot loop over ~200k candidate instances.
+        tclip = (getattr(rar, "_walk_tclip_total", 0.0) - _tcl0) * 1e3
+        tprune = (getattr(rar, "_walk_tprune_total", 0.0) - _tpr0) * 1e3
         bwalk = (getattr(rar, "_t_bwalk", 0.0) - _bw0) * 1e3
         bunion = (getattr(rar, "_t_bunion", 0.0) - _bu0) * 1e3
         bmorph = (getattr(rar, "_t_bmorph", 0.0) - _bm0) * 1e3
@@ -307,7 +318,8 @@ def align_and_export_one_image(job, rar, root, poi_colored, cfg, out_dir,
               f"total={total:.0f}ms  cells_decoded={n_dec} "
               f"reach_new={reach_new} cellvisits={cellvisits} "
               f"instances={instances}  "
-              f"[walk: place={tplace:.0f} rect={trect:.0f} poly={tpoly:.0f}]  "
+              f"[walk: place={tplace:.0f} rect={trect:.0f} poly={tpoly:.0f} "
+              f"decode={tdecode:.0f} clip={tclip:.0f} prune={tprune:.0f}]  "
               f"[mat: arrays={arrmat} instances={instmat} maxk={maxk}]  "
               f"[bool: walk={bwalk:.0f} union={bunion:.0f} morph={bmorph:.0f}]  "
               f"status={row['status']}", flush=True)

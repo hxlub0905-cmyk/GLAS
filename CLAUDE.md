@@ -224,9 +224,10 @@ HMI 風格表達式 → 遞迴下降 parser → AST → shapely 運算。運算�
   **M1–M4 完成 + 收尾大致完成**（`perfmon` 事件匯流排 + `perf_panel` 暖色系監控視窗〔配色沿用 styles.py〕 + 互動插樁
   + export worker 即時監控/ramp/RAM/thrash 標紅 + 11 類事件全接 + Export log 一次性匯出；README 已補、PR #15 已關）。
   M5（worker mid-image 心跳）deferred。**剩：user 真機驗收**。plan：`docs/plans/F28-perf-hud.md`。
-- [F29] LTV giant-cell 共享記憶體（消除 8× giant 複製 thrash，估 ~3×）+ 效能/體驗 roadmap（M2 ramp/RAM 護欄、
-  M3 UX/ETA/level 篩選、M4 [B01] 中文路徑、M5 native placement 解碼）。**plan 已寫、可行性審核過（walk 唯讀→唯讀 SHM 可行）、
-  待 user 核准開工 M1**。plan：`docs/plans/F29-shared-mem-giant-roadmap.md`。
+- [F30] LTV export TPT 優化（walk 熱路徑）。真機證實暖機後 ~5s/張、walk 佔 80%：~2666ms 遞迴+decode 黑盒、giant rect
+  emit 536ms（每張對 10.8M bbox 重 transform，但 T 固定→ROI-independent）。**plan 已寫、user 核准積極路線（含 L4 遞迴重構）、
+  待核准開工 M1**。分階段：M1 量測（印 `t_decode` 拆黑盒）→ M2 giant 空間索引+transform 快取 → M3 暖機 footprint →
+  M4 遞迴重構（batched-via-sbbox，byte-identical 護欄）→ M5 真機驗收。plan：`docs/plans/F30-export-tpt-walk-hotpath.md`。
 
 ### 待辦 (Backlog)
 
@@ -236,6 +237,11 @@ HMI 風格表達式 → 遞迴下降 parser → AST → shapely 運算。運算�
 - [F17] （原 `[F16-B]`，改號避免與「大 cell 解碼快取」F16-B 撞名）S_BOUNDING_BOX 的後續：給「大檔 + 無
   S_BOUNDING_BOX + 無 CE 層」型做一次性 bbox sweep + sidecar 快取。**目前已知三個測試檔都用不到**（會慢的大檔
   都帶 S_BOUNDING_BOX）→ 低優先。F16 方案 A 已完成（`docs/plans/F16-sbbox-roi-prune.md`）。
+- [F29] ~~LTV giant-cell 共享記憶體（8× np.load → 1× 唯讀共享）~~ — **撤案**（2026-07-07，M1 全實作但真機驗收失敗）。
+  真機 `[export-timing]`：worker 實算 ~5s/張，但牆鐘 ~35s/張 → 每張 ~30s 空檔（per-task SHM 傳遞 + Windows
+  pagefile-backed shared_memory 在低 RAM paging），**對 2-worker 比原本每 worker np.load 還糟**。已 `reset --hard
+  origin/main` 撤除，保留 F28 HUD / F27 ramp。真正瓶頸是 flat giant 的 per-ROI 幾何（另需 spatial index，與記憶體無關）。
+  plan `docs/plans/F29-shared-mem-giant-roadmap.md` 標「撤案」保留為 design history。
 - [F11] ~~整顆 chip OASIS 匯出（原始 + Boolean 全 chip 重算）+ GDS 座標可見性~~ — **撤案**（2026-06-03，
   user 決定不做）。plan 仍保留於 `docs/plans/F11-whole-chip-export.md` 供日後參考。
 - [F12] 無索引表 OASIS：**部分完成（2026-06-04）**。原「全原生支援」（含無 per-cell bbox 的隨機存取）

@@ -1,9 +1,13 @@
 # [F29] LTV giant-cell 共享記憶體 + 效能/體驗 roadmap
 
-> **狀態：** planned（M1 待核准開工）
-> **§8 ID：** [F29]
-> **建立：** 2026-07-06
-> **負責 branch：** claude/code-review-handoff-65xwf4（PR #18）
+> **狀態：** ⛔ **撤案（2026-07-07）** — M1 全實作 + 上 PR #19，但真機 LTV 驗收失敗後 revert。保留為 design history。
+> **撤案原因：** `[export-timing]` 顯示 worker 實算僅 ~5s/張，但牆鐘 ~35s/張 → 每張 ~30s 空檔（per-task SHM descriptor
+> 傳遞 + Windows pagefile-backed `shared_memory` 在低 free RAM〔11→7.2→4.4GB〕下 paging）。SHM 只共享 coords、未共享每
+> worker ~GB 的 extent cache，**對 2-worker 比原本「每 worker np.load」更糟**。真正瓶頸是 flat giant 的 per-ROI 幾何
+> （另需 spatial index，與記憶體重複無關）。詳見 SESSION_LOG 2026-07-07。
+> **§8 ID：** [F29]（已移入 Backlog 標撤案）
+> **建立：** 2026-07-06　**撤案：** 2026-07-07
+> **負責 branch：** claude/code-review-handoff-65xwf4（PR #19，已關）
 
 ---
 

@@ -4,6 +4,115 @@
 
 ---
 
+## [2026-07-08] [F30 M4] walk 遞迴主體：leaf 分組 emit（`_WALK_LEAF_BATCH`，cut-1→cut-2）
+
+**變更類型：** 效能重構（walk 熱路徑，純 Python、不需 CI）· **狀態：cut-2 已真機驗收＝大致中性；真瓶頸另在，加 M4′ 診斷重定向**
+
+**真機驗收（2026-07-08，user LTV 8-worker）+ M4′ 診斷：** cut-2 上機後 **TPT 大致中性**。`[export-timing]` 拆解定案：
+`walk − (place+rect+poly+decode)` 這塊「UNACCOUNTED」才是 walk 主體，**不是** cut-1/cut-2 攻的 emit（`rect=`）。穩定張
+（warm，decode=0）：UNACCOUNTED ≈ 3646-7351ms、rect(emit) 僅 729-7708ms——低內容 ROI 時 UNACCOUNTED 是 emit 的 5×。
+這塊是 `walk()` placement loop 內**每 array 的 analytic clip（`_clip_grid_offsets`，~11000 次/張 Python）+ root-coord exact
+prune（plb + `apply_to_rects` + ROI mask，~200k candidate instance/張）**，之前無計時 → M1 式黑盒重現。**M4′：** 加
+`t_clip`/`t_prune` 兩計時（RoiWalkStats + per-reader 累加 + `[export-timing]` 印 `clip=`/`prune=`），下一張真機即可分辨主戰場
+是 clip（Python-per-array，需 batched/演算法）還是 prune（可批次化 `apply_to_rects`+mask）。cut-1/cut-2 保留（byte-identical、
+對高內容 ROI 的 emit 仍略有幫助）。冷啟首波（ramp 2→8）另 40-165s/張、rect 20-49s（giant emit × 記憶體爭用），是 M3 warmup 大魚。
+
+**動機（cut-1/cut-2）：** M1 真機定調——LTV 穩定張 walk 主體是 **per-instance 遞迴主導**（~4.2-4.8s）。冗餘有兩類：(a) dense repetition
+array 被逐 instance `walk()`（`[export-timing]` `mat maxk=6938`）、(b) 同 leaf 被同 parent 多個 placement 各放一次。
+plan：`docs/plans/F30-export-tpt-walk-hotpath.md`（M4 路徑 (a) 第一刀）。
+
+**實作（cut-2，subsumes cut-1）：** `oasis_random.walk_roi` 的 `walk()` placement descent——當 `pl.target` 是純幾何 leaf
+（`placement_count()==0`）時**不遞迴**，把該 leaf 的存活 instance 累進 per-`(target, composed_M)` group；parent 的
+placement loop 跑完後，每個 group 用**一次** `_emit_leaf_segment`（新增）vectorize emit 掉全部 instance。這同時 collapse
+(a) 單 placement 的 repetition array **和** (b) 同 parent 多個 distinct placement 放同 leaf。plain-rects/no-poly 走
+vectorized `_emit_plain_rects_seg`；repeated rect / polygon 落回逐 instance `_emit_cell_geom`（與遞迴同一 emit 碼）。新增
+`CellContent.rect_plain_coords`（純 leaf 的 `(N,4)` coords；非 plain / 有 poly / 超 cap 回 None）。singleton leaf 也走 group
+路（省掉 `walk()` 函式開銷）→ 對 leaf **嚴格 ≥ 遞迴速度**。**不碰 topo/DAG**，繞開 whole-graph batched 的 decode+記憶體 regression。
+
+**F29 記憶體雷防護（硬要求）：** `_LEAF_PLAIN_MAX_RECTS = 1_000_000` cap——`rect_plain_coords` 對超過的 cell **在 materialize
+float64 前**（先看 `shape[0]`）回 None → 落回逐 instance emit、零額外快取。giant flat cell（`_2_gri_yank_top`，10.8M rects）
+雖也走 group 路，但 cap 直接擋掉 coords copy → **345MB copy（F29 的錯）不會重演**。`leaf_groups` 為 per-`walk()`-call 區域變數、
+return 即釋放、不跨 parent 累積。
+
+**範疇：** cut-2 收「同 parent 內」的 cross-placement 冗餘。「leaf 被**跨 parent**多處放」（DAG 冗餘）仍留 M4 (ii)——已定位唯一
+blocker 是 `walk_roi_batched` 的 whole-graph topo build（`load_cell_bbox` 對 giant 10.8M full-decode；`_decode_bbox_at` 只留
+placements+bbox 故**記憶體有界**，純 decode 時間問題）→ 解法是「topo 對 giant 走 sidecar + 翻 `_batched_walk_affordable` gate」，
+但一次性 warmup 成本未量測，待真機 cut-2 數據再定投入。
+
+**測試：** 新增 `tests/test_walk_leaf_batch.py`（5 tests：dense array / 多 distinct placement 分組 / sbbox prune 分組 /
+repeated-rect 落回 / size-cap 落回，`_WALK_LEAF_BATCH` ON vs OFF 全 byte-identical）；`test_walk_batched` 補
+`test_batched_matches_walk_roi_sbbox_hierarchy`；`TestBigGridRepetition`（精確 rects + stats）綠。全套 `pytest tests/`
+**852 passed, 4 skipped**（含 `test_export_fused` 融合匯出 byte-identity）。
+
+**影響檔案：** `glas/core/oasis_random.py`（`_WALK_LEAF_BATCH` / `_LEAF_PLAIN_MAX_RECTS` / `rect_plain_coords` /
+`_emit_leaf_segment` / descent 分組；M4′：`t_clip`/`t_prune`）、`glas/core/overlay_export.py`（M4′：`[export-timing]` 印
+`clip=`/`prune=`）、`tests/test_walk_leaf_batch.py`（新）、`tests/test_walk_batched.py`、`docs/plans/F30-export-tpt-walk-hotpath.md`。
+**Branch：** `claude/code-review-handoff-65xwf4`。
+
+---
+
+## [2026-07-07] [F30 M1] export TPT 優化：量測 — 拆開「遞迴+decode」黑盒
+
+**變更類型：** 診斷插樁（純 Python、不改運算、不需 CI）· **狀態：code done、59 tests 綠、待 user 真機數據定調 M4**
+
+**動機：** F29 撤案後真機 LTV 8-worker 已不卡、196 張 ~7min；但暖機後仍 ~5s/張、walk 佔 80%，其中 ~2666ms 是「per-instance
+遞迴 + decode」黑盒，`[export-timing]` 看不到 decode vs 遞迴 拆分 → 無法決定 M4 該攻哪塊。plan：`docs/plans/F30-export-tpt-walk-hotpath.md`。
+
+**實作：** `RoiWalkStats.t_decode` 已在 `walk_roi` 量（`_decode_prof`），只是沒導出。`oasis_random.walk_roi` 尾段新增
+`rar._walk_tdecode_total += stats.t_decode`（比照既有 `_walk_trect_total` 等 per-reader 累加）；`overlay_export`
+的 `[export-timing]` 快照差量後印於 `[walk: place=… rect=… poly=… decode=…]`。`walk − (place+rect+poly+decode) ≈ 純遞迴`。
+
+**測試：** `test_export_fused`（byte-identical 護欄）/ `test_oasis_random` / `test_cellcache` 共 59 passed；inline 驗 `_walk_tdecode_total` 流通。
+
+**M1 數據（user 真機，已到）：** 穩定張 decode 小（~231-545ms，~5-8%）、**per-instance 遞迴主導**（walk−place−rect−poly−decode
+≈4.2-4.8s）；冷第一張/worker 才 decode-heavy（~24s，giant extent 冷建，屬 warmup/M3）。**定案：L4 走路徑 (a)「sbbox-pruned 子圖
+batch」**（只在 ~210-cell ROI 子圖內 collapse「leaf 放 K 次 → K 次 walk() 重 emit」為 vectorized，不建 whole-graph topo → 繞開
+agent 證得的 whole-graph 不可行）。decode 小 → L5 leaf 快取剔除。M4 開工前待 user 核准（大重構、byte-identical 為硬底線）。
+
+**M2 試作後撤回（transform 快取，同日）：** 做了「把 giant 的 `T.apply_to_rects(ext_bb)` 結果 memo 於 cell+T」版
+（`_trect_cache` + `rect_ext_transformed`，byte-identical 護欄綠）。**撤回**：(1) 快取 tb = 346MB/worker × 8 = **+2.8GB 常駐**，
+真機 free_ram 已到 9.9GB → 極可能重演剛撤掉的 F29 paging（違反 F30「降 footprint 不增」）；(2) 收益比想像小——此 env 無 native
+`.pyd`、bench 灌水，真機 `apply_to_rects` 是 native（~150ms）、giant survivor loop 僅 ~2150 iter，且 `mat: arrays=11413
+instances=205849` 顯示 rect=536ms 大頭其實是 **leaf repetition 展開**非 giant transform。→ **M2 降為低優先**，rect 性價比不如
+M4 的 2666ms；先看 M1 真機數據再決定。`git checkout` 還原 oasis_random.py（保留已 commit 的 M1）、刪 `test_walk_giant_index.py`。
+
+**影響檔案：** `glas/core/oasis_random.py`（M1）、`glas/core/overlay_export.py`（M1）、`docs/plans/F30-...md`、`CLAUDE.md`（§8 F30）。
+**Branch：** `claude/code-review-handoff-65xwf4`。
+
+---
+
+## [2026-07-07] [F29] 撤案 — 共享記憶體 giant 真機驗收失敗，revert 回 session 前
+
+**變更類型：** 撤案 / revert（移除整個 F29 SHM 機制）· **狀態：branch reset 回 `origin/main`（846 passed）· PR #19 關閉**
+
+**動機（user 真機 LTV 連續驗收）：** F29 M1 全部實作完成並上 PR #19（sharedcell publish/attach、`_shared_cells`、
+orchestrator 發布、sidecar 快速發布、free giant、codex P2 修正），但 user 真機回報「**UI 每張圖凍一次**、session 前不會」。
+`[export-timing]` 分解**確認根因**：
+- worker **實際運算只有 ~5s/張**（`walk` 35s→3s 會攤提，giant 幾何其實沒問題）；
+- 但**牆鐘 ~35s/張** → 每張有 **~30s「非運算」空檔**（worker 5s 算完後呆等 ~30s 才拿到下一張）；
+- `free_ram` 三次測試 **11GB → 7.2GB → 4.4GB** 一路下滑。
+研判：那 30s 是 **F29 的 per-task SHM 傳遞 + Windows pagefile-backed shared_memory 在低 RAM 下 paging** 的開銷 ——
+**對 user 的 2-worker 情境，比它取代的「每 worker 各自 np.load」還糟**。SHM 只共享了 coords，未共享每 worker ~GB 的
+衍生 extent cache，記憶體壓力沒真的解掉，反而多一層 pagefile SHM thrash。
+
+**決策（user 明示「直接撤」）：** `git reset --hard origin/main` 移除 branch 上 5 個 F29 commit（回到 PR #18 merged 狀態）。
+匯出回到 session 前流程：workers 各自處理 giant（2-worker 無 thrash、無 30s 空檔、無 publish 凍結）。**保留** F28 效能 HUD、
+F27 log/ramp。M7j orchestrator 預解仍在 main（pre-existing，~12s 一次性、非本次 flagged 的 per-image 凍結；如仍礙眼可另議 gate）。
+
+**教訓：** SHM 的可行性審核只驗了「唯讀正確性」，沒驗「Windows pagefile SHM 在低 RAM 的效能」與「per-task descriptor 傳遞
+開銷」——真機才暴露。真正的 LTV 瓶頸是 flat giant 的 per-ROI 幾何（~5s/張 warm，另需 spatial index），與記憶體重複無關。
+
+**影響檔案：** 移除 `glas/core/sharedcell.py`、`tests/test_sharedcell.py`；還原 `oasis_random.py` / `overlay_export.py` /
+`gds_align_tool.py` / `cellcache.py`（`load_arrays`）/ `tests/test_cellcache.py` 至 main。plan 檔標「撤案」保留為 design history。
+**Branch：** `claude/code-review-handoff-65xwf4`（force-with-lease 回 main）。
+
+**撤除後真機驗收（user 確認「不卡 很順」）：** 8 workers（`ramp warm 2 → 8`, `free_ram=9.9GB`）跑 LTV **196 張 ≈ 7 分鐘、全程無凍結**。
+暖機前 8 張 ~60–137s（每 worker 各建一次 giant extent cache，ramp 錯開不 thrash），穩定期 **~6–8s/張 × 8 並行**。
+**結論：F27 M7n ramp（保留）已足夠讓 8 workers 不 thrash；SHM 的複雜度與開銷不值得。** 後續真正的速度槓桿是 flat giant
+per-ROI 幾何的 spatial index（暖機一次性 + ~7s/張 地板，皆與記憶體重複無關），列為未來可選優化。
+
+---
+
 ## [2026-07-06] [F29 plan] LTV giant-cell 共享記憶體 + 效能/體驗 roadmap（草擬，待核准）
 
 **變更類型：** 規劃（新 plan 檔 + 可行性審核，尚未動 code）· **狀態：plan 已寫、待 user 核准開工 M1**
