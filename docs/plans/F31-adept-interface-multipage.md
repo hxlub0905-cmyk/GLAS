@@ -1,6 +1,6 @@
 # [F31] ADEPT 介面契約：EBI-patch KLARF ingest + manifest 契約補齊
 
-> **狀態：** planned
+> **狀態：** in progress（M1–M4 done，待 M5 真機驗收）
 > **§8 ID：** [F31]
 > **建立：** 2026-08-17
 > **負責 branch：** `claude/adept-glas-interface-s5e8fb`
@@ -160,20 +160,20 @@ CLAUDE.md §7 明令 `klarf_to_gds` 不可動（user 已實測落點正確），
       對位結果與匯出 PNG **byte-identical**；多頁 fixture 改 ordinal 會讓 `fine_dx/dy_nm`
       改變、設回去逐項相同。
 
-### M4: manifest 契約（建議 3 / 4 / 5）  [status: planned]
+### M4: manifest 契約（建議 3 / 4 / 5）  [status: done 2026-08-17]
 
-- [ ] `fine_align.OVERLAY_MANIFEST_COLS` 增補 `id_source`、`width_px`、`height_px`、
+- [x] `fine_align.OVERLAY_MANIFEST_COLS` 增補 `id_source`、`width_px`、`height_px`、
       逐張 `nm_per_px`、`page`。逐張 `nm_per_px` 本來就在 worker 內算（`fov_w / W`），
       只是沒寫出來。
-- [ ] `status` 補齊五種：`ok` / `low-score`（gate 沒過）/ `no-coords` / `flat` /
+- [x] `status` 補齊五種：`ok` / `low-score`（gate 沒過）/ `no-coords` / `flat` /
       `missing-file` / `not-run`，與 `gds_align_tool.fine_align_result_rows` 既有語彙一致。
       **目前 gate 沒過只是檔名空白、status 仍 `ok`** —— 這是本 milestone 的主要行為修正。
-- [ ] schema `mmh-gds-overlay-v3` → **`mmh-gds-overlay-v4`**（新增欄位 additive；
+- [x] schema `mmh-gds-overlay-v3` → **`mmh-gds-overlay-v4`**（新增欄位 additive；
       `label_png` 整數 label map 契約與 `label_view_png` 不動）。
-- [ ] 建議 5：`label_map` 的 `layer` 名穩定性規範寫進 README ——
+- [x] 建議 5：`label_map` 的 `layer` 名穩定性規範寫進 README ——
       同一份 recipe 生命週期內穩定、變更要 bump schema；匯出時對「不能當變數用的字元」
       （空白、減號等）發出可照做的警告（**不自動改名**，避免下游 recipe 指不到）。
-- [ ] 驗證：`tests/test_overlay_manifest.py`（新）—— 五種 status 各自可重現、新欄位
+- [x] 驗證：`tests/test_overlay_manifest.py`（新）—— 五種 status 各自可重現、新欄位
       round-trip、schema 字串為 v4。
 
 ### M5: 真機驗收  [status: planned]

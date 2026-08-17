@@ -279,3 +279,15 @@ HMI 風格表達式 → 遞迴下降 parser → AST → shapely 運算。運算�
 4. **發現新 bug / 新增任務？** → 在 §8 用 `[Bxx]` / `[Fxx]` 補上
 5. **語法檢查**：`python3 -m py_compile <修改檔案>`
 6. **跑相關測試**：`pytest tests/<相關檔> -v`
+7. **重產搬運檔**（動到任何進版控的檔案就要做）：
+
+   ```bash
+   git add -A && python tools/release.py && git add -A
+   ```
+
+   一行做完兩件事、**順序不能顛倒**（包裡面含著那份清單）：`tools/FILELIST.txt`
+   與 `bundle/GLAS_bundle.py`（整個 repo 壓成**一個**純文字自解 `.py`，給不能
+   clone 的機器用）。`git add` 要在前面 —— 兩者都從 `git ls-files` 產，**還沒
+   add 的新檔案會安靜地不在裡面**。忘了跑沒有任何當下症狀，所以
+   `tests/test_bundle_tools.py::test_the_transfer_files_are_up_to_date` 會變紅，
+   錯誤訊息就是上面那行指令。

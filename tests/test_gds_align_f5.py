@@ -161,6 +161,10 @@ class TestManifest:
         assert got[0]["status"] == "ok"
         jpath = tmp_path / "overlay_manifest.json"
         payload = json.loads(jpath.read_text())
-        assert payload["schema"] == "mmh-gds-overlay-v3"  # F24: +label_view_png
+        # F24 added label_view_png (v3); F31 added the provenance + pixel-grid
+        # columns and the full status vocabulary (v4). Both additive.
+        assert payload["schema"] == "mmh-gds-overlay-v4"
         assert len(payload["images"]) == 2
         assert "label_view_png" in payload["columns"]
+        for col in ("id_source", "page", "width_px", "height_px", "nm_per_px"):
+            assert col in payload["columns"], col

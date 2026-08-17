@@ -1942,7 +1942,12 @@ class ExportWorker(QObject):
         # v3 (F24): adds the ``label_view_png`` column (human-viewable colourised
         # preview of ``label_png``). Additive — readers that key by column name
         # are unaffected; ``label_png`` stays the exact integer label map.
-        manifest = {"schema": "mmh-gds-overlay-v3", "columns": self._COLS,
+        # v4 (F31): adds id_source / page / width_px / height_px / nm_per_px
+        # and fills in the full status vocabulary (low-score / no-coords / flat
+        # were previously indistinguishable from "ok" or "not-run"). Additive —
+        # readers that key by column name are unaffected, and ``label_png``
+        # stays the exact integer label map.
+        manifest = {"schema": "mmh-gds-overlay-v4", "columns": self._COLS,
                     "images": rows}
         # F15: id → POI layer map so downstream can turn label_png pixels back
         # into named layers (read a region with gray[label == id]).
@@ -7507,7 +7512,7 @@ class MainWindow(QMainWindow):
         jobs = [(im.image_id, self._coarse_gds(im),
                  self._refined.get(im.image_id),
                  str(im.file_path) if im.file_path else "", bool(im.exists),
-                 self._align_page_of(im))
+                 self._align_page_of(im), getattr(im, "id_source", ""))
                 for im in images]
         cfg = {
             "fov_w": self._fov_w, "fov_h": self._fov_h,
@@ -7515,6 +7520,13 @@ class MainWindow(QMainWindow):
             **self.sem_panel.fine_align.values(),
         }
         label_map = self._export_label_map() if exp_label else []
+        # F31: the label_map's layer names become named regions downstream, and
+        # a recipe references them by name. Warn about names that can't be used
+        # as an identifier, or two ids sharing one — but never rename: the name
+        # IS the contract, so rewriting it here would silently break whichever
+        # recipe already points at it. Warn, and let its owner decide.
+        for warn in fine_align.label_map_warnings(label_map):
+            print(f"{devlog.tag('klarf')} label_map: {warn}", flush=True)
         # Stash the deferred alignment-manifest write for the finish handler (a
         # cancel / failure clears it so a half-done set is never written).
         self._export_pending = {"images": images, "fmt": fmt,

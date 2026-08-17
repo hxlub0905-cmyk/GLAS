@@ -51,6 +51,17 @@ import tiff_index
 OVERLAY_MANIFEST_COLS = [
     "image_id", "raw_png", "overlay_png",
     "fine_dx_nm", "fine_dy_nm", "score", "status", "gray_png", "label_png",
+    # F31 (schema v4) — what a downstream consumer needs to *validate* a row
+    # instead of assuming:
+    #   id_source  — is ``image_id`` a KLARF DEFECTID (joinable) or a filename
+    #                stem? Guessing wrong mis-joins the whole batch, silently.
+    #   page       — which page of a multi-page patch TIFF this row describes
+    #                (blank for single-image datasets).
+    #   width_px / height_px / nm_per_px — the pixel grid the label map and
+    #                grayscale were rasterised on. A consumer that puts regions
+    #                on a differently-sized patch must rescale or refuse; it
+    #                cannot tell without these.
+    "id_source", "page", "width_px", "height_px", "nm_per_px",
     # ``label_view_png`` is a human-viewable colourised preview of ``label_png``
     # (F24): the integer ``label_png`` looks all-black in a viewer because its
     # pixel values are tiny label ids (1, 2, …). The preview paints each id with
@@ -82,6 +93,79 @@ def mask_should_export(refined, threshold: float) -> bool:
     threshold, so every exported mask is trustworthy (MMH needs no fallback).
     ``refined`` is ``(dx, dy, score)`` or ``None``."""
     return refined is not None and refined[2] >= threshold
+
+
+#: Every value ``manifest_status`` and its callers can produce (F31 M4). The
+#: same vocabulary the results table uses (``fine_align_result_rows``), so an
+#: operator reading the UI and a script reading the manifest see one language.
+MANIFEST_STATUSES = ("ok", "low-score", "no-coords", "flat", "missing-file",
+                     "not-run")
+
+
+def manifest_status(coarse, refined, threshold: float) -> str:
+    """The export status for an image that was read successfully (F31 M4).
+
+    Splits apart three cases the manifest used to blur together, all of which
+    showed up downstream as nothing more than "the file isn't there":
+
+    * ``no-coords``  — the image has no KLARF position, so it could never be
+      aligned. A data problem.
+    * ``not-run``    — it has a position but no alignment was computed.
+    * ``low-score``  — it *was* aligned, but below the threshold, so the
+      alignment (and any region derived from it) should not be trusted.
+
+    The remaining two are decided at their own sites, because only there is the
+    fact known: ``missing-file`` (the frame could not be read) and ``flat``
+    (the ROI walk found no geometry to match against).
+
+    ``low-score`` is reported on the score alone, whether or not gray/label
+    were requested — it describes the alignment, not the products.
+    """
+    if refined is None:
+        return "no-coords" if coarse is None else "not-run"
+    return "ok" if refined[2] >= threshold else "low-score"
+
+
+def invalid_layer_name_chars(name: str) -> str:
+    """Characters in a POI layer name that a downstream expression language
+    cannot use as an identifier (F31 M4 / interface suggestion 5).
+
+    Returns them as a string (empty when the name is clean). GLAS deliberately
+    **does not rename** the layer: the name is the join between a recipe and a
+    label id, so silently rewriting it would break the recipe that references
+    it. Warn, and let whoever owns the recipe decide.
+    """
+    ok = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
+    bad = []
+    for ch in str(name):
+        if ch not in ok and ch not in bad:
+            bad.append(ch)
+    if name and name[0].isdigit() and "0-9(leading)" not in bad:
+        bad.append("0-9(leading)")
+    return "".join(bad)
+
+
+def label_map_warnings(label_map) -> list:
+    """Human-readable warnings about a manifest ``label_map`` (F31 M4).
+
+    Two things a downstream recipe cannot survive: a layer name it cannot spell
+    as a variable, and two ids sharing a name (a region reference would be
+    ambiguous). Returns ``[]` when the map is clean."""
+    out, seen = [], {}
+    for ent in label_map or []:
+        name = str(ent.get("layer", ""))
+        bad = invalid_layer_name_chars(name)
+        if bad:
+            out.append(f"label id {ent.get('id')}: layer name {name!r} contains "
+                       f"{bad!r} — downstream recipes may not be able to "
+                       f"reference it by name.")
+        if name in seen:
+            out.append(f"layer name {name!r} is used by label ids "
+                       f"{seen[name]} and {ent.get('id')} — a region reference "
+                       f"would be ambiguous.")
+        else:
+            seen[name] = ent.get("id")
+    return out
 
 
 def rerun_image_subset(images, image_ids):

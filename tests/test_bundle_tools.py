@@ -27,6 +27,7 @@ sys.path.insert(0, str(_ROOT / "tools"))
 
 import make_filelist       # noqa: E402
 import make_text_bundle    # noqa: E402
+import release             # noqa: E402
 
 
 def _git_available() -> bool:
@@ -160,15 +161,28 @@ class TestBundleRoundTrip:
 
 
 class TestShippedBundle:
-    """The committed bundle under ``bundle/`` is what the operator actually
-    copies; it has to be in step with the repo."""
+    """The committed ``bundle/GLAS_bundle.py`` is what actually gets copied onto
+    a machine that can't clone; it has to stay in step with the repo."""
 
-    def test_parts_exist_and_are_under_the_github_display_limit(self):
-        parts = sorted((_ROOT / "bundle").glob("GLAS_bundle*.py"))
-        if not parts:
-            pytest.skip("no bundle built in this checkout")
-        for p in parts:
-            size_kb = p.stat().st_size / 1024
-            # GitHub won't render a file over 1 MB, and the clipboard is the
-            # only way in — an unrenderable part cannot be copied at all.
-            assert size_kb <= make_text_bundle.LIMIT_KB, f"{p.name}: {size_kb:.0f} KB"
+    def test_the_transfer_files_are_up_to_date(self):
+        """**The point of this whole file.** Forgetting to regenerate has no
+        symptom here — it shows up later as a missing or stale file on a machine
+        that has no other way to get the code. So it fails in the test suite
+        instead, and the message is the command that fixes it."""
+        problems = release.stale(str(_ROOT))
+        assert not problems, (
+            "transfer files are stale: " + "; ".join(problems)
+            + "  →  run: git add -A && python tools/release.py && git add -A")
+
+    def test_it_is_a_single_file(self):
+        """One file, not parts. GitHub's 1 MB display limit doesn't apply — the
+        operator copies raw — so splitting would only add copy steps."""
+        built = sorted((_ROOT / "bundle").glob("GLAS_bundle*.py"))
+        assert [p.name for p in built] == ["GLAS_bundle.py"]
+
+    def test_size_report_is_informational_only(self):
+        """The size line must never grow back into a gate: a warning nobody can
+        act on just teaches people to ignore warnings."""
+        level, msg = release.bundle_size_report(5 * 1024 * 1024)
+        assert level == "ok"
+        assert "KB" in msg
