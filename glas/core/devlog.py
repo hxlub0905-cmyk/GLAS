@@ -34,6 +34,7 @@ _COLORS = {
     "fa-timing": "\033[35m",  # magenta — batch per-stage timing
     "jump": "\033[33m",       # yellow — coordinate maths on image select
     "gds-align": "\033[32m",  # green  — debug / trace mode banners
+    "klarf": "\033[34m",      # blue   — KLARF ingest: patch page mapping (F31)
 }
 
 

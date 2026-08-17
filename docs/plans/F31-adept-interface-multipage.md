@@ -126,21 +126,21 @@ CLAUDE.md §7 明令 `klarf_to_gds` 不可動（user 已實測落點正確），
       單頁 `read_sem_gray(page=None)` 與 `cv2.imread` **逐 byte 相同**、越界 page 丟
       `IndexError`、無 tifffile 時 fallback 可跑。
 
-### M2: EBI-patch KLARF ingest  [status: planned]
+### M2: EBI-patch KLARF ingest  [status: done 2026-08-17]
 
-- [ ] 移植 ADEPT `core/ingest/klarf_core.py` 的**唯讀**部分 → `glas/core/klarf_doc.py`
+- [x] 移植 ADEPT `core/ingest/klarf_core.py` 的**唯讀**部分 → `glas/core/klarf_doc.py`
       （`KlarfDoc` 載入 / `unit_info` / `col_index` / `image_layout` /
       `defect_image_entries` / `defect_image_map` / `tiff_path`）。**不移植寫回 API。**
-- [ ] `sem_loader` 新增 EBI-patch 偵測與載入路徑：找得到 patch TIFF
+- [x] `sem_loader` 新增 EBI-patch 偵測與載入路徑：找得到 patch TIFF
       （`TiffFileName` 或 KLARF 同名 `.tif`）且 `defect_image_map` 對得出頁 → 走新路徑；
       否則**完全走現有 rSEM 路徑**（現行程式碼一行不改）。
-- [ ] `SemImage` 加 `page: Optional[int]`（0-based，實際用於對位/匯出的頁）、
+- [x] `SemImage` 加 `page: Optional[int]`（0-based，實際用於對位/匯出的頁）、
       `pages: list[int]`（該 defect 完整頁清單）、`id_source: str`
       （`"klarf-defectid"` | `"filename-stem"`）。
-- [ ] **單位換算在載入端做完**：`xrel/yrel = raw × to_nm`（1.2 → ×1000、1.8 → ×1）。
+- [x] **單位換算在載入端做完**：`xrel/yrel = raw × to_nm`（1.2 → ×1000、1.8 → ×1）。
       `klarf_to_gds` 不動（§7）。`read_die_pitch_nm` 補 1.2 的 `DiePitch a b;` 寫法 + 換算。
-- [ ] `load_folder`：`id_source="filename-stem"`。
-- [ ] 驗證：`tests/test_klarf_doc.py` + `tests/test_sem_loader.py` 補測 ——
+- [x] `load_folder`：`id_source="filename-stem"`。
+- [x] 驗證：`tests/test_klarf_doc.py` + `tests/test_sem_loader.py` 補測 ——
       1.2 flat 與 1.8 hierarchical 的 EBI fixture 各載入出「每顆 2 頁、`(file,page)` 互異」；
       1.2 的 µm 座標換算後與等價 1.8 檔逐項相同；`sample_real.klarf`（rSEM 單頁）
       **既有測試全綠且逐項不變**。

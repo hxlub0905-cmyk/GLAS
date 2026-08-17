@@ -6847,8 +6847,9 @@ class MainWindow(QMainWindow):
         if not path:
             return
         self._dlg_remember("klarf", path)
+        notes: list = []
         try:
-            images = sem_loader.load_klarf(path)
+            images = sem_loader.load_klarf(path, notes=notes)
         except Exception as exc:
             QMessageBox.critical(self, "KLARF load failed", str(exc))
             return
@@ -6857,9 +6858,23 @@ class MainWindow(QMainWindow):
         self.sem_panel.set_images(images)
         self._maybe_prewarm_batch_pool()   # F23 M2: batch now plausible
         with_coords = sum(1 for i in images if i.has_coords)
+        # F31: a multi-page (EBI patch) KLARF addresses one batch TIFF, so say
+        # which page each defect aligns on — reading the wrong one mis-aligns
+        # the whole lot without any visible error. The mapping notes go to the
+        # dev log rather than a dialog: there is always at least one, and a
+        # modal on every load would train the user to dismiss it unread.
+        multi = [i for i in images if i.pages]
+        extra = ""
+        if multi:
+            per = sorted({len(i.pages) for i in multi})
+            extra = (f" · patch TIFF: {per[0] if len(per) == 1 else 'varied'} "
+                     f"page(s)/defect, aligning on #"
+                     f"{sem_loader.DEFAULT_ALIGN_PAGE_ORDINAL}")
+        for n in notes:
+            print(f"{devlog.tag('klarf')} {n}", flush=True)
         self._status_state(
             f"KLARF: {len(images)} images ({with_coords} with coords) · "
-            f"{Path(path).name}")
+            f"{Path(path).name}{extra}")
         # Overview: frame all defect positions so the FOV marker visibly
         # jumps across the chip as you click different images.
         self._fit_view_to_defects()
