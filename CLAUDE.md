@@ -229,13 +229,15 @@ HMI 風格表達式 → 遞迴下降 parser → AST → shapely 運算。運算�
   待核准開工 M1**。分階段：M1 量測（印 `t_decode` 拆黑盒）→ M2 giant 空間索引+transform 快取 → M3 暖機 footprint →
   M4 遞迴重構（batched-via-sbbox，byte-identical 護欄）→ M5 真機驗收。plan：`docs/plans/F30-export-tpt-walk-hotpath.md`。
 
-- [F31] ADEPT 介面契約：多頁 TIFF page 對應 + manifest 契約補齊。下游 ADEPT 不做 OASIS/GDS parser，只吃
-  GLAS 的 `<id>_label.png` / `<id>_gray.png` / manifest（join key = KLARF `DEFECTID`）。兩個缺口：(1) 多頁 TIFF
-  無 page 概念 → `cv2.imread` 恆讀第 0 頁，整批 defect 拿同一張圖對位（**會安靜地整批對錯**）；(2) manifest 缺
-  `id_source` / `width_px` / `height_px`，且 score gate 沒過時 status 仍是 `ok`，下游分不出「沒跑 / 分數低 / 無座標」。
-  **plan 已寫、待核准開工 M1**。M1 TIFF 讀取底座（移植 ADEPT `tiff_index`）→ M2 KLARF 頁對應（移植
-  `defect_image_map` 雙模式）→ M3 對位頁可設定（預設 defect 內第 2 張＝BSE）→ M4 manifest schema v3→v4 →
-  M5 真機驗收。plan：`docs/plans/F31-adept-interface-multipage.md`。
+- [F31] ADEPT 介面契約：EBI-patch KLARF ingest + manifest 契約補齊。下游 ADEPT 不做 OASIS/GDS parser，只吃
+  GLAS 的 `<id>_label.png` / `<id>_gray.png` / manifest（join key = KLARF `DEFECTID`）。處理型別＝**一顆 DID
+  對兩張 patch**（第 1 頁 test、第 2 頁 ref，整批一個多頁 TIFF）；BSE/SE 拼版型無 KLARF，不處理。
+  **規劃期實測：GLAS 今天對 EBI-patch KLARF 載入 0 張影像** —— 1.2 flat parser 不支援（欄位全 `_extra_N`）、
+  1.8 帶 `IMAGECOUNT`/`IMAGELIST` 但無 `Images{}` 檔名的 defect 被 `continue` 跳掉。另 1.2 座標是 µm
+  （§7 的 `klarf_to_gds` 當 nm，換算須在載入端做）。**plan 已寫、待核准開工 M1**。M1 TIFF 讀取底座（移植 ADEPT
+  `tiff_index`，含 pid 版本鍵 + read lock）→ M2 EBI ingest（移植 `KlarfDoc` 唯讀部分 + `defect_image_map`）→
+  M3 對位頁可設定（預設第 2 張＝ref）→ M4 manifest schema v3→v4 → M5 真機驗收。
+  plan：`docs/plans/F31-adept-interface-multipage.md`。
 
 ### 待辦 (Backlog)
 
