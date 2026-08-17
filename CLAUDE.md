@@ -229,6 +229,14 @@ HMI 風格表達式 → 遞迴下降 parser → AST → shapely 運算。運算�
   待核准開工 M1**。分階段：M1 量測（印 `t_decode` 拆黑盒）→ M2 giant 空間索引+transform 快取 → M3 暖機 footprint →
   M4 遞迴重構（batched-via-sbbox，byte-identical 護欄）→ M5 真機驗收。plan：`docs/plans/F30-export-tpt-walk-hotpath.md`。
 
+- [F31] ADEPT 介面契約：多頁 TIFF page 對應 + manifest 契約補齊。下游 ADEPT 不做 OASIS/GDS parser，只吃
+  GLAS 的 `<id>_label.png` / `<id>_gray.png` / manifest（join key = KLARF `DEFECTID`）。兩個缺口：(1) 多頁 TIFF
+  無 page 概念 → `cv2.imread` 恆讀第 0 頁，整批 defect 拿同一張圖對位（**會安靜地整批對錯**）；(2) manifest 缺
+  `id_source` / `width_px` / `height_px`，且 score gate 沒過時 status 仍是 `ok`，下游分不出「沒跑 / 分數低 / 無座標」。
+  **plan 已寫、待核准開工 M1**。M1 TIFF 讀取底座（移植 ADEPT `tiff_index`）→ M2 KLARF 頁對應（移植
+  `defect_image_map` 雙模式）→ M3 對位頁可設定（預設 defect 內第 2 張＝BSE）→ M4 manifest schema v3→v4 →
+  M5 真機驗收。plan：`docs/plans/F31-adept-interface-multipage.md`。
+
 ### 待辦 (Backlog)
 
 - [B01] 中文路徑無法讀取：含中文的資料夾/檔名（KLARF / layout / 輸出夾）疑似讀不到（Windows cp950 vs UTF-8
