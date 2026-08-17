@@ -64,7 +64,7 @@ read-only 探索（沒動任何檔案）才可略過。
 
 ```bash
 python main.py                          # 啟動 GUI
-pytest tests/ -v                        # 完整測試（~707 項，需 numpy / cv2 / shapely / PyQt6）
+pytest tests/ -v                        # 完整測試（~950 項，需 numpy / cv2 / shapely / PyQt6）
 python3 -m py_compile <file>            # 修改後語法檢查
 ```
 
@@ -101,7 +101,9 @@ GLAS/
 │   │   ├── gds_layer_cache.py   # layer .npz cache + metadata（schema v4/v5）
 │   │   ├── cellcache.py         # F16-B：大 cell 解碼結果 + placement prep 的 sidecar 快取（欄狀 .npz）
 │   │   ├── perfmon.py           # F28 即時效能事件收集器（Qt-free；HUD 的資料匯流排 + on_summary）
-│   │   └── klarf_parser.py      # KLARF I/O（自 MMH 複製，純標準庫）
+│   │   ├── klarf_parser.py      # KLARF I/O（自 MMH 複製，純標準庫）— rSEM 路徑 + 唯一的 writer
+│   │   ├── klarf_doc.py         # F31 KLARF 1.2/1.8 唯讀 reader（移植 ADEPT；EBI-patch 專用，不寫回）
+│   │   └── tiff_index.py        # F31 多頁 TIFF：純 stdlib IFD 走訪 + read_sem_gray 單一讀圖入口
 │   └── app/                 # 🖼 PyQt6 app 殼
 │       ├── gds_align_tool.py    # 主視窗 + 所有 widget（~4500 行）
 │       ├── perf_panel.py        # F28 即時效能監控 HUD（獨立深色監控台視窗，分類彩色 + 總覽 KPI）
@@ -109,8 +111,10 @@ GLAS/
 │       ├── styles.py            # QSS 設計 token（自 MMH 複製）
 │       ├── collapsible.py       # CollapsibleSection widget（自 MMH 複製）
 │       └── icons/               # Lucide-style SVG icon set（自 MMH 複製）
-├── tests/                   # ~707 項（test_oasis_* / test_gds_* / test_sem_loader / test_parts_catalog / test_cellcache / test_devlog / test_accel_*）
+├── tests/                   # ~950 項（test_oasis_* / test_gds_* / test_sem_loader / test_parts_catalog / test_cellcache / test_devlog / test_accel_*）
 │   └── fixtures/sample_real.klarf
+├── tools/                   # F31 離線搬運：release.py（一鍵重產）/ make_text_bundle.py / make_filelist.py
+├── bundle/GLAS_bundle.py    # 整個 repo 的單檔純文字自解包（給不能 clone 的機器；由 release.py 產）
 └── docs/plans/              # plan 檔（_template.md + F2 design history）
 ```
 
@@ -152,8 +156,9 @@ sem_loader 載 KLARF（die-corner XREL/YREL）→ 選 PART/CHIP（PartChipPanel 
   + 影像匯出：模擬 GLV 灰階圖 `<id>_gray.png` + ROI label map `<id>_label.png`（F15，
   同一組 per-layer 幾何 rasterize、gray 套 blur / label 不 blur、像素網格一致，下游
   `gray[label==id]` 取 ROI；取代 F13 binary mask）+ `<id>_label_view.png`（F24，label map 的
-  上色預覽供目視 QC，label.png 維持整數 id 機器契約不變）；manifest schema mmh-gds-overlay-v3
-  帶 label_map + label_view_png 欄
+  上色預覽供目視 QC，label.png 維持整數 id 機器契約不變）；manifest schema mmh-gds-overlay-v4
+  帶 label_map + label_view_png + F31 的 id_source / page / width_px / height_px / nm_per_px，
+  status 六態（ok / low-score / no-coords / flat / missing-file / not-run）
 ```
 
 **並行模型（F8/F14/F23/F25）：** 匯出走**單一融合 worker** `ExportWorker`（F25，取代舊
@@ -208,6 +213,11 @@ HMI 風格表達式 → 遞迴下降 parser → AST → shapely 運算。運算�
 | `cellcache` 一律 mtime+size 驗證、毀損/版本不符當 miss、原子寫；`_place_prep` 的 index 必須對齊 `content.placements` 順序 | cache 永不可破壞正確性；prep survivor 用 index 取 placement |
 | `gds_layer_cache` `_LOADABLE_SCHEMAS` 必須能讀「現在 + 前一版」schema（v4+v5） | F21 加 part_id/chip_id 時，舊 v4 cache 仍須能載入（轉「legacy snapshot」UI 模式） |
 | `parts_catalog`：catalog 沒有的 PART/CHIP 不可進下拉、Custom override 只能改 FOV / nm-per-px，不能改 chip_corner | Q4 嚴格清單；chip_corner 來自 catalog 是「不會 key 錯」設計的核心 |
+| `tiff_index.read_sem_gray(path, page=None)`：`page is None` 必須就是 `cv2.imread(path, IMREAD_GRAYSCALE)` | F31 單一讀圖入口；單頁資料（rSEM / 資料夾）逐 byte 不變是 `test_export_fused` 護欄的前提 |
+| `tiff_index` 的 handle 快取版本鍵含 **pid**、`read_page` 全程持鎖 | 兩者擋的都是**靜默讀到別頁**（fork worker 共用 fd offset／執行緒共用 handle），不報錯只是拿錯圖；GLAS 的 export ProcessPool + 預覽 QThread 兩個都會踩 |
+| KLARF 座標的單位換算只在 `sem_loader` 做（1.2 µm ×1000、1.8 ×1）；`klarf_to_gds` 永遠收 nm | §7 既有規則不可動該函式；換算下放到載入端才能同時支援兩種版本 |
+| `klarf_doc` 只讀不寫；KLARF 的無損寫回仍只由 `klarf_parser` 負責 | 兩個 parser 共存的唯一安全前提就是職責不重疊（F31 Q3） |
+| `bundle/` 不進 `FILELIST.txt` 也不進打包來源 | 它是 repo 的複本不是內容；列進去每打一次包就多吃一份上一次的包 |
 
 完整演進與每個決策理由見 `docs/plans/F2-gds-align-tool.md`（design history）。
 
@@ -234,9 +244,12 @@ HMI 風格表達式 → 遞迴下降 parser → AST → shapely 運算。運算�
   對兩張 patch**（第 1 頁 test、第 2 頁 ref，整批一個多頁 TIFF）；BSE/SE 拼版型無 KLARF，不處理。
   **規劃期實測：GLAS 今天對 EBI-patch KLARF 載入 0 張影像** —— 1.2 flat parser 不支援（欄位全 `_extra_N`）、
   1.8 帶 `IMAGECOUNT`/`IMAGELIST` 但無 `Images{}` 檔名的 defect 被 `continue` 跳掉。另 1.2 座標是 µm
-  （§7 的 `klarf_to_gds` 當 nm，換算須在載入端做）。**plan 已寫、待核准開工 M1**。M1 TIFF 讀取底座（移植 ADEPT
-  `tiff_index`，含 pid 版本鍵 + read lock）→ M2 EBI ingest（移植 `KlarfDoc` 唯讀部分 + `defect_image_map`）→
-  M3 對位頁可設定（預設第 2 張＝ref）→ M4 manifest schema v3→v4 → M5 真機驗收。
+  （§7 的 `klarf_to_gds` 當 nm，換算須在載入端做）。
+  **M1–M4 完成（949 tests 綠）**：M1 `tiff_index` + `read_sem_gray`（單頁逐 byte 等同原 `cv2.imread`）→
+  M2 `klarf_doc` 唯讀移植 + EBI ingest（`klarf_parser` 未動、座標離開載入端一律 nm）→ M3 對位頁可設定
+  （UI「Align on image #」預設 2＝ref；讀圖點實為 5 處，含預覽）→ M4 manifest v3→v4（`id_source`/`page`/
+  像素網格 + 六種 status，修掉「score gate 沒過仍寫 `ok`」）。**剩 M5：user 真機驗收** —— 真實 EBI KLARF
+  跑一次 Export、確認每顆 defect 的 label 不同，manifest 交 ADEPT 側試接。
   plan：`docs/plans/F31-adept-interface-multipage.md`。
 
 ### 待辦 (Backlog)

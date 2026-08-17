@@ -4,6 +4,57 @@
 
 ---
 
+## [2026-08-17] [F31 M1–M4] ADEPT 介面契約：EBI-patch KLARF ingest + 多頁 TIFF + manifest v4（+ 離線搬運包）
+
+**變更類型：** 新功能（下游介面契約）+ 工具移植 · **狀態：M1–M4 完成、949 tests 綠；M5 待 user 真機驗收**
+
+**動機（規劃期實測，推翻了原始需求文件的描述）：** ADEPT 定調不做 OASIS/GDS parser，只吃 GLAS 的
+`<id>_label.png` / `<id>_gray.png` / manifest（join key = KLARF `DEFECTID`）。契約文件把缺口描述成
+「`cv2.imread` 只讀第 0 頁」，但**實測 GLAS 對 EBI-patch KLARF 是載入 0 張影像** —— 1.2 flat 的
+`DefectRecordSpec` parser 完全不支援（`defect_columns` 空、欄位全落 `_extra_N`、連 `SummarySpec` token 都被吃進
+defect 列）；1.8 帶 `IMAGECOUNT`/`IMAGELIST` 但無 `Images{}` 檔名的 defect 被 `continue` 跳掉。另 KLARF 1.2 座標
+是 µm 而 `klarf_to_gds` 無條件當 nm（差 1000×），§7 禁止動該函式 → 換算必須在載入端。處理型別經 user 修正為
+**一顆 DID 對兩張 patch**（第 1 頁 test、第 2 頁 ref，整批一個多頁 TIFF）；BSE/SE 拼版型無 KLARF，不處理。
+plan：`docs/plans/F31-adept-interface-multipage.md`。
+
+**實作：**
+- **M1 讀取底座**：移植 ADEPT `tiff_index.py`（← KLIP）→ `glas/core/`，新增 `read_sem_gray(path, page=None)` 單一
+  入口。`page is None` 逐 byte 等同原 `cv2.imread(..., IMREAD_GRAYSCALE)`；`tifffile` 為 optional，缺席退回
+  `cv2.imreadmulti`。**保留上游兩段防護**：handle 快取版本鍵含 pid（fork worker 共用 fd offset → 靜默讀到別頁）、
+  `read_page` 全程持鎖（QThread 共用 handle → tifffile 把像素當 IFD 解析）；GLAS 的 ProcessPool + QThread 兩個都踩得到。
+- **M2 EBI ingest**：移植 ADEPT `klarf_core.py` 的**唯讀部分** → `glas/core/klarf_doc.py`（不移植寫回 API；
+  `klarf_parser` 一行不改、仍是唯一 writer）。`sem_loader._load_klarf_ebi` 只在「klarf_doc 讀得動 + 找得到 patch TIFF
+  + page 對得出來」時接手，否則落回原 rSEM 路徑。`SemImage` 加 `pages` / `page` / `id_source` + `page_for_ordinal`
+  （頁數不足退回最後一張）。**座標離開載入端一律 nm**（1.2 ×1000、1.8 ×1 → 原路徑逐項不變）；`read_die_pitch_nm`
+  補 1.2 的 `DiePitch a b;` 寫法。
+- **M3 對位頁可設定**：讀圖點**實際是 5 處不是 plan 寫的 3 處** —— 除 `fine_align`/`overlay_export` 三處外，app 的
+  `_load_sem_gray`（單張 Run + template 預覽）與 `SemViewer.set_image` 的 `QPixmap` 也恆讀第 0 頁；不改的話使用者
+  對著看不到的影像調參數。page 以**可選末位元素**掛在 job tuple（舊 4/5-tuple 仍合法）。UI「Align on image #」
+  預設 2 = ref（鄰近 die、無 defect 干擾 → matchTemplate 最穩），改值即時重載預覽並提示既有結果需 re-run。
+- **M4 manifest v3→v4**：加 `id_source` / `page` / `width_px` / `height_px` / 逐張 `nm_per_px`；`status` 補齊六種
+  （`ok` / `low-score` / `no-coords` / `flat` / `missing-file` / `not-run`）。**主要行為修正是 `low-score`** ——
+  原本 score gate 沒過只是清空檔名、status 仍寫 `ok`，下游分不出「沒跑 / 分數低 / 無座標」。`label_map` 層名做
+  識別字元與同名檢查，**只警告不改名**（名字就是 recipe 與 label id 的 join）。
+- **離線搬運包**（user 另外要求）：移植 ADEPT `make_text_bundle.py` / `make_filelist.py` / `release.py` →
+  `bundle/GLAS_bundle.py`（整個 repo 壓成**單一**純文字自解 `.py`，逐檔 git blob SHA 驗證）。GLAS 差異：全面用
+  `git ls-files -z`（repo 有中文檔名，git 預設會跳脫成開不了的路徑）；二進位檔不再讓打包直接失敗，改走 `#X`
+  base64 記錄（GLAS 有一份 PDF），其餘維持純文字；不自動分批（user 確認走 raw 複製、無 1 MB 限制）。
+
+**測試：** 新增 `test_tiff_index.py`(20) / `test_klarf_doc.py`(14) / `test_align_page.py`(10) /
+`test_overlay_manifest.py`(22) / `test_bundle_tools.py`(14)，`test_sem_loader.py` +18。全套
+**949 passed, 4 skipped**（F31 前 852）。M3 的對位測試用「template 自身平移」當影像 —— 用不相干圖樣時
+matchTemplate 一律回 (0,0)/score 0，測試會空洞地通過，故另加一項驗「回復位移＝已知位移、score > 0.9」。
+搬運包在乾淨目錄實測解開並逐位元組比對 163 個檔案，零差異。
+
+**影響檔案：** `glas/core/tiff_index.py`(新) / `klarf_doc.py`(新) / `fine_align.py` / `overlay_export.py` /
+`devlog.py`、`glas/app/sem_loader.py` / `gds_align_tool.py`、`tools/make_text_bundle.py`(新) /
+`make_filelist.py`(新) / `release.py`(新) / `FILELIST.txt`(新)、`bundle/GLAS_bundle.py`(新)、
+`requirements.txt`（tifffile optional）、`README.md`、`CLAUDE.md`（§8 + §10 搬運檔重產）、
+`docs/plans/F31-adept-interface-multipage.md`(新)、上述測試。
+**Branch：** `claude/adept-glas-interface-s5e8fb`。
+
+---
+
 ## [2026-07-08] [F30 M4] walk 遞迴主體：leaf 分組 emit（`_WALK_LEAF_BATCH`，cut-1→cut-2）
 
 **變更類型：** 效能重構（walk 熱路徑，純 Python、不需 CI）· **狀態：cut-2 已真機驗收＝大致中性；真瓶頸另在，加 M4′ 診斷重定向**
