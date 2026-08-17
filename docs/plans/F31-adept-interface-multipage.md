@@ -108,21 +108,21 @@ CLAUDE.md §7 明令 `klarf_to_gds` 不可動（user 已實測落點正確），
 
 ## Milestones
 
-### M1: TIFF page 讀取底座（Qt-free core）  [status: planned]
+### M1: TIFF page 讀取底座（Qt-free core）  [status: done 2026-08-17]
 
-- [ ] 移植 ADEPT `core/ingest/tiff_index.py` → `glas/core/tiff_index.py`，保留來源標註
+- [x] 移植 ADEPT `core/ingest/tiff_index.py` → `glas/core/tiff_index.py`，保留來源標註
       （KLIP → ADEPT → GLAS）與**兩段防護的原註解**：
       - handle 快取版本鍵含 **pid** —— fork 出來的 worker 共用檔案偏移量會靜默讀到
         別頁的 bytes（GLAS 的 export ProcessPool 正是這個情境）；
       - `read_page` 全程持 `RLock` —— QThread 併發共用 handle 會讓 tifffile 把像素當
         IFD 解析（`suspicious number of tags`）。
-- [ ] 新增 `read_sem_gray(path, page=None)` 作為讀圖單一入口：
+- [x] 新增 `read_sem_gray(path, page=None)` 作為讀圖單一入口：
       - `page is None` → 原封不動 `cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)`（**byte-identical**）；
       - `page` 有值 → `tiff_index.read_page` 後轉 uint8 灰階（多通道走 cv2 灰階轉換、
         16-bit 依現有慣例縮放）；
       - `tifffile` 不在 → `cv2.imreadmulti` fallback（log 說明代價）。
-- [ ] `requirements.txt` 加 `tifffile`（標為多頁 TIFF 才需要的 optional 相依）。
-- [ ] 驗證：`tests/test_tiff_index.py` —— 合成多頁 TIFF（classic + BigTIFF）頁數正確、
+- [x] `requirements.txt` 加 `tifffile`（標為多頁 TIFF 才需要的 optional 相依）。
+- [x] 驗證：`tests/test_tiff_index.py` —— 合成多頁 TIFF（classic + BigTIFF）頁數正確、
       單頁 `read_sem_gray(page=None)` 與 `cv2.imread` **逐 byte 相同**、越界 page 丟
       `IndexError`、無 tifffile 時 fallback 可跑。
 
