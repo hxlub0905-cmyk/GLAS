@@ -36,6 +36,7 @@ except Exception:  # pragma: no cover
 import devlog
 import gds_boolean
 import oasis_random
+import tiff_index
 
 
 # ── F13: batch re-run + mask-export decision helpers ─────────────────────────
@@ -775,14 +776,18 @@ def _fine_align_image(job, rar, root, poi_specs, cfg, cancel_is_set):
     or across a process pool (F6 M3 / F8). Returns
     ``(image_id, dx, dy, score, used_radius_px, status)`` or ``None`` if
     cancelled before any work was done."""
-    image_id, anchor, path, exists = job
+    # F31: an optional 5th element carries the TIFF page for multi-page patch
+    # files. Read tolerantly so a 4-tuple (every pre-F31 caller, and the single
+    # -image flows) still means "plain image, no page".
+    image_id, anchor, path, exists = job[:4]
+    page = job[4] if len(job) > 4 else None
     if cancel_is_set():
         return None
     c = cfg
     if anchor is None:
         return (str(image_id), 0.0, 0.0, 0.0, 0, "no-coords")
     t0 = time.perf_counter()
-    sem = (cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    sem = (tiff_index.read_sem_gray(path, page)
            if (cv2 and exists) else None)
     if sem is None:
         return (str(image_id), 0.0, 0.0, 0.0, 0, "missing-file")

@@ -145,15 +145,18 @@ CLAUDE.md §7 明令 `klarf_to_gds` 不可動（user 已實測落點正確），
       1.2 的 µm 座標換算後與等價 1.8 檔逐項相同；`sample_real.klarf`（rSEM 單頁）
       **既有測試全綠且逐項不變**。
 
-### M3: 對位頁可設定（必要 2）  [status: planned]
+### M3: 對位頁可設定（必要 2）  [status: done 2026-08-17]
 
-- [ ] fine-align 設定加 `align_page_ordinal`（1-based，defect 頁清單內序位，預設 **2 = ref**），
+- [x] fine-align 設定加 `align_page_ordinal`（1-based，defect 頁清單內序位，預設 **2 = ref**），
       進 `cfg` 隨 worker 走、存 QSettings；頁數不足時退回最後一張並標記。
-- [ ] 三個讀圖點改走 `read_sem_gray(path, page)`：`fine_align.py:785`、
-      `overlay_export.py:114`、`overlay_export.py:340`。job tuple 帶上 page。
-- [ ] UI：FineAlign 面板新增「Align page」欄（說明：一顆 defect 內的第幾張；
+- [x] 讀圖點改走 `read_sem_gray(path, page)`。**實作時發現是 5 處不是 plan 寫的 3 處**：
+      除 `fine_align.py:785` / `overlay_export.py:114` / `overlay_export.py:340` 外，app 還有
+      `_load_sem_gray`（單張 Run + template 預覽）與 `SemViewer.set_image` 的 `QPixmap`。
+      後兩者不改的話，畫面顯示第 0 頁而批次對位第 1 頁 —— 使用者會對著看不到的影像調參數。
+      job tuple 以**可選末位元素**帶 page（舊的 4/5-tuple 仍合法 → 既有測試與呼叫端不動）。
+- [x] UI：FineAlign 面板新增「Align page」欄（說明：一顆 defect 內的第幾張；
       第 1 張 = test、第 2 張 = ref）。
-- [ ] 驗證：`test_fine_align` / `test_export_fused` 護欄 —— 單頁資料（`page=None`）的
+- [x] 驗證：`test_fine_align` / `test_export_fused` 護欄 —— 單頁資料（`page=None`）的
       對位結果與匯出 PNG **byte-identical**；多頁 fixture 改 ordinal 會讓 `fine_dx/dy_nm`
       改變、設回去逐項相同。
 

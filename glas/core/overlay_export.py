@@ -28,6 +28,7 @@ except Exception:  # pragma: no cover
 
 import fine_align
 import oasis_random
+import tiff_index
 
 
 def _safe_name(s: str) -> str:
@@ -100,7 +101,10 @@ def export_one_image(job, rar, root, poi, cfg, out_dir,
     grayscale/label (hole-preserving geometry, F15). Pure per-image work with no
     shared state — identical whether run in-thread or across the process pool —
     so the parallel output matches the sequential output (§7)."""
-    image_id, coarse, refined, path, exists = job
+    # F31: optional 6th element = TIFF page (multi-page patch file); absent →
+    # plain single-image read, exactly as before.
+    image_id, coarse, refined, path, exists = job[:5]
+    page = job[5] if len(job) > 5 else None
     out_dir = Path(out_dir)
     c = cfg
     row = {
@@ -111,7 +115,7 @@ def export_one_image(job, rar, root, poi, cfg, out_dir,
         "score": "" if refined is None else round(refined[2], 6),
         "status": "ok" if refined is not None else "not-run",
     }
-    sem = (cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    sem = (tiff_index.read_sem_gray(path, page)
            if (cv2 and exists) else None)
     if sem is None:
         row["status"] = "missing-file"
@@ -228,7 +232,8 @@ def align_and_export_one_image(job, rar, root, poi_colored, cfg, out_dir,
         ``_refined`` untouched, exactly like the F24 two-pass flow).
       * ``row`` = the overlay-manifest row (filenames + dx/dy/score/status).
     """
-    image_id, coarse, prior_refined, path, exists = job
+    image_id, coarse, prior_refined, path, exists = job[:5]
+    page = job[5] if len(job) > 5 else None   # F31, see export_one_image
     c = cfg
     out_dir = Path(out_dir)
     row = {
@@ -337,7 +342,7 @@ def align_and_export_one_image(job, rar, root, poi_colored, cfg, out_dir,
     if not (need_align or export_raw or want_products):
         return _finish(prior_refined, None)
 
-    sem = (cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    sem = (tiff_index.read_sem_gray(path, page)
            if (cv2 and exists) else None)
     if sem is None:
         row["status"] = "missing-file"

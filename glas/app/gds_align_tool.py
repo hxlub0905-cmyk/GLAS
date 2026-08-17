@@ -128,6 +128,7 @@ import gds_layer_cache  # noqa: E402
 import sem_loader       # noqa: E402
 import oasis_random     # noqa: E402
 import devlog            # noqa: E402  (dev-mode coloured console tags)
+import tiff_index        # noqa: E402  (F31: multi-page patch reads + read_sem_gray)
 import layout_export     # noqa: E402  (F9: OASIS export — shapely guarded inside)
 import oasis_debug        # noqa: E402  (F10: OASIS diagnostics — Qt-free)
 # F8: the Qt-free fine-align compute lives in glas/core/fine_align.py so a
@@ -3363,7 +3364,13 @@ class SemViewer(QWidget):
             return None
         return self._pixmap.width(), self._pixmap.height()
 
-    def set_image(self, img: Optional["sem_loader.SemImage"]) -> None:
+    def set_image(self, img: Optional["sem_loader.SemImage"],
+                  page: Optional[int] = None) -> None:
+        """Show ``img``. ``page`` selects the frame of a multi-page patch TIFF
+        (F31) — pass the page alignment will use, so what the operator drags
+        against on screen is the frame the export actually matches. ``QPixmap``
+        can only ever decode page 0, so a paged read goes through
+        ``tiff_index`` and is converted from the grayscale array."""
         self._pixmap = None
         if img is None:
             self._caption = "no SEM image"
@@ -3371,12 +3378,19 @@ class SemViewer(QWidget):
             self._caption = (f"{img.filename}\n(file not found next to KLARF — "
                              f"load the image folder)")
         else:
-            pm = QPixmap(str(img.file_path))
+            if page is None and getattr(img, "pages", ()):
+                page = img.page
+            if page is None:
+                pm = QPixmap(str(img.file_path))
+            else:
+                arr = tiff_index.read_sem_gray(str(img.file_path), page)
+                pm = QPixmap() if arr is None else _gray_to_pixmap(arr)
             if pm.isNull():
                 self._caption = f"{img.filename}\n(unreadable image)"
             else:
                 self._pixmap = pm
-                self._caption = img.filename
+                self._caption = (img.filename if page is None
+                                 else f"{img.filename}  ·  page {page + 1}")
         self._drag_x = self._drag_y = 0.0   # temp drag never survives a new image
         # S12: CTA shows only on the empty viewer; hide as soon as any
         # pixmap (even an unreadable one) has been assigned for inspection.
@@ -4623,6 +4637,9 @@ class FineAlignPanel(QGroupBox):
     export_requested = pyqtSignal()
     preview_requested = pyqtSignal()
     results_requested = pyqtSignal()
+    # F31: the "align on which page" setting changed — the viewer must reload
+    # the current defect's frame, or the operator drags against the old one.
+    align_page_changed = pyqtSignal()
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__("Fine Align", parent)
@@ -4676,6 +4693,27 @@ class FineAlignPanel(QGroupBox):
             "lower to limit CPU / memory.")
         self._workers.valueChanged.connect(
             lambda v: QSettings("GLAS", "GLAS").setValue("batch_workers", int(v)))
+        # F31: which image of a defect drives alignment, for datasets whose
+        # patches live in one multi-page TIFF (1 = test, 2 = ref). A setting
+        # rather than a constant because the convention is per-site; ref is the
+        # default since it is the same location on a neighbouring die and so
+        # carries no defect to confuse the match. Ignored by single-image
+        # datasets, which have no pages at all.
+        saved_page = QSettings("GLAS", "GLAS").value(
+            "align_page_ordinal", sem_loader.DEFAULT_ALIGN_PAGE_ORDINAL, type=int)
+        self._page_ord = _spin(1, 64, int(saved_page))
+        self._page_ord.setToolTip(
+            "Which image of each defect to align on, for patch datasets that "
+            "pack several frames per defect into one multi-page TIFF.\n"
+            "1 = test, 2 = ref (default — the reference die carries no defect, "
+            "so it matches the layout most cleanly).\n"
+            "Defects with fewer frames fall back to their last one. "
+            "No effect on single-image datasets.")
+        self._page_ord.valueChanged.connect(
+            lambda v: QSettings("GLAS", "GLAS").setValue(
+                "align_page_ordinal", int(v)))
+        self._page_ord.valueChanged.connect(
+            lambda _v: self.align_page_changed.emit())
 
         # Secondary (not primaryBtn): a disabled primary renders as washed-out
         # pale-orange with faint text; secondary greys cleanly (M7 R6).
@@ -4716,6 +4754,7 @@ class FineAlignPanel(QGroupBox):
             ("Background GL", self._bg), ("Blur σ (px)", self._blur),
             ("Search radius (nm)", self._radius),
             ("Score threshold", self._thresh),
+            ("Align on image # (patch TIFF)", self._page_ord),
             ("Parallel workers (0 = auto)", self._workers),
             ("span", self._run_btn), ("span", self._export_btn),
             ("span", self._preview_btn), ("span", self._results_btn),
@@ -4803,6 +4842,7 @@ class FineAlignPanel(QGroupBox):
             "search_radius_nm": float(self._radius.value()),
             "score_threshold": float(self._thresh.value()),
             "max_workers": int(self._workers.value()),
+            "align_page_ordinal": int(self._page_ord.value()),
         }
 
     def set_result(self, score: float, dx_nm: float, dy_nm: float) -> None:
@@ -6252,6 +6292,8 @@ class MainWindow(QMainWindow):
         self.sem_panel.fine_align.export_requested.connect(self._on_export)
         self.sem_panel.fine_align.preview_requested.connect(self._on_preview_template)
         self.sem_panel.fine_align.results_requested.connect(self._open_fa_results)
+        self.sem_panel.fine_align.align_page_changed.connect(
+            self._on_align_page_changed)
         self.sem_viewer.drag_changed.connect(self._on_overlay_drag)
 
         # F28: live performance-monitor HUD — a separate top-level window fed by
@@ -6896,7 +6938,7 @@ class MainWindow(QMainWindow):
 
     def _on_sem_image_selected(self, img) -> None:
         self._current_sem = img
-        self.sem_viewer.set_image(img)
+        self.sem_viewer.set_image(img, self._align_page_of(img))
         self._jump_to_image(img)
         self._refresh_overview_defects()      # move the "current" ring
         self._update_guidance()
@@ -7189,13 +7231,40 @@ class MainWindow(QMainWindow):
             f"fine align {img.image_id}: score {score:.3f}, "
             f"Δ ({dx_nm:,.0f}, {dy_nm:,.0f}) nm")
 
-    @staticmethod
-    def _load_sem_gray(img):
-        """Load a SEM image as a grayscale uint8 ndarray, or None (M4b)."""
+    def _load_sem_gray(self, img):
+        """Load a SEM image as a grayscale uint8 ndarray, or None (M4b).
+
+        F31: for a multi-page patch TIFF this reads the page the *current*
+        settings align on, so the single-image Run and the template preview see
+        the same frame the batch will — otherwise the operator would tune
+        against one image and export another."""
         if cv2 is None or img is None or not getattr(img, "exists", False):
             return None
-        arr = cv2.imread(str(img.file_path), cv2.IMREAD_GRAYSCALE)
-        return arr
+        return tiff_index.read_sem_gray(str(img.file_path),
+                                        self._align_page_of(img))
+
+    def _on_align_page_changed(self) -> None:
+        """The align-page setting moved: reload the displayed frame so the
+        viewer keeps showing what alignment will actually match (F31 M3).
+        Stored alignments are left alone — they were computed against whichever
+        page was set at the time, and re-running is the operator's call."""
+        img = self._current_sem
+        if img is None or not getattr(img, "pages", ()):
+            return
+        self.sem_viewer.set_image(img, self._align_page_of(img))
+        self._status_doc.setText(
+            f"aligning on image #"
+            f"{self.sem_panel.fine_align.values()['align_page_ordinal']} "
+            f"of each defect — re-run fine align to apply it to stored results")
+
+    def _align_page_of(self, img):
+        """The TIFF page this image aligns on under the current settings, or
+        ``None`` for a plain single-image file (F31 M3)."""
+        if img is None or not getattr(img, "pages", ()):
+            return None
+        ordinal = int(self.sem_panel.fine_align.values().get(
+            "align_page_ordinal", sem_loader.DEFAULT_ALIGN_PAGE_ORDINAL))
+        return img.page_for_ordinal(ordinal)
 
     def _entry_spec(self, e):
         """One POI layer as a batch-walkable spec, or None (F3). Synthetic
@@ -7352,7 +7421,8 @@ class MainWindow(QMainWindow):
             self._status_doc.setText("run all: set FOV width/height first")
             return
         jobs = [(im.image_id, self._coarse_gds(im),
-                 str(im.file_path) if im.file_path else "", bool(im.exists))
+                 str(im.file_path) if im.file_path else "", bool(im.exists),
+                 self._align_page_of(im))
                 for im in self._sem_images]
         cfg = {
             "fov_w": self._fov_w, "fov_h": self._fov_h,
@@ -7436,7 +7506,8 @@ class MainWindow(QMainWindow):
         self._dlg_remember("export_align", align_path)
         jobs = [(im.image_id, self._coarse_gds(im),
                  self._refined.get(im.image_id),
-                 str(im.file_path) if im.file_path else "", bool(im.exists))
+                 str(im.file_path) if im.file_path else "", bool(im.exists),
+                 self._align_page_of(im))
                 for im in images]
         cfg = {
             "fov_w": self._fov_w, "fov_h": self._fov_h,
@@ -7553,7 +7624,8 @@ class MainWindow(QMainWindow):
             return
         subset = fine_align.rerun_image_subset(self._sem_images, image_ids)
         jobs = [(im.image_id, self._coarse_gds(im),
-                 str(im.file_path) if im.file_path else "", bool(im.exists))
+                 str(im.file_path) if im.file_path else "", bool(im.exists),
+                 self._align_page_of(im))
                 for im in subset]
         if not jobs:
             self._status_doc.setText("re-run: no matching images")
