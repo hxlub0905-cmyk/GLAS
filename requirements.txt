@@ -3,5 +3,11 @@ numpy>=1.24
 opencv-python>=4.8
 shapely>=2.0
 
+# Optional (F31): multi-page TIFF patch files. Only needed when a KLARF points
+# at a batch TIFF holding several defects' patches -- single-image datasets
+# (rSEM KLARF, folder mode) never touch it. Without it GLAS falls back to
+# cv2.imreadmulti, which works but decodes every page of the file per read.
+tifffile>=2023.1.1
+
 # dev / test
 pytest>=7.0

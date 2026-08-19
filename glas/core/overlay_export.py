@@ -28,6 +28,7 @@ except Exception:  # pragma: no cover
 
 import fine_align
 import oasis_random
+import tiff_index
 
 
 def _safe_name(s: str) -> str:
@@ -87,6 +88,22 @@ def overlay_outlines_on_sem(sem_gray: np.ndarray, entries: list, anchor: tuple,
     return rgb
 
 
+def _record_grid(row, sem, cfg) -> None:
+    """Stamp the row with the pixel grid this image was rasterised on (F31 M4).
+
+    ``nm_per_px`` is per-image on purpose: with auto scaling it is
+    ``fov_w / width``, so two frames of different widths in the same batch have
+    different scales. The alignment CSV carries one value for the whole run,
+    which is only right when every frame is the same size — this is the value
+    that actually produced *this* row's label map."""
+    H, W = sem.shape[:2]
+    row["width_px"] = int(W)
+    row["height_px"] = int(H)
+    npx = (cfg["nm_manual"] if (not cfg["nm_auto"] and cfg["nm_manual"] > 0)
+           else cfg["fov_w"] / max(1, W))
+    row["nm_per_px"] = round(float(npx), 6)
+
+
 def export_one_image(job, rar, root, poi, cfg, out_dir,
                      export_raw: bool, export_overlay: bool,
                      export_gray: bool = False, export_label: bool = False,
@@ -100,7 +117,11 @@ def export_one_image(job, rar, root, poi, cfg, out_dir,
     grayscale/label (hole-preserving geometry, F15). Pure per-image work with no
     shared state — identical whether run in-thread or across the process pool —
     so the parallel output matches the sequential output (§7)."""
-    image_id, coarse, refined, path, exists = job
+    # F31: optional 6th element = TIFF page (multi-page patch file); absent →
+    # plain single-image read, exactly as before.
+    image_id, coarse, refined, path, exists = job[:5]
+    page = job[5] if len(job) > 5 else None
+    id_source = job[6] if len(job) > 6 else ""
     out_dir = Path(out_dir)
     c = cfg
     row = {
@@ -109,9 +130,13 @@ def export_one_image(job, rar, root, poi, cfg, out_dir,
         "fine_dx_nm": "" if refined is None else round(refined[0], 3),
         "fine_dy_nm": "" if refined is None else round(refined[1], 3),
         "score": "" if refined is None else round(refined[2], 6),
-        "status": "ok" if refined is not None else "not-run",
+        "status": fine_align.manifest_status(coarse, refined, score_thr),
+        # F31 (v4): provenance + the pixel grid. Filled in below once the frame
+        # is read; blank on a row that never got that far.
+        "id_source": str(id_source), "page": "" if page is None else int(page),
+        "width_px": "", "height_px": "", "nm_per_px": "",
     }
-    sem = (cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    sem = (tiff_index.read_sem_gray(path, page)
            if (cv2 and exists) else None)
     if sem is None:
         row["status"] = "missing-file"
@@ -121,6 +146,7 @@ def export_one_image(job, rar, root, poi, cfg, out_dir,
         name = f"{base}_raw.png"
         cv2.imwrite(str(out_dir / name), sem)
         row["raw_png"] = name
+    _record_grid(row, sem, c)
     # overlay, grayscale and label all consume one ROI walk per image.
     if (export_overlay or export_gray or export_label) and coarse is not None \
             and poi:
@@ -228,21 +254,27 @@ def align_and_export_one_image(job, rar, root, poi_colored, cfg, out_dir,
         ``_refined`` untouched, exactly like the F24 two-pass flow).
       * ``row`` = the overlay-manifest row (filenames + dx/dy/score/status).
     """
-    image_id, coarse, prior_refined, path, exists = job
+    image_id, coarse, prior_refined, path, exists = job[:5]
+    page = job[5] if len(job) > 5 else None   # F31, see export_one_image
+    id_source = job[6] if len(job) > 6 else ""
     c = cfg
     out_dir = Path(out_dir)
     row = {
         "image_id": str(image_id), "raw_png": "", "overlay_png": "",
         "gray_png": "", "label_png": "", "label_view_png": "",
-        "fine_dx_nm": "", "fine_dy_nm": "", "score": "", "status": "not-run",
+        "fine_dx_nm": "", "fine_dy_nm": "", "score": "",
+        "status": fine_align.manifest_status(coarse, None, score_thr),
+        "id_source": str(id_source), "page": "" if page is None else int(page),
+        "width_px": "", "height_px": "", "nm_per_px": "",
     }
 
-    def _finish(refined, fa_result):
+    def _finish(refined, fa_result, status=None):
         if refined is not None:
             row["fine_dx_nm"] = round(refined[0], 3)
             row["fine_dy_nm"] = round(refined[1], 3)
             row["score"] = round(refined[2], 6)
-            row["status"] = "ok"
+        row["status"] = status or fine_align.manifest_status(
+            coarse, refined, score_thr)
         return fa_result, row
 
     # F26 diagnostic: one timing line per image (gated on the same
@@ -337,7 +369,7 @@ def align_and_export_one_image(job, rar, root, poi_colored, cfg, out_dir,
     if not (need_align or export_raw or want_products):
         return _finish(prior_refined, None)
 
-    sem = (cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    sem = (tiff_index.read_sem_gray(path, page)
            if (cv2 and exists) else None)
     if sem is None:
         row["status"] = "missing-file"
@@ -355,6 +387,7 @@ def align_and_export_one_image(job, rar, root, poi_colored, cfg, out_dir,
     H, W = sem.shape[:2]
     nm_per_px = (c["nm_manual"] if (not c["nm_auto"] and
                  c["nm_manual"] > 0) else c["fov_w"] / max(1, W))
+    _record_grid(row, sem, c)
 
     _lap("read")
     fa_result = None
@@ -397,7 +430,8 @@ def align_and_export_one_image(job, rar, root, poi_colored, cfg, out_dir,
             if not poi_layers:
                 # No geometry in this ROI → nothing to match against.
                 _emit()
-                return _finish(None, (str(image_id), 0.0, 0.0, 0.0, 0, "flat"))
+                return _finish(None, (str(image_id), 0.0, 0.0, 0.0, 0, "flat"),
+                               status="flat")
             template = fine_align.render_composite_template(
                 poi_layers, coarse, W, H, nm_per_px,
                 c["bg_glv"], c["blur_sigma_px"])
