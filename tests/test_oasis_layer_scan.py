@@ -528,3 +528,33 @@ class TestSampleOffsets:
     def test_returns_all_when_fewer_than_cap(self):
         offs = [50, 10, 30]
         assert orx._sample_offsets(offs, 8) == [10, 30, 50]
+
+
+class TestKLayoutCblockTables:
+    """KLayout strict mode + 'Use CBLOCK compression' wraps the name tables in
+    a CBLOCK, so the END table offsets point at a CBLOCK record. The scanner
+    used to stop on that record and then seek inside the leftover substream,
+    so the GUI reported 'no S_CELL_OFFSET index'."""
+
+    def test_cblock_wrapped_tables_found(self, tmp_path):
+        db = pytest.importorskip("klayout.db")
+        ly = db.Layout()
+        ly.dbu = 0.001
+        l1 = ly.layer(1, 0)
+        leaf = ly.create_cell("LEAF")
+        leaf.shapes(l1).insert(db.Box(0, 0, 100, 50))
+        top = ly.create_cell("TOP")
+        top.insert(db.CellInstArray(leaf.cell_index(), db.Trans(),
+                                    db.Vector(200, 0), db.Vector(0, 100), 3, 4))
+        opt = db.SaveLayoutOptions()
+        opt.format = "OASIS"
+        opt.oasis_strict_mode = True
+        opt.oasis_write_std_properties = 2
+        opt.oasis_write_cblocks = True
+        p = tmp_path / "klayout_cblock.oas"
+        ly.write(str(p), opt)
+
+        idx = oas.scan_cell_offsets(p)
+        assert idx["offset_flag"] == 1
+        assert idx["offsets_via"] == "tables"
+        assert set(idx["by_name"]) == {"LEAF", "TOP"}

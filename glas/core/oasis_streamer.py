@@ -326,7 +326,15 @@ class OasisStream:
     def clear_substreams(self) -> None:
         """Drop any pending CBLOCK substream frames. Used before a random
         seek (M3.5b) so a previous partial decode that stopped inside a
-        CBLOCK doesn't leave the substream stack dangling."""
+        CBLOCK doesn't leave the substream stack dangling.
+
+        Also restores the OUTERMOST buffer: a random seek takes an absolute
+        file offset, so leaving an inner CBLOCK payload active (the old
+        behaviour) made the next seek land inside the decompressed slab and
+        fail with "unexpected EOF". KLayout's strict-mode writer puts the name
+        tables inside CBLOCKs when CBLOCK compression is on, which hit this."""
+        if self._stack:
+            self._buf, self._pos = self._stack[0]
         self._stack.clear()
 
     def close(self) -> None:
@@ -2433,6 +2441,12 @@ def _read_table_region(reader: "OasisReader", offset: int, keep_ids: tuple,
     f.seek(int(offset))
     n = 0
     for rid, payload in reader.iter_records():
+        if rid in (CBLOCK, PAD):
+            # KLayout (CBLOCK compression on) wraps the name tables in a
+            # CBLOCK, so the table offset points at the CBLOCK record.
+            # iter_records has already pushed its payload; keep going and the
+            # table's records come out of the substream next.
+            continue
         if rid not in keep_ids:
             break                      # left this table region
         consume(rid, payload)
