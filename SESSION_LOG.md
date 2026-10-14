@@ -4,6 +4,63 @@
 
 ---
 
+## [2026-10-14] [F32 M1–M6] 無圖 / 無 KLARF / 純 GDS 三種缺料模式都能「移過去並顯示」+ bundle 對齊 d4t 純 ASCII 格式
+
+**變更類型：** 新功能（導航 / 顯示）+ 工具格式升級 · **狀態：M1–M6 code 完成、1,003 passed / 4 skipped；待 user 真機驗收**
+
+**動機：** user 要三種資料不全的情境都能跳到對應 GDS 位置並看到 layout：(a) 有 GDS + KLARF **沒影像檔**、
+(b) 有影像 + GDS **沒 KLARF**（只能手 key 座標）、(c) **純 GDS**（無 KLARF 無影像，key 座標）。探索定調硬依賴只有兩點：
+`SemViewer` 沒 pixmap 就**什麼都不畫**（`_compute_geometry` 回 None → overlay / 拖動 / 縮放 / HUD 全失效、auto nm/px 回 0），
+以及所有跳位都讀 `img.xrel/yrel` 而只有 KLARF loader 會設它（`load_klarf` 還把無檔名的 defect 直接 `continue` 丟掉 → (a) 載入 0 張）；
+工具列 Goto 只驅動預設隱藏的 `GdsCanvas`。Q&A 定案：虛擬底圖（不自動切 GDS 檢視）/ 兩種座標單位下拉、內部統一存 die-corner nm /
+選中影像逐張 key / bundle 只升級 GLAS 這份。plan：`docs/plans/F32-coordless-navigation.md`。
+
+同場第二件事：user 要「幫其他專案 d4t 等建 bundle.py」，實查 **d4t 已有**（而且比 GLAS 新：2026-09-03 在公司機撞到
+「記事本存成 cp950 → 整檔 `SyntaxError: Non-UTF-8 code`」後改成純 ASCII、2026-10-06 改逐檔 raw LZMA2 + base85）。
+GLAS 2026-08-17 那份解包程式**檔頭與訊息是中文**、資料整包 lzma+base64 —— 同一顆地雷只是還沒踩到，且整包壓縮讓 git
+每 commit 存一份完整 bundle。user 選「把 GLAS 升級成 d4t 現行格式」。
+
+**實作：**
+- **M1 資料層**：`gds_fov.gds_to_klarf`（`klarf_to_gds` 精確反函數，含 `flip_y`；原函式一行不動）。`SemImage.coord_source`
+  （`klarf` / `manual-gds` / `manual-klarf`）。`load_klarf` rSEM 路徑**有座標無檔名的 defect 保留**（`file_path=None`），
+  只丟「無檔名又無座標」；EBI 路徑 `IMAGECOUNT 0` 有座標同樣保留；新增 `_load_klarf_coords_only`：rSEM 產 0 張但 `klarf_doc`
+  讀得動（典型 1.2 flat 沒 TIFF）→ coords-only 載入（1.2 ×1000），**只在 rSEM 給 0 張時接手**。
+- **M2 SemViewer 虛擬底圖**：`set_blank(w, h, caption)` / `is_blank()`；`native_size()` 無 pixmap 時回虛擬尺寸 →
+  `_compute_geometry` / `_apply_zoom` / `_effective_nm_per_px`（FOV 寬 / native 寬）**零特判**自洽。`paintEvent` 畫深色底板
+  + 虛線框 + 「no SEM image — layout only」，overlay / 十字 / HUD / 拖動照常；CTA 隱藏。fold 不變式在 blank 下成立（測試）。
+- **M3 MainWindow**：`_virtual_canvas_size()`（手動 nm/px → FOV/nm；否則 1024 寬依 FOV 長寬比）、`_show_sem_or_blank(img)`、
+  `_goto_virtual(gx, gy)`（`id_source="virtual"` 的 stand-in `SemImage` 當 `_current_sem`、**不進 `_sem_images`**）、
+  工具列 Goto 改走它（保留 ±25 µm canvas 視窗；輸入是最終 GDS 位置所以先扣掉 δ）；`_auto_load_roi_for_current` 抽出共用。
+  guidance / `_refresh_action_states` 對虛擬目標與無圖影像放行；列表徽章新增 `no image` / `keyed`（keyed 優先）、無檔名列
+  顯示 `(no image)`；`_on_load_folder` 清 `_klarf_path`（folder 資料集的 manifest 不該帶上一個 KLARF 路徑）。
+- **M4 CoordinateKeyPanel**：右欄 ALIGNMENT δ 下新區塊：單位下拉〔GDS µm｜KLARF nm (XREL/YREL)〕+ X/Y + 「Apply to selected」
+  + 「Go (no image)」；選中影像時以所選單位回填（兼讀出，chip_corner 由 MainWindow 給）。`_apply_keyed_coord` 寫回
+  `xrel/yrel`（die-corner nm）+ `coord_source`、清掉舊 refined、更新徽章、同點選流程跳位 + ROI。keyed 影像之後跟 KLARF 影像
+  完全同路（δ / fine-align / Export 的 `has_coords` 過濾自然納入）。
+- **M5 bundle**：`make_text_bundle.py` 解包程式全英文 ASCII + `BUILD <sha12> <date>` 檔頭；預設 `#ENC lzma2+b85/file`
+  （逐檔 raw LZMA2 preset 6 + base85）；仍認得舊 `#ENC lzma+base64` / `#ENC text`（含 `#X`）→ 公司機上的舊包照解。
+  **GLAS 特有**：有中文檔名（`GLAS_快速參考卡.pdf`）→ `#F` 檔頭路徑 percent-encode（d4t 沒這題）。`collect()` 保留
+  `git ls-files -z`，二進位檔不再特判（全部走 base85）；拿掉 `--no-binary`。`release.py` `compress=False`（ast 測試守）、
+  `_bundle_entries` 認新格式、size 報告改 MB 不印百分比。新 `glas/core/buildinfo.py`（`GLAS_VERSION` 單一來源 +
+  `build_id()`）；`main.py --version` 印 `GLAS 1.0.0 (build xxxx)`；About / status chip tooltip 帶 build。
+  重產後包約 1.25 MB、**非 ASCII 位元組 0**。
+
+**測試：** 新增 `tests/test_f32_coordless.py`（28：viewer blank 幾何 / 映射 / fold / zoom、無圖 defect 虛擬尺寸與 auto nm/px、
+徽章、keyed 兩種單位落點與 δ、Export 候選納入、虛擬 Goto 不進列表、guidance、folder 清 `_klarf_path`）；
+`test_bundle_tools.py` 重寫（28：三種編碼 round-trip、純 ASCII、**cp950 / BOM / CRLF 存一次再解**、base85 改一字一個檔都不落地、
+中文路徑 percent-encode、build id 與 `main.py --version` 一致、repo 內那份是 per-file 且純 ASCII、ast 守 `compress=False`）；
+`test_gds_fov` +`TestGdsToKlarf`；`test_sem_loader` 改 3 條語意 + 新 4 條。全套 **1,003 passed, 4 skipped**（F31 後 949）。
+真包乾淨目錄解開 167 檔逐位元組零差異；`iconv -t cp950` 存一次後 `--list` 仍成功。一條既有測試
+（`test_gds_align_m6_6::test_step_progression` 用 `object()` 當 current_sem）揭露 guidance 新分支的 `getattr` 預設要為 True。
+
+**影響檔案：** `glas/core/gds_fov.py` / `buildinfo.py`(新)、`glas/app/sem_loader.py` / `gds_align_tool.py`、`main.py`、
+`tools/make_text_bundle.py` / `release.py` / `FILELIST.txt`、`bundle/GLAS_bundle.py`、`tests/test_f32_coordless.py`(新) /
+`test_bundle_tools.py` / `test_gds_fov.py` / `test_sem_loader.py`、`README.md`、`CLAUDE.md`（§3 / §4 / §7 四條 / §8 F32）、
+`docs/plans/F32-coordless-navigation.md`(新)。
+**Branch：** `claude/epic-goodall-guq8mb`。
+
+---
+
 ## [2026-08-17] [F31 M1–M4] ADEPT 介面契約：EBI-patch KLARF ingest + 多頁 TIFF + manifest v4（+ 離線搬運包）
 
 **變更類型：** 新功能（下游介面契約）+ 工具移植 · **狀態：M1–M4 完成、949 tests 綠；M5 待 user 真機驗收**

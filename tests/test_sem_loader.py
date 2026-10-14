@@ -57,11 +57,30 @@ class TestLoadKlarf:
         assert imgs[0].exists is True
         assert imgs[1].exists is False   # b.tif not created
 
-    def test_defects_without_image_skipped(self, tmp_path):
+    def test_defects_without_image_but_with_coords_are_kept(self, tmp_path):
+        """F32: a defect list with no review images is still navigable -- the
+        defect survives image-less (no file, has coords). Before F32 it was
+        dropped and the KLARF loaded as zero images."""
         k = tmp_path / "lot.klarf"
         k.write_text(_KLARF_NO_IMG)
         imgs = load_klarf(k)
-        assert imgs == []
+        assert len(imgs) == 1
+        img = imgs[0]
+        assert img.has_coords and (img.xrel, img.yrel) == (1000, 2000)
+        assert img.exists is False and img.file_path is None
+        assert img.filename == ""
+        assert img.coord_source == "klarf"
+
+    def test_defects_with_neither_image_nor_coords_are_dropped(self, tmp_path):
+        k = tmp_path / "lot.klarf"
+        k.write_text("FileVersion 1 8\nDefectList 2 DEFECTID CLASSNUMBER\n"
+                     "Data 1\n1 7 ;\nEndOfList\n")
+        assert load_klarf(k) == []
+
+    def test_klarf_images_record_their_coord_source(self, tmp_path):
+        k = tmp_path / "lot.klarf"
+        k.write_text(_FLAT_KLARF)
+        assert all(i.coord_source == "klarf" for i in load_klarf(k))
 
 
 class TestLoadFolder:
@@ -228,7 +247,9 @@ class TestLoadKlarfEbi:
         load_klarf(ebi12, notes=notes)
         assert any("page" in n.lower() for n in notes)
 
-    def test_defect_without_a_patch_is_skipped_and_noted(self, tmp_path):
+    def test_defect_without_a_patch_is_kept_image_less_and_noted(self, tmp_path):
+        """F32: IMAGECOUNT 0 but XREL/YREL present -> the defect stays in the
+        list without a file (it used to be dropped), and the note says so."""
         _write_batch_tiff(tmp_path / "LOT001.tif", 2)
         k = tmp_path / "lot.klarf"
         k.write_text(_kd.KLARF12_EBI.replace(
@@ -236,15 +257,39 @@ class TestLoadKlarfEbi:
             " 2 300.000 400.000 2 3 0.6 0.6 4 0;"))
         notes = []
         imgs = load_klarf(k, notes=notes)
-        assert [i.image_id for i in imgs] == ["1"]
+        assert [i.image_id for i in imgs] == ["1", "2"]
+        a, b = imgs
+        assert a.exists and a.pages == (0, 1)
+        assert not b.exists and b.file_path is None and b.pages == ()
+        assert b.has_coords and (b.xrel, b.yrel) == (300000.0, 400000.0)
         assert any("no patch image" in n for n in notes)
 
-    def test_missing_tiff_falls_through_to_the_old_path(self, tmp_path):
-        """No batch TIFF beside the KLARF => not an EBI dataset. It must not be
-        half-loaded; the rSEM path decides (and finds no filenames here)."""
+    def test_missing_tiff_loads_coordinates_only(self, tmp_path):
+        """No batch TIFF beside the KLARF => not an EBI dataset, and the rSEM
+        parser cannot read a 1.2 flat file at all. F32: instead of zero images
+        the defects load as coordinates only (image-less, nm) so the operator
+        can still step through them on the layout."""
         k = tmp_path / "lot.klarf"
         k.write_text(_kd.KLARF12_EBI)
-        assert load_klarf(k) == []
+        notes = []
+        imgs = load_klarf(k, notes=notes)
+        assert [i.image_id for i in imgs] == ["1", "2"]
+        assert all(not i.exists and i.file_path is None and i.pages == ()
+                   for i in imgs)
+        assert [(i.xrel, i.yrel) for i in imgs] == [
+            (100500.0, 200500.0), (300000.0, 400000.0)]      # µm -> nm
+        assert all(i.coord_source == "klarf" for i in imgs)
+        assert any("coordinates only" in n for n in notes)
+
+    def test_coords_only_fallback_never_touches_a_klarf_the_rsem_path_serves(
+            self, tmp_path):
+        """The fallback is a last resort: when the rSEM path finds images the
+        result must be exactly what it was before F32."""
+        k = tmp_path / "lot.klarf"
+        k.write_text(_FLAT_KLARF)
+        imgs = load_klarf(k)
+        assert [i.filename for i in imgs] == ["a.tif", "b.tif"]
+        assert all(i.file_path is not None for i in imgs)
 
 
 class TestRsemUnaffectedByF31:

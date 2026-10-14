@@ -64,7 +64,8 @@ read-only 探索（沒動任何檔案）才可略過。
 
 ```bash
 python main.py                          # 啟動 GUI
-pytest tests/ -v                        # 完整測試（~950 項，需 numpy / cv2 / shapely / PyQt6）
+pytest tests/ -v                        # 完整測試（~1000 項，需 numpy / cv2 / shapely / PyQt6）
+python main.py --version                # 版本 + build id（= bundle 檔頭 BUILD；公司機問「跑的是哪一版」用）
 python3 -m py_compile <file>            # 修改後語法檢查
 ```
 
@@ -103,18 +104,21 @@ GLAS/
 │   │   ├── perfmon.py           # F28 即時效能事件收集器（Qt-free；HUD 的資料匯流排 + on_summary）
 │   │   ├── klarf_parser.py      # KLARF I/O（自 MMH 複製，純標準庫）— rSEM 路徑 + 唯一的 writer
 │   │   ├── klarf_doc.py         # F31 KLARF 1.2/1.8 唯讀 reader（移植 ADEPT；EBI-patch 專用，不寫回）
-│   │   └── tiff_index.py        # F31 多頁 TIFF：純 stdlib IFD 走訪 + read_sem_gray 單一讀圖入口
+│   │   ├── tiff_index.py        # F31 多頁 TIFF：純 stdlib IFD 走訪 + read_sem_gray 單一讀圖入口
+│   │   └── buildinfo.py         # F32 GLAS_VERSION + build_id()（= tools/FILELIST.txt blob SHA 前 12 碼 = 包檔頭 BUILD）
 │   └── app/                 # 🖼 PyQt6 app 殼
 │       ├── gds_align_tool.py    # 主視窗 + 所有 widget（~4500 行）
 │       ├── perf_panel.py        # F28 即時效能監控 HUD（獨立深色監控台視窗，分類彩色 + 總覽 KPI）
-│       ├── sem_loader.py        # KLARF / 資料夾載 SEM 影像列表
+│       ├── sem_loader.py        # KLARF / 資料夾載 SEM 影像列表（F32：有座標無檔的 defect 保留為無圖影像；
+│       │                        #   rSEM 0 張時 klarf_doc coords-only 後備；SemImage.coord_source）
 │       ├── styles.py            # QSS 設計 token（自 MMH 複製）
 │       ├── collapsible.py       # CollapsibleSection widget（自 MMH 複製）
 │       └── icons/               # Lucide-style SVG icon set（自 MMH 複製）
-├── tests/                   # ~950 項（test_oasis_* / test_gds_* / test_sem_loader / test_parts_catalog / test_cellcache / test_devlog / test_accel_*）
+├── tests/                   # ~1000 項（test_oasis_* / test_gds_* / test_sem_loader / test_f32_coordless / test_bundle_tools / test_cellcache / …）
 │   └── fixtures/sample_real.klarf
 ├── tools/                   # F31 離線搬運：release.py（一鍵重產）/ make_text_bundle.py / make_filelist.py
-├── bundle/GLAS_bundle.py    # 整個 repo 的單檔純文字自解包（給不能 clone 的機器；由 release.py 產）
+├── bundle/GLAS_bundle.py    # 整個 repo 的單檔**純 ASCII** 自解包（給不能 clone 的機器；由 release.py 產；
+│                            #   F32 起逐檔 raw LZMA2+base85、英文解包程式、BUILD id，對齊 d4t 2026-10-06 格式）
 └── docs/plans/              # plan 檔（_template.md + F2 design history）
 ```
 
@@ -205,6 +209,10 @@ HMI 風格表達式 → 遞迴下降 parser → AST → shapely 運算。運算�
 |---|---|
 | OASIS PLACEMENT info-byte N-bit branch 方向（SEMI P39 §22.6） | M1.10 曾寫反；decoder 與 test 都要對齊 spec |
 | `klarf_to_gds`：`GDS = XREL − chip_corner`（Y 預設同向 `flip_y=False`） | user 已實測落點正確；改方向會破壞對位 |
+| `gds_to_klarf` 必須是 `klarf_to_gds` 的**精確反函數**（含 `flip_y`，round-trip 測試守著） | F32 手動 key 的 GDS 座標靠它存成 die-corner nm 走既有路徑；兩邊分家＝keyed 影像落點錯 |
+| F32 keyed / 無圖影像走**同一條** `xrel/yrel` 路徑；虛擬 Goto 目標（`id_source="virtual"`）**不進** `_sem_images` | 不另開導航路徑才保證拖動 / δ / fine-align / Export 對 keyed 影像一致；虛擬目標進列表會被 Export 當 defect |
+| `SemViewer` 無 pixmap 時 `native_size()` 回虛擬尺寸（`set_blank`），`_effective_nm_per_px` 不特判 | auto nm/px = FOV 寬 / native 寬 在有圖無圖兩種情況下自洽；特判會讓同一 FOV 兩種 scale |
+| 搬運包**整份純 ASCII**（解包程式英文、路徑 percent-encode、資料 base85）；`release.py` 的 `build(..., compress=False)` | 公司機記事本存 cp950，一個非 ASCII 位元組就整檔 `SyntaxError`（d4t 2026-09-03 實撞）；整包壓縮讓 git 每 commit 存一份完整 bundle |
 | KLARF↔GDS overlay sign：image x 右=GDS x（anchor.x 減）、image y 下=GDS y 上（anchor.y 加） | M4 對位不變式；fine-align 修正量符號依此 |
 | SemViewer 折疊不變式 `render(anchor,drag)==render(anchor−drag,0)` | Set Offset 把拖動折進原點 δ 的基礎 |
 | `oasis_random` CE 邊界 early-stop：reachable_bbox 用 `load_cell_bbox`、walk 用完整 `load_cell` | 剪枝靠 bbox、命中才全 decode；混用會慢或漏幾何 |
@@ -251,6 +259,13 @@ HMI 風格表達式 → 遞迴下降 parser → AST → shapely 運算。運算�
   像素網格 + 六種 status，修掉「score gate 沒過仍寫 `ok`」）。**剩 M5：user 真機驗收** —— 真實 EBI KLARF
   跑一次 Export、確認每顆 defect 的 label 不同，manifest 交 ADEPT 側試接。
   plan：`docs/plans/F31-adept-interface-multipage.md`。
+
+- [F32] 無圖 / 無 KLARF / 純 GDS 三種缺料模式都能「移過去並顯示」+ bundle 對齊 d4t 現行格式。
+  **M1–M6 code 完成（1,003 tests 綠）**：`SemViewer.set_blank` 虛擬底圖、`load_klarf` 保留有座標無檔 defect +
+  `klarf_doc` coords-only 後備、`gds_to_klarf` 反函數、右欄 `CoordinateKeyPanel`（GDS µm / KLARF nm、Apply / Go）、
+  虛擬 Goto 目標；bundle 純 ASCII 逐檔 LZMA2+base85 + `main.py --version` build id。**剩：user 真機驗收**
+  （三種模式各走一遍；公司機用記事本存一次包再解）。plan：`docs/plans/F32-coordless-navigation.md`。
+  Backlog 候選：keyed 座標 sidecar 持久化 / CSV 匯入；manifest 帶 `coord_source`（要 bump v5、通知 ADEPT）。
 
 ### 待辦 (Backlog)
 
