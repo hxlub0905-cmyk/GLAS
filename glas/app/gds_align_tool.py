@@ -128,6 +128,7 @@ import gds_layer_cache  # noqa: E402
 import sem_loader       # noqa: E402
 import oasis_random     # noqa: E402
 import devlog            # noqa: E402  (dev-mode coloured console tags)
+import buildinfo         # noqa: E402  (F32: build id = bundle header BUILD)
 import tiff_index        # noqa: E402  (F31: multi-page patch reads + read_sem_gray)
 import layout_export     # noqa: E402  (F9: OASIS export — shapely guarded inside)
 import oasis_debug        # noqa: E402  (F10: OASIS diagnostics — Qt-free)
@@ -179,7 +180,7 @@ except Exception:  # pragma: no cover
 
 # App version. Surfaced in the status-bar brand chip (left edge) and the
 # About dialog so a user reporting a bug can quote it at a glance.
-GLAS_VERSION = "1.0.0"
+GLAS_VERSION = buildinfo.GLAS_VERSION     # single source: glas/core/buildinfo.py
 
 
 _TK_BG_PAGE   = QColor("#f7f4ef")
@@ -195,6 +196,12 @@ _TK_ACCENT_DK = QColor("#c97028")
 _TK_GRID_FAINT = QColor(0, 0, 0, 26)
 _TK_GRID_BOLD  = QColor(0, 0, 0, 64)
 _TK_CANVAS_BG  = QColor("#fbf8f3")
+# F32 blank canvas (SemViewer without an image): a dark plate like a SEM frame
+# would be, with a dashed warm border + muted caption so it can't be mistaken
+# for a real (black) image.
+_TK_BLANK_PLATE  = QColor("#2b2622")
+_TK_BLANK_BORDER = QColor("#c8b89e")
+_TK_BLANK_TEXT   = QColor("#a89580")
 # Semantic + structural tokens (M7.2): centralize colours/font-sizes that were
 # previously hard-coded inline across the widgets. Values match src/gui/styles.py
 # so the tool reads identically to the main app.
@@ -3311,11 +3318,25 @@ class SemViewer(QWidget):
         screen = img_centre + ((px, py) − eff_anchor)/nm_per_px · s   (Y flipped)
         eff_anchor = anchor − drag
     so folding ``drag`` into the origin (anchor += −drag) reproduces the
-    dragged view with drag reset — the invariant Set Offset relies on."""
+    dragged view with drag reset — the invariant Set Offset relies on.
+
+    **Blank canvas (F32).** When there is no SEM image to show -- a KLARF
+    defect whose review image was never copied, or a coordinate the operator
+    keyed in without any SEM at all -- :meth:`set_blank` gives the viewer a
+    *virtual* image size. Everything that used to need the pixmap (fit scale,
+    zoom, pan, the overlay mapping, HUD, scale bar) reads that size instead, so
+    the layout is drawn, dragged and zoomed exactly as it would be over a real
+    image; only the pixels underneath are a flat dark plate. ``native_size()``
+    returns the virtual size too, which is what keeps the auto nm-per-px
+    (FOV width / native width) consistent between the two cases."""
 
     drag_changed = pyqtSignal()
     cursor_gds = pyqtSignal(object)   # F11 M1: (x_nm, y_nm) or None
     load_sem_requested = pyqtSignal()  # S12: empty-state CTA click
+
+    #: Caption painted across a blank canvas so nobody mistakes the dark plate
+    #: for a black SEM frame.
+    BLANK_HINT = "no SEM image — layout only"
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -3323,6 +3344,9 @@ class SemViewer(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Expanding,
                            QSizePolicy.Policy.Expanding)
         self._pixmap: Optional[QPixmap] = None
+        # F32: virtual image size (w, h) in "native px" when drawing without a
+        # pixmap; None = ordinary empty state (nothing to draw on).
+        self._blank_size: Optional[tuple] = None
         self._caption = "no SEM image"
         self._entries: list = []          # list[(polys: list[ndarray], QColor, alpha:int)]
         self._anchor: Optional[tuple] = None   # (gx, gy) nm at image centre
@@ -3365,9 +3389,32 @@ class SemViewer(QWidget):
         self._reposition_cta()
 
     def native_size(self) -> Optional[tuple]:
+        """Native image size in px: the pixmap's, or the virtual size of a
+        blank canvas (F32), or ``None`` when there is nothing to draw on."""
         if self._pixmap is None or self._pixmap.isNull():
-            return None
+            return self._blank_size
         return self._pixmap.width(), self._pixmap.height()
+
+    def is_blank(self) -> bool:
+        """True while drawing on a virtual (image-less) canvas (F32)."""
+        return self._pixmap is None and self._blank_size is not None
+
+    def set_blank(self, width_px: int, height_px: int,
+                  caption: str = "") -> None:
+        """Draw on a virtual canvas of ``width_px × height_px`` instead of a
+        SEM image (F32). Used when the selected defect has coordinates but no
+        image file, and for a coordinate keyed in with no SEM loaded at all.
+        The overlay anchor / scale set through :meth:`set_overlay` apply
+        unchanged; ``caption`` is painted at the bottom like a filename."""
+        self._pixmap = None
+        self._blank_size = (max(1, int(width_px)), max(1, int(height_px)))
+        self._caption = caption or self.BLANK_HINT
+        self._drag_x = self._drag_y = 0.0
+        # The empty-state CTA would sit on top of the layout; the right
+        # column's Load SEM… button stays available.
+        self._cta_btn.setVisible(False)
+        self.reset_view()
+        self.update()
 
     def set_image(self, img: Optional["sem_loader.SemImage"],
                   page: Optional[int] = None) -> None:
@@ -3375,13 +3422,19 @@ class SemViewer(QWidget):
         (F31) — pass the page alignment will use, so what the operator drags
         against on screen is the frame the export actually matches. ``QPixmap``
         can only ever decode page 0, so a paged read goes through
-        ``tiff_index`` and is converted from the grayscale array."""
+        ``tiff_index`` and is converted from the grayscale array.
+
+        Leaves the ordinary empty state when the image is missing or
+        unreadable; the caller decides whether to fall back to a blank canvas
+        (:meth:`set_blank`) — it knows whether there is a position to show."""
         self._pixmap = None
+        self._blank_size = None
         if img is None:
             self._caption = "no SEM image"
         elif not img.exists:
             self._caption = (f"{img.filename}\n(file not found next to KLARF — "
-                             f"load the image folder)")
+                             f"load the image folder)" if img.filename
+                             else f"defect {img.image_id}\n(no image file)")
         else:
             if page is None and getattr(img, "pages", ()):
                 page = img.page
@@ -3435,12 +3488,14 @@ class SemViewer(QWidget):
 
     def _compute_geometry(self) -> Optional[tuple]:
         """Image placement on screen as ``(ox, oy, dw, dh, s)`` given the
-        current zoom + pan, or ``None`` if there's no image. Used by both
-        paint and wheel/pan so zoom works before the first paint."""
-        if self._pixmap is None or self._pixmap.isNull():
+        current zoom + pan, or ``None`` if there's no image (and no blank
+        canvas, F32). Used by both paint and wheel/pan so zoom works before
+        the first paint."""
+        nat = self.native_size()
+        if nat is None:
             return None
-        nw = max(1, self._pixmap.width())
-        nh = max(1, self._pixmap.height())
+        nw = max(1, nat[0])
+        nh = max(1, nat[1])
         fit = min(self.width() / nw, self.height() / nh)
         s = fit * self._view_zoom
         dw, dh = nw * s, nh * s
@@ -3479,9 +3534,26 @@ class SemViewer(QWidget):
         geom = self._compute_geometry()
         if geom is not None:
             ox, oy, dw, dh, s = geom
-            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-            p.drawPixmap(QRectF(ox, oy, dw, dh), self._pixmap,
-                         QRectF(0, 0, self._pixmap.width(), self._pixmap.height()))
+            if self._pixmap is not None:
+                p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+                p.drawPixmap(QRectF(ox, oy, dw, dh), self._pixmap,
+                             QRectF(0, 0, self._pixmap.width(),
+                                    self._pixmap.height()))
+            else:
+                # F32 blank canvas: a flat dark plate where the SEM would be,
+                # so the overlay reads against the same "image" extent (and
+                # the clip rect below still means something).
+                p.fillRect(QRectF(ox, oy, dw, dh), _TK_BLANK_PLATE)
+                p.setPen(QPen(_TK_BLANK_BORDER, 1.0, Qt.PenStyle.DashLine))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawRect(QRectF(ox, oy, dw, dh))
+                hint = p.font()
+                hint.setPixelSize(_FS_LABEL)
+                p.setFont(hint)
+                p.setPen(QPen(_TK_BLANK_TEXT))
+                p.drawText(QRectF(ox, oy, dw, dh).adjusted(0, 18, 0, 0),
+                           Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter,
+                           self.BLANK_HINT)
             self._img_rect = (ox, oy, dw, dh)
             self._scale = s
             # GDS overlay.
@@ -3662,8 +3734,9 @@ class SemViewer(QWidget):
                        min(self._MAX_ZOOM, self._view_zoom * factor))
         if new_zoom == self._view_zoom:
             return
-        nw = max(1, self._pixmap.width())
-        nh = max(1, self._pixmap.height())
+        nat = self.native_size()          # pixmap or blank canvas (F32)
+        nw = max(1, nat[0])
+        nh = max(1, nat[1])
         fit = min(self.width() / nw, self.height() / nh)
         s2 = fit * new_zoom
         self._view_zoom = new_zoom
@@ -5439,16 +5512,207 @@ class _ImageListDelegate(QStyledItemDelegate):
         painter.restore()
 
 
+class CoordinateKeyPanel(QFrame):
+    """Key a coordinate by hand (F32): unit drop-down + X / Y + two actions.
+
+    * **Apply to selected image** — gives the selected SEM image (typically a
+      folder-loaded one, which carries no KLARF coordinates) a position, so it
+      jumps, loads its ROI, fine-aligns and exports like a KLARF defect.
+    * **Go (no image)** — navigates to the coordinate with no SEM at all: the
+      viewer draws the layout on a blank canvas (pure-GDS browsing).
+
+    Units: ``gds-um`` (layout coordinates, what klayout's Ctrl+G shows) or
+    ``klarf-nm`` (die-corner XREL/YREL as written in a KLARF). The panel only
+    *displays* in the chosen unit; MainWindow owns the conversion, because it
+    owns the chip corner (``klarf_to_gds`` / ``gds_to_klarf``). When an image
+    is selected its coordinate is echoed here in the chosen unit, so the panel
+    doubles as a readout.
+    """
+
+    #: ``(key, label)`` of the unit drop-down, in display order.
+    UNITS = (("gds-um", "GDS µm"), ("klarf-nm", "KLARF nm (XREL/YREL)"))
+
+    apply_requested = pyqtSignal(float, float, str)   # x, y, unit key
+    go_requested = pyqtSignal(float, float, str)
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("coordKeyPanel")
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setStyleSheet(
+            f"QFrame#coordKeyPanel {{ background: {_TK_BG_PANEL.name()}; "
+            f"border: 1px solid {_TK_BORDER.name()}; border-radius: 4px; }}")
+        v = QVBoxLayout(self)
+        v.setContentsMargins(10, 8, 10, 10)
+        v.setSpacing(6)
+
+        title = QLabel("KEY COORDINATE")
+        title.setStyleSheet(
+            f"color:{_TK_ACCENT_DK.name()}; font-size:{_FS_MICRO}px; "
+            f"font-weight:700; letter-spacing:1px;")
+        v.addWidget(title)
+
+        self.unit_combo = QComboBox(self)
+        for key, label in self.UNITS:
+            self.unit_combo.addItem(label, key)
+        self.unit_combo.setToolTip(
+            "GDS µm: layout coordinate (same as klayout Ctrl+G).\n"
+            "KLARF nm: die-corner XREL/YREL as written in a KLARF; converted "
+            "through the selected PART/CHIP's chip corner.")
+        self.unit_combo.currentIndexChanged.connect(self._on_unit_changed)
+        v.addWidget(self.unit_combo)
+
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        self.x_edit = QLineEdit(self)
+        self.y_edit = QLineEdit(self)
+        for ed, name in ((self.x_edit, "X"), (self.y_edit, "Y")):
+            ed.setPlaceholderText(name)
+            # No QDoubleValidator: its locale rules reject '.' on some
+            # Windows locales; values() parses and rejects bad text itself.
+            ed.returnPressed.connect(self._emit_apply)
+            row.addWidget(QLabel(f"{name}:"))
+            row.addWidget(ed, 1)
+        v.addLayout(row)
+
+        btns = QHBoxLayout()
+        btns.setSpacing(6)
+        self.apply_btn = QPushButton("Apply to selected", self)
+        self.apply_btn.setToolTip(
+            "Give the selected SEM image this coordinate (folder images have "
+            "none). It then jumps, loads its GDS ROI and takes part in fine "
+            "align / Export like a KLARF defect.")
+        self.apply_btn.clicked.connect(self._emit_apply)
+        self.go_btn = QPushButton("Go (no image)", self)
+        self.go_btn.setToolTip(
+            "Jump to this coordinate without any SEM image: the layout is "
+            "drawn on a blank canvas (pure GDS browsing).")
+        self.go_btn.clicked.connect(self._emit_go)
+        btns.addWidget(self.apply_btn, 1)
+        btns.addWidget(self.go_btn, 1)
+        v.addLayout(btns)
+
+        hint = QLabel("No KLARF? Select an image and key its position; or Go "
+                      "to browse the layout with no SEM at all.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(_hint_qss(_FS_MICRO, pad="2px 0 0 0"))
+        v.addWidget(hint)
+
+        self._coord_nm: Optional[tuple] = None    # (xrel, yrel) die-corner nm
+        self._cc: tuple = (0.0, 0.0)              # chip corner nm, for display
+        self.apply_btn.setEnabled(False)
+
+    # ── unit handling ────────────────────────────────────────────────────
+    def unit(self) -> str:
+        return str(self.unit_combo.currentData() or "gds-um")
+
+    def set_unit(self, key: str) -> None:
+        for i in range(self.unit_combo.count()):
+            if self.unit_combo.itemData(i) == key:
+                self.unit_combo.setCurrentIndex(i)
+                return
+
+    def _on_unit_changed(self) -> None:
+        # Re-render the echoed coordinate in the new unit (typed, unapplied
+        # text is replaced — the unit it was typed in is gone).
+        if self._coord_nm is not None:
+            self._render()
+
+    # ── values ───────────────────────────────────────────────────────────
+    def values(self) -> Optional[tuple]:
+        """``(x, y)`` as typed, in the current unit, or ``None`` if either
+        field is empty / not a number."""
+        try:
+            return (float(self.x_edit.text().replace(",", "")),
+                    float(self.y_edit.text().replace(",", "")))
+        except ValueError:
+            return None
+
+    def set_values(self, x: float, y: float) -> None:
+        """Fill the fields (current unit) without touching the echo state."""
+        fmt = "{:.3f}" if self.unit() == "gds-um" else "{:.0f}"
+        self.x_edit.setText(fmt.format(x))
+        self.y_edit.setText(fmt.format(y))
+
+    def show_coord(self, xrel: Optional[float], yrel: Optional[float],
+                   chip_corner: tuple) -> None:
+        """Echo an image's die-corner coordinate (nm) in the chosen unit, or
+        clear the fields when it has none. ``chip_corner`` is needed for the
+        GDS µm rendering only; the stored value stays die-corner nm."""
+        self._cc = (float(chip_corner[0]), float(chip_corner[1]))
+        if xrel is None or yrel is None:
+            self._coord_nm = None
+            self.x_edit.clear()
+            self.y_edit.clear()
+            return
+        self._coord_nm = (float(xrel), float(yrel))
+        self._render()
+
+    def _render(self) -> None:
+        xr, yr = self._coord_nm
+        if self.unit() == "gds-um":
+            gx, gy = gds_fov.klarf_to_gds(xr, yr, self._cc[0], self._cc[1])
+            self.set_values(gx / 1e3, gy / 1e3)
+        else:
+            self.set_values(xr, yr)
+
+    def set_has_image(self, on: bool) -> None:
+        """Apply needs a real selected image to write the coordinate on."""
+        self.apply_btn.setEnabled(bool(on))
+
+    def _emit_apply(self) -> None:
+        v = self.values()
+        if v is not None and self.apply_btn.isEnabled():
+            self.apply_requested.emit(v[0], v[1], self.unit())
+
+    def _emit_go(self) -> None:
+        v = self.values()
+        if v is not None:
+            self.go_requested.emit(v[0], v[1], self.unit())
+
+
 class SemPanel(QFrame):
     """Right column: a single 'Load SEM…' button (KLARF / image folder via a
     drop-down) + PART/CHIP catalog (F21) + always-visible Alignment δ panel
-    + the image list. Owns no file I/O — it asks MainWindow to open dialogs
-    and is handed the resulting :class:`sem_loader.SemImage` list."""
+    + Key coordinate panel (F32) + the image list. Owns no file I/O — it asks
+    MainWindow to open dialogs and is handed the resulting
+    :class:`sem_loader.SemImage` list."""
 
     load_klarf_requested = pyqtSignal()
     load_folder_requested = pyqtSignal()
     load_roi_requested = pyqtSignal()
     image_selected = pyqtSignal(object)   # sem_loader.SemImage
+
+    # F32 list badges: an image with coordinates but no file on disk, and one
+    # whose coordinate the operator keyed in. Same muted palette as "no coords"
+    # so the three read as status, not as scores.
+    _BADGE_NO_COORDS = ("no coords", "#9a8878", "#f4f0ea")
+    _BADGE_NO_IMAGE = ("no image", "#7a6a5a", "#efe9e2")
+    _BADGE_KEYED = ("keyed", "#5a6f8a", "#eaf0f7")
+
+    @classmethod
+    def _default_badge(cls, img) -> Optional[tuple]:
+        """The status badge an image row carries when no score is shown."""
+        if not getattr(img, "has_coords", True):
+            return cls._BADGE_NO_COORDS
+        # "keyed" before "no image": the operator's action is the more useful
+        # thing to see on a row that may well be both.
+        if str(getattr(img, "coord_source", "")).startswith("manual"):
+            return cls._BADGE_KEYED
+        if not getattr(img, "exists", True):
+            return cls._BADGE_NO_IMAGE
+        return None
+
+    @staticmethod
+    def _apply_badge(item: QListWidgetItem, badge: Optional[tuple]) -> None:
+        text, fg, bg = badge if badge else (None, None, None)
+        item.setData(Qt.ItemDataRole.UserRole + 2, text)
+        item.setData(Qt.ItemDataRole.UserRole + 3, fg)
+        item.setData(Qt.ItemDataRole.UserRole + 4, bg)
+
+    @staticmethod
+    def _row_text(img) -> str:
+        return f"{img.image_id}: {img.filename or '(no image)'}"
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -5527,6 +5791,12 @@ class SemPanel(QFrame):
         self.alignment_delta.setEnabled(False)
         v.addWidget(self.alignment_delta)
 
+        # F32: key a coordinate by hand — for folder images (no KLARF) and
+        # for browsing the layout with no SEM at all. Always visible: it is
+        # the only way in for two of the three supported data shapes.
+        self.coord_key = CoordinateKeyPanel(self)
+        v.addWidget(self.coord_key)
+
         # Image list — the primary defect-navigation control — gets the
         # stretch space so it's the prominent element in the column.
         self.list = QListWidget(self)
@@ -5595,14 +5865,29 @@ class SemPanel(QFrame):
             self._show_list_placeholder()
             return
         for img in self._images:
-            item = QListWidgetItem(f"{img.image_id}: {img.filename}")
+            item = QListWidgetItem(self._row_text(img))
             item.setData(Qt.ItemDataRole.UserRole, img)
             if not img.has_coords:
                 item.setForeground(QColor(_TK_TEXT_SEC))
-                item.setData(Qt.ItemDataRole.UserRole + 2, "no coords")
-                item.setData(Qt.ItemDataRole.UserRole + 3, "#9a8878")
-                item.setData(Qt.ItemDataRole.UserRole + 4, "#f4f0ea")
+            self._apply_badge(item, self._default_badge(img))
             self.list.addItem(item)
+
+    def refresh_image_row(self, img) -> None:
+        """Re-render one row after its coordinate changed (F32 keyed coord):
+        text, muted colour and status badge — unless a score badge is shown,
+        which stays (the score is still valid for the position it was run at
+        until the operator re-runs)."""
+        for i in range(self.list.count()):
+            item = self.list.item(i)
+            if item.data(Qt.ItemDataRole.UserRole) is not img:
+                continue
+            item.setText(self._row_text(img))
+            item.setForeground(QColor(_TK_TEXT_PRI if img.has_coords
+                                      else _TK_TEXT_SEC))
+            if img.image_id not in self._scores:
+                self._apply_badge(item, self._default_badge(img))
+            self.list.viewport().update()
+            break
 
     def set_score(self, image_id, score: float, threshold: float) -> None:
         """Annotate the matching list row with a colour-coded fine-align
@@ -5634,14 +5919,7 @@ class SemPanel(QFrame):
             img = item.data(Qt.ItemDataRole.UserRole)
             if img is None or img.image_id != image_id:
                 continue
-            if not getattr(img, "has_coords", True):
-                item.setData(Qt.ItemDataRole.UserRole + 2, "no coords")
-                item.setData(Qt.ItemDataRole.UserRole + 3, "#9a8878")
-                item.setData(Qt.ItemDataRole.UserRole + 4, "#f4f0ea")
-            else:
-                item.setData(Qt.ItemDataRole.UserRole + 2, None)
-                item.setData(Qt.ItemDataRole.UserRole + 3, None)
-                item.setData(Qt.ItemDataRole.UserRole + 4, None)
+            self._apply_badge(item, self._default_badge(img))
             self.list.viewport().update()
             break
 
@@ -6251,7 +6529,8 @@ class MainWindow(QMainWindow):
             f"font-size:{_FS_MICRO}px; font-weight:700; "
             f"letter-spacing:1.5px; padding:0 10px;")
         self._status_brand.setToolTip(
-            f"GLAS — GDS-Layout Alignment for SEM · version {GLAS_VERSION}")
+            f"GLAS — GDS-Layout Alignment for SEM · version {GLAS_VERSION} · "
+            f"build {buildinfo.build_id()}")
         self._status_bar.addWidget(self._status_brand)
         self._status_doc = QLabel("no GDS loaded")
         self._status_cursor = QLabel("")
@@ -6293,6 +6572,9 @@ class MainWindow(QMainWindow):
         self.sem_panel.coord_setup.set_dev_mode(self._dev_mode)
         self.sem_panel.alignment_delta.set_requested.connect(self._on_set_offset)
         self.sem_panel.alignment_delta.clear_requested.connect(self._on_clear_offset)
+        # F32: keyed coordinates (per-image Apply / image-less Go).
+        self.sem_panel.coord_key.apply_requested.connect(self._on_keyed_apply)
+        self.sem_panel.coord_key.go_requested.connect(self._on_keyed_go)
         self.sem_panel.fine_align.run_requested.connect(self._on_run_fine_align)
         self.sem_panel.fine_align.export_requested.connect(self._on_export)
         self.sem_panel.fine_align.preview_requested.connect(self._on_preview_template)
@@ -6668,14 +6950,23 @@ class MainWindow(QMainWindow):
 
     def _update_guidance(self) -> None:
         """Show the next workflow step; hide the strip once set up (M6.6)."""
+        virtual = self._is_virtual(self._current_sem)
         if self._rar is None and self._doc is None:
             msg = "Step 1 — Open an OASIS: toolbar “Open OASIS…” — a 3-page wizard guides you (file → layers → root cell)."
-        elif not self._sem_images:
-            msg = "Step 2 — Load SEM: right panel “Load SEM…” (KLARF file or image folder)."
+        elif not self._sem_images and not virtual:
+            msg = ("Step 2 — Load SEM: right panel “Load SEM…” (KLARF file or "
+                   "image folder) — or key a coordinate (right panel “Go”) to "
+                   "browse the layout with no SEM.")
         elif self._fov_w <= 0 or self._fov_h <= 0:
             msg = "Step 3 — Pick PART / CHIP (right panel): the catalog supplies chip-corner + FOV automatically."
         elif self._current_sem is None:
             msg = "Step 4 — Click a defect image in the list to jump and load its GDS ROI."
+        elif virtual:
+            msg = ("Browsing the layout at a keyed coordinate (no SEM). Key "
+                   "another coordinate, or load SEM images to align.")
+        elif not getattr(self._current_sem, "has_coords", True):
+            msg = ("This image has no coordinates: key its position in the "
+                   "right panel (GDS µm or KLARF nm) and press Apply.")
         else:
             msg = ("Step 5 — Left-drag the GDS overlay to align it on the SEM, "
                    "then press Set Offset. Wheel zooms; middle/right-drag pans.")
@@ -6697,6 +6988,16 @@ class MainWindow(QMainWindow):
         has_sem = bool(self._sem_images)
         has_defects = has_sem and any(
             getattr(im, "has_coords", False) for im in self._sem_images)
+        # F32: a keyed (virtual) target is a position to centre on too.
+        cur = self._current_sem
+        if cur is not None and getattr(cur, "has_coords", False):
+            has_defects = True
+        sem_panel = getattr(self, "sem_panel", None)
+        if sem_panel is not None and hasattr(sem_panel, "coord_key"):
+            # Apply writes onto a real selected image; the virtual Goto target
+            # isn't one (it has nothing to export).
+            sem_panel.coord_key.set_has_image(
+                cur is not None and not self._is_virtual(cur))
         # GDS overview is only meaningful when there's geometry to draw.
         seg_gds = getattr(self, "_seg_gds", None)
         if seg_gds is not None:
@@ -6935,6 +7236,9 @@ class MainWindow(QMainWindow):
         self._dlg_remember("folder", path, is_dir=True)
         images = sem_loader.load_folder(path)
         self._sem_images = images
+        # A folder has no KLARF; a stale path from an earlier KLARF load would
+        # otherwise be written into this dataset's export manifest (F32).
+        self._klarf_path = ""
         self.sem_panel.set_images(images)
         self._maybe_prewarm_batch_pool()   # F23 M2: batch now plausible
         self._status_state(
@@ -6943,29 +7247,156 @@ class MainWindow(QMainWindow):
 
     def _on_sem_image_selected(self, img) -> None:
         self._current_sem = img
-        self.sem_viewer.set_image(img, self._align_page_of(img))
+        self._show_sem_or_blank(img)
         self._jump_to_image(img)
         self._refresh_overview_defects()      # move the "current" ring
+        self.sem_panel.coord_key.show_coord(
+            getattr(img, "xrel", None), getattr(img, "yrel", None),
+            (self._chip_corner_x, self._chip_corner_y))
         self._update_guidance()
         # Auto-load the ROI geometry around the clicked defect (option 2).
         # Only on an explicit image click — not on fine-tune / coord edits
         # (which also call _jump_to_image) — so the parser isn't re-run on
         # every spinbox keystroke.
-        if self._rar is not None and self._fov_w > 0 and self._fov_h > 0:
-            pos = self._current_image_gds()
-            if pos is not None:
-                if self._roi_thread is None:
-                    self._roi_pending_pos = None
-                    self._load_roi_around(*pos)
-                else:
-                    # A load is already running — park the latest click and let
-                    # _cleanup_roi pick it up (coalesce-to-latest), rather than
-                    # dropping it. Keeps the displayed overlay matched to the
-                    # selected defect.
-                    self._roi_pending_pos = pos
-                    self._status_cursor.setText(
-                        "ROI busy — loading this defect when the current "
-                        "load finishes")
+        self._auto_load_roi_for_current()
+
+    def _auto_load_roi_for_current(self, *, half_w=None, half_h=None) -> None:
+        """Load the ROI around the current image's GDS position if a reader
+        is open, coalescing to the latest request while a load is running."""
+        if self._rar is None or self._fov_w <= 0 or self._fov_h <= 0:
+            return
+        pos = self._current_image_gds()
+        if pos is None:
+            return
+        if self._roi_thread is None:
+            self._roi_pending_pos = None
+            self._load_roi_around(*pos, half_w=half_w, half_h=half_h)
+        else:
+            # A load is already running — park the latest click and let
+            # _cleanup_roi pick it up (coalesce-to-latest), rather than
+            # dropping it. Keeps the displayed overlay matched to the
+            # selected defect.
+            self._roi_pending_pos = pos
+            self._status_cursor.setText(
+                "ROI busy — loading this defect when the current "
+                "load finishes")
+
+    # ── F32: display without an image / navigate without a KLARF ───────────
+    #: Width (native px) of the virtual canvas when no image and no manual
+    #: nm-per-px fix the size. 1024 is a typical SEM frame width, so the auto
+    #: nm/px (FOV width / 1024) lands in the range a real image would give.
+    _VIRTUAL_CANVAS_W = 1024
+
+    def _virtual_canvas_size(self) -> tuple:
+        """``(w, h)`` native px of the blank canvas standing in for a SEM
+        image: manual nm-per-px makes it exactly FOV / nm-per-px (so the
+        scale the operator typed is the scale drawn); otherwise a fixed
+        width with the FOV's aspect ratio."""
+        if (not self._nm_auto and self._nm_per_px_manual > 0
+                and self._fov_w > 0 and self._fov_h > 0):
+            return (max(1, round(self._fov_w / self._nm_per_px_manual)),
+                    max(1, round(self._fov_h / self._nm_per_px_manual)))
+        w = self._VIRTUAL_CANVAS_W
+        if self._fov_w > 0 and self._fov_h > 0:
+            return w, max(1, round(w * self._fov_h / self._fov_w))
+        return w, w
+
+    def _show_sem_or_blank(self, img) -> None:
+        """Show ``img`` in the viewer; when it has no readable file but does
+        have a position, draw the layout on a blank canvas instead of leaving
+        the empty state (F32). A SEM file that exists always wins."""
+        self.sem_viewer.set_image(img, self._align_page_of(img))
+        if (self.sem_viewer.native_size() is None and img is not None
+                and getattr(img, "has_coords", False)):
+            w, h = self._virtual_canvas_size()
+            if self._is_virtual(img):
+                caption = "keyed coordinate — layout only (no SEM)"
+            else:
+                caption = f"defect {img.image_id} — no image file, layout only"
+            self.sem_viewer.set_blank(w, h, caption)
+
+    @staticmethod
+    def _is_virtual(img) -> bool:
+        """True for the stand-in image a keyed Goto creates (F32): it has a
+        position but no file and is not part of the loaded dataset."""
+        return img is not None and getattr(img, "id_source", "") == "virtual"
+
+    def _goto_virtual(self, gx: float, gy: float, *,
+                      half_w=None, half_h=None) -> None:
+        """Navigate to GDS ``(gx, gy)`` nm with no SEM image (F32, mode c).
+
+        Builds a stand-in :class:`sem_loader.SemImage` carrying that position
+        as die-corner nm and makes it the current image, so every existing
+        path (jump, overlay anchor, ROI load, origin δ) applies unchanged. It
+        is deliberately **not** added to ``_sem_images``: it is a viewpoint,
+        not a defect — nothing to export, no dot on the overview."""
+        xr, yr = gds_fov.gds_to_klarf(float(gx), float(gy),
+                                      self._chip_corner_x, self._chip_corner_y)
+        target = sem_loader.SemImage(
+            image_id="goto", filename="", file_path=None,
+            xrel=xr, yrel=yr, id_source="virtual", coord_source="manual-gds")
+        self._current_sem = target
+        self._show_sem_or_blank(target)
+        self._jump_to_image(target)
+        self._refresh_overview_defects()
+        self.sem_panel.list.clearSelection()
+        self.sem_panel.coord_key.show_coord(
+            xr, yr, (self._chip_corner_x, self._chip_corner_y))
+        self._update_guidance()
+        if self._rar is None:
+            self._status_cursor.setText(
+                "open an OASIS (toolbar) to load geometry at this coordinate")
+        self._auto_load_roi_for_current(half_w=half_w, half_h=half_h)
+
+    def _keyed_to_die_corner_nm(self, x: float, y: float, unit: str) -> tuple:
+        """A keyed ``(x, y)`` in ``unit`` -> KLARF die-corner nm."""
+        if unit == "klarf-nm":
+            return float(x), float(y)
+        # gds-um: layout µm -> nm -> inverse of klarf_to_gds.
+        return gds_fov.gds_to_klarf(float(x) * 1e3, float(y) * 1e3,
+                                    self._chip_corner_x, self._chip_corner_y)
+
+    def _apply_keyed_coord(self, img, x: float, y: float, *,
+                           unit: str = "gds-um") -> None:
+        """Give ``img`` a keyed coordinate (F32, mode b) and navigate to it.
+
+        Stored as die-corner nm so the image is indistinguishable downstream
+        from a KLARF defect: it jumps, loads its ROI, takes part in fine align
+        and Export (``has_coords`` is what those filter on), and origin δ
+        applies to it like to every other image."""
+        if img is None or self._is_virtual(img):
+            return
+        img.xrel, img.yrel = self._keyed_to_die_corner_nm(x, y, unit)
+        img.coord_source = "manual-gds" if unit == "gds-um" else "manual-klarf"
+        # A stored fine-align result belongs to the old position.
+        if self._refined.pop(img.image_id, None) is not None:
+            self._fa_meta.pop(img.image_id, None)
+            self.sem_panel.clear_score(img.image_id)
+        self.sem_panel.refresh_image_row(img)
+        if self._current_sem is img:
+            self._on_sem_image_selected(img)
+        else:
+            self._refresh_overview_defects()
+            self._update_guidance()
+        gx, gy = gds_fov.klarf_to_gds(img.xrel, img.yrel,
+                                      self._chip_corner_x, self._chip_corner_y)
+        self._status_transient(
+            f"image {img.image_id}: coordinate keyed → GDS "
+            f"({gx / 1e3:,.3f}, {gy / 1e3:,.3f}) µm")
+
+    def _on_keyed_apply(self, x: float, y: float, unit: str) -> None:
+        img = self._current_sem
+        if img is None or self._is_virtual(img):
+            self._status_doc.setText(
+                "Key coordinate: select an image in the list first (or use Go)")
+            return
+        self._apply_keyed_coord(img, x, y, unit=unit)
+
+    def _on_keyed_go(self, x: float, y: float, unit: str) -> None:
+        xr, yr = self._keyed_to_die_corner_nm(x, y, unit)
+        gx, gy = gds_fov.klarf_to_gds(xr, yr, self._chip_corner_x,
+                                      self._chip_corner_y)
+        self._goto_virtual(gx, gy)
 
     def _on_coord_changed(self) -> None:
         # F21: PartChipPanel is the source of truth for chip / FOV / scale.
@@ -6978,7 +7409,13 @@ class MainWindow(QMainWindow):
         self._nm_per_px_manual = v["nm_per_px_manual"]
         self._nm_auto = v["nm_auto"]
         if self._current_sem is not None:
+            if self.sem_viewer.is_blank():
+                # F32: the blank canvas's size follows FOV / nm-per-px.
+                self._show_sem_or_blank(self._current_sem)
             self._jump_to_image(self._current_sem)
+            self.sem_panel.coord_key.show_coord(
+                self._current_sem.xrel, self._current_sem.yrel,
+                (self._chip_corner_x, self._chip_corner_y))
         self._refresh_overview_defects()
         self._update_guidance()
 
@@ -7256,7 +7693,7 @@ class MainWindow(QMainWindow):
         img = self._current_sem
         if img is None or not getattr(img, "pages", ()):
             return
-        self.sem_viewer.set_image(img, self._align_page_of(img))
+        self._show_sem_or_blank(img)
         self._status_doc.setText(
             f"aligning on image #"
             f"{self.sem_panel.fine_align.values()['align_page_ordinal']} "
@@ -7848,13 +8285,16 @@ class MainWindow(QMainWindow):
         cx, cy = x_um * 1e3, y_um * 1e3        # µm -> nm
         half = 25_000.0                         # ±25 µm view + ROI window
         self.canvas.set_view_to_bbox(cx - half, cy - half, cx + half, cy + half)
-        self.canvas.set_fov_marker(cx, cy, self._fov_w or 2000.0,
-                                   self._fov_h or 2000.0)
+        # F32: the SEM viewer (the default view) shows the layout there too,
+        # on a blank canvas, via the virtual current image; the ROI window
+        # stays the wide one so the GDS overview has geometry to compare.
+        # Goto types a *final* GDS position, so take origin δ back out: the
+        # ordinary path adds it again on the way to the screen.
+        self._goto_virtual(cx - self._origin_dx, cy - self._origin_dy,
+                           half_w=half, half_h=half)
         self._status_doc.setText(
             f"goto GDS ({x_um:,.3f}, {y_um:,.3f}) µm — compare to klayout "
             f"Ctrl+G at the same coord")
-        if self._rar is not None and self._roi_thread is None:
-            self._load_roi_around(cx, cy, half_w=half, half_h=half)
 
     def _on_load_roi_clicked(self) -> None:
         """Explicit 'Load GDS ROI here' button (M3.5d) — only loads on
@@ -8818,7 +9258,10 @@ class MainWindow(QMainWindow):
 
         v.addSpacing(16)
 
-        ver_lbl = QLabel(f"Version {GLAS_VERSION}", dlg)
+        # F32: the build id is the bundle header's BUILD number — the only
+        # way to tell which build an unpacked (git-less) machine is running.
+        ver_lbl = QLabel(f"Version {GLAS_VERSION} · build {buildinfo.build_id()}",
+                         dlg)
         ver_lbl.setStyleSheet("font-size: 12px; color: #9a8878;")
         ver_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         v.addWidget(ver_lbl)

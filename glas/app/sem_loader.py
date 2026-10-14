@@ -17,7 +17,15 @@ which one produced it:
   ``klarf_doc`` instead; see :func:`_load_klarf_ebi`.
 * **Load Folder** -- scan a directory for image files. No coordinates
   are available, so these images can be browsed but won't auto-jump
-  until the user keys an offset (or M4 fine-aligns).
+  until the user keys a coordinate for them (F32 CoordinateKeyPanel).
+
+**Images without a file are kept (F32).** A KLARF that carries defect
+coordinates but no review images -- or whose images were never copied next
+to it -- is still a defect list worth navigating: GLAS jumps to each defect's
+GDS position and shows the layout on a blank canvas. So a defect with
+coordinates survives here with ``file_path=None`` (``exists`` False); only a
+defect with neither an image nor coordinates is dropped, because nothing can
+be done with it.
 
 **Coordinates leave here in nm, always.** KLARF 1.2 stores XREL/YREL in µm and
 1.8 in nm; the conversion happens at load time because ``gds_fov.klarf_to_gds``
@@ -77,6 +85,12 @@ class SemImage:
         it may join on KLARF ``DEFECTID``: ``"klarf-defectid"``,
         ``"filename-stem"``, ``"row-index"`` (a KLARF with no DEFECTID column
         -- ids are positional and join on nothing), or ``""`` when unknown.
+    ``coord_source`` (F32)
+        Where ``xrel`` / ``yrel`` came from: ``"klarf"`` (read from the
+        defect list), ``"manual-gds"`` / ``"manual-klarf"`` (keyed by the
+        operator, in GDS µm or KLARF die-corner nm respectively), or ``""``
+        when there are no coordinates. Drives the list badge; an exporter can
+        use it to tell a keyed position from a measured one.
     """
     image_id: str
     filename: str
@@ -86,6 +100,7 @@ class SemImage:
     pages: tuple = ()
     page: Optional[int] = None
     id_source: str = ""
+    coord_source: str = ""
 
     @property
     def has_coords(self) -> bool:
@@ -177,31 +192,87 @@ def _load_klarf_ebi(p: Path, ordinal: int, notes: list) -> Optional[list]:
     tiff_path = Path(tiff)
     out: list[SemImage] = []
     n_skipped = 0
+    n_no_image = 0
     for k, (row, pages) in enumerate(zip(doc.defects, imap["pages"])):
-        if not pages:
-            # No patch for this defect (IMAGECOUNT 0) — nothing to display or
-            # align, same as the rSEM path skipping a defect with no filename.
-            n_skipped += 1
-            continue
         image_id = (str(row[i_id]) if 0 <= i_id < len(row) else str(k + 1))
         xrel = _to_float(row[i_x]) if 0 <= i_x < len(row) else None
         yrel = _to_float(row[i_y]) if 0 <= i_y < len(row) else None
+        if not pages and (xrel is None or yrel is None):
+            # No patch (IMAGECOUNT 0) *and* no coordinates: nothing to show,
+            # nothing to jump to.
+            n_skipped += 1
+            continue
         img = SemImage(
             image_id=image_id,
-            filename=tiff_path.name,
-            file_path=tiff_path,
+            # F32: a defect with coordinates but no patch keeps its place in
+            # the list (navigable, drawn on a blank canvas); it has no file.
+            filename=tiff_path.name if pages else "",
+            file_path=tiff_path if pages else None,
             # µm (1.2) → nm; 1.8 multiplies by 1 and is bit-for-bit unchanged.
             xrel=None if xrel is None else xrel * to_nm,
             yrel=None if yrel is None else yrel * to_nm,
             pages=tuple(int(pg) for pg in pages),
             id_source=id_source,
+            coord_source="klarf" if (xrel is not None and yrel is not None) else "",
         )
         img.page = img.page_for_ordinal(ordinal)
         out.append(img)
+        if not pages:
+            n_no_image += 1
     if n_skipped:
-        notes.append(f"{n_skipped} defect(s) carry no patch image and were skipped.")
+        notes.append(f"{n_skipped} defect(s) carry no patch image and no "
+                     "coordinates and were skipped.")
+    if n_no_image:
+        notes.append(f"{n_no_image} defect(s) carry no patch image; kept for "
+                     "navigation (coordinates only).")
     if not out:
         return None
+    return out
+
+
+def _load_klarf_coords_only(p: Path, notes: list) -> Optional[list]:
+    """F32 fallback: a KLARF the rSEM parser yields nothing from, but that
+    :mod:`klarf_doc` can read -- typically a 1.2 flat file with no patch TIFF
+    beside it (``klarf_parser`` has no 1.2 ``DefectRecordSpec`` support, see
+    F31). Every defect with XREL/YREL becomes an image-less :class:`SemImage`
+    so the operator can still step through the defects on the layout.
+
+    Only called when the rSEM path returned **no** images: a KLARF the old path
+    can serve must keep loading exactly as before, filenames included.
+    """
+    try:
+        import klarf_doc
+    except ImportError:                     # pragma: no cover - vendored
+        return None
+    try:
+        doc = klarf_doc.load(str(p))
+    except (OSError, ValueError, UnicodeError):
+        return None
+    i_x, i_y = doc.col_index("XREL"), doc.col_index("YREL")
+    if i_x < 0 or i_y < 0 or not doc.defects:
+        return None
+    to_nm = float(doc.unit_info()["to_nm"])
+    i_id = doc.col_index("DEFECTID")
+    id_source = "klarf-defectid" if i_id >= 0 else "row-index"
+    out: list[SemImage] = []
+    for k, row in enumerate(doc.defects):
+        xrel = _to_float(row[i_x]) if i_x < len(row) else None
+        yrel = _to_float(row[i_y]) if i_y < len(row) else None
+        if xrel is None or yrel is None:
+            continue
+        out.append(SemImage(
+            image_id=str(row[i_id]) if 0 <= i_id < len(row) else str(k + 1),
+            filename="",
+            file_path=None,
+            xrel=xrel * to_nm,
+            yrel=yrel * to_nm,
+            id_source=id_source,
+            coord_source="klarf",
+        ))
+    if not out:
+        return None
+    notes.append(f"No image files referenced: {len(out)} defect(s) loaded "
+                 "as coordinates only (KLARF %s)." % doc.version)
     return out
 
 
@@ -214,8 +285,11 @@ def load_klarf(path: str | Path, *,
     :func:`_load_klarf_ebi`); if the file isn't that shape, falls through to the
     original rSEM path below, unchanged: image filenames come from the parser's
     ``_image_filename`` field and are resolved relative to the KLARF file's
-    directory, defects without an image are skipped (nothing to display), and
-    XREL/YREL are read case-insensitively from the defect columns.
+    directory, defects with neither an image nor coordinates are skipped
+    (nothing to display, nothing to jump to -- F32 keeps the ones that have
+    coordinates, image-less), and XREL/YREL are read case-insensitively from
+    the defect columns. When that path yields nothing at all, a last resort
+    reads coordinates only through ``klarf_doc`` (:func:`_load_klarf_coords_only`).
 
     ``align_page_ordinal`` picks which of a defect's images alignment uses
     (1-based; only meaningful for the EBI path). Pass ``notes`` a list to
@@ -235,11 +309,12 @@ def load_klarf(path: str | Path, *,
     base_dir = p.parent
     for i, defect in enumerate(parsed.get("defects", []) or []):
         fname = defect.get("_image_filename", "") or ""
-        if not fname:
-            continue
         # XREL/YREL stored under their column name; values are strings.
         xrel = _to_float(defect.get(columns[cols["XREL"]])) if "XREL" in cols else None
         yrel = _to_float(defect.get(columns[cols["YREL"]])) if "YREL" in cols else None
+        has_coords = xrel is not None and yrel is not None
+        if not fname and not has_coords:
+            continue
         if "DEFECTID" in cols:
             image_id = str(defect.get(columns[cols["DEFECTID"]], i + 1))
             id_source = "klarf-defectid"
@@ -249,12 +324,15 @@ def load_klarf(path: str | Path, *,
         out.append(SemImage(
             image_id=image_id,
             filename=fname,
-            file_path=base_dir / fname,
+            file_path=(base_dir / fname) if fname else None,
             xrel=xrel,
             yrel=yrel,
             id_source=id_source,
+            coord_source="klarf" if has_coords else "",
         ))
-    return out
+    if out:
+        return out
+    return _load_klarf_coords_only(p, notes) or []
 
 
 def read_die_pitch_nm(path: str | Path) -> Optional[tuple[float, float]]:

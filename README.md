@@ -21,6 +21,7 @@
 | **大檔 OASIS 解析** | 自寫 streaming + random-access parser，數百 MB production OASIS 秒級 ROI 隨機存取，不依賴 klayout / gdstk |
 | **Layer 掃描** | 優先讀 LAYERNAME 表（秒級）；無 LAYERNAME 時自動 bounded cell 抽樣，從幾何列舉 `layer/datatype`，結果有 sidecar 快取 |
 | **KLARF ↔ GDS 座標換算** | 由 SEM defect 的 die-corner 座標定位到 layout，自動跳位 + FOV 框。KLARF 1.2 的 µm 座標在載入時換算成 nm |
+| **缺料也能看 layout（F32）** | 三種資料不全的情況都能「移過去並顯示」：(a) **有 KLARF 沒影像** —— 有座標的 defect 照樣進列表（徽章 `no image`），點了就在**虛擬底圖**上畫 layout；(b) **有影像沒 KLARF** —— 選中影像後在右欄 KEY COORDINATE 鍵入 GDS µm 或 KLARF nm 按 Apply（徽章 `keyed`），之後跟 KLARF defect 一樣可 fine-align / Export；(c) **純 GDS** —— 右欄 Go 或工具列 Goto，不載任何 SEM 直接瀏覽 layout |
 | **EBI patch（多頁 TIFF）** | 一顆 DEFECTID 對應多張 patch、整批裝在一個多頁 TIFF（lot 層 `TiffFileName` + `IMAGECOUNT`/`IMAGELIST`）時，每顆 defect 取得自己的頁；對位用哪一張可設定（預設第 2 張 = ref） |
 | **PART / CHIP catalog** | fab 工程師以下拉選定 chip，自動帶入 chip corner / FOV / nm-per-px，取代 6 欄手填 |
 
@@ -93,11 +94,12 @@ python main.py
 ```
 1. Open OASIS   ── 三頁 Wizard：選檔 → 選 layers → 選 root cell
         ↓
-2. Load SEM     ── 載入 KLARF 或影像資料夾
+2. Load SEM     ── 載入 KLARF 或影像資料夾（沒 SEM 也行：右欄 KEY COORDINATE → Go 直接看 layout）
         ↓
 3. 選 PART / CHIP  ── catalog 自動帶入 chip corner / FOV / nm-per-px
         ↓
 4. 點選 image   ── 自動跳位 + 載入 GDS ROI（半透明 overlay）
+                   沒 KLARF 座標的影像：右欄鍵入 GDS µm / KLARF nm → Apply；沒影像檔的 defect 畫在虛擬底圖上
         ↓
 5. 對位         ── 手動拖動 Set Offset，或 Fine Align 自動 matchTemplate（單張確認幾張）
         ↓
@@ -156,14 +158,21 @@ ADEPT 不做 OASIS/GDS parser —— layout 的解析與對位留在 GLAS，它�
 
 ## 離線搬運（不能 clone 的機器）
 
-`bundle/GLAS_bundle.py` 是整個 repo 壓成的**單一純文字自解 `.py`**：複製 raw 的內容、
-存成檔案、執行它就展開整個 repo。每個檔案都帶 git blob SHA-1，解開時逐檔驗過才落地，
+`bundle/GLAS_bundle.py` 是整個 repo 壓成的**單一純 ASCII 自解 `.py`**：在瀏覽器打開 raw、
+全選複製、存成檔案、執行它就展開整個 repo。每個檔案都帶 git blob SHA-1，解開時逐檔驗過才落地，
 傳輸途中被改動會當場講出來，而不是給你一份安靜壞掉的程式碼。
 
 ```bash
-python GLAS_bundle.py                 # 解到 .\GLASpython GLAS_bundle.py --dest D:	ools
+python GLAS_bundle.py                 # 解到 .\GLAS
+python GLAS_bundle.py --dest D:\tools
 python GLAS_bundle.py --list          # 只看裡面有什麼，不寫任何檔案
+python main.py --version              # 解開後：這台跑的是哪一版（build id = 包檔頭的 BUILD）
 ```
+
+格式（2026-10-14 起，對齊 d4t）：解包程式是英文、資料區是**逐檔 raw LZMA2 + base85**，
+整份**純 ASCII** —— 公司機的記事本把檔案存成 ANSI（cp950）也弄不壞它（d4t 2026-09-03 在
+公司機上撞過 `SyntaxError: Non-UTF-8 code`）；逐檔壓縮讓 git 每次 commit 只多改到的那幾檔。
+舊格式的包（整包 lzma+base64）帶著自己的解包程式，照樣解得開。
 
 改完程式碼後**重產**（順序不能顛倒，包裡面含著那份清單）：
 
