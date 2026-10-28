@@ -13,6 +13,7 @@ if str(_TOOLS) not in sys.path:
 
 import gds_fov  # noqa: E402
 from gds_fov import (  # noqa: E402
+    gds_to_klarf,
     klarf_to_gds,
     rfl_to_chip_corner,
     fov_bounds,
@@ -90,6 +91,32 @@ class TestKlarfToGds:
         gx, gy = klarf_to_gds(1000, 2000, 100, 50, flip_y=True)
         assert gx == 900
         assert gy == -1950
+
+
+class TestGdsToKlarf:
+    """F32: the inverse used to store a keyed GDS coordinate as die-corner nm.
+    The property that matters is the round trip, not any particular sign."""
+
+    def test_scalar_inverse(self):
+        assert gds_to_klarf(900, 1950, 100, 50) == (1000, 2000)
+
+    @pytest.mark.parametrize("flip", [False, True])
+    @pytest.mark.parametrize("pt", [(0.0, 0.0), (123.5, -42.0),
+                                    (20_267_174.0, 20_652_619.0)])
+    def test_round_trips_through_klarf_to_gds(self, flip, pt):
+        cc = (12_345.0, -678.0)
+        xr, yr = gds_to_klarf(pt[0], pt[1], *cc, flip_y=flip)
+        assert klarf_to_gds(xr, yr, *cc, flip_y=flip) == pytest.approx(pt)
+        back = gds_to_klarf(*klarf_to_gds(pt[0], pt[1], *cc, flip_y=flip),
+                            *cc, flip_y=flip)
+        assert back == pytest.approx(pt)
+
+    def test_array_inputs(self):
+        gx = np.array([900.0, 1900.0])
+        gy = np.array([-100.0, 400.0])
+        xr, yr = gds_to_klarf(gx, gy, 100, 100)
+        np.testing.assert_array_equal(xr, [1000, 2000])
+        np.testing.assert_array_equal(yr, [0, 500])
 
 
 # ── FOV bounds ───────────────────────────────────────────────────────

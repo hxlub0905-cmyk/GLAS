@@ -20,6 +20,12 @@ for _sub in ("glas/core", "glas/app"):
 
 
 def main() -> int:
+    if "--version" in sys.argv[1:]:
+        # F32: "which build is this machine running" -- answerable without
+        # git (the unpacked bundle has none) and without Qt installed.
+        import buildinfo
+        print(buildinfo.version_line())
+        return 0
     import gds_align_tool
     return gds_align_tool.main()
 

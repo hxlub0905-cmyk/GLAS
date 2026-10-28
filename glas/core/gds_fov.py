@@ -124,6 +124,29 @@ def klarf_to_gds(
     return gds_x, gds_y
 
 
+def gds_to_klarf(
+    gds_x: Number,
+    gds_y: Number,
+    chip_corner_x: float,
+    chip_corner_y: float,
+    *,
+    flip_y: bool = False,
+) -> tuple[Number, Number]:
+    """Exact inverse of :func:`klarf_to_gds` (F32).
+
+    A coordinate the operator keys in as GDS nm is stored on the image as a
+    KLARF die-corner coordinate, so every downstream path (jump, ROI load,
+    fine-align, export) stays the one KLARF images already use. The round
+    trip ``klarf_to_gds(*gds_to_klarf(x, y, cc)) == (x, y)`` must hold for any
+    ``flip_y``; this function exists only so that inverse lives in one place
+    instead of being re-derived (and mis-signed) at each call site.
+    ``klarf_to_gds`` itself is frozen (CLAUDE.md §7) and untouched.
+    """
+    if flip_y:
+        gds_y = -gds_y
+    return gds_x + chip_corner_x, gds_y + chip_corner_y
+
+
 # ── M2.2: FOV bbox filtering ─────────────────────────────────────────
 
 

@@ -11,9 +11,17 @@
 
 1. ``tools/FILELIST.txt`` —— 全部檔案的 git blob SHA（分批搬運時用來回報
    「還缺哪幾個」）。
-2. ``bundle/GLAS_bundle.py`` —— 整個 repo 壓成**一個**純文字 `.py`，
+2. ``bundle/GLAS_bundle.py`` —— 整個 repo 壓成**一個**純 ASCII `.py`，
    在 GitHub 上複製 raw 就能整包搬進受限的機器。每次產完會報一句目前的
    大小（見 :func:`bundle_size_report`）—— 那是**資訊**，不是門檻。
+
+   ⚠ **逐檔 raw LZMA2 + base85**（``#ENC lzma2+b85/file``，2026-10-14 起、對齊
+   d4t 2026-10-06 的格式；之前是整包 lzma+base64、解包程式帶中文）。要同時滿足
+   三件事：**純 ASCII**（公司機的記事本會把包存成 cp950，一個中文字就整檔
+   ``SyntaxError``）、**git delta 壓得動**（整包壓成一個流改一行就整份變樣，
+   d4t 實測 bundle 歷史佔 pack 98%）、**夠小**。理由與數字見
+   `make_text_bundle.py` 的模組說明。每一包都帶著**自己的**解包程式，所以已經
+   搬進公司機的舊包照樣解得開。
 
 **先清單再打包**：包裡面含著那份清單，順序反了就會把舊清單封進新包裡。
 
@@ -58,11 +66,13 @@ def bundle_size_report(nbytes: int) -> Tuple[str, str]:
     以前這裡分 ok / warn / over 三級，85% 就開始喊。那是「1 MB 是硬牆」年代
     的產物；使用者改用 raw 複製之後，喊了也沒有人需要做任何事，而**一句沒有
     對應動作的警告只會訓練人忽略警告**。現在它只報事實。
+
+    ⚠ **不要把「佔 1 MB 的百分之幾」印回來**（d4t 的教訓）：包超過 1 MB 之後那個
+    數字讀起來就是一句警報 —— 對著一件沒有人需要做任何事的事情。
     """
-    pct = 100.0 * nbytes / BUNDLE_LIMIT_BYTES
-    size = ("%.0f KB（GitHub 檔案頁的顯示上限是 1 MB，佔 %.0f%%；"
-            "搬運走 raw，不受這個數字影響）" % (nbytes / 1024.0, pct))
-    return "ok", "  %s" % size
+    return "ok", ("  %.2f MB（走 raw 複製，跟這個數字無關；GitHub 的檔案瀏覽頁"
+                  "在 1 MB 以上不顯示，那條路本來就沒在用）"
+                  % (nbytes / 1024.0 / 1024.0))
 
 
 def repo_root() -> str:
@@ -105,6 +115,7 @@ def _bundle_entries(text: str) -> List[Tuple[str, str]]:
     """
     import base64
     import lzma
+    from urllib.parse import unquote
 
     lines = text.split("\n")
     try:
@@ -114,17 +125,19 @@ def _bundle_entries(text: str) -> List[Tuple[str, str]]:
     data = lines[start:]
     enc = data[0].strip() if data else ""
     data = data[1:]
-    if enc == "#ENC lzma+base64":
+    per_file = enc == "#ENC lzma2+b85/file"
+    if enc == "#ENC lzma+base64":                 # 舊：整包一個流
         blob = "".join(ln[2:] for ln in data if ln.startswith("#B"))
         data = lzma.decompress(base64.b64decode(blob)).decode("utf-8").split("\n")
     out = []
     i = 0
     while i < len(data):
-        # ``#X`` = base64 記錄（裝不進行導向格式的檔案，GLAS 有一份 PDF）。
-        # 漏掉它的話這支會永遠說「包裡少了那個檔案」，而重打一次也不會好。
+        # 現行 ``#F`` 記錄的 count 是 base85 行數、舊 ``#F`` 是文字行數、
+        # ``#X`` 是 base64 行數 —— 三種都是「跳過 count 行」，所以同一個迴圈。
+        # 漏掉任一種的話這支會永遠說「包裡少了那個檔案」，而重打一次也不會好。
         if data[i][:3] in ("#F ", "#X "):
             _, sha, count, path = data[i].split(" ", 3)
-            out.append((sha, path))
+            out.append((sha, unquote(path) if per_file else path))
             i += 1 + int(count)
         else:
             i += 1
@@ -176,7 +189,11 @@ def write(root: str = "") -> None:
     # 2. 再打包
     bundle = os.path.join(root, BUNDLE.replace("/", os.sep))
     os.makedirs(os.path.dirname(bundle), exist_ok=True)
-    text = make_text_bundle.build(os.path.basename(bundle), root, compress=True)
+    # `compress=False` ＝ **逐檔** raw LZMA2 + base85（純 ASCII、git 壓得動）。
+    # **不要改成 True**：那是「整包壓成一個流」的舊格式，git 每個 commit 都得
+    # 完整存一份。`tests/test_bundle_tools.py` 用 ast 守著這個關鍵字。
+    text = make_text_bundle.build(os.path.basename(bundle), root,
+                                  compress=False)
     tmp = bundle + ".tmp"
     with open(tmp, "w", encoding="utf-8", newline="\n") as f:
         f.write(text)
@@ -204,6 +221,7 @@ def main(argv=None) -> int:
         print("  你手上如果是解開的搬運包（沒有 .git），那就對了 —— 直接跑：")
         print("    pip install -r requirements.txt")
         print("    python main.py")
+        print("    python main.py --version      # 這台跑的是哪一版（build id）")
         return 2
 
     loose = untracked(root)
